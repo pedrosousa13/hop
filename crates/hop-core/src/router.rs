@@ -359,13 +359,14 @@ mod tests {
         );
     }
 
-    // Deviation from the JS suite (deliberate, see brief): the original
-    // case was `zurich`, which is not in M1's alias set — the old extension
-    // only resolved it via the full city dataset that arrives in M4.
-    // `berlin` is substituted because it *is* an alias-set key, preserving
-    // the case's intent (a bare city token infers timezone mode) within
-    // this milestone's scope. Do not "fix" this by adding zurich to the
-    // alias set.
+    // DIVERGENCE: the original JS case was `zurich`, which is not one of
+    // the 22 keys in `TIMEZONE_ALIASES` above. The old extension resolved
+    // `zurich` through its full city dataset, not a small embedded alias
+    // set; that full dataset arrives with the timezone provider in M4, out
+    // of scope here. `berlin` is substituted because it *is* an
+    // alias-set key, preserving the case's intent (a bare city token
+    // infers timezone mode) within this milestone's scope. Do not "fix"
+    // this by adding zurich to the alias set.
     #[test]
     fn bare_alias_city_routes_to_timezone_and_augments() {
         let r = route("berlin");
@@ -375,10 +376,13 @@ mod tests {
         );
     }
 
-    // Deviation from the JS suite (deliberate, see brief): the original
-    // case was `zurich time`. Substituted with `berlin time` for the same
-    // reason as above — `zurich` is out of scope for M1's alias-only
-    // lookup, `berlin` is not.
+    // DIVERGENCE: the original JS case was `zurich time`. Substituted with
+    // `berlin time` for the same reason as above — `zurich` is not one of
+    // the 22 keys in `TIMEZONE_ALIASES`, the old extension only resolved it
+    // through its full city dataset, and that dataset arrives with the
+    // timezone provider in M4, out of scope here. `berlin` is in the alias
+    // set, so it preserves the original case's intent within this
+    // milestone's scope.
     #[test]
     fn city_time_suffix_routes_to_timezone_and_augments() {
         let r = route("berlin time");

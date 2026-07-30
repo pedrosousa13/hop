@@ -383,14 +383,24 @@ mod tests {
 
     // --- Not named in the brief, but required by it. ---
 
+    // What this test does and does not establish: with today's
+    // one-kind-per-mode table (see `kinds_for_mode`), step 5's exclusive
+    // filter always leaves `body` homogeneous — every survivor is already
+    // the one kind the mode serves — so re-running `promote_kinds` on it in
+    // step 7 would be a structural no-op regardless of the `!exclusive`
+    // guard. Deleting that guard entirely would not make this test fail.
+    // What this test *does* pin is the observable behavior of an explicit
+    // prefix: exactly the mode's kind comes back, nothing else. The guard
+    // itself is still correct to keep, because the mapping is not
+    // guaranteed to stay one-kind-per-mode — if a mode is ever widened to
+    // serve several kinds, an exclusive query's `body` would become
+    // heterogeneous after step 5, and running step 7's promotion again on
+    // it would then be observable (and wrong, since step 5 already ordered
+    // it exactly as the user asked). `tests::promote_kinds_is_a_stable_reorder`
+    // below pins the promotion helper's own behavior directly, independent
+    // of whether any caller's guard is present.
     #[test]
     fn explicit_prefix_does_not_trigger_step_seven_promotion() {
-        // "w " is exclusive Windows. Without step 5's filter this would
-        // have both a window and an app; the filter already removes the
-        // app, so re-running the promotion step here would be a no-op at
-        // best — and running it unconditionally (a bug) would be invisible
-        // in this filtered case, which is exactly why it must be gated on
-        // `!exclusive` rather than proven safe by this test alone.
         let mut pipeline = Pipeline::default();
         let items = vec![
             item(Kind::App, "app:terminal", "Terminal"),
@@ -399,6 +409,41 @@ mod tests {
         let out = pipeline.assemble("w terminal", items, 10);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, Kind::Window);
+    }
+
+    // Direct coverage of `promote_kinds` itself, independent of `assemble`
+    // and its `!exclusive` guard (see the comment on
+    // `explicit_prefix_does_not_trigger_step_seven_promotion` above for why
+    // that guard's absence is not currently detectable through `assemble`).
+    #[test]
+    fn promote_kinds_is_a_no_op_on_a_homogeneous_list() {
+        let mut items = vec![
+            item(Kind::Window, "window:1", "Alpha"),
+            item(Kind::Window, "window:2", "Bravo"),
+        ];
+        let before: Vec<_> = items.iter().map(|i| i.id.clone()).collect();
+        promote_kinds(&mut items, &[Kind::Window]);
+        let after: Vec<_> = items.iter().map(|i| i.id.clone()).collect();
+        assert_eq!(before, after, "nothing to promote, nothing to reorder");
+    }
+
+    #[test]
+    fn promote_kinds_stably_reorders_a_heterogeneous_list() {
+        let mut items = vec![
+            item(Kind::File, "file:1", "Alpha"),
+            item(Kind::Calculator, "calc:1", "Bravo"),
+            item(Kind::App, "app:1", "Charlie"),
+            item(Kind::Calculator, "calc:2", "Delta"),
+            item(Kind::File, "file:2", "Echo"),
+        ];
+        promote_kinds(&mut items, &[Kind::Calculator]);
+        let ids: Vec<_> = items.iter().map(|i| i.id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["calc:1", "calc:2", "file:1", "app:1", "file:2"],
+            "promoted kind leads, relative order preserved within both \
+             groups, nothing dropped"
+        );
     }
 
     #[test]
