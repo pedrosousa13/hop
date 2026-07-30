@@ -65,8 +65,9 @@ concern about the *shape being locked*, not as an accusation of oversight.
      `^ ^ ^` each return *every* candidate while the control term `zzzqxk`
      returns none, and that `!Firefox` returns everything *except* Firefox.
      This falsifies `rank.rs`'s documented contract that "an item that doesn't
-     match at all is dropped". The test was deleted after use; the workspace is
-     unchanged.
+     match at all, or whose fuzzy component alone falls below
+     `weights.min_score`, is dropped". The test was deleted after use; the
+     workspace is unchanged.
    - **[#46](https://github.com/pedrosousa13/hop/issues/46)** — wall-clock
      measurements of `Ranker::rank` and `Pipeline::assemble` under long queries
      and large candidate sets, up to 4.09 s for a 100 KB query over 5 000 items.
@@ -142,10 +143,24 @@ zero callers ([#32](https://github.com/pedrosousa13/hop/issues/32)). The
 pipeline caps output but not work
 ([#30](https://github.com/pedrosousa13/hop/issues/30)), and ranking cost is
 `O(atoms × items)` with no ceiling on either factor — measured at 4.09 s
-([#46](https://github.com/pedrosousa13/hop/issues/46)). The raw-vs-routed query
+([#46](https://github.com/pedrosousa13/hop/issues/46)). The raw-query-vs-term
 distinction that `CONTEXT.md` defines carefully turns out to have no
 enforcement and no escaping contract at the seam where it matters, and `raw` is
 read by nothing at all ([#47](https://github.com/pedrosousa13/hop/issues/47)).
+
+Four more sit in the same shape. `IconSpec.path` is an unvalidated filesystem
+path the client is instructed to load, with no requirement that it be
+absolute, regular, or inside any allowed root
+([#24](https://github.com/pedrosousa13/hop/issues/24)). The `append_to_end`
+flag lets any Provider pin an Item past ranking, `min_score`, and the
+exclusive-mode filter in one field
+([#33](https://github.com/pedrosousa13/hop/issues/33)). And two routing
+predicates disagree with themselves: currency inference accepts Unicode digits
+where calculator inference accepts only ASCII
+([#48](https://github.com/pedrosousa13/hop/issues/48)), and timezone inference
+decides on a normalized string but forwards the un-normalized one
+([#49](https://github.com/pedrosousa13/hop/issues/49)) — the classic
+validate-one-representation-use-another shape.
 
 ### A05 — Security Misconfiguration · applicable
 
@@ -254,7 +269,7 @@ with no finding" half of each verdict is legible.
   constants rather than literals, so a tampered store cannot outrank an
   explicit user alias.
 - **Alias rewrites cannot inject a mode prefix**: the pipeline routes the raw
-  query before applying aliases and never re-routes the rewritten term.
+  query before applying aliases and never re-routes the effective term.
 - **Nesting-depth bombs are handled** by `serde_json`'s default 128-level
   recursion limit — noting that the future daemon must not disable it.
 - **All protocol enums are closed sets** with no `#[serde(other)]` catch-all,
