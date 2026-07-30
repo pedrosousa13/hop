@@ -5,9 +5,15 @@
 //! result vanished entirely. `nucleo-matcher` matches subsequences (needle
 //! characters must appear, in order, in the haystack, but gaps between them
 //! are fine), so a dropped character no longer loses the match. It is
-//! *not* an edit-distance matcher, though — see the `// DIVERGENCE:` note
-//! on [`tests::one_character_substitution_typo_is_not_recovered`] for the
-//! one case that distinction actually costs us.
+//! *not* an edit-distance matcher, though: it recovers dropped characters
+//! reliably, but not substituted or transposed ones — see the
+//! `// DIVERGENCE:` notes on
+//! [`tests::one_character_substitution_typo_is_not_recovered`] and
+//! [`tests::adjacent_transposition_typo_is_not_recovered`] for the cases
+//! that distinction actually costs us. Word-boundary (acronym-style)
+//! matching for short queries is a related gap — see the `// DIVERGENCE:`
+//! note on
+//! [`tests::word_boundary_does_not_yet_beat_scattered_for_short_acronym_queries`].
 //!
 //! ## Score normalization
 //!
@@ -283,6 +289,35 @@ mod tests {
             "\"crome\" has no valid subsequence alignment in \"Files\" at all"
         );
         assert_eq!(ranked[0].item.title, "Chrome");
+    }
+
+    // DIVERGENCE: nucleo is a strict left-to-right subsequence matcher —
+    // every needle character must align, in order, to some haystack
+    // character. A true adjacent-character transposition changes that
+    // required order (needle position i now wants what haystack position
+    // i+1 held, and vice versa), and unless both swapped letters happen to
+    // reappear elsewhere in the right order, no alignment exists at all.
+    // "termianl" (swapping "na" for "an" in "terminal") is exactly that:
+    // it does not match "Terminal" even weakly — `None`, not a low score.
+    //
+    // Acceptance criterion #2 ("a query with a transposed or missing
+    // character still finds its target") is only half true: the
+    // missing-character half holds (`typo_tolerant_match`, above); this
+    // documents that the transposed-character half does not, so nothing
+    // here would silently regress unnoticed if that ever mattered later.
+    // Recovering it would need the same edit-distance fallback the old JS
+    // scorer had (see `one_character_substitution_typo_is_not_recovered`,
+    // below), which nucleo's subsequence algorithm has no equivalent of.
+    #[test]
+    fn adjacent_transposition_typo_is_not_recovered() {
+        let query = route("termianl");
+        let items = vec![item(Kind::App, "app:terminal", "Terminal", None)];
+        let mut ranker = Ranker::new();
+        let ranked = ranker.rank(items, &query, &Weights::default(), &Boosts::default());
+        assert!(
+            ranked.is_empty(),
+            "nucleo cannot align a transposed adjacent pair as a subsequence"
+        );
     }
 
     // DIVERGENCE: the JS scorer accepts this via its own Levenshtein-
@@ -589,25 +624,46 @@ mod tests {
 
     // --- From the plan (not in the JS suite).
 
-    // Uses "vscode" rather than the shorter "vsc" named in the plan:
-    // nucleo, like any subsequence-based fuzzy matcher, scores a literal
-    // contiguous prefix match ("vscodium...") higher than a 3-letter
-    // acronym spread across three word boundaries ("Visual Studio Code")
-    // — "vsc" alone doesn't disambiguate them (probed: 88 vs 72 raw). A
-    // 6-character query carries enough signal for nucleo's own
-    // consecutive/boundary bonuses to tip the boundary-aligned match
-    // ahead (probed: 150 vs 149 raw) — and it's what a real user typing
-    // towards "Visual Studio Code" specifically would type anyway.
+    // DIVERGENCE: the plan specifies this exact case — `route("vsc")` over
+    // "Visual Studio Code" versus "vscodium helper thing" — expecting the
+    // word-boundary (acronym-style) match to win. It doesn't: nucleo scores
+    // a literal contiguous prefix match ("vscodium...", raw 88) higher than
+    // a 3-letter acronym spread across three word boundaries ("Visual
+    // Studio Code", raw 72).
+    //
+    // This isn't a `Config` knob we failed to reach for. nucleo-matcher
+    // 0.3.1's boundary-bonus tuning (`bonus_boundary_white`,
+    // `bonus_boundary_delimiter`, `delimiter_chars`) is `pub(crate)` —
+    // unreachable from outside the crate — and `Pattern::score` overwrites
+    // `Config::ignore_case`/`normalize` from the atom on every call, so the
+    // only externally-tunable knob left is `prefer_prefix`. Probed: setting
+    // it doesn't flip the order either (96 vs 80 — same direction, same
+    // gap). Nucleo's own module docs describe it as fundamentally a
+    // substring-matching tool, not an acronym matcher, which is exactly
+    // this behavior.
+    //
+    // Fixing this for real would mean not relying on `Pattern::score`
+    // alone: compute match indices via `Pattern::indices`, detect which
+    // matched characters land on word-boundary positions ourselves, and
+    // add an explicit boundary-density bonus in this module's own scoring
+    // layer — at the cost of the slower `indices` API on every candidate
+    // instead of `score`, on every keystroke. That's a real design change
+    // and a real cost, out of scope for this slice. Recording the gap here
+    // rather than quietly rewriting the query until it passes.
     #[test]
-    fn word_boundary_beats_scattered() {
-        let query = route("vscode");
+    fn word_boundary_does_not_yet_beat_scattered_for_short_acronym_queries() {
+        let query = route("vsc");
         let items = vec![
             item(Kind::App, "app:vscode", "Visual Studio Code", None),
             item(Kind::App, "app:vscodium", "vscodium helper thing", None),
         ];
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &Boosts::default());
-        assert_eq!(ranked[0].item.title, "Visual Studio Code");
+        assert_eq!(
+            ranked[0].item.title, "vscodium helper thing",
+            "documents the actual (undesired) behavior: nucleo currently \
+             prefers the contiguous prefix match over the word-boundary one"
+        );
     }
 
     #[test]
@@ -625,25 +681,46 @@ mod tests {
     #[test]
     fn boost_overrides_fuzzy_order() {
         let query = route("chrome");
-        let items = vec![
-            item(Kind::App, "app:chrome", "Google Chrome", None),
-            item(
-                Kind::App,
-                "app:chromium-tools",
-                "Chromium Extra Tools",
-                None,
-            ),
-        ];
-        // Without the boost, "Google Chrome" is the stronger match (raw
-        // 166 vs 160). +180 is enough to flip it — see the module doc
-        // comment on why 180 always dominates.
+        // "Google Chrome" is a clean contiguous match (raw 166, ~27.7 per
+        // character). The second candidate is deliberately constructed so
+        // each needle character lands mid-word, far apart, and off any
+        // word boundary — a genuinely "barely-there" scattered subsequence
+        // match (raw 31, ~5.2 per character), not merely a somewhat weaker
+        // one. The two are both `Kind::App`, so weight doesn't separate
+        // them either. That ~22.5-point-per-character gap means a boost of
+        // ~2 would do nothing; only a boost that actually closes a gap
+        // this size proves anything about 180 (this ranker's boost scale)
+        // doing real load-bearing work.
+        let build_items = || {
+            vec![
+                item(Kind::App, "app:chrome", "Google Chrome", None),
+                item(
+                    Kind::App,
+                    "app:scattered",
+                    "czzzzzzzzzzzzzzzhzzzzzzzzzzzzzzzrzzzzzzzzzzzzzzzozzzzzzzzzzzzzzzmzzzzzzzzzzzzzzze",
+                    None,
+                ),
+            ]
+        };
+
+        let mut ranker = Ranker::new();
+        let unboosted = ranker.rank(
+            build_items(),
+            &query,
+            &Weights::default(),
+            &Boosts::default(),
+        );
+        assert_eq!(
+            unboosted[0].item.title, "Google Chrome",
+            "sanity check: without a boost, the genuinely better match wins"
+        );
+
         let mut boosts = Boosts::default();
         boosts
             .by_item_id
-            .insert(ItemId("app:chromium-tools".into()), 180.0);
-        let mut ranker = Ranker::new();
-        let ranked = ranker.rank(items, &query, &Weights::default(), &boosts);
-        assert_eq!(ranked[0].item.title, "Chromium Extra Tools");
+            .insert(ItemId("app:scattered".into()), 40.0);
+        let boosted = ranker.rank(build_items(), &query, &Weights::default(), &boosts);
+        assert_eq!(boosted[0].item.id, ItemId("app:scattered".into()));
     }
 
     #[test]
