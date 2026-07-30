@@ -153,6 +153,18 @@ Published on extensions.gnome.org as "Hop Launcher Integration". hopd probes for
 - Settings window (libadwaita): keybinding guidance per platform, feature toggles, search tuning, web-search service editor, indexed folders (under Files, not under web search — extension B10), learning controls + insights, theme selection. Every control is wired or it does not ship.
 - Empty-query view: recent/frequent items from learning (replaces the extension's blank panel).
 
+### 8a. Design quality bar (UI/UX is a product feature, not a coat of paint)
+
+The launcher window IS the product — users see ~400×500px of it hundreds of times a day. Design investment concentrates there.
+
+- **Design system before pixels**: one `tokens.css` defining the spacing scale, type scale (with a deliberate monospace choice — a launcher brand lives in its mono), radii, elevation/shadow, timing curves, and one committed accent color on a disciplined dark neutral scale (the "first in class vs AI-template" separator from the site research applies to the app itself). Every component consumes tokens; no ad-hoc values.
+- **Dark-first, both themes**: dark and light ship in v1, tracking the desktop preference; high-contrast variant in v1.x. User `theme.css` overrides tokens, hot-reloaded.
+- **Motion with restraint**: one signature open/close animation (starting values inherited from the extension's tuned 140ms open / 110ms close, ease-out), subtle selection/result transitions, zero jank during result streaming (no layout shift when async rows resolve — pending rows reserve their height). `prefers-reduced-motion` respected via the GTK setting.
+- **Keyboard-first affordances**: right-side action hints on every row (ported hint system: Focus/Open/Run/Copy + key glyph), visible-but-quiet prefix cheatsheet in the empty state, first-run overlay teaching the 5 core interactions once.
+- **States are designed, not defaulted**: empty query (recents/frequents), no results (suggest web search, never a blank void), pending network rows (skeleton with provider icon), error rows (plain language + retry action), offline (cached-data labels with "as of" timestamps).
+- **Process**: before GTK implementation in M3, a static design pass produces the visual direction (mock frames of the 6 key states, iterated with Pedro until approved) — GTK CSS then implements the approved direction. Screenshots of real builds reviewed against the mocks at each milestone. HIG-informed where it serves (icon language, a11y), deliberately non-stock where identity demands (the overlay is not an Adwaita dialog).
+- **Accessibility**: full keyboard operability (already structural), screen-reader labels on rows and actions, contrast-checked palette in both themes, respects system font scaling.
+
 ## 9. Config, state, errors, logging
 
 - Config: TOML at `$XDG_CONFIG_HOME/hop/config.toml`, watched, persisted (branch's in-memory-only config store is explicitly banned). CLI: `hop config get/set`.
@@ -199,7 +211,7 @@ Site (parallel workstream once v1 alpha exists): upgrade docs-site to Astro 6 + 
 
 - **M1 — Core**: workspace, hop-protocol, hop-core with ported test suites green (fuzzy/router/learning/aliases).
 - **M2 — Daemon**: hopd serving apps+files+calculator over socket; `hop query` CLI proves the loop; latency test green.
-- **M3 — Frontend**: hop-gtk overlay on the author's GNOME session (toggle, search, launch); layer-shell path verified on a wlroots session; X11 session verified.
+- **M3 — Frontend**: design pass first (§8a: tokens + mock frames of the 6 key states, approved by Pedro), then hop-gtk overlay on the author's GNOME session (toggle, search, launch); layer-shell path verified on a wlroots session; X11 session verified.
 - **M4 — Full v1 providers**: windows (all platforms incl. shim on e.g.o review queue), web search, emoji, timezone, currency, weather.
 - **M5 — Polish + release**: settings UI, theming, doctor, docs, rollout steps 1–3. **Author daily-drives Hop from M3 onward.**
 
