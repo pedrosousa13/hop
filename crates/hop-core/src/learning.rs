@@ -83,7 +83,7 @@ struct LearningEntry {
 /// [`Learning::frequent_launches`] and [`Learning::is_empty`] are also
 /// public, carried over from the salvage as-is for later milestones (surfacing
 /// learning insights to the user is explicitly out of scope here).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Learning {
     version: u32,
     #[serde(default, skip_serializing)]
