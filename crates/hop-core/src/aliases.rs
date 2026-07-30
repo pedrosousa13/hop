@@ -1,0 +1,490 @@
+//! Exact-match aliases: a user types a short token and gets the thing they
+//! meant, either by rewriting the query text the ranker sees, or by boosting
+//! a specific target item.
+//!
+//! Ported from the previous GNOME extension's `lib/aliases.js`
+//! (`parseAliasRecord` / `parseAliasesConfig` / `buildAliasContext`).
+//! Matching is **exact only** — no prefix matching, no fuzzy matching. An
+//! alias must never surprise a user mid-word; that is a deliberate design
+//! decision, not an omission.
+//!
+//! ## Deliberate divergence from the JS
+//!
+//! The JS `parseAliasesConfig` swallows a JSON parse error and returns an
+//! empty list, silently. [`Aliases::from_json`] does not: invalid JSON is a
+//! configuration mistake worth surfacing, so it returns [`AliasError`]
+//! instead. Everything else about tolerant parsing is preserved — a single
+//! malformed *entry* inside an otherwise-valid array is skipped, not fatal.
+//!
+//! ## Window aliases — the one thing `apply` cannot do
+//!
+//! See the doc comment on [`Aliases::apply`].
+
+use std::collections::HashMap;
+
+use hop_protocol::ItemId;
+use serde_json::Value;
+
+/// The boost [`Aliases::apply`] contributes for each matching `AppBoost`
+/// record. Must sit strictly above [`crate::learning::LEARNING_BOOST_CAP`]
+/// (85.0) — an explicit alias is a direct user instruction and must always
+/// beat learned behavior. See
+/// [`tests::alias_boost_constant_beats_learning_cap`].
+pub const ALIAS_BOOST: f32 = 180.0;
+
+/// What an alias record resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AliasTarget {
+    /// Replace the ranking term with this query text.
+    Rewrite(String),
+    /// Boost the app item `app:<appId>`.
+    AppBoost(String),
+    /// Boost windows matching an app id and/or a substring of their title.
+    /// Faithfully parsed and stored, but never resolved by
+    /// [`Aliases::apply`] — see that method's doc comment.
+    WindowBoost {
+        app_id: Option<String>,
+        title_contains: Option<String>,
+    },
+}
+
+/// A tolerant, exact-match alias table: alias string -> every target
+/// registered under it. Kept as a `Vec` per key (not a single target)
+/// because the JS filters the whole list by key and applies *every* match —
+/// two records sharing a key are both meant to fire, not to shadow one
+/// another.
+#[derive(Debug, Default, Clone)]
+pub struct Aliases {
+    by_key: HashMap<String, Vec<AliasTarget>>,
+}
+
+/// The alias config was not valid JSON at all. Carries the underlying parse
+/// message.
+#[derive(Debug, thiserror::Error)]
+#[error("aliases config is not valid JSON: {0}")]
+pub struct AliasError(String);
+
+/// The result of applying aliases to a raw search term.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AliasEffect {
+    /// The term the ranker should actually use. Equal to the raw `term`
+    /// passed to [`Aliases::apply`], byte-for-byte, unless a `Rewrite`
+    /// alias matched.
+    pub effective_term: String,
+    /// Additional per-item score contributions, keyed by [`ItemId`]. Empty
+    /// when no alias matched, or when only a `WindowBoost` matched (see
+    /// [`Aliases::apply`]).
+    pub boosts: HashMap<ItemId, f32>,
+}
+
+/// Trim, then lowercase — the normalization `parseAliasRecord` and
+/// `buildAliasContext` both apply to alias keys and to `titleContains`.
+fn normalize_token(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+/// Reads `obj[key]` as a JSON string, if present and actually a string.
+/// A missing key or a wrong-typed value (a number, an object, ...) both
+/// come back `None` here rather than failing the whole entry outright —
+/// callers decide what "missing" means for that field.
+fn str_field<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
+    obj.get(key).and_then(Value::as_str)
+}
+
+/// Parses one alias record out of a `serde_json::Value`, per
+/// `parseAliasRecord` in the JS. Returns `None` for anything malformed:
+/// not an object, an empty or whitespace-containing alias, an unrecognized
+/// `type`, or a target missing its required field(s). Never fails the
+/// caller's loop — that tolerance is the point.
+fn parse_record(value: &Value) -> Option<(String, AliasTarget)> {
+    // A bare number, string, or array element that isn't an object at all
+    // is a malformed entry: skip it rather than failing the whole parse.
+    let obj = value.as_object()?;
+
+    let alias = normalize_token(str_field(obj, "alias")?);
+    if alias.is_empty() || alias.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let kind = normalize_token(str_field(obj, "type")?);
+    let target_obj = obj.get("target").and_then(Value::as_object);
+
+    let target = match kind.as_str() {
+        "rewrite" => {
+            let query = target_obj
+                .and_then(|t| str_field(t, "query"))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if query.is_empty() {
+                return None;
+            }
+            AliasTarget::Rewrite(query)
+        }
+        "app" => {
+            let app_id = target_obj
+                .and_then(|t| str_field(t, "appId"))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if app_id.is_empty() {
+                return None;
+            }
+            AliasTarget::AppBoost(app_id)
+        }
+        "window" => {
+            let app_id = target_obj
+                .and_then(|t| str_field(t, "appId"))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let title_contains = target_obj
+                .and_then(|t| str_field(t, "titleContains"))
+                .map(normalize_token)
+                .unwrap_or_default();
+            if app_id.is_empty() && title_contains.is_empty() {
+                return None;
+            }
+            AliasTarget::WindowBoost {
+                app_id: (!app_id.is_empty()).then_some(app_id),
+                title_contains: (!title_contains.is_empty()).then_some(title_contains),
+            }
+        }
+        _ => return None,
+    };
+
+    Some((alias, target))
+}
+
+impl Aliases {
+    /// Parses an alias configuration, ported from `parseAliasesConfig`.
+    ///
+    /// - Input that is not valid JSON at all returns [`AliasError`] — a
+    ///   **deliberate divergence** from the JS, which swallowed this case
+    ///   and returned an empty list. See the module docs.
+    /// - Valid JSON that is not an array (an object, a number, a string, a
+    ///   bool, `null`) returns `Ok` with no aliases: it parsed, it just has
+    ///   nothing in it.
+    /// - A valid array parses entry by entry; a malformed entry (wrong
+    ///   shape, missing required fields, an unrecognized `type`, a
+    ///   non-object element) is skipped rather than failing the whole
+    ///   config, so one typo can't silently disable every other alias.
+    pub fn from_json(json: &str) -> Result<Aliases, AliasError> {
+        let value: Value = serde_json::from_str(json).map_err(|err| AliasError(err.to_string()))?;
+
+        let mut by_key: HashMap<String, Vec<AliasTarget>> = HashMap::new();
+        if let Value::Array(items) = value {
+            for item in &items {
+                if let Some((alias, target)) = parse_record(item) {
+                    by_key.entry(alias).or_default().push(target);
+                }
+            }
+        }
+
+        Ok(Aliases { by_key })
+    }
+
+    /// Applies aliases to a raw search term, ported from
+    /// `buildAliasContext` minus the candidate item list.
+    ///
+    /// 1. Normalizes `term` (trim, lowercase) and looks up records whose
+    ///    alias equals it **exactly** — no prefix or fuzzy matching. No
+    ///    match returns `term` unchanged, verbatim, with no boosts.
+    /// 2. If any matching record is a [`AliasTarget::Rewrite`], its query
+    ///    becomes `effective_term` (the first one, if several match — same
+    ///    as the JS `Array.prototype.find`).
+    /// 3. Otherwise `effective_term` is `term` **exactly as passed in**,
+    ///    not the normalized lookup key — original case and surrounding
+    ///    whitespace intact. This is what the ranker receives.
+    /// 4. Every matching [`AliasTarget::AppBoost`] adds [`ALIAS_BOOST`] to
+    ///    item id `app:<appId>`; two records boosting the same id sum.
+    ///
+    /// ### Window aliases are not resolved here
+    ///
+    /// The JS `buildAliasContext` matches window aliases against the live
+    /// candidate item list (by the window's app id and title). This method
+    /// never sees items — it cannot synthesize an [`ItemId`] for a window,
+    /// because that id depends on which windows happen to be open right
+    /// now. So a matching [`AliasTarget::WindowBoost`] contributes **no
+    /// boost** here; it is resolved later, by the search pipeline in M1.7,
+    /// which does have the candidate items. This is a known boundary, not a
+    /// bug — see
+    /// [`tests::window_alias_matches_but_apply_emits_no_boost_by_design`].
+    pub fn apply(&self, term: &str) -> AliasEffect {
+        let key = normalize_token(term);
+        let mut boosts: HashMap<ItemId, f32> = HashMap::new();
+
+        let Some(targets) = self.by_key.get(&key) else {
+            return AliasEffect {
+                effective_term: term.to_string(),
+                boosts,
+            };
+        };
+
+        let rewrite = targets.iter().find_map(|target| match target {
+            AliasTarget::Rewrite(query) => Some(query.clone()),
+            _ => None,
+        });
+        let effective_term = rewrite.unwrap_or_else(|| term.to_string());
+
+        for target in targets {
+            if let AliasTarget::AppBoost(app_id) = target {
+                let id = ItemId(format!("app:{app_id}"));
+                *boosts.entry(id).or_insert(0.0) += ALIAS_BOOST;
+            }
+            // AliasTarget::WindowBoost: deliberately not resolved here —
+            // see the doc comment above.
+        }
+
+        AliasEffect {
+            effective_term,
+            boosts,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    // --- Ported from aliases.test.mjs ---
+
+    // Inverted from the JS's "parseAliasesConfig falls back to empty
+    // aliases for invalid JSON": this crate's contract is the opposite on
+    // purpose (see the module docs) — invalid JSON is an error, not a
+    // silent empty config. The JS swallowed this case; we don't.
+    #[test]
+    fn invalid_json_returns_an_error_rather_than_silently_yielding_empty_aliases() {
+        let result = Aliases::from_json("{broken");
+        assert!(result.is_err());
+    }
+
+    // Ports "buildAliasContext rewrites query from rewrite alias".
+    #[test]
+    fn rewrite_alias_rewrites_the_query() {
+        let aliases =
+            Aliases::from_json(r#"[{"alias":"gh","type":"rewrite","target":{"query":"github"}}]"#)
+                .unwrap();
+        let effect = aliases.apply("gh");
+        assert_eq!(effect.effective_term, "github");
+        assert!(effect.boosts.is_empty());
+    }
+
+    // Pins the other half of the rewrite-target rule: `target.query` is
+    // trimmed but deliberately *not* lowercased, unlike `alias` and
+    // `titleContains`. Nothing else in this suite exercises a mixed-case
+    // rewrite query, so a future "helpful" normalization of this field
+    // would slip through unnoticed without this test.
+    #[test]
+    fn rewrite_target_query_is_trimmed_but_not_lowercased() {
+        let aliases = Aliases::from_json(
+            r#"[{"alias":"gh","type":"rewrite","target":{"query":"  GitHub Pull Requests  "}}]"#,
+        )
+        .unwrap();
+        let effect = aliases.apply("gh");
+        assert_eq!(effect.effective_term, "GitHub Pull Requests");
+    }
+
+    // Ports "buildAliasContext boosts app alias targets on exact alias
+    // query".
+    #[test]
+    fn app_alias_boosts_its_target() {
+        let aliases = Aliases::from_json(
+            r#"[{"alias":"term","type":"app","target":{"appId":"org.gnome.Terminal.desktop"}}]"#,
+        )
+        .unwrap();
+        let effect = aliases.apply("term");
+        assert_eq!(effect.effective_term, "term");
+        assert_eq!(
+            effect
+                .boosts
+                .get(&ItemId("app:org.gnome.Terminal.desktop".into())),
+            Some(&ALIAS_BOOST)
+        );
+        assert_eq!(effect.boosts.len(), 1);
+    }
+
+    // Cannot port "buildAliasContext boosts only matching open window
+    // aliases" as-is: that JS test resolves the alias against a live item
+    // list, and `apply(&self, term: &str)` never sees items (see the doc
+    // comment on `apply`). This asserts the documented boundary instead:
+    // a window alias that matches the term parses and is stored, but
+    // contributes no boost from `apply` alone. Resolving it against real
+    // windows is the search pipeline's job in M1.7.
+    #[test]
+    fn window_alias_matches_but_apply_emits_no_boost_by_design() {
+        let aliases = Aliases::from_json(
+            r#"[{"alias":"stand","type":"window","target":{"appId":"org.gnome.Calendar","titleContains":"standup"}}]"#,
+        )
+        .unwrap();
+        let effect = aliases.apply("stand");
+        assert_eq!(
+            effect.effective_term, "stand",
+            "no rewrite matched, so the raw term survives unchanged"
+        );
+        assert!(
+            effect.boosts.is_empty(),
+            "window aliases are a known boundary: apply() has no item list to \
+             resolve them against, so it must not fabricate a boost here"
+        );
+    }
+
+    // --- From the acceptance criteria and parsing rules ---
+
+    #[test]
+    fn exact_match_only_rejects_prefixes_in_both_directions() {
+        let aliases =
+            Aliases::from_json(r#"[{"alias":"gh","type":"rewrite","target":{"query":"github"}}]"#)
+                .unwrap();
+        // "g": alias is longer than the term (term is a prefix of alias).
+        // "ghi", "gh1": alias is shorter than the term (alias is a prefix
+        // of term). "1gh": alias appears as a suffix, not the whole term.
+        // None of these should match; each must fall through as an
+        // identity effect, term untouched.
+        for term in ["g", "ghi", "gh1", "1gh"] {
+            let effect = aliases.apply(term);
+            assert_eq!(
+                effect.effective_term, term,
+                "prefix/suffix variant {term:?} must not match the alias"
+            );
+            assert!(
+                effect.boosts.is_empty(),
+                "{term:?} must not match the alias"
+            );
+        }
+    }
+
+    #[test]
+    fn case_and_whitespace_are_normalized_before_lookup() {
+        let aliases =
+            Aliases::from_json(r#"[{"alias":"gh","type":"rewrite","target":{"query":"github"}}]"#)
+                .unwrap();
+        assert_eq!(aliases.apply("GH").effective_term, "github");
+        assert_eq!(aliases.apply("  gh  ").effective_term, "github");
+    }
+
+    #[test]
+    fn unknown_term_is_an_identity_effect() {
+        let aliases =
+            Aliases::from_json(r#"[{"alias":"gh","type":"rewrite","target":{"query":"github"}}]"#)
+                .unwrap();
+        let effect = aliases.apply("nothing-registered");
+        assert_eq!(effect.effective_term, "nothing-registered");
+        assert!(effect.boosts.is_empty());
+    }
+
+    // The point of rule 3 in `apply`'s doc comment, and easy to get wrong:
+    // when no rewrite matches, the effective term is the raw input
+    // *exactly as passed in* — not the normalized lookup key.
+    #[test]
+    fn no_rewrite_means_the_raw_term_survives_unnormalized() {
+        let aliases = Aliases::from_json(
+            r#"[{"alias":"gh","type":"app","target":{"appId":"org.example.Github"}}]"#,
+        )
+        .unwrap();
+        let effect = aliases.apply("  GH  ");
+        assert_eq!(
+            effect.effective_term, "  GH  ",
+            "no rewrite matched, so the term must survive with its original \
+             case and whitespace, not the normalized \"gh\""
+        );
+        assert_eq!(
+            effect.boosts.get(&ItemId("app:org.example.Github".into())),
+            Some(&ALIAS_BOOST)
+        );
+    }
+
+    // One malformed entry per rejection reason worth covering, interleaved
+    // with two valid entries, must not sink the valid ones.
+    #[test]
+    fn one_malformed_entry_does_not_sink_the_rest() {
+        let json = r#"[
+            {"alias":"good1","type":"rewrite","target":{"query":"one"}},
+            {"alias":"gh hub","type":"rewrite","target":{"query":"x"}},
+            {"alias":"bad-type","type":"unknown","target":{}},
+            {"alias":"bad-rewrite","type":"rewrite","target":{"query":"   "}},
+            {"alias":"bad-app","type":"app","target":{}},
+            {"alias":"bad-window","type":"window","target":{}},
+            42,
+            {"alias":"good2","type":"app","target":{"appId":"org.example.App"}}
+        ]"#;
+        let aliases = Aliases::from_json(json).unwrap();
+
+        assert_eq!(aliases.apply("good1").effective_term, "one");
+        assert_eq!(
+            aliases
+                .apply("good2")
+                .boosts
+                .get(&ItemId("app:org.example.App".into())),
+            Some(&ALIAS_BOOST)
+        );
+
+        // None of the malformed keys registered anything.
+        for term in ["gh hub", "bad-type", "bad-rewrite", "bad-app", "bad-window"] {
+            let effect = aliases.apply(term);
+            assert_eq!(effect.effective_term, term);
+            assert!(effect.boosts.is_empty());
+        }
+    }
+
+    #[test]
+    fn valid_json_that_is_not_an_array_yields_ok_with_no_aliases() {
+        for json in [
+            r#"{"alias":"gh"}"#,
+            "42",
+            r#""just a string""#,
+            "null",
+            "true",
+        ] {
+            let aliases = Aliases::from_json(json).unwrap();
+            assert_eq!(aliases.apply("gh").effective_term, "gh");
+            assert!(aliases.apply("gh").boosts.is_empty());
+        }
+    }
+
+    #[test]
+    fn two_app_aliases_under_the_same_key_sum() {
+        let json = r#"[
+            {"alias":"gh","type":"app","target":{"appId":"org.example.App"}},
+            {"alias":"gh","type":"app","target":{"appId":"org.example.App"}}
+        ]"#;
+        let aliases = Aliases::from_json(json).unwrap();
+        let effect = aliases.apply("gh");
+        assert_eq!(
+            effect.boosts.get(&ItemId("app:org.example.App".into())),
+            Some(&(2.0 * ALIAS_BOOST))
+        );
+    }
+
+    #[test]
+    fn a_rewrite_and_an_app_boost_under_the_same_key_both_apply() {
+        let json = r#"[
+            {"alias":"gh","type":"rewrite","target":{"query":"github"}},
+            {"alias":"gh","type":"app","target":{"appId":"org.example.App"}}
+        ]"#;
+        let aliases = Aliases::from_json(json).unwrap();
+        let effect = aliases.apply("gh");
+        assert_eq!(effect.effective_term, "github");
+        assert_eq!(
+            effect.boosts.get(&ItemId("app:org.example.App".into())),
+            Some(&ALIAS_BOOST)
+        );
+    }
+
+    // --- The precedence constant ---
+
+    // Must reference both constants rather than repeating their values: a
+    // test that hardcodes `180.0 > 85.0` would keep passing after either
+    // constant was retuned and prove nothing about the code. Clippy flags
+    // this as an "assertion has a constant value" since both operands
+    // happen to be `const`s resolvable at compile time — true, but that's
+    // exactly the point being asserted, so it's allowed here rather than
+    // rewritten to hide the comparison from clippy's analysis.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn alias_boost_constant_beats_learning_cap() {
+        assert!(ALIAS_BOOST > crate::learning::LEARNING_BOOST_CAP);
+    }
+}
