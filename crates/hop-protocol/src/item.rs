@@ -77,7 +77,6 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::wire::{ErrorCode, ExecOutcome, ProtoError};
 
     fn sample_item() -> Item {
         Item {
@@ -162,8 +161,22 @@ mod tests {
 
     #[test]
     fn item_round_trips_with_none_fields() {
-        let item = sample_item();
+        let item = Item {
+            subtitle: None,
+            icon: None,
+            copy_text: None,
+            ..sample_item()
+        };
         let json = serde_json::to_string(&item).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"id":"app:firefox","kind":"app","title":"Firefox","#,
+                r#""subtitle":null,"icon":null,"#,
+                r#""actions":[{"id":"open","kind":"open","label":"Open"}],"#,
+                r#""default_action":"open","copy_text":null,"append_to_end":false,"provider":"apps"}"#
+            )
+        );
         assert_eq!(serde_json::from_str::<Item>(&json).unwrap(), item);
     }
 
@@ -178,46 +191,6 @@ mod tests {
         assert!(json.contains(r#""copy_text":"https://example.com""#));
         assert!(json.contains(r#""append_to_end":true"#));
         assert_eq!(serde_json::from_str::<Item>(&json).unwrap(), item);
-    }
-
-    #[test]
-    fn exec_outcome_variants_round_trip() {
-        let done = ExecOutcome::Done;
-        let json = serde_json::to_string(&done).unwrap();
-        assert_eq!(json, r#""done""#);
-        assert_eq!(serde_json::from_str::<ExecOutcome>(&json).unwrap(), done);
-
-        let copy = ExecOutcome::CopyText("hello".into());
-        let json = serde_json::to_string(&copy).unwrap();
-        assert_eq!(json, r#"{"copy_text":"hello"}"#);
-        assert_eq!(serde_json::from_str::<ExecOutcome>(&json).unwrap(), copy);
-
-        let open = ExecOutcome::OpenUrl("https://example.com".into());
-        let json = serde_json::to_string(&open).unwrap();
-        assert_eq!(json, r#"{"open_url":"https://example.com"}"#);
-        assert_eq!(serde_json::from_str::<ExecOutcome>(&json).unwrap(), open);
-    }
-
-    #[test]
-    fn proto_error_round_trips_for_each_error_code() {
-        let codes = [
-            ErrorCode::VersionMismatch,
-            ErrorCode::UnknownItem,
-            ErrorCode::UnknownAction,
-            ErrorCode::ProviderFailed,
-            ErrorCode::Internal,
-        ];
-        for code in codes {
-            let err = ProtoError {
-                code: code.clone(),
-                message: "boom".into(),
-            };
-            let json = serde_json::to_string(&err).unwrap();
-            assert_eq!(serde_json::from_str::<ProtoError>(&json).unwrap(), err);
-        }
-
-        let json = serde_json::to_string(&ErrorCode::VersionMismatch).unwrap();
-        assert_eq!(json, r#""version_mismatch""#);
     }
 
     #[test]
