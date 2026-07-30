@@ -3,5 +3,7 @@
 
 pub mod aliases;
 pub mod learning;
+pub mod pipeline;
+pub mod provider;
 pub mod rank;
 pub mod router;

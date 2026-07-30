@@ -205,10 +205,11 @@ impl Aliases {
     /// candidate item list (by the window's app id and title). This method
     /// never sees items — it cannot synthesize an [`ItemId`] for a window,
     /// because that id depends on which windows happen to be open right
-    /// now. So a matching [`AliasTarget::WindowBoost`] contributes **no
-    /// boost** here; it is resolved later, by the search pipeline in M1.7,
-    /// which does have the candidate items. This is a known boundary, not a
-    /// bug — see
+    /// now. So a matching [`AliasTarget::WindowBoost`] parses and is stored,
+    /// but contributes **no boost** here. Resolving it needs a candidate
+    /// item list to match against, which `apply` doesn't have — that is
+    /// still open work, not yet scheduled against a specific milestone. This
+    /// is a known boundary, not a bug — see
     /// [`tests::window_alias_matches_but_apply_emits_no_boost_by_design`].
     pub fn apply(&self, term: &str) -> AliasEffect {
         let key = normalize_token(term);
@@ -312,7 +313,8 @@ mod tests {
     // comment on `apply`). This asserts the documented boundary instead:
     // a window alias that matches the term parses and is stored, but
     // contributes no boost from `apply` alone. Resolving it against real
-    // windows is the search pipeline's job in M1.7.
+    // windows needs a candidate item list `apply` doesn't have; that
+    // remains open work, not yet scheduled against a specific milestone.
     #[test]
     fn window_alias_matches_but_apply_emits_no_boost_by_design() {
         let aliases = Aliases::from_json(
