@@ -132,6 +132,7 @@ The `Provider` trait + `hop-protocol` frames **are** the plugin seam. Locked in 
   - Web: `/plugins` directory on the site, generated from the monorepo's manifests (icon, description, author, install command/deep-link, install counts when telemetry exists) — the store pages and the in-app store read the same manifest data.
   - Scaffolding DX: `npm create hop-extension` + hot-reload dev mode against a running hopd — author experience is a launch feature of the store, not an afterthought.
 - **v3 — Tier 2, sandboxed plugins**: wasmtime components, versioned WIT (Zed's model), deny-by-default capabilities, epoch deadlines, install-time compilation (Zellij's lesson). This is the differentiator no launcher offers.
+- **Raycast-compat option (deliberately preserved, not scheduled)**: Tier 1's view-tree JSON and component names/props SHOULD map 1:1 onto Raycast's equivalents (`List`, `Detail`, `Form`, `ActionPanel`, …) wherever that costs nothing, and the sidecar/worker shape already matches theirs. This keeps a future compat layer (require-patching + API shim, the Vicinae approach) a bounded 2-quarter project instead of a rewrite. Decision point: after v2 ships, based on whether catalog size is the actual bottleneck. Not a v1/v2 commitment.
 
 ## 7. GNOME shim (shims/gnome-shell)
 
@@ -188,6 +189,15 @@ The launcher window IS the product — users see ~400×500px of it hundreds of t
 | Not salvaged | Branch's GTK monolith, hotkeyd dbus-monitor scraping, all release scaffolding, 6.6k lines of plan docs, parity matrix, stale review doc | — |
 
 ## 11. Testing & CI
+
+### Agent-testable by construction (principle)
+
+The product must be fully exercisable by an automated agent with no human at the keyboard — this is both how it gets built and a quality forcing-function:
+
+- **Every behavior has a headless path**: `hop query "<text>" --json` returns the exact assembled result list the UI would show; `hop exec <item> <action>` performs the action; meaningful exit codes throughout. If a feature can't be driven through the CLI, it isn't done.
+- **hopd runs against scripted fake providers** (a test fixture config) so integration tests are deterministic — fixed clock injection for learning/decay and cache-TTL tests.
+- **The GTK frontend runs headless in CI** (offscreen/Broadway GDK backend) and supports `hop-gtk --screenshot <path>` to render its current state to a PNG — agents verify visual states (empty, results, pending, error) by reading the screenshot, and the M3 design-pass mocks are compared against these captures.
+- **`hop doctor --json`** exposes every capability probe result machine-readably.
 
 - hop-core: unit tests ported from the JS suites + property tests (encoding, parser fuzz). This happens **before/with** implementation, TDD-style.
 - hopd: integration tests over a real socket (spawn daemon, drive queries, assert frames, cancellation, budgets).
