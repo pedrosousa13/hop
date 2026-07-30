@@ -1,61 +1,26 @@
-# Issue tracker: GitHub Issues
+# Issue tracker: GitHub
 
-Issues and PRDs for this repo live in GitHub Issues, on the **pedrosousa13/hop**
-repository — the Project **Hop**.
-https://github.com/pedrosousa13/hop/issues
+Issues and PRDs for this repo live as GitHub issues on **pedrosousa13/hop**.
 
-Use the `gh` CLI. Every command below names the repo explicitly with
-`--repo pedrosousa13/hop`, so it works from any directory.
-
-## The state model
-
-GitHub issues are only `open` or `closed`, so the Factory's four states map
-onto open/closed plus the **assignee** field:
-
-| Factory state | GitHub |
-| --- | --- |
-| unstarted | open, no assignee |
-| started | open, assigned to the maintainer |
-| completed | closed with reason `completed` |
-| canceled | closed with reason `not planned` |
-
-The assignee is the started marker. That is what makes pickup atomic: a
-single `gh issue edit --add-assignee` both claims the issue and moves it out
-of the unstarted set, so there is no window where an issue is assigned but
-still Queue-eligible.
-
-## Priority
-
-GitHub Issues has no priority field, so Queue order comes from a label
-vocabulary — created alongside the canonical triage labels, as repository
-labels on pedrosousa13/hop:
-
-| Label | Rank |
-| --- | --- |
-| `P0` | highest — urgent |
-| `P1` | high |
-| `P2` | medium |
-| `P3` | low |
-
-Exactly one `P` label per open issue. An issue carrying none sorts **last**,
-after `P3` — the equivalent of Linear's "No priority". Ordering is `P0` →
-`P1` → `P2` → `P3` → unlabeled, with ties broken by ascending issue number
-(oldest first).
+Use the `gh` CLI for all operations. Pass `-R pedrosousa13/hop` explicitly on every
+call rather than relying on the current directory's remote — a session that
+runs from a worktree, a subdirectory, or another clone stays correct.
 
 ## Conventions
 
-- **Create an issue**: `gh issue create --repo pedrosousa13/hop --title "..." --body-file -`.
-  Title in imperative mood; body as Markdown on stdin (a heredoc or a file —
-  never an inline `--body` string, so newlines stay literal).
-- **Read an issue**: `gh issue view <number> --repo pedrosousa13/hop --json number,title,body,comments,labels,milestone,assignees,state,stateReason,createdAt`
-  — one call returns the body *and* every comment, unlike trackers that need two.
-- **List issues**: `gh issue list --repo pedrosousa13/hop --state open --json number,title,labels,milestone,assignees,createdAt`,
-  plus `--label` / `--milestone` filters as needed. Pass `--limit` above the
-  default 30 when the Project has more open issues than that.
-- **Comment**: `gh issue comment <number> --repo pedrosousa13/hop --body-file -`.
-- **Apply / remove labels**: `gh issue edit <number> --repo pedrosousa13/hop --add-label "..." --remove-label "..."`.
-- **Close**: `gh issue close <number> --repo pedrosousa13/hop --reason completed`
-  (resolved) or `--reason "not planned"` (wontfix).
+- **Create an issue**: `gh issue create -R pedrosousa13/hop --title "..." --body
+  "..."`. Title in imperative mood; use a heredoc for multi-line bodies.
+- **Read an issue**: `gh issue view <n> -R pedrosousa13/hop --json
+  title,body,labels,milestone,state,stateReason,comments` — `comments` is a
+  `--json` field, so one call returns the body and the discussion together.
+- **List issues**: `gh issue list -R pedrosousa13/hop --state open --limit 500 --json
+  number,title,labels,milestone,createdAt`, plus `--label` / `--milestone`
+  filters as needed. `--limit` defaults to 30; pass it on every listing.
+- **Comment**: `gh issue comment <n> -R pedrosousa13/hop --body "..."`.
+- **Apply / remove labels**: `gh issue edit <n> -R pedrosousa13/hop --add-label
+  "..."` / `--remove-label "..."`.
+- **Close**: `gh issue close <n> -R pedrosousa13/hop --reason completed` (resolved)
+  or `--reason "not planned"` (wontfix).
 
 ## When a skill says "publish to the issue tracker"
 
@@ -63,7 +28,8 @@ Create a GitHub issue on pedrosousa13/hop.
 
 ## When a skill says "fetch the relevant ticket"
 
-`gh issue view <number> --repo pedrosousa13/hop --json body,comments`.
+Run `gh issue view <n> -R pedrosousa13/hop --json
+title,body,labels,milestone,state,stateReason,comments`.
 
 ## Factory loop operations
 
@@ -72,80 +38,147 @@ Factory plugin's own protocol document — a session with the Factory
 installed can find it, and one without it has no use for this section — one
 bullet per row. A `/factory` Loop Session needs every one of them.
 
-- **Reachability**: `gh auth status` confirms the CLI is authenticated;
-  `gh repo view pedrosousa13/hop --json name,hasIssuesEnabled` confirms the repo
-  exists and has its issue tracker turned on. A repo with
-  `hasIssuesEnabled: false` is unreachable for this Project's purposes even
-  though the repo resolves.
-- **Queue listing**: `gh issue list --repo pedrosousa13/hop --state open --label ready-for-agent --json number,title,labels,milestone,assignees,createdAt`,
-  keeping only issues with an **empty `assignees` array** (the unstarted
-  state, above). `--milestone` filters server-side when the Queue scope is a
-  single milestone; the "(No milestone)" scope has no server-side filter, so
-  apply it client-side on `milestone == null`.
-- **Queue order**: the `P` label vocabulary above — `P0` > `P1` > `P2` >
-  `P3` > unlabeled — with ties broken by the oldest `createdAt`. Both fields
-  come back on `gh issue list`, so ordering costs no extra call. Issue number
-  ascending is equivalent to `createdAt` ascending on GitHub and may be used
-  instead.
-- **State: started**: `gh issue edit <number> --repo pedrosousa13/hop --add-assignee @me`
-  — one call, which is what makes pickup atomic. There is no separate status
-  field to set.
-- **State: completed / canceled**: `gh issue close <number> --repo pedrosousa13/hop --reason completed`
-  for landed work, `--reason "not planned"` for wontfix. The reason is what
-  distinguishes the two — a bare `gh issue close` defaults to `completed`
-  and would silently record a wontfix as done.
-- **Park**: `gh issue edit <number> --repo pedrosousa13/hop --remove-assignee @me --remove-label ready-for-agent --add-label needs-info`
-  — unassigning is what returns the issue to the unstarted state, so it must
-  happen alongside the label swap, not instead of it.
-- **Blocking**: `gh api repos/pedrosousa13/hop/issues/<number>/dependencies/blocked_by`
-  returns the issues this one is blocked by; the issue is blocked while any
-  of them has `state` `open`. An empty array means unblocked. This is
-  GitHub's native issue-dependency API — not a body convention — so a
-  `## Blocked by` section written in prose is documentation for humans and
-  is **not** what the loop checks.
-- **Milestone**: GitHub's native milestone field. List with
-  `gh api repos/pedrosousa13/hop/milestones --jq '.[] | "\(.number) \(.title)"'`,
-  ascending `number` (creation order, stable between runs); set with
-  `gh issue edit <number> --repo pedrosousa13/hop --milestone "<title>"`. Read a
-  milestone's completion by **counting issues**, open and closed, with the
-  two `gh issue list --milestone` queries below — never from the
-  `open_issues` / `closed_issues` fields on the milestone object. Those
-  counters are computed asynchronously and have been observed reporting
-  zero long after issues were assigned; the issue list is authoritative and
-  immediate.
-- **Milestone issue counts**: `gh issue list --repo pedrosousa13/hop --state open --milestone "<title>" --json number,labels`,
-  with no `ready-for-agent` filter, then bucketed by the triage label each
-  issue carries. This is its own query, not a re-count of the Queue — the
-  Queue listing above filters to `ready-for-agent` and so can only ever
-  report zero for `needs-info` and `ready-for-human`.
-- **Read an issue**: `gh issue view <number> --repo pedrosousa13/hop --json body,comments`
-  — body and comments in one call.
-- **Comment**: `gh issue comment <number> --repo pedrosousa13/hop --body-file -`.
-  Body as Markdown on stdin with literal newlines.
-- **Branch name**: `<number>-<slugified-title>` — GitHub's own convention,
-  which is what makes GitHub link the branch and its PR back to the issue.
-  Derive the slug from the title: lowercase, non-alphanumerics collapsed to
-  single hyphens, trimmed. **If a branch matching `<number>-*` already
-  exists** locally or on the remote, reuse it rather than deriving a new
-  one — that is what keeps the name stable for the life of the issue even if
-  its title is later edited.
-- **State verification**: `gh issue view <number> --repo pedrosousa13/hop --json state,stateReason,assignees,labels`
-  reports the issue's current state. Fetch it fresh when verifying a Pause
-  note's claim — never compare against a value read earlier in the session.
+- **Reachability**: `gh auth status` resolves the `gh` CLI and confirms it
+  is authenticated; `gh repo view pedrosousa13/hop --json name` confirms the
+  **pedrosousa13/hop** repo exists and is visible to this account.
+- **Queue listing**: `gh issue list -R pedrosousa13/hop --state open --label
+  ready-for-agent --milestone <n-or-title> --limit 500 --json
+  number,title,labels,milestone,createdAt`. `--milestone` accepts either a
+  milestone number or its title; drop the flag entirely for an unscoped
+  run. `--limit` is not optional: `gh issue list` fetches 30 by default, so
+  a Queue longer than that loses everything past the cap with no error, and
+  because the order below is applied to whatever came back, the issue that
+  should have been picked can simply be absent. Unstarted means the issue
+  does **not** carry `in-progress` — GitHub has no started state, so the
+  label stands in for one (see "Where a label is weaker than a field"
+  below). Treat the result as a set of candidates to confirm, not as fact:
+  the listing lags label writes, and each candidate is re-checked
+  individually before it is picked.
+- **Queue order**: the `P0`–`P3` labels, highest first — **`P0` (Urgent) >
+  `P1` (High) > `P2` (Medium) > `P3` (Low) > no priority label** — ties
+  broken by the oldest `createdAt`. Both the labels and `createdAt` come
+  back on the same listing call, so ordering costs no extra call.
+- **State: started**: `gh issue edit <n> -R pedrosousa13/hop --add-label
+  in-progress --add-assignee @me` — one call, which is what makes pickup
+  atomic. GitHub issues have only `OPEN` and `CLOSED`, so `in-progress` is
+  the started state.
+- **State: completed / canceled**: `gh issue close <n> -R pedrosousa13/hop --reason
+  completed` for landed work, which reads back as `state=CLOSED`,
+  `stateReason=COMPLETED`. Wontfix is two calls, because `gh issue close`
+  has no label flag: `gh issue edit <n> -R pedrosousa13/hop --add-label wontfix`,
+  then `gh issue close <n> -R pedrosousa13/hop --reason "not planned"`, which reads
+  back as `state=CLOSED`, `stateReason=NOT_PLANNED`. The reason is what
+  distinguishes the two — a closed issue with no reason is
+  indistinguishable from either.
+- **Park**: `gh issue edit <n> -R pedrosousa13/hop --remove-label ready-for-agent
+  --remove-label in-progress --add-label needs-info`. The issue stays
+  **open**: Park returns work to an unstarted state, it does not close it.
+  Removing `in-progress` is the unstarted half of the Park and is not
+  optional — an issue left carrying it never re-enters the Queue even once
+  it is re-labeled `ready-for-agent`.
+- **Blocking**: GitHub's native **sub-issues**. Link one with `gh issue
+  edit <parent> -R pedrosousa13/hop --add-sub-issue <child>`; read them back with
+  `gh issue view <n> -R pedrosousa13/hop --json subIssues,subIssuesSummary`:
 
-## Landing and PR linkage
+  ```json
+  {"subIssues":{"nodes":[{"number":2,"state":"OPEN","title":"...",
+                          "url":"..."}],
+                "totalCount":1},
+   "subIssuesSummary":{"completed":0,"percentCompleted":0,"total":1}}
+  ```
 
-Put `Closes #<number>` in the PR body so GitHub links the PR to the issue and
-closes it on merge. The Landing gate's explicit close then confirms a state
-GitHub has usually already applied — run it anyway, and set `--reason` on it,
-because GitHub's auto-close always records `completed`.
+  **Direction matters.** A sub-issue is a *child* of its parent, and the
+  child **blocks** the parent: an issue is blocked while any of its
+  sub-issues is still `OPEN`. Equivalently, `subIssuesSummary.completed <
+  subIssuesSummary.total` means blocked. Issues filed from a plan also
+  carry a `Blocked by #N` line in the body, the form `/to-tickets` writes;
+  where that line is present, an open issue it names blocks this one too.
+  `gh issue list` returns neither, so each candidate needs its own `gh
+  issue view` — check them one at a time, in Queue order, and stop at the
+  first unblocked one.
+- **Milestone**: a GitHub **milestone** on the issue, not a label. Create
+  one with `gh api repos/pedrosousa13/hop/milestones -f title=... -f
+  description=...`; list a repo's milestones with `gh api --paginate
+  "repos/pedrosousa13/hop/milestones?state=all&per_page=100"`, which returns them
+  in GitHub's own order, stable between runs. Both halves of that query
+  are load-bearing: the endpoint returns only open milestones by default
+  and pages at 30, and the milestone menu is supposed to show *every*
+  milestone in the Project — a stable menu shape matters more than hiding
+  the closed or the empty ones. Set one with `gh issue create --milestone
+  <n-or-title>` at creation, or `gh issue edit <n> -R pedrosousa13/hop --milestone
+  <n-or-title>` afterwards. Read a milestone's completion with `gh api
+  repos/pedrosousa13/hop/milestones/<n>` and its `open_issues` / `closed_issues`
+  counts — GitHub reports no percentage, so compute one from the pair.
+- **Milestone issue counts**: one listing per state label: `gh issue list
+  -R pedrosousa13/hop --state open --milestone <n> --label <state-label> --limit
+  500 --json number --jq 'length'`, run once for `ready-for-human`, once
+  for `needs-info`, and once for `ready-for-agent`. `--jq` counts
+  client-side, over whatever the listing already fetched, so `--limit` is
+  the real ceiling on the count: leave it off and the default of 30 pins
+  every larger milestone at exactly 30, and the empty-Queue report states
+  a wrong number without any sign that it did. This is deliberately not a
+  re-count of the Queue, which sees only `ready-for-agent`. The blocked
+  figure is the `ready-for-agent` count narrowed to those with an
+  unfinished blocker, by the same per-issue check as **Blocking** above.
+- **Read an issue**: `gh issue view <n> -R pedrosousa13/hop --json
+  title,body,labels,milestone,state,stateReason,comments` — one call.
+  `comments` is a valid `--json` field and returns each comment's author,
+  body and timestamp, so the body and the whole discussion come back
+  together. `gh issue view <n> -R pedrosousa13/hop --comments` renders the same
+  discussion for a human to read, but a session working from the issue
+  needs only the `--json` call.
+- **Comment**: `gh issue comment <n> -R pedrosousa13/hop --body "..."`. Body as
+  Markdown; use a heredoc so newlines stay literal.
+- **Branch name**: GitHub supplies none, so it is a convention this repo
+  derives: `<user>/issue-<number>-<slug>`, where `<user>` is the
+  maintainer's GitHub login and `<slug>` is the issue title lowercased,
+  non-alphanumerics collapsed to single hyphens, trimmed to a few words —
+  e.g. `pedrosousa13/issue-42-add-the-github-adapter`. Nothing stores it,
+  so every session that touches the issue must derive it the same way from
+  the same title, and a session resuming an issue looks for that branch
+  rather than inventing a new one.
+- **State verification**: `gh issue view <n> -R pedrosousa13/hop --json
+  state,stateReason,labels,milestone` returns the issue's current state.
+  Fetch it fresh when verifying a Pause note's claim — never compare
+  against a value read earlier in the session.
 
 ## Reachability
 
-What the Factory's Preflight checks: `gh` is authenticated, and the
-**pedrosousa13/hop** repository both exists and has issues enabled —
-`gh auth status`, then `gh repo view pedrosousa13/hop --json name,hasIssuesEnabled`.
+What the Factory's Preflight checks: `gh` resolves and is authenticated,
+and the **pedrosousa13/hop** repo exists and is visible — `gh auth status`, then
+`gh repo view pedrosousa13/hop --json name`.
 
 ## If GitHub is unreachable
 
 Say so and stop. Don't silently fall back to another tracker or local files.
+
+## Where a label is weaker than a field
+
+Linear-shaped trackers carry state and priority as native fields; GitHub
+carries them as labels, which nothing validates. Three invariants can
+therefore break. Each has a resolution rule, so two sessions over identical
+state still behave the same.
+
+- **Two priority labels on one issue.** Nothing stops `P0` and `P2` both
+  being applied. Rule: **highest wins** — `P0` beats `P1` beats `P2` beats
+  `P3`. Ordering stays deterministic no matter how many priority labels an
+  issue carries, and no session has to stop and ask.
+- **`in-progress` is enforced by nothing.** A session that dies mid-issue
+  leaves the label behind; nothing removes it. Rule: `in-progress` on an
+  issue with no matching branch (see **Branch name** above) is a **stale
+  marker to verify, not a fact to trust** — the same posture `PROTOCOL.md`'s
+  Pause note section takes toward an interrupted state. Verify against the
+  branch and the Pause note; if neither backs it up, the issue was never
+  really started.
+- **`gh issue list` lags label writes.** Verified against a real repo:
+  freshly created issues were missing from a filtered listing for tens of
+  seconds, and an issue kept appearing in a `--label ready-for-agent`
+  listing for about a minute after that label was removed. `gh issue view`
+  on the same issue was correct immediately, every time. Rule: **the
+  listing is a hint; the per-candidate `gh issue view` is the authority.**
+  Queue selection already confirms each candidate individually for the
+  blocker check — that same confirmation must also re-check that the
+  candidate still carries `ready-for-agent`, still lacks `in-progress`, and
+  is still open, and skip it otherwise. Without that re-check, a Loop
+  Session that Parks an issue and immediately re-runs Queue selection
+  re-picks the issue it just Parked, Parks it again, and loops forever.
