@@ -1,5 +1,7 @@
 # hop
 
+The GNOME-native, trustworthy-plugins launcher that works everywhere.
+
 Pre-alpha. This repository currently contains the M1 core scaffold: a cargo
 workspace with two library crates and nothing else. There is no binary, no
 daemon, and no UI yet.
@@ -21,6 +23,5 @@ Both are currently empty stubs.
 ## Build and test
 
 ```sh
-cargo check --workspace
 cargo test --workspace
 ```
