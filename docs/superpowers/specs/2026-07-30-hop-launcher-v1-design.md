@@ -125,7 +125,12 @@ The `Provider` trait + `hop-protocol` frames **are** the plugin seam. Locked in 
 3. Query IDs + cancellation + per-plugin deadlines with incremental merging.
 4. Version handshake at every boundary.
 
-- **v2 — Tier 1, trusted TS extensions**: one Node sidecar, one `worker_threads` Worker per extension (heap-capped, pre-warmed), Raycast-shaped TS SDK (`List`, `Detail`, `ActionPanel` catalog), curated monorepo store with PR review. Start `no-view`/list-only; defer full React reconciler until demand exists.
+- **v2 — Tier 1, trusted TS extensions**: one Node sidecar, one `worker_threads` Worker per extension (heap-capped, pre-warmed), Raycast-shaped TS SDK (`List`, `Detail`, `ActionPanel` catalog). Start `no-view`/list-only; defer full React reconciler until demand exists.
+- **v2 — the Hop Extension Store** (ships with Tier 1, not after it):
+  - Distribution: a public `hop-extensions` monorepo; publishing = PR with human review (the Raycast model — review is the quality gate; the WASM tier later relaxes the trust requirement, not the quality bar).
+  - Install: in-app store browsing + one-click install/update inside the launcher itself, and `hop ext install <name>`; update model is implicit-latest with SDK-version compatibility checks (the api-version handshake from §6 rule 4 is what makes this safe).
+  - Web: `/plugins` directory on the site, generated from the monorepo's manifests (icon, description, author, install command/deep-link, install counts when telemetry exists) — the store pages and the in-app store read the same manifest data.
+  - Scaffolding DX: `npm create hop-extension` + hot-reload dev mode against a running hopd — author experience is a launch feature of the store, not an afterthought.
 - **v3 — Tier 2, sandboxed plugins**: wasmtime components, versioned WIT (Zed's model), deny-by-default capabilities, epoch deadlines, install-time compilation (Zellij's lesson). This is the differentiator no launcher offers.
 
 ## 7. GNOME shim (shims/gnome-shell)
@@ -188,7 +193,7 @@ Rollout (from distribution research; nothing before a daily-drivable v1):
 4. AppImage (FUSE-free static runtime, zsync updates). Then Copr. Shim to e.g.o.
 5. Skipped: Snap, PPA. Flathub: revisit ≥12 months post-launch (AI policy + sandbox hostility documented in research).
 
-Site (parallel workstream once v1 alpha exists): upgrade docs-site to Astro 6 + Starlight at `/docs`, typeable launcher demo as landing centerpiece, `/install` per-distro page, changelog. Plugin directory pages arrive with v2. Site repo/dir decision made then.
+Site (parallel workstream once v1 alpha exists): upgrade docs-site to Astro 6 + Starlight at `/docs`, typeable launcher demo as landing centerpiece, `/install` per-distro page, changelog. The `/plugins` store directory (§6) arrives with v2, generated from the `hop-extensions` monorepo manifests. Site repo/dir decision made then.
 
 ## 13. Milestones
 
