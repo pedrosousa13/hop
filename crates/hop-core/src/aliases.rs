@@ -272,6 +272,21 @@ mod tests {
         assert!(effect.boosts.is_empty());
     }
 
+    // Pins the other half of the rewrite-target rule: `target.query` is
+    // trimmed but deliberately *not* lowercased, unlike `alias` and
+    // `titleContains`. Nothing else in this suite exercises a mixed-case
+    // rewrite query, so a future "helpful" normalization of this field
+    // would slip through unnoticed without this test.
+    #[test]
+    fn rewrite_target_query_is_trimmed_but_not_lowercased() {
+        let aliases = Aliases::from_json(
+            r#"[{"alias":"gh","type":"rewrite","target":{"query":"  GitHub Pull Requests  "}}]"#,
+        )
+        .unwrap();
+        let effect = aliases.apply("gh");
+        assert_eq!(effect.effective_term, "GitHub Pull Requests");
+    }
+
     // Ports "buildAliasContext boosts app alias targets on exact alias
     // query".
     #[test]
