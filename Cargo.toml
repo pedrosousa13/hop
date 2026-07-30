@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/hop-protocol", "crates/hop-core"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/pedrosousa13/hop"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+nucleo-matcher = "0.3"
+tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt"] }
+tempfile = "3"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"

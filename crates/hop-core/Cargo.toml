@@ -1,0 +1,20 @@
+[package]
+name = "hop-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hop-protocol = { path = "../hop-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+nucleo-matcher.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
