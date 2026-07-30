@@ -1,8 +1,17 @@
 # Hop Launcher v1 — Design Spec
 
 Date: 2026-07-30
-Status: Approved pending final review
+Status: Approved; amended 2026-07-31
 Decisions by: Pedro Sousa
+
+**Amendment, 2026-07-31.** Amended after a grilling session over the milestone
+structure, held once M1 landed and the M1 OWASP sweep
+(`docs/security/2026-07-30-m1-owasp-sweep.md`) had filed its 29 findings.
+Seven sections changed: §3 (hop-cli verbs), §5 (Files moves to the providers
+milestone), §6 (what "locked" means and when), §8 (the keymap is
+configurable), §8a (theming becomes an ecosystem), §11 (the latency test
+gains an adversarial arm), §13 (milestones split from five to six). Each
+change is marked **[Amended 2026-07-31]** in place.
 
 ## 1. What this is
 
@@ -51,7 +60,7 @@ hop-launcher/
 │   │                     #   learning/frecency engine, aliases, result/action model
 │   ├── hopd              # daemon: tokio Unix-socket server, provider host, indexes,
 │   │                     #   config + state persistence, single-instance
-│   ├── hop-cli           # `hop` binary: toggle | query | doctor | version
+│   ├── hop-cli           # `hop` binary: query | exec | toggle | doctor | version
 │   └── hop-hotkeyd       # optional hotkey agent: X11 grab loop, portal backend (zbus)
 ├── apps/hop-gtk          # GTK4 + libadwaita frontend + gtk4-layer-shell; settings UI
 ├── shims/gnome-shell/    # thin companion extension (D-Bus bridge, no UI)
@@ -108,7 +117,7 @@ trait Provider {
 |---|---|---|
 | Apps | `.desktop` parse (salvaged parser) + inotify; icon via icon-theme lookup | Focus-existing-window-else-launch semantics ported from `appLaunch.js` tests |
 | Windows | Per-platform sources (§2 table) feeding one cached window index | Actions: focus (default), close, move-to-workspace |
-| Files | notify-watched index of configured roots; sensible default excludes; cap + depth configurable | Substring+fuzzy on names; open via `gio`/`xdg-open` equivalent (no shell) |
+| Files | notify-watched index of configured roots; sensible default excludes; cap + depth configurable | Substring+fuzzy on names; open via `gio`/`xdg-open` equivalent (no shell). **[Amended 2026-07-31]** Moved out of M2 into M5, where it is the *first* slice |
 | Calculator | `fasteval` (salvaged choice — it was real in the branch) | Handles unary minus, `%`; copy result (default) |
 | Currency | **Real rates**: Frankfurter API (ECB, keyless) fetched on TTL (default 12h), cached in state dir; offline = last rates + "as of" label | Never fabricates freshness (extension B9); converts, copy default |
 | Timezone | IANA via `chrono-tz` + ported alias table + city dataset (regenerated, license-documented) | Bare-token matches augment, never hijack (B4) |
@@ -119,6 +128,8 @@ trait Provider {
 ## 6. Plugin roadmap (designed now, built later)
 
 The `Provider` trait + `hop-protocol` frames **are** the plugin seam. Locked in v1's protocol so retrofit is never needed (the four rules every predecessor got wrong):
+
+> **[Amended 2026-07-31] What "locked" means, and when it starts.** The lock exists so that *third-party* plugin authors never face a retrofit. No external consumer exists until v2's Tier 1 extensions ship, so the seam stays **open to change throughout v1 development** — and M2 is precisely when the daemon discovers what the trait actually needs. The M1 sweep found two gaps that can only be closed by changing these types: the protocol has no frame-size cap (#21), and `Provider::query`'s borrowed arguments make the returned future non-`'static`, so it cannot be `tokio::spawn`ed — which is the very panic isolation the trait's own doc comment reaches for (#29). Both are ordinary M2 work. The lock takes effect when the extension store ships, not now.
 
 1. Host owns fuzzy filtering by default; plugins opt into raw keystrokes via throttle.
 2. Declarative manifest pre-filters (keyword, regex, min-length) — most keystrokes never reach most plugins.
@@ -150,7 +161,8 @@ Published on extensions.gnome.org as "Hop Launcher Integration". hopd probes for
 - Pre-built hidden window; `hop toggle` → control message → `present()` with activation token when provided.
 - **All IPC off the main thread** (`glib::spawn_future_local` over an async channel to a tokio client task). The UI never blocks on the socket (branch's frontend flaw).
 - Results list: fixed row widget recycling (GtkListView + factory), not destroy-and-rebuild.
-- Keyboard: Up/Down/PgUp/PgDn/Home/End, Enter (default action), configurable secondary-action menu key, Tab completion for prefixes, Escape. Mouse: click activates (extension gap).
+- Keyboard: Up/Down/PgUp/PgDn/Home/End, Enter (default action), secondary-action menu key, Tab completion for prefixes, Escape. Mouse: click activates (extension gap).
+- **[Amended 2026-07-31] The whole keymap is configurable, not just the menu key.** M3 reads the keymap from `config.toml` with these as defaults, so every key handler is data-driven from the start and nothing is hardcoded. M6 adds the settings-window capture widget (press a key, it records and writes back) plus conflict detection. The retrofit cost of unpicking hardcoded handlers after M3 ships is what forces the config half early.
 - Settings window (libadwaita): keybinding guidance per platform, feature toggles, search tuning, web-search service editor, indexed folders (under Files, not under web search — extension B10), learning controls + insights, theme selection. Every control is wired or it does not ship.
 - Empty-query view: recent/frequent items from learning (replaces the extension's blank panel).
 
@@ -160,6 +172,7 @@ The launcher window IS the product — users see ~400×500px of it hundreds of t
 
 - **Design system before pixels**: one `tokens.css` defining the spacing scale, type scale (with a deliberate monospace choice — a launcher brand lives in its mono), radii, elevation/shadow, timing curves, and one committed accent color on a disciplined dark neutral scale (the "first in class vs AI-template" separator from the site research applies to the app itself). Every component consumes tokens; no ad-hoc values.
 - **Dark-first, both themes**: dark and light ship in v1, tracking the desktop preference; high-contrast variant in v1.x. User `theme.css` overrides tokens, hot-reloaded.
+- **[Amended 2026-07-31] Theming is an ecosystem in v1, not just an override file.** M6 ships a theme format (manifest + css), a themes directory, `hop theme list/use/install <path-or-url>`, the settings picker, and a **documented, versioned token contract** so a theme written today does not break on the next release. The *distribution* half — curated monorepo, PR review, in-app browsing, site gallery — rides along with v2's extension store (§6), which needs identical machinery; building it twice is the thing being avoided, not the feature being cut. **A theme is untrusted input**: GTK CSS executes no code, but it can restyle or hide the very labels §5 relies on to stay honest — the "as of" timestamp on cached rates, the pending-row skeleton, the offline indicator. A theme that makes stale data look fresh defeats "never fabricates freshness". Tracked as its own issue against M3, where `theme.css` hot-reload first lands.
 - **Motion with restraint**: one signature open/close animation (starting values inherited from the extension's tuned 140ms open / 110ms close, ease-out), subtle selection/result transitions, zero jank during result streaming (no layout shift when async rows resolve — pending rows reserve their height). `prefers-reduced-motion` respected via the GTK setting.
 - **Keyboard-first affordances**: right-side action hints on every row (ported hint system: Focus/Open/Run/Copy + key glyph), visible-but-quiet prefix cheatsheet in the empty state, first-run overlay teaching the 5 core interactions once.
 - **States are designed, not defaulted**: empty query (recents/frequents), no results (suggest web search, never a blank void), pending network rows (skeleton with provider icon), error rows (plain language + retry action), offline (cached-data labels with "as of" timestamps).
@@ -203,6 +216,7 @@ The product must be fully exercisable by an automated agent with no human at the
 - hopd: integration tests over a real socket (spawn daemon, drive queries, assert frames, cancellation, budgets).
 - hop-gtk: headless smoke test (broadway/offscreen) + `scripts/dev-run.sh` manual loop (salvaged style).
 - Latency regression test: scripted 10k-item index, assert p95 query < 10 ms in CI.
+- **[Amended 2026-07-31] The latency gate needs a second, adversarial arm.** A p95 over a normal workload never sees the pathological case: sweep finding #46 measured `Ranker::rank` at 4.09 s for a 100 KB query over 5 000 items — `Pattern::parse` splits on spaces into one atom per word, so cost is `O(atoms × items)` with no ceiling on either factor, and `truncate(max_results)` runs *last*, bounding the output rather than the work. So CI asserts both: p95 < 10 ms over the scripted index, **and** a bounded worst case over pathological input (long query, oversized candidate set, huge per-item strings). This forces #46's input cap to be decided in M2 rather than discovered in production.
 - CI (GitHub Actions): fmt, clippy (deny warnings), test, cross-compile check. **No release automation until v1 works on the author's machine** (branch red-flag #1).
 
 ## 12. Release & site plan
@@ -219,11 +233,14 @@ Site (parallel workstream once v1 alpha exists): upgrade docs-site to Astro 6 + 
 
 ## 13. Milestones
 
-- **M1 — Core**: workspace, hop-protocol, hop-core with ported test suites green (fuzzy/router/learning/aliases).
-- **M2 — Daemon**: hopd serving apps+files+calculator over socket; `hop query` CLI proves the loop; latency test green.
-- **M3 — Frontend**: design pass first (§8a: tokens + mock frames of the 6 key states, approved by Pedro), then hop-gtk overlay on the author's GNOME session (toggle, search, launch); layer-shell path verified on a wlroots session; X11 session verified.
-- **M4 — Full v1 providers**: windows (all platforms incl. shim on e.g.o review queue), web search, emoji, timezone, currency, weather.
-- **M5 — Polish + release**: settings UI, theming, doctor, docs, rollout steps 1–3. **Author daily-drives Hop from M3 onward.**
+**[Amended 2026-07-31] Six milestones, not five.** The old M3 split in two — GNOME first so daily-driving starts at the earliest possible point, cross-platform second so a slip in X11 grab work cannot block the thing the author actually uses. Files moved out of M2 (it was the milestone's largest piece by far, and §11's latency test runs against scripted fake providers, so it never needed the real indexer) and became the *first* slice of the providers milestone. Milestone numbers in the tracker match their M-numbers.
+
+- **M1 — Core**: workspace, hop-protocol, hop-core with ported test suites green (fuzzy/router/learning/aliases). **Landed 2026-07-30.** Now also carries the 8 `Bug` findings from the M1 sweep; #45, #48 and #49 (query path) land before M2 wires ranking into the daemon, and #36 (unconditional parent-directory chmod) before M2 computes a real state path.
+- **M2 — Daemon**: hopd serving apps+calculator over the socket; `hop query --json` and `hop exec` prove the loop headlessly; latency test green including its adversarial arm. Threat model for the socket boundary written *before* the read loop; then a walking skeleton (socket + framed codec + handshake + one hardcoded Item, end to end) that later slices thicken. `rt-multi-thread` tokio runtime — M1's trait already assumes it via its `+ Send` bound. Socket activation + systemd user unit. Read-only config load. Carries 19 sweep findings, 9 folded into slices as acceptance criteria. Ends with its own OWASP sweep.
+- **M3 — Frontend (GNOME)**: design pass first (§8a: tokens + mock frames of the 6 key states, approved by Pedro), then the standalone hop-gtk app on the author's GNOME Wayland session (toggle, search, launch). Keymap from config. Headless CI + `--screenshot`. **Not a GNOME Shell extension** — an ordinary desktop application; the only extension in v1 is the ~200-line D-Bus shim in M5 (§7).
+- **M4 — Frontend (cross-platform)**: layer-shell path verified on a wlroots session; X11 session verified; hop-hotkeyd (X11 grab loop, zbus portal backend). One OWASP sweep covering M3 and M4 together — the same application on different sessions.
+- **M5 — Full v1 providers**: **files first**, then windows (all platforms incl. the shim, submitted to e.g.o as soon as its D-Bus interface is stable, to absorb the review latency §14 flags), web search, emoji, timezone, currency, weather. Datasets are **vendored** — generated artefacts committed alongside their generator scripts and a LICENSES file — because §12's Nix flake builds network-isolated and could not run a build-time download. Its OWASP sweep must re-run **A10 (SSRF)**, which the M1 sweep recorded as not-applicable only because nothing could yet make an outbound request.
+- **M6 — Polish + release**: settings UI, keymap capture UI + conflict detection, theme ecosystem, doctor, docs, rollout steps 1–3. Final OWASP sweep covering theming and the release path. **Author daily-drives Hop from M3 onward** — on apps + calculator until M5 lands files.
 
 ## 14. Risks
 
