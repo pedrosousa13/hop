@@ -181,8 +181,8 @@ impl Pipeline {
         // appending the tail (see `tests/search-results-layout.test.mjs`'s
         // "reserves space for tail rows within max results": 3 ranked + 2
         // tail capped at 3 yields 1 ranked + both tail rows). This slice
-        // deliberately does not port that behavior — see the brief's
-        // decision above — so a cap that the ranked body alone fills
+        // deliberately does not port that behavior — the issue specifies
+        // "concatenate, then truncate" — so a cap that the ranked body fills
         // squeezes the tail out here, where the JS would have squeezed the
         // ranked body instead.
         ranked_items.truncate(max_results);

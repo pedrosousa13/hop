@@ -19,9 +19,9 @@ The full design is at
   learning engine, aliases, provider trait, search pipeline.
 
 `hop-protocol` carries the item/action model and the client/daemon IPC
-message frames. `hop-core` so far carries the query router, fuzzy ranking, the
-learning engine and aliases; the provider trait and search pipeline are still
-to come.
+message frames. `hop-core` carries all six pieces listed above. Both crates are
+libraries: nothing yet runs them. The daemon that hosts providers, the CLI and
+the UI all come later.
 
 ## Build and test
 
