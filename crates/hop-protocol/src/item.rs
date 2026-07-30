@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The stable identifier of an [`Item`], opaque to clients.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ItemId(pub String);
 
@@ -13,7 +13,7 @@ pub struct ItemId(pub String);
 pub struct ActionId(pub String);
 
 /// The category of an [`Item`], used for display and ranking hints.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     App,
