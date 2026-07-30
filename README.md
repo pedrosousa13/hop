@@ -18,7 +18,8 @@ The full design is at
 - `crates/hop-core` — the search behavior: query router, fuzzy ranking,
   learning engine, aliases, provider trait, search pipeline.
 
-Both are currently empty stubs.
+`hop-protocol` carries the item/action model and the client/daemon IPC
+message frames. `hop-core` is still an empty stub.
 
 ## Build and test
 
