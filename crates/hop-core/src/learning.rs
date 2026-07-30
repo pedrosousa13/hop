@@ -77,9 +77,12 @@ struct LearningEntry {
 /// Frecency state: per-query selection history plus a global launch
 /// frequency table, both decayed by recency and capped in size.
 ///
-/// State is private — reach it only through [`Learning::load`],
-/// [`Learning::save`], [`Learning::record_launch`] and
-/// [`Learning::boost_for`].
+/// State is private. The contract this slice was specified against is
+/// [`Learning::load`], [`Learning::save`], [`Learning::record_launch`] and
+/// [`Learning::boost_for`]; [`Learning::reset`], [`Learning::recent_launches`],
+/// [`Learning::frequent_launches`] and [`Learning::is_empty`] are also
+/// public, carried over from the salvage as-is for later milestones (surfacing
+/// learning insights to the user is explicitly out of scope here).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Learning {
     version: u32,
@@ -282,7 +285,7 @@ impl Learning {
         result?;
 
         #[cfg(unix)]
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
 
@@ -762,14 +765,33 @@ mod tests {
         // A pairing that was never recorded: "app:never-seen" has no
         // query-specific or global-frequency history at all.
         assert_eq!(l.boost_for("q", &ItemId("app:never-seen".into())), 0.0);
+    }
 
-        // An empty query: `frequency_boost` doesn't depend on the query
-        // text, so it must be checked against an item with no launches at
-        // all for the total to be zero — otherwise its global-frequency
-        // component alone would make `boost_for` non-zero regardless of
-        // the (empty) query.
-        let fresh = Learning::load(&dir.path().join("fresh.json"));
-        assert_eq!(fresh.boost_for("", &ItemId("app:a".into())), 0.0);
+    // `query_boost` early-returns zero for an empty (post-trim) query, but
+    // `boost_for` sums in `frequency_boost`, which is query-independent by
+    // design — it only looks up the item's global launch history, never the
+    // query text. So an item *with* recorded launches, queried with an
+    // empty string, returns its frequency boost rather than zero. This is
+    // the real interaction the pipeline will meet in M1.7, when an empty
+    // term returns everything ranked by weight and boost.
+    #[test]
+    fn boost_for_empty_query_still_carries_frequency_boost_for_a_recorded_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let mut l = Learning::load(&path);
+        l.record_launch("q", &ItemId("app:a".into()));
+
+        let boost = l.boost_for("", &ItemId("app:a".into()));
+        assert!(
+            boost > 0.0,
+            "frequency_boost doesn't consider the query text, so a recorded \
+             item's boost survives an empty query"
+        );
+        assert_eq!(
+            boost,
+            l.frequency_boost("app:a") as f32,
+            "with an empty query, boost_for is exactly the frequency component"
+        );
     }
 
     #[test]
