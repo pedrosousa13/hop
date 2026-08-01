@@ -833,15 +833,13 @@ mod tests {
 
     // --- Parent-directory permissions (issue #36). ---
     //
-    // The path `save` is handed derives from `XDG_STATE_HOME`, which the user
-    // controls and which this module never sees. So these tests are really
-    // about blast radius: `save` may narrow a directory it created itself,
-    // and must not touch anything that was already there.
+    // These tests are about blast radius: `save` may narrow a directory it
+    // created itself, and must not touch anything that was already there.
+    // `save`'s doc comment says why.
 
-    /// A parent that already exists keeps whatever mode it had. 0755 is
-    /// chosen because it is both a plausible real-world mode (`$HOME`, if the
-    /// user exports `XDG_STATE_HOME=$HOME`) and unmistakably not 0700, so a
-    /// stray chmod cannot pass this assertion by coincidence.
+    // A parent that already exists keeps whatever mode it had. 0755 is chosen
+    // because it is both a plausible real-world mode and unmistakably not
+    // 0700, so a stray chmod cannot pass this assertion by coincidence.
     #[cfg(unix)]
     #[test]
     fn save_leaves_a_pre_existing_parent_directory_mode_untouched() {
@@ -862,18 +860,16 @@ mod tests {
         );
     }
 
-    /// A parent this code creates is 0700, and so is every ancestor created
-    /// along the way — `~/.local/state` counts as "a directory this code
-    /// created" just as much as `~/.local/state/hop` does.
-    ///
-    /// There is deliberately no assertion about a transient wider mode: an
-    /// in-process test cannot observe one, and a timing loop would only
-    /// pretend to. The absence of a window is structural rather than
-    /// empirical — the mode is an argument to `mkdir(2)` itself, so the
-    /// directory never exists at any other mode, and 0700 has no group or
-    /// other bits for the umask (which only clears bits) to have left set.
-    /// This test pins the post-condition; the mechanism is what guarantees
-    /// the window, and the mechanism is enforced by the code, not here.
+    // A parent this code creates is 0700, and so is every ancestor created
+    // along the way — `~/.local/state` counts as "a directory this code
+    // created" just as much as `~/.local/state/hop` does.
+    //
+    // There is deliberately no assertion about a transient wider mode: an
+    // in-process test cannot observe one, and a timing loop would only
+    // pretend to. So this test pins the post-condition only. The absence of
+    // a window is structural rather than empirical, and lives at the code
+    // that guarantees it — see `save`'s comment on the `mkdir(2)` mode
+    // argument.
     #[cfg(unix)]
     #[test]
     fn save_creates_missing_parent_directories_at_0700() {
@@ -902,11 +898,9 @@ mod tests {
         );
     }
 
-    /// `chmod(2)` follows symlinks, so the previous implementation narrowed a
-    /// symlinked parent's *target* — a directory somewhere else entirely,
-    /// which this code certainly did not create. Creating the directory
-    /// rather than chmod-ing it sidesteps the whole class: `mkdir(2)` on an
-    /// existing path fails with `EEXIST` and changes nothing.
+    // Regression guard for the chmod this fix removed: it followed the
+    // symlink and narrowed the *target* — a directory somewhere else
+    // entirely, which this code certainly did not create.
     #[cfg(unix)]
     #[test]
     fn save_does_not_chmod_through_a_symlinked_parent() {
