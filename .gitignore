@@ -1,2 +1,4 @@
 .scratch/
 /target
+.factory/run.lock
+.factory/journal.json
