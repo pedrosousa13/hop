@@ -98,10 +98,12 @@ static TIMEZONE_ALIASES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// Those are two of this file's three inference predicates; the agreement
 /// stops there. [`infer_timezone`] still normalizes with full `to_lowercase`,
 /// which folds U+212A KELVIN SIGN to an ASCII `k` — so a `tokyo` spelled with
-/// one still matches the alias set, and the un-normalized spelling is what
-/// gets forwarded. That is known and separately ticketed (issue #49, on that
-/// function's normalization), not an oversight here. Do not read this file as
-/// uniformly ASCII-folded.
+/// one still matches the alias set. Do not read this file as uniformly
+/// ASCII-folded. What that widened match no longer does is escape the router:
+/// the alias branches forward the key they matched rather than the spelling
+/// that was typed, so the term reaching the provider is `tokyo` either way.
+/// Narrowing the fold would change which queries match at all, not just which
+/// term they carry — a wider change than either of these two made.
 ///
 /// `\s` is deliberately left Unicode-aware. Whitespace never lands inside the
 /// numeric portion, so it carries none of that hazard, and [`looks_like_math`]
@@ -254,6 +256,10 @@ fn looks_like_currency(q: &str) -> bool {
 /// Returns the timezone term (prefix/suffix phrasing stripped) if `q` looks
 /// like a timezone query, or `None` otherwise. See the module-level routing
 /// table doc for the three conditions this checks, in order.
+///
+/// An alias match returns the alias key it matched, so the term can differ
+/// from what the user typed; the phrase-prefix forms return the term as
+/// typed. The comment on the alias branches says why.
 fn infer_timezone(q: &str) -> Option<String> {
     let trimmed = q.trim();
     if trimmed.is_empty() {
@@ -262,7 +268,9 @@ fn infer_timezone(q: &str) -> Option<String> {
 
     // `time in ` must be checked before `time ` — the latter is a prefix of
     // the former, so checking it first would wrongly leave "in " glued to
-    // the term.
+    // the term. All three forward what the user typed rather than a
+    // canonical form; the alias branches below say why the two halves of
+    // this function differ on that.
     if let Some(rest) = strip_prefix_ci(trimmed, "time in ") {
         return Some(rest.to_string());
     }
@@ -273,16 +281,29 @@ fn infer_timezone(q: &str) -> Option<String> {
         return Some(rest.to_string());
     }
 
+    // Both alias branches forward the normalized token, not the spelling it
+    // was normalized from: the term must be the representation that
+    // authorized the route. Deciding on one representation and forwarding
+    // another is what let a `sao paulo` written with U+00A0 match the key
+    // `sao_paulo` and still hand the provider that char, and `PST` match
+    // `pst` and still hand it the uppercase.
+    //
+    // Normalizing is deliberately *not* extended to the phrase-prefix
+    // branches above. Those are authorized by the prefix the user typed, and
+    // their term is never checked against the alias set — or against anything
+    // else — so they have no matched representation to forward. The visible
+    // asymmetry (`sao paulo` comes back canonical, `time in São Paulo` comes
+    // back as typed) is that difference showing through, not an oversight.
     if let Some(prefix_part) = strip_suffix_ci(trimmed, " time") {
         let token = collapse_whitespace(&prefix_part.trim().to_lowercase());
         if token.chars().count() >= 2 && TIMEZONE_ALIASES.contains(token.as_str()) {
-            return Some(prefix_part.to_string());
+            return Some(token);
         }
     }
 
     let whole = collapse_whitespace(&trimmed.to_lowercase());
     if whole.chars().count() >= 2 && TIMEZONE_ALIASES.contains(whole.as_str()) {
-        return Some(trimmed.to_string());
+        return Some(whole);
     }
 
     None
@@ -721,5 +742,66 @@ mod tests {
                 "routed {q:?} to currency, but its numeric portion {numeric:?} is not an f64"
             );
         }
+    }
+
+    // --- An alias-matched timezone route forwards the alias key it matched.
+    // See `infer_timezone` for why the phrase-prefix branches do not.
+
+    #[test]
+    fn non_breaking_space_alias_forwards_the_matched_alias_key() {
+        // The alias set holds no NBSP; `sao_paulo` is what authorized this
+        // route, so `sao_paulo` is what the provider must be handed.
+        let r = route("sao\u{a0}paulo");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::Timezone, "sao_paulo", false)
+        );
+    }
+
+    #[test]
+    fn uppercase_alias_forwards_the_matched_alias_key() {
+        let r = route("PST");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::Timezone, "pst", false)
+        );
+    }
+
+    #[test]
+    fn city_time_suffix_alias_forwards_the_matched_alias_key() {
+        // The ` time` suffix branch reaches the alias set by the same route
+        // as the bare-token branch, so it owes the same term.
+        let r = route("Sao\u{a0}Paulo Time");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::Timezone, "sao_paulo", false)
+        );
+    }
+
+    #[test]
+    fn kelvin_sign_alias_forwards_the_ascii_alias_key() {
+        // U+212A KELVIN SIGN folds to an ASCII `k` under `to_lowercase`, so
+        // this still reaches `tokyo` — see CURRENCY_RE's docs for why that
+        // widened match stands. Forwarding the key is what keeps the char out
+        // of the term, and this pins that half.
+        let r = route("to\u{212a}yo");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::Timezone, "tokyo", false)
+        );
+    }
+
+    #[test]
+    fn phrase_prefix_forwards_the_term_as_typed() {
+        // Green before the alias branches started forwarding their key as
+        // well as after. The asymmetry it pins is deliberate — nothing
+        // normalized authorized this route, so canonicalizing the term here
+        // would invent a claim the router never checked. The test guards
+        // against a later sweep reading the asymmetry as an oversight.
+        let r = route("time in São Paulo");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::Timezone, "São Paulo", false)
+        );
     }
 }
