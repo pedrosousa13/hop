@@ -85,9 +85,23 @@ static TIMEZONE_ALIASES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 });
 
 /// Matches `100 usd to eur`, `100usd to eur`, `100.50 usd to eur`, etc.
-/// against the lowercased, trimmed query.
+/// against the ASCII-lowercased, trimmed query.
+///
+/// The digits are `[0-9]` rather than `\d` because the regex crate's `\d` is
+/// Unicode-aware: it also accepts Arabic-Indic, Devanagari and fullwidth
+/// digits, which `str::parse::<f64>` then rejects. That handed the currency
+/// provider a term whose numeric portion routing had implied was already
+/// shape-checked. `[0-9]` is also what [`looks_like_math`] means by a digit,
+/// so the two inference predicates now agree on what a number is.
+///
+/// `\s` is deliberately left Unicode-aware. Whitespace never lands inside the
+/// numeric portion, so it carries none of that hazard, and [`looks_like_math`]
+/// already accepts whitespace Unicode-wide via `char::is_whitespace` — whose
+/// set `\s` matches exactly. Narrowing it here would trade one disagreement
+/// between the predicates for another, and would reject amounts pasted from
+/// documents that separate them with a non-breaking space.
 static CURRENCY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\d+(\.\d+)?\s*[a-z]{3}\s+to\s+[a-z]{3}$")
+    Regex::new(r"^[0-9]+(\.[0-9]+)?\s*[a-z]{3}\s+to\s+[a-z]{3}$")
         .expect("CURRENCY_RE pattern is a fixed literal and must compile")
 });
 
@@ -213,10 +227,19 @@ fn looks_like_math(q: &str) -> bool {
     })
 }
 
-/// `^\d+(\.\d+)?\s*[a-z]{3}\s+to\s+[a-z]{3}$` against the lowercased,
-/// trimmed query — e.g. `100 usd to eur` or `100usd to eur`.
+/// `^[0-9]+(\.[0-9]+)?\s*[a-z]{3}\s+to\s+[a-z]{3}$` against the
+/// ASCII-lowercased, trimmed query — e.g. `100 usd to eur` or `100usd to eur`.
+///
+/// The fold is `to_ascii_lowercase`, not `to_lowercase`, so that it shares the
+/// alphabet of the `[a-z]` classes it feeds. Full Unicode folding maps U+212A
+/// KELVIN SIGN to an ASCII `k` — the only char outside ASCII it does that for
+/// — which let a code the pattern spells in ASCII match while the term
+/// forwarded to the currency provider still held the non-ASCII char. (Full
+/// folding can also change a string's length: U+0130 lowercases to two chars.
+/// That one is harmless here, because the second is a combining mark that
+/// `[a-z]` rejects either way.)
 fn looks_like_currency(q: &str) -> bool {
-    CURRENCY_RE.is_match(&q.trim().to_lowercase())
+    CURRENCY_RE.is_match(&q.trim().to_ascii_lowercase())
 }
 
 /// Returns the timezone term (prefix/suffix phrasing stripped) if `q` looks
@@ -509,6 +532,10 @@ mod tests {
 
     #[test]
     fn sigil_dollar_routes_to_currency() {
+        // A sigil is the user naming the mode outright, so nothing shape-checks
+        // what follows it — the guarantee pinned by
+        // `inferred_currency_terms_carry_a_parseable_numeric_portion` covers
+        // inferred routes only.
         let r = route("$100 usd to eur");
         assert_eq!(
             (r.mode, r.term.as_str(), r.exclusive),
@@ -590,5 +617,111 @@ mod tests {
         // ordering never lets it shadow the currency check.
         let r = route("100usd to eur");
         assert_eq!(r.mode, Mode::Currency);
+    }
+
+    // --- The currency shape check is ASCII-only. See CURRENCY_RE and
+    // `looks_like_currency` for why each half is.
+
+    #[test]
+    fn arabic_indic_digits_do_not_route_to_currency() {
+        let r = route("١٠٠ usd to eur");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::All, "١٠٠ usd to eur", false)
+        );
+    }
+
+    #[test]
+    fn devanagari_digits_do_not_route_to_currency() {
+        let r = route("१०० usd to eur");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::All, "१०० usd to eur", false)
+        );
+    }
+
+    #[test]
+    fn fullwidth_digits_do_not_route_to_currency() {
+        let r = route("１００ usd to eur");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::All, "１００ usd to eur", false)
+        );
+    }
+
+    #[test]
+    fn kelvin_sign_does_not_fold_into_a_currency_code() {
+        // U+212A is the only char outside ASCII whose Unicode lowercase is
+        // an ASCII letter, so it alone could smuggle a non-ASCII code past
+        // an ASCII-only character class.
+        let r = route("100 us\u{212a} to eur");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::All, "100 us\u{212a} to eur", false)
+        );
+    }
+
+    #[test]
+    fn uppercase_ascii_currency_codes_still_route_to_currency() {
+        // Guards the folding in `looks_like_currency` against being dropped
+        // rather than narrowed to ASCII.
+        let r = route("100 USD to EUR");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::Currency, "100 USD to EUR", false)
+        );
+    }
+
+    #[test]
+    fn non_breaking_space_still_routes_to_currency() {
+        let r = route("100\u{a0}usd to eur");
+        assert_eq!(
+            (r.mode, r.term.as_str(), r.exclusive),
+            (Mode::Currency, "100\u{a0}usd to eur", false)
+        );
+    }
+
+    #[test]
+    fn inferred_currency_terms_carry_a_parseable_numeric_portion() {
+        // The guarantee the currency provider is being built to lean on: it
+        // may read the leading numeric portion of the term straight into an
+        // f64. Asserting the mode alone would not pin that.
+        //
+        // Only inferred routes are checked. The `$` sigil is the user naming
+        // the mode outright, so it carries no shape guarantee at all — see
+        // the note on `sigil_dollar_routes_to_currency`.
+        let candidates = [
+            "100 usd to eur",
+            "100usd to eur",
+            "100.50 usd to eur",
+            "100\u{a0}usd to eur",
+            "١٠٠ usd to eur",
+            "१०० usd to eur",
+            "１００ usd to eur",
+            "100 us\u{212a} to eur",
+        ];
+
+        let mut checked = 0;
+        for q in candidates {
+            let r = route(q);
+            if r.mode != Mode::Currency {
+                continue;
+            }
+            let numeric: String = r
+                .term
+                .chars()
+                .take_while(|c| !c.is_ascii_alphabetic() && !c.is_whitespace())
+                .collect();
+            assert!(
+                numeric.parse::<f64>().is_ok(),
+                "routed {q:?} to currency, but its numeric portion {numeric:?} is not an f64"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 4,
+            "the four ASCII-digit candidates must still reach currency mode; \
+             a vacuous pass above would prove nothing"
+        );
     }
 }
