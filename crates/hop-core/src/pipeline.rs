@@ -102,10 +102,13 @@ impl Pipeline {
         //
         // DECISION: the learning boost is keyed on `routed.term` — the
         // query after any prefix was stripped, but *before* the alias
-        // rewrite above. Learning records what the user actually typed; an
-        // alias rewrite is a ranking substitution the user never typed, so
-        // crediting it to learning would be recording a fact that didn't
-        // happen. This is a judgement call M2 may revisit once the daemon
+        // rewrite above. An alias rewrite is a ranking substitution the user
+        // never typed, so crediting it to learning would be recording a fact
+        // that didn't happen. That distinction is the point here — not that
+        // the term is the typed spelling, which it is not in every case:
+        // routing canonicalizes an alias-matched timezone query, so
+        // `sao paulo` and `SAO PAULO` share one learning key. See CONTEXT.md
+        // on **Term**. This is a judgement call M2 may revisit once the daemon
         // records real launches and can observe how users actually expect
         // aliased queries to be learned from.
         let mut boosts = Boosts::default();

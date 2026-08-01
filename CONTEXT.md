@@ -38,12 +38,18 @@ Three different strings travel together, and confusing them causes real bugs:
 **Raw query** — exactly what the user typed, untouched, whitespace and all.
 Carried as `RoutedQuery::raw`.
 
-**Term** — the raw query with any explicit prefix stripped and trimmed. This is
-what search means by "the query". Carried as `RoutedQuery::term`.
+**Term** — the raw query with any explicit prefix stripped and trimmed, plus,
+where routing matched a known key rather than just a shape, the canonical form
+of that key: an alias-matched timezone query carries the alias key it matched
+(`sao_paulo`), not the spelling that was typed. This is what search means by
+"the query". Carried as `RoutedQuery::term`.
 
 **Effective term** — the term after an alias rewrite, if one applied. This is
 what ranking scores against. It is *not* what learning is keyed on: learning
-records what the user typed, so it keys on the term, before any rewrite.
+keys on the term, before any rewrite — an alias rewrite is a ranking
+substitution the user never typed. The term is not always the typed spelling
+either, though: where routing canonicalized it, `sao paulo` and `SAO PAULO`
+learn as one key rather than two.
 
 **Mode** — how a query should be interpreted. One of `All`, `Windows`, `Apps`,
 `Files`, `Emoji`, `Timezone`, `Currency`, `Calculator`, `Weather`, `Actions`,
