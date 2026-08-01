@@ -252,78 +252,19 @@ impl Learning {
     /// Per-query selections are never written — only the canonicalized,
     /// retention-purged global frequency table is.
     ///
-    /// This is the only other function (besides `load`) that touches the
+    /// Serialize, then write: a payload that cannot be serialized returns
+    /// `Err` having created nothing, so the store already on disk survives
+    /// intact. `write_payload` says why that ordering is structural.
+    ///
+    /// This is the only other entry point (besides `load`) that touches the
     /// filesystem.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            // `DirBuilder` rather than `create_dir_all` + `set_permissions`,
-            // for three reasons that all come down to only ever touching a
-            // directory we made:
-            //
-            // - The mode is an argument to `mkdir(2)`, so the directory is
-            //   born at 0700. There is no window at a wider mode to race,
-            //   unlike a create-then-chmod pair. `mkdir` masks the mode with
-            //   the umask (`mode & ~umask`), which can only clear bits — and
-            //   0700 has no group or other bits to begin with — so no umask
-            //   can widen this, only narrow it to something useless-but-safe.
-            // - `recursive(true)` makes an existing path a no-op rather than
-            //   an error: std's `mkdir` returns `EEXIST`, std confirms the
-            //   path is a directory, and stops. Both syscalls are read-only
-            //   with respect to the mode, so a pre-existing parent keeps
-            //   whatever it had by construction — not by a check we could
-            //   forget to write.
-            // - That also disposes of symlinks. `chmod(2)` follows them and
-            //   would have narrowed a symlinked parent's *target*; `mkdir(2)`
-            //   on a symlink to a directory just returns `EEXIST`.
-            //
-            // Recursive creation applies 0700 to every component it creates,
-            // not only the leaf — if `~/.local/state` is missing too, it is
-            // created at 0700 as well. That is correct under the same rule:
-            // we created it, so it is ours to narrow. Anything that already
-            // existed is skipped, so the reach stops at the first component
-            // we did not make.
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            builder.mode(0o700);
-            builder.create(parent)?;
-        }
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "path has no valid file name")
-            })?;
-        let temp_name = format!(
-            ".{}.tmp-{}-{}",
-            file_name,
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let temp_path = parent.join(temp_name);
-
         let purged_global = purge_retention(&self.global_frequency);
         let payload = serde_json::to_string_pretty(&PersistedLearningStore {
             version: self.version,
             global_frequency: canonicalized_global_frequency(&purged_global),
-        })
-        .unwrap_or_default();
-
-        let result = write_and_rename(&temp_path, path, payload.as_bytes());
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        result?;
-
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
+        });
+        write_payload(path, payload)
     }
 
     /// Record a launch: the user reached `item_id` while typing `query`.
@@ -468,10 +409,94 @@ impl Learning {
     }
 }
 
+/// The filesystem half of [`Learning::save`]: everything after the payload
+/// exists. Takes the serialization *result* rather than a `String` so the
+/// only place a failed serialize can be handled is before the first syscall
+/// — the ordering is a consequence of the signature, not of a comment
+/// asking the next editor to keep the `?` at the top.
+///
+/// That is also the seam the failure is tested through.
+/// `PersistedLearningStore` is `String` keys over `u32`/`u64` today, so
+/// `to_string_pretty` cannot actually fail and no test could provoke this
+/// through `save`. Taking a `serde_json::Result` lets a test hand over a
+/// payload that genuinely failed to serialize, and keeps the guard honest
+/// for the day the persisted shape grows a field that can fail.
+fn write_payload(path: &Path, payload: serde_json::Result<String>) -> io::Result<()> {
+    // `InvalidData` because that is what this is from the filesystem's point
+    // of view: data that cannot be represented on disk. The
+    // `unwrap_or_default()` that used to stand here turned the same
+    // condition into an empty payload, wrote it over a good store, and
+    // reported success.
+    let payload = payload.map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+    if let Some(parent) = path.parent() {
+        // `DirBuilder` rather than `create_dir_all` + `set_permissions`,
+        // for three reasons that all come down to only ever touching a
+        // directory we made:
+        //
+        // - The mode is an argument to `mkdir(2)`, so the directory is
+        //   born at 0700. There is no window at a wider mode to race,
+        //   unlike a create-then-chmod pair. `mkdir` masks the mode with
+        //   the umask (`mode & ~umask`), which can only clear bits — and
+        //   0700 has no group or other bits to begin with — so no umask
+        //   can widen this, only narrow it to something useless-but-safe.
+        // - `recursive(true)` makes an existing path a no-op rather than
+        //   an error: std's `mkdir` returns `EEXIST`, std confirms the
+        //   path is a directory, and stops. Both syscalls are read-only
+        //   with respect to the mode, so a pre-existing parent keeps
+        //   whatever it had by construction — not by a check we could
+        //   forget to write.
+        // - That also disposes of symlinks. `chmod(2)` follows them and
+        //   would have narrowed a symlinked parent's *target*; `mkdir(2)`
+        //   on a symlink to a directory just returns `EEXIST`.
+        //
+        // Recursive creation applies 0700 to every component it creates,
+        // not only the leaf — if `~/.local/state` is missing too, it is
+        // created at 0700 as well. That is correct under the same rule:
+        // we created it, so it is ours to narrow. Anything that already
+        // existed is skipped, so the reach stops at the first component
+        // we did not make.
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(parent)?;
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path has no valid file name")
+        })?;
+    let temp_name = format!(
+        ".{}.tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temp_path = parent.join(temp_name);
+
+    let result = write_and_rename(&temp_path, path, payload.as_bytes());
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result?;
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 /// Write `payload` to `temp_path` (create/truncate, mode 0600 on unix),
-/// fsync it, then rename it onto `dest`. Split out of `save` purely to keep
-/// the `?`-propagation linear; the caller is responsible for cleaning up
-/// `temp_path` on error.
+/// fsync it, then rename it onto `dest`. Split out of `write_payload` purely
+/// to keep the `?`-propagation linear; the caller is responsible for cleaning
+/// up `temp_path` on error.
 fn write_and_rename(temp_path: &Path, dest: &Path, payload: &[u8]) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
@@ -921,6 +946,62 @@ mod tests {
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o755,
             "a symlinked parent's target must not be re-permissioned"
+        );
+    }
+
+    // --- Serialization failure (issue #41). ---
+
+    // A payload `serde_json` genuinely refuses: JSON object keys must be
+    // strings, and a tuple is not one. `PersistedLearningStore` cannot
+    // produce such a value today, which is exactly why `write_payload`
+    // takes a `serde_json::Result` — see its doc comment.
+    fn unserializable_payload() -> serde_json::Result<String> {
+        let mut tuple_keyed: HashMap<(u8, u8), u8> = HashMap::new();
+        tuple_keyed.insert((1, 2), 3);
+        serde_json::to_string_pretty(&tuple_keyed)
+    }
+
+    // Read the bytes, not the parsed store: the failure mode being guarded
+    // against wrote an empty file, which parses back to an empty store —
+    // indistinguishable from a legitimately empty one.
+    #[test]
+    fn a_serialization_failure_leaves_an_existing_store_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+
+        let mut l = Learning::load(&path);
+        l.record_launch("q", &ItemId("app:a".into()));
+        l.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(write_payload(&path, unserializable_payload()).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a payload that cannot be serialized must not reach the store"
+        );
+    }
+
+    // The path here is two components deep in an empty temp dir, so a
+    // stray directory, a temp file or a destination file all show up as
+    // something existing that should not. This is what pins the ordering:
+    // serialization is checked before the first syscall.
+    #[test]
+    fn a_serialization_failure_creates_no_file_and_no_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        let path = parent.join("learning.json");
+
+        assert!(write_payload(&path, unserializable_payload()).is_err());
+
+        assert!(
+            !parent.exists(),
+            "the parent directory should not be created"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no destination file and no temp file should be left behind"
         );
     }
 
