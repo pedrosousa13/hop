@@ -323,13 +323,13 @@ mod tests {
 
     /// The second, non-interactive sink for the same bug the ranker fixes:
     /// step 6 substitutes `alias_effect.effective_term` into the query the
-    /// ranker sees, so a rewrite target is raw text the *user never typed*
-    /// and cannot proofread. While the ranker parsed its term as a query
-    /// DSL, an alias whose target began with `!` silently inverted matching
-    /// — `nf` here would have returned every item except the ones matching
-    /// "firefox", which is both wrong and impossible to diagnose from the
-    /// alias config alone. The term is matched literally now, so the target
-    /// means the eight characters it spells.
+    /// ranker sees, so a rewrite target reaches the ranker as text the *user
+    /// never typed* and cannot proofread. While the ranker parsed its term
+    /// as a query DSL, an alias whose target began with `!` silently
+    /// inverted matching — `nf` here would have returned every item except
+    /// the ones matching "firefox", which is both wrong and impossible to
+    /// diagnose from the alias config alone. The effective term is matched
+    /// literally now, so the target means the eight characters it spells.
     #[test]
     fn an_alias_rewriting_to_a_leading_bang_does_not_invert_matching() {
         let mut pipeline = Pipeline {

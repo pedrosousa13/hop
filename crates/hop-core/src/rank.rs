@@ -30,11 +30,12 @@
 //!
 //! Parsing the term was wrong in both directions. A term of `^`, `'`, `!` or
 //! `$` alone parsed to an atom with an empty needle, which `parse` discards,
-//! leaving a pattern with no atoms — and `Pattern::score` scores *every*
-//! candidate `Some(0)` for such a pattern, so a single stray character
-//! returned the entire result set. And `!firefox` did something worse than
-//! nothing: it inverted the query, returning every item that does not
-//! contain "firefox".
+//! leaving a pattern with no atoms — and a pattern with no atoms matches
+//! *every* candidate, so a single stray character returned the entire result
+//! set. (Why an empty atom list matches everything, and why this module now
+//! guards against it directly, is set out in full on `Matching::for_term`.)
+//! And `!firefox` did something worse than nothing: it inverted the query,
+//! returning every item that does not contain "firefox".
 //!
 //! Nothing in this launcher's surface ever offered that DSL to users. It was
 //! inherited implicitly from the library, along with an escaping obligation
@@ -43,7 +44,7 @@
 //! [`crate::pipeline::Pipeline::assemble`], which substitutes an alias's
 //! rewrite target into the term — text the user never typed and cannot
 //! proofread. **That obligation is now gone rather than reassigned:** every
-//! caller passes raw text and gets literal matching, and no caller needs to
+//! caller passes its term verbatim and gets literal matching; nobody has to
 //! escape anything on the way in.
 //!
 //! If a query syntax is ever wanted, it should be an explicit, documented
@@ -191,17 +192,17 @@ impl Ranker {
     ///   whitespace into one atom per word, and that is the only
     ///   interpretation applied: `$`, `!`, `'` and `^` are ordinary
     ///   characters that must appear in the haystack like any others, not
-    ///   nucleo's negation/substring/prefix/postfix syntax. Callers pass
-    ///   raw user text and owe no escaping — including
+    ///   nucleo's negation/substring/prefix/postfix syntax. Callers pass the
+    ///   term verbatim and owe no escaping — including
     ///   [`crate::pipeline::Pipeline::assemble`], which passes an alias's
-    ///   rewrite target through here. See the module docs for why opting
-    ///   into the DSL would have to be an explicit decision at a seam, and
-    ///   for the one residual `\` quirk.
+    ///   rewrite target through here as the effective term. See the module
+    ///   docs for why opting into the DSL would have to be an explicit
+    ///   decision at a seam, and for the one residual `\` quirk.
     /// - The "doesn't match at all is dropped" rule above holds for *every*
     ///   non-empty term, including one that yields no matchable atoms. It is
     ///   never weakened into "scores zero and survives `min_score`" — see
-    ///   the `Matching::for_pattern` internals for why that distinction
-    ///   needs enforcing rather than coming for free.
+    ///   [`Matching::for_term`] for why that distinction needs enforcing
+    ///   rather than coming for free.
     /// - Surviving items score `fuzzy + kind_weight + boost`, sorted
     ///   descending by score; ties break by kind weight descending, then
     ///   by title ascending.
@@ -226,7 +227,7 @@ impl Ranker {
     /// The body of [`rank`](Ranker::rank), taking the already-classified
     /// [`Matching`] rather than a query. Split out so
     /// [`Matching::Nothing`] — which no term input currently produces, see
-    /// [`Matching::for_pattern`] — is still reachable from a test.
+    /// [`Matching::for_term`] — is still reachable from a test.
     fn rank_matching(
         &mut self,
         matching: &Matching,
@@ -241,10 +242,8 @@ impl Ranker {
             .filter_map(|item| {
                 let fuzzy = match matching {
                     // The zero-atom guard, and the whole reason this arm is
-                    // written out rather than folded into `Everything`:
-                    // dropping the item here is what stops a non-empty term
-                    // with no atoms from scoring every candidate `0.0` and
-                    // returning the lot. See `Matching::for_pattern`.
+                    // written out rather than folded into `Everything` — see
+                    // `Matching::for_term` for what it stops.
                     Matching::Nothing => return None,
                     Matching::Everything => 0.0,
                     Matching::Fuzzy {
@@ -292,8 +291,8 @@ impl Ranker {
 /// cases, not two, and the third one is easy to lose: a term can be empty
 /// (match everything), can carry atoms to match against, or can be non-empty
 /// yet carry *no* atoms — which must match nothing. Collapsing the first and
-/// third into a single "no pattern" case is precisely the bug documented on
-/// [`Matching::for_pattern`].
+/// third into a single "no pattern" case is precisely the bug set out on
+/// [`Matching::for_term`].
 enum Matching {
     /// The term is empty. Every item passes with no fuzzy component, and
     /// `min_score` is deliberately not applied — see [`Ranker::rank`].
@@ -307,29 +306,15 @@ enum Matching {
 }
 
 impl Matching {
-    /// Classifies a **trimmed** term.
-    fn for_term(term: &str) -> Matching {
-        if term.is_empty() {
-            return Matching::Everything;
-        }
-        let pattern = Pattern::new(
-            term,
-            CaseMatching::Ignore,
-            Normalization::Smart,
-            AtomKind::Fuzzy,
-        );
-        Matching::for_pattern(pattern, term.chars().count())
-    }
-
-    /// Classifies an already-built pattern. Split from [`Matching::for_term`]
-    /// so the zero-atom case can be constructed in a test.
+    /// Classifies a **trimmed** term. This is where the zero-atom rationale
+    /// the rest of the module points at lives, in full.
     ///
-    /// A pattern with no atoms must be [`Matching::Nothing`], never a
-    /// zero-scoring match. `Pattern::score` short-circuits to `Some(0)` when
-    /// `atoms` is empty, and a normalized `0.0` clears the default
-    /// `min_score` of `0.0` (`0.0 < 0.0` is false), so without this branch a
-    /// non-empty term the user actually typed would return the entire
-    /// candidate set — the failure mode that made a bare `^` match
+    /// A term whose pattern carries no atoms must be [`Matching::Nothing`],
+    /// never a zero-scoring match. `Pattern::score` short-circuits to
+    /// `Some(0)` when `atoms` is empty, and a normalized `0.0` clears the
+    /// default `min_score` of `0.0` (`0.0 < 0.0` is false), so without that
+    /// branch a non-empty term the user actually typed would return the
+    /// entire candidate set — the failure mode that made a bare `^` match
     /// everything before this module stopped parsing its term as a DSL.
     ///
     /// No term currently reaches it. `Pattern::new` splits on unescaped
@@ -343,15 +328,25 @@ impl Matching {
     /// branch stays: this module's documented contract ("an item that
     /// doesn't match at all is dropped") should hold because this module
     /// enforces it, not because a dependency's atom construction happens to
-    /// be shaped conveniently. See
-    /// [`tests::a_pattern_with_no_atoms_is_classified_as_matching_nothing`].
-    fn for_pattern(pattern: Pattern, term_chars: usize) -> Matching {
+    /// be shaped conveniently. Because no term reaches it, the guard is
+    /// pinned instead through [`Ranker::rank_matching`], by
+    /// [`tests::matching_nothing_drops_every_item`].
+    fn for_term(term: &str) -> Matching {
+        if term.is_empty() {
+            return Matching::Everything;
+        }
+        let pattern = Pattern::new(
+            term,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
         if pattern.atoms.is_empty() {
             Matching::Nothing
         } else {
             Matching::Fuzzy {
                 pattern,
-                term_chars,
+                term_chars: term.chars().count(),
             }
         }
     }
@@ -914,15 +909,12 @@ mod tests {
 
     /// Builds a `RoutedQuery` carrying `term` verbatim, bypassing [`route`].
     ///
-    /// Most tests here route their input, which is the honest thing when the
-    /// point is what a user typed. It is the wrong tool for the sigil cases
-    /// below: `route("$")` strips the `$` as its *currency* prefix and hands
-    /// the ranker an empty term, so routing `$` would silently test the
-    /// empty-term path instead of the one under test. The ranker's contract
-    /// is about the term it is handed, and `Pipeline::assemble` hands it
-    /// `alias_effect.effective_term` — arbitrary text from an alias's
-    /// rewrite target, which never passes through `route` at all. This
-    /// helper reproduces that: any string, straight to `rank`.
+    /// Every other test in this file routes its input, which is the honest
+    /// thing when the point is what a user typed. This helper is the honest
+    /// model of the *other* sink: `Pipeline::assemble` hands the ranker
+    /// `alias_effect.effective_term` — arbitrary text from an alias's rewrite
+    /// target, which never passes through `route` at all. Use it only for a
+    /// term `route` cannot deliver, and say why at the call site.
     fn term_query(term: &str) -> RoutedQuery {
         RoutedQuery {
             mode: crate::router::Mode::All,
@@ -932,16 +924,22 @@ mod tests {
         }
     }
 
-    /// Each of `^`, `'`, `!` and `$` is a leading/trailing sigil in
-    /// `Pattern::parse`'s DSL, and a term consisting of one alone parses to
-    /// an atom with an empty needle, which `parse` then discards — leaving a
-    /// pattern with no atoms, which `Pattern::score` scores `Some(0)` for
-    /// every candidate. Matched literally, each is instead an ordinary
-    /// one-character needle that neither haystack contains.
+    /// Each of `^`, `'` and `!` is a leading sigil in `Pattern::parse`'s DSL,
+    /// and a term consisting of one alone parsed to an atom with an empty
+    /// needle, which `parse` then discarded — leaving a pattern with no
+    /// atoms, which `Pattern::score` scores `Some(0)` for every candidate.
+    /// Matched literally, each is instead an ordinary one-character needle
+    /// that neither haystack contains.
+    ///
+    /// Routed, because a user really can type these three and have them reach
+    /// the ranker intact: none is a routing prefix, so `route` classifies
+    /// each as [`Mode::All`](crate::router::Mode::All) with the term
+    /// untouched. The DSL's fourth sigil, `$`, is the one that cannot be
+    /// routed — hence the separate test that follows.
     #[test]
     fn dsl_sigils_alone_match_nothing_rather_than_everything() {
-        for term in ["^", "'", "!", "$"] {
-            let query = term_query(term);
+        for term in ["^", "'", "!"] {
+            let query = route(term);
             let items = vec![
                 item(Kind::App, "app:firefox", "Firefox", None),
                 item(Kind::App, "app:files", "Files", None),
@@ -957,6 +955,30 @@ mod tests {
         }
     }
 
+    /// The fourth sigil, kept separate from its three siblings above because
+    /// it is the one [`route`] cannot deliver: `$` is the *currency* prefix,
+    /// so `route("$")` strips it and hands the ranker an empty term — the
+    /// match-everything path, not the one under test. A bare `$` reaches the
+    /// ranker only through the alias sink, as the effective term of a rewrite
+    /// whose target is `$`, which is what [`term_query`] stands in for here.
+    /// The conclusion is the sigils' conclusion: matched literally, `$` is an
+    /// ordinary one-character needle that neither haystack contains.
+    #[test]
+    fn a_bare_dollar_term_matches_nothing_rather_than_everything() {
+        let query = term_query("$");
+        let items = vec![
+            item(Kind::App, "app:firefox", "Firefox", None),
+            item(Kind::App, "app:files", "Files", None),
+        ];
+        let mut ranker = Ranker::new();
+        let ranked = ranker.rank(items, &query, &Weights::default(), &Boosts::default());
+        assert!(
+            ranked.is_empty(),
+            "\"$\" matches neither candidate literally, so the documented \
+             contract (a non-matching item is dropped) must drop both"
+        );
+    }
+
     /// The headline case from the issue. Under `Pattern::parse`, a leading
     /// `!` makes the atom a *negated substring*: `!firefox` returned every
     /// candidate that does **not** contain "firefox" — the exact inverse of
@@ -970,7 +992,7 @@ mod tests {
     /// excluded-as-a-special-case nor swept in.
     #[test]
     fn leading_bang_is_a_literal_character_not_an_exclusion() {
-        let query = term_query("!firefox");
+        let query = route("!firefox");
         let items = vec![
             item(Kind::App, "app:firefox", "Firefox", None),
             item(Kind::App, "app:files", "Files", None),
@@ -994,7 +1016,7 @@ mod tests {
     /// everything.
     #[test]
     fn an_ordinary_term_still_finds_firefox() {
-        let query = term_query("firefox");
+        let query = route("firefox");
         let items = vec![
             item(Kind::App, "app:firefox", "Firefox", None),
             item(Kind::App, "app:files", "Files", None),
@@ -1013,7 +1035,7 @@ mod tests {
     /// (the other way to get literal matching) can't quietly break it.
     #[test]
     fn a_multi_word_term_still_matches_word_by_word() {
-        let query = term_query("firefox workspace");
+        let query = route("firefox workspace");
         let items = vec![
             // Deliberately reversed: the haystack is "Workspace 2 Mozilla
             // Firefox", so "workspace" precedes "firefox" in it. Matched as
@@ -1040,29 +1062,13 @@ mod tests {
     }
 
     /// Part two of the fix, and the reason [`Matching`] exists as a named
-    /// type rather than an `Option<Pattern>`: `Pattern::score` short-circuits
-    /// `Some(0)` for a pattern with no atoms, and a normalized `0.0` clears
-    /// the default `min_score` of `0.0` (`0.0 < 0.0` is false), so a
-    /// zero-atom pattern would hand back the entire candidate set for a term
-    /// the user did type. [`Matching::for_pattern`] classifies that shape as
-    /// [`Matching::Nothing`] instead of letting it reach the scorer.
-    ///
-    /// No term input currently reaches this branch — see the note on
-    /// `Matching::for_pattern` — which is exactly why it is tested here at
-    /// the classifier rather than through a term: an unreachable guard with
-    /// no test is a guard that rots silently.
-    #[test]
-    fn a_pattern_with_no_atoms_is_classified_as_matching_nothing() {
-        assert!(matches!(
-            Matching::for_pattern(Pattern::default(), 3),
-            Matching::Nothing
-        ));
-    }
-
-    /// The behavior that classification buys: `Matching::Nothing` drops
-    /// every candidate, exactly as a term that matches nothing does. Pinned
-    /// through the ranking path (not just the classifier) because the hole
-    /// this closes was a *scoring* hole — items surviving with score `0.0`.
+    /// type rather than an `Option<Pattern>`: [`Matching::Nothing`] drops
+    /// every candidate, where a zero-atom pattern reaching the scorer would
+    /// have kept the lot. See [`Matching::for_term`] for why, and for why no
+    /// term input currently produces this arm — which is what makes an
+    /// unreachable guard worth a test at all, and why this one goes through
+    /// the ranking path: the hole it closes was a *scoring* hole, items
+    /// surviving with score `0.0`.
     #[test]
     fn matching_nothing_drops_every_item() {
         let items = vec![
