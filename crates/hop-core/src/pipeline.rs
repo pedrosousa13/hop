@@ -246,8 +246,13 @@ mod tests {
     // drop it as a non-match *before* step 7 ever ran — no promotion logic
     // could resurrect an item the ranker already filtered out, and that
     // would be true no matter how step 7 is written. Confirmed empirically
-    // against `nucleo_matcher` directly: `Pattern::parse("2+2", ...)
-    // .score(Utf32Str::new("2048", ...), ...)` returns `None`.
+    // against `nucleo_matcher` directly: `Pattern::new("2+2", ...,
+    // AtomKind::Fuzzy).score(Utf32Str::new("2048", ...), ...)` returns
+    // `None`. (This comment said `Pattern::parse` until the ranker stopped
+    // parsing its term as a query DSL — see the "matched literally" section
+    // of `rank.rs`'s module docs. The conclusion is unchanged either way:
+    // `+` is not one of the four sigils the two constructors disagree about,
+    // so "2048" fails to match for the same reason under both.)
     //
     // This test keeps the exact mechanism the acceptance criterion is
     // actually about — promotion reorders without removing an item that
@@ -314,6 +319,39 @@ mod tests {
             "ranking must behave as if \"firefox\" had been typed"
         );
         assert_eq!(out[0].title, "Firefox");
+    }
+
+    /// The second, non-interactive sink for the same bug the ranker fixes:
+    /// step 6 substitutes `alias_effect.effective_term` into the query the
+    /// ranker sees, so a rewrite target reaches the ranker as text the *user
+    /// never typed* and cannot proofread. While the ranker parsed its term
+    /// as a query DSL, an alias whose target began with `!` silently
+    /// inverted matching — `nf` here would have returned every item except
+    /// the ones matching "firefox", which is both wrong and impossible to
+    /// diagnose from the alias config alone. The effective term is matched
+    /// literally now, so the target means the eight characters it spells.
+    #[test]
+    fn an_alias_rewriting_to_a_leading_bang_does_not_invert_matching() {
+        let mut pipeline = Pipeline {
+            aliases: Aliases::from_json(
+                r#"[{"alias":"nf","type":"rewrite","target":{"query":"!firefox"}}]"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        let items = vec![
+            item(Kind::App, "app:firefox", "Firefox"),
+            item(Kind::App, "app:files", "Files"),
+            item(Kind::Action, "action:bug", "!firefox crash note"),
+        ];
+        let out = pipeline.assemble("nf", items, 10);
+        let titles: Vec<_> = out.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["!firefox crash note"],
+            "the rewrite target must match literally; inverted matching would \
+             have returned \"Files\" — everything *but* the firefox items"
+        );
     }
 
     #[test]
