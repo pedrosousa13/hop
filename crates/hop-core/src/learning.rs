@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -239,17 +239,54 @@ impl Learning {
     }
 
     /// Persist to disk via a temp file + atomic rename, mode 0600. Creates
-    /// the parent directory (mode 0700) if it doesn't exist yet. Per-query
-    /// selections are never written — only the canonicalized, retention-
-    /// purged global frequency table is.
+    /// the parent directory if it doesn't exist yet, at mode 0700 on unix —
+    /// but a parent that already exists is left exactly as found, whatever
+    /// its mode. That asymmetry is deliberate and load-bearing: `path` is
+    /// derived from `XDG_STATE_HOME`, which the user controls and which this
+    /// module never sees, so `save` can only reason about a directory it
+    /// created itself. A user who exports `XDG_STATE_HOME=$HOME` must not
+    /// find their home directory silently narrowed to 0700 on first launch,
+    /// and `save` is the only persistence entry point, so there would be no
+    /// way to opt out.
+    ///
+    /// Per-query selections are never written — only the canonicalized,
+    /// retention-purged global frequency table is.
     ///
     /// This is the only other function (besides `load`) that touches the
     /// filesystem.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            // `DirBuilder` rather than `create_dir_all` + `set_permissions`,
+            // for three reasons that all come down to only ever touching a
+            // directory we made:
+            //
+            // - The mode is an argument to `mkdir(2)`, so the directory is
+            //   born at 0700. There is no window at a wider mode to race,
+            //   unlike a create-then-chmod pair. `mkdir` masks the mode with
+            //   the umask (`mode & ~umask`), which can only clear bits — and
+            //   0700 has no group or other bits to begin with — so no umask
+            //   can widen this, only narrow it to something useless-but-safe.
+            // - `recursive(true)` makes an existing path a no-op rather than
+            //   an error: std's `mkdir` returns `EEXIST`, std confirms the
+            //   path is a directory, and stops. Both syscalls are read-only
+            //   with respect to the mode, so a pre-existing parent keeps
+            //   whatever it had by construction — not by a check we could
+            //   forget to write.
+            // - That also disposes of symlinks. `chmod(2)` follows them and
+            //   would have narrowed a symlinked parent's *target*; `mkdir(2)`
+            //   on a symlink to a directory just returns `EEXIST`.
+            //
+            // Recursive creation applies 0700 to every component it creates,
+            // not only the leaf — if `~/.local/state` is missing too, it is
+            // created at 0700 as well. That is correct under the same rule:
+            // we created it, so it is ours to narrow. Anything that already
+            // existed is skipped, so the reach stops at the first component
+            // we did not make.
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
             #[cfg(unix)]
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            builder.mode(0o700);
+            builder.create(parent)?;
         }
         let parent = path
             .parent()
@@ -791,6 +828,99 @@ mod tests {
             boost,
             l.frequency_boost("app:a") as f32,
             "with an empty query, boost_for is exactly the frequency component"
+        );
+    }
+
+    // --- Parent-directory permissions (issue #36). ---
+    //
+    // These tests are about blast radius: `save` may narrow a directory it
+    // created itself, and must not touch anything that was already there.
+    // `save`'s doc comment says why.
+
+    // A parent that already exists keeps whatever mode it had. 0755 is chosen
+    // because it is both a plausible real-world mode and unmistakably not
+    // 0700, so a stray chmod cannot pass this assertion by coincidence.
+    #[cfg(unix)]
+    #[test]
+    fn save_leaves_a_pre_existing_parent_directory_mode_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("already-here");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = parent.join("learning.json");
+        let mut l = Learning::load(&path);
+        l.record_launch("q", &ItemId("app:a".into()));
+        l.save(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "save must not re-permission a directory it did not create"
+        );
+    }
+
+    // A parent this code creates is 0700, and so is every ancestor created
+    // along the way — `~/.local/state` counts as "a directory this code
+    // created" just as much as `~/.local/state/hop` does.
+    //
+    // There is deliberately no assertion about a transient wider mode: an
+    // in-process test cannot observe one, and a timing loop would only
+    // pretend to. So this test pins the post-condition only. The absence of
+    // a window is structural rather than empirical, and lives at the code
+    // that guarantees it — see `save`'s comment on the `mkdir(2)` mode
+    // argument.
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_missing_parent_directories_at_0700() {
+        let dir = tempfile::tempdir().unwrap();
+        let intermediate = dir.path().join("state");
+        let leaf = intermediate.join("hop");
+        let path = leaf.join("learning.json");
+
+        let mut l = Learning::load(&path);
+        l.record_launch("q", &ItemId("app:a".into()));
+        l.save(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&leaf).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "a directory this code created must be owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(&intermediate)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "an ancestor this code created is equally ours to narrow"
+        );
+    }
+
+    // Regression guard for the chmod this fix removed: it followed the
+    // symlink and narrowed the *target* — a directory somewhere else
+    // entirely, which this code certainly did not create.
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_chmod_through_a_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-directory");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let link = dir.path().join("link-to-real-directory");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let path = link.join("learning.json");
+        let mut l = Learning::load(&path);
+        l.record_launch("q", &ItemId("app:a".into()));
+        l.save(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "a symlinked parent's target must not be re-permissioned"
         );
     }
 
