@@ -92,7 +92,16 @@ static TIMEZONE_ALIASES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// digits, which `str::parse::<f64>` then rejects. That handed the currency
 /// provider a term whose numeric portion routing had implied was already
 /// shape-checked. `[0-9]` is also what [`looks_like_math`] means by a digit,
-/// so the two inference predicates now agree on what a number is.
+/// so [`looks_like_currency`] and [`looks_like_math`] now agree on what a
+/// number is.
+///
+/// Those are two of this file's three inference predicates; the agreement
+/// stops there. [`infer_timezone`] still normalizes with full `to_lowercase`,
+/// which folds U+212A KELVIN SIGN to an ASCII `k` — so a `tokyo` spelled with
+/// one still matches the alias set, and the un-normalized spelling is what
+/// gets forwarded. That is known and separately ticketed (issue #49, on that
+/// function's normalization), not an oversight here. Do not read this file as
+/// uniformly ASCII-folded.
 ///
 /// `\s` is deliberately left Unicode-aware. Whitespace never lands inside the
 /// numeric portion, so it carries none of that hazard, and [`looks_like_math`]
@@ -532,10 +541,6 @@ mod tests {
 
     #[test]
     fn sigil_dollar_routes_to_currency() {
-        // A sigil is the user naming the mode outright, so nothing shape-checks
-        // what follows it — the guarantee pinned by
-        // `inferred_currency_terms_carry_a_parseable_numeric_portion` covers
-        // inferred routes only.
         let r = route("$100 usd to eur");
         assert_eq!(
             (r.mode, r.term.as_str(), r.exclusive),
@@ -651,9 +656,6 @@ mod tests {
 
     #[test]
     fn kelvin_sign_does_not_fold_into_a_currency_code() {
-        // U+212A is the only char outside ASCII whose Unicode lowercase is
-        // an ASCII letter, so it alone could smuggle a non-ASCII code past
-        // an ASCII-only character class.
         let r = route("100 us\u{212a} to eur");
         assert_eq!(
             (r.mode, r.term.as_str(), r.exclusive),
@@ -674,6 +676,10 @@ mod tests {
 
     #[test]
     fn non_breaking_space_still_routes_to_currency() {
+        // Green before this commit as well as after: `\s` was left
+        // Unicode-aware on purpose, so nothing about NBSP changed here. The
+        // test pins that deliberate exception against a later sweep that
+        // narrows the whole pattern to ASCII on the assumption it was missed.
         let r = route("100\u{a0}usd to eur");
         assert_eq!(
             (r.mode, r.term.as_str(), r.exclusive),
@@ -687,26 +693,24 @@ mod tests {
         // may read the leading numeric portion of the term straight into an
         // f64. Asserting the mode alone would not pin that.
         //
-        // Only inferred routes are checked. The `$` sigil is the user naming
-        // the mode outright, so it carries no shape guarantee at all — see
-        // the note on `sigil_dollar_routes_to_currency`.
+        // Only inferred routes are checked. A `$` sigil is the user naming the
+        // mode outright, so nothing shape-checks what follows it and it carries
+        // no such guarantee.
+        //
+        // Every candidate here must both reach currency mode and parse. The
+        // terms that must *not* reach it are pinned by name in the tests
+        // above, so listing them here too would only weaken this one into
+        // "whatever routed must parse".
         let candidates = [
             "100 usd to eur",
             "100usd to eur",
             "100.50 usd to eur",
             "100\u{a0}usd to eur",
-            "١٠٠ usd to eur",
-            "१०० usd to eur",
-            "１００ usd to eur",
-            "100 us\u{212a} to eur",
         ];
 
-        let mut checked = 0;
         for q in candidates {
             let r = route(q);
-            if r.mode != Mode::Currency {
-                continue;
-            }
+            assert_eq!(r.mode, Mode::Currency, "{q:?} must reach currency mode");
             let numeric: String = r
                 .term
                 .chars()
@@ -716,12 +720,6 @@ mod tests {
                 numeric.parse::<f64>().is_ok(),
                 "routed {q:?} to currency, but its numeric portion {numeric:?} is not an f64"
             );
-            checked += 1;
         }
-        assert_eq!(
-            checked, 4,
-            "the four ASCII-digit candidates must still reach currency mode; \
-             a vacuous pass above would prove nothing"
-        );
     }
 }
