@@ -255,7 +255,10 @@ impl Ranker {
     ///   them after the ranked block instead of ranking them here.
     /// - Results are deduped after sorting, keeping the first (best-
     ///   scoring) occurrence: apps key on title alone; every other kind
-    ///   keys on kind, id and title together.
+    ///   keys on kind, id and title together. This split is deliberate and
+    ///   security-relevant, not an oversight — see the doc comment on
+    ///   `dedupe` for why apps drop id from the key, what that costs, and
+    ///   what `CheckedItems::check` does and does not contain about it.
     /// - No result cap — callers that need one (the pipeline, in a later
     ///   slice) apply it themselves.
     pub fn rank(
@@ -437,6 +440,57 @@ fn haystack_of(item: &Item) -> String {
 /// scoring) occurrence of each key. Apps key on title alone; every other
 /// kind keys on kind, id and title together (the issue's wording, not the
 /// JS's — the JS also folded `secondaryText` into the key, this doesn't).
+///
+/// DECISION: apps drop id from the key and everyone else keeps it, because a
+/// title collision means opposite things in the two cases. Two `Window`s (or
+/// `File`s, `Action`s, ...) that happen to share a title are almost always
+/// genuinely different things a user might want to pick between — two
+/// windows both called "Terminal" in two workspaces are two windows, not one
+/// duplicated — so their distinct ids keep both in the result (see
+/// `tests::non_app_kinds_with_same_title_and_different_ids_both_survive_dedupe`).
+/// An app, by contrast, is identified for the user by its title, not by
+/// whichever id its provider's index happened to assign it; nothing stops
+/// two different ids from naming the same real application as far as the
+/// user can see, and title is the only thing the user *can* see (see
+/// `tests::duplicate_apps_deduped_by_title`, which merges two `App` items
+/// with different ids and an identical title on exactly that basis).
+/// Dropping id from the app key is what makes that merge happen.
+///
+/// The cost: dedupe runs on an already best-first-sorted list and keeps only
+/// the first match per key, so *any* two `App` items that share a title
+/// collapse into whichever one sorted first — not just the honest
+/// duplicates above. A higher-scoring item, for any reason, evicts a
+/// lower-scoring, genuinely different `App` outright: not ranked below it,
+/// not flagged, simply absent from the result with nothing left to show it
+/// was ever there. This is issue #31's "eviction" abuse: a forged item
+/// claiming `kind: App` and the real Firefox's title, boosted past the
+/// genuine item's score by stolen boosts, used to delete the genuine
+/// Firefox from the list this way.
+///
+/// [`crate::pipeline::CheckedItems::check`] narrows who can cause that; it
+/// does not close it. An item reaching this function via
+/// [`crate::pipeline::Pipeline::assemble`] is now guaranteed to be a
+/// genuinely-declared `App` — its kind checked against its own producer's
+/// manifest `kinds`, and its `provider` string checked against that
+/// manifest's `id` — before it can evict anything (see
+/// `tests::a_rejected_item_cannot_evict_a_genuine_item_through_dedupe` in
+/// `pipeline.rs`). What that guarantee honestly does *not* cover: two
+/// genuinely-declared `App` items from the same honest provider that happen
+/// to share a title still collapse to one — that is this rule working as
+/// intended, not a residual hole — and the guarantee only holds on the
+/// `Pipeline::assemble` path. `Ranker::rank` is `pub`, takes a bare
+/// `Vec<Item>`, and nothing stops a caller from invoking it directly on
+/// items no manifest ever checked; on that path this function dedupes
+/// exactly as trustingly as it did before issue #31.
+///
+/// DECISION: this rule — apps by title alone, everything else by kind, id
+/// and title — is deliberate and pinned by
+/// `tests::duplicate_apps_deduped_by_title` and
+/// `tests::non_app_kinds_with_same_title_and_different_ids_both_survive_dedupe`.
+/// Changing it (folding id into the app key, say, to close the eviction gap
+/// outright) is a separate decision with its own cost — it would stop
+/// merging the honest duplicate-id case above — and is out of issue #31's
+/// scope. Do not "fix" it here in passing.
 fn dedupe(ranked: Vec<Ranked>) -> Vec<Ranked> {
     let mut seen = HashSet::new();
     ranked
