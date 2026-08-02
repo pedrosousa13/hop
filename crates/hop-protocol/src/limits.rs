@@ -222,12 +222,15 @@ pub(crate) fn check_len(field: &'static str, max: usize, actual: usize) -> Resul
 /// slice borrowed from the input and checks it before copying, so an over-long
 /// value costs no allocation of its own there. It buys nothing on the other two.
 /// [`BoundedString::visit_string`] is handed a `String` that has already been
-/// allocated — the path taken for any JSON string containing an escape sequence,
-/// and for anything arriving through the internally-tagged `Content` buffer,
-/// which is every field of every real frame. And the buffering caveat in this
-/// module's docs sits above all three regardless. The check is placed here
-/// because the parse is the right *place* to refuse, not because it makes the
-/// refusal free.
+/// allocated — the path taken when the reader cannot lend out a borrowed slice
+/// (`from_reader`, say) or when the JSON string contains an escape sequence.
+/// Note that the internally-tagged `Content` buffer does *not* force it:
+/// `Content::Str` borrows from the input and `ContentDeserializer` forwards to
+/// `visit_borrowed_str`, so an ordinary field inside a real frame parsed by
+/// `from_str` still takes the borrowed `visit_str` path. And the buffering
+/// caveat in this module's docs sits above all three regardless. The check is
+/// placed here because the parse is the right *place* to refuse, not because it
+/// makes the refusal free.
 fn string<'de, D>(deserializer: D, field: &'static str, max: usize) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
