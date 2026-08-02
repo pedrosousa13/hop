@@ -529,7 +529,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::content::{CopyText, OpenUrl};
+    use crate::content::{ALLOWED_URL_SCHEMES, CopyText, OpenUrl};
     use crate::item::Item;
     use crate::wire::{ClientMsg, DaemonMsg, ExecOutcome, ProtoError};
 
@@ -551,6 +551,22 @@ mod tests {
 
     fn action_json() -> Value {
         json!({ "id": "open", "kind": "open", "label": "Open" })
+    }
+
+    /// An opening that carries a candidate URL past
+    /// [`OpenUrl`]'s scheme rule, so that its length is what a
+    /// boundary test is left measuring.
+    ///
+    /// Built from [`ALLOWED_URL_SCHEMES`] rather than spelled out: which
+    /// schemes are allowed, and why, is [`crate::content`]'s to say, and a
+    /// literal here would be a second copy of that decision in a module with no
+    /// view of it. Any member of the list will do — nothing in these tests
+    /// depends on which — so the first is taken.
+    fn allowed_url_opening() -> String {
+        let scheme = ALLOWED_URL_SCHEMES
+            .first()
+            .expect("the scheme allow-list is never empty");
+        format!("{scheme}:")
     }
 
     /// Asserts a bounded string field is tested on **both** sides of its bound:
@@ -586,15 +602,16 @@ mod tests {
     {
         // "é" is two bytes, so `filler / 2` of them sit exactly on the bound; a
         // trailing ASCII byte then puts the value one byte — not one character —
-        // over it. Every bound in this module is even, so the halving is exact
-        // for an empty or even-length prefix.
+        // over it. An odd filler takes one ASCII byte of padding so the
+        // candidate still lands exactly on the bound: the prefix's length is
+        // whatever the field's content rules require, not something this helper
+        // gets to choose.
         let filler = max - prefix.len();
-        assert_eq!(
-            filler % 2,
-            0,
-            "the multi-byte candidate assumes an even filler"
+        let multi_byte = format!(
+            "{prefix}{}{}",
+            "é".repeat(filler / 2),
+            "a".repeat(filler % 2)
         );
-        let multi_byte = format!("{prefix}{}", "é".repeat(filler / 2));
         assert_eq!(multi_byte.len(), max);
 
         for at_bound in [format!("{prefix}{}", "a".repeat(filler)), multi_byte] {
@@ -745,7 +762,7 @@ mod tests {
         // being the reason it is refused.
         assert_string_boundary_with_prefix::<ExecOutcome>(
             MAX_OPEN_URL,
-            "https://",
+            &allowed_url_opening(),
             |v| json!({ "open_url": v }),
         );
     }
@@ -892,6 +909,9 @@ mod tests {
 
     #[test]
     fn outcome_and_error_bounds_fire_through_their_tagged_frames() {
+        let opening = allowed_url_opening();
+        let over_long_url = format!("{opening}{}", "a".repeat(MAX_OPEN_URL + 1 - opening.len()));
+
         let cases = [
             (
                 CopyText::FIELD,
@@ -906,9 +926,7 @@ mod tests {
                 json!({
                     "type": "executed",
                     "query_id": 1,
-                    "outcome": {
-                        "open_url": format!("https://{}", "a".repeat(MAX_OPEN_URL + 1 - "https://".len())),
-                    },
+                    "outcome": { "open_url": over_long_url },
                 }),
             ),
             (

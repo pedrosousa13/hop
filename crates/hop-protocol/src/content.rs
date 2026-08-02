@@ -1,13 +1,21 @@
 //! What the two command-shaped outcomes are allowed to contain.
 //!
 //! [`ExecOutcome::CopyText`](crate::wire::ExecOutcome::CopyText) and
-//! [`ExecOutcome::OpenUrl`](crate::wire::ExecOutcome::OpenUrl) are the only
-//! values in this contract that tell a client to *act* — put this on the
-//! clipboard, hand this to a URL launcher — rather than to display something.
-//! Every other field is text a client draws. Both originate in a provider, and
-//! a provider is the plugin seam every later extension tier adapts to, so "the
-//! daemon is trusted" does not reach these two: it degrades to "every installed
-//! provider is trusted".
+//! [`ExecOutcome::OpenUrl`](crate::wire::ExecOutcome::OpenUrl) are the two
+//! variants of [`ExecOutcome`](crate::wire::ExecOutcome) that tell a client to
+//! *act* — put this on the clipboard, hand this to a URL launcher — rather than
+//! reporting what happened. Both originate in a provider, and a provider is the
+//! plugin seam every later extension tier adapts to, so "the daemon is trusted"
+//! does not reach them: it degrades to "every installed provider is trusted".
+//!
+//! They are not the only values in the contract that a client acts on.
+//! [`Item`](crate::item::Item)'s `copy_text` reaches the same clipboard by a
+//! different route, and it is still a plain bounded `String` — it wants
+//! [`CopyText`] too, and giving it one changes the item model rather than the
+//! outcome, so it is deliberately left for its own change. What is true of
+//! these two and of nothing else is that acting on them is *all* they are for:
+//! an outcome is not displayed, so there is no reading of either that is merely
+//! text.
 //!
 //! [`limits`] says how *long* these values may be; this module
 //! says what they may *contain*. The two compose rather than replace one
@@ -66,7 +74,7 @@
 //! observes which arm a parse reached — that is serde's internal routing, which
 //! this crate neither controls nor should pin — so if that routing changed, the
 //! table would go stale while every test above stayed green. It is a
-//! measurement, dated by the commit that took it, and the conclusion drawn from
+//! measurement, taken against serde_json 1.0.151, and the conclusion drawn from
 //! it is one that holds however the routing moves.
 //!
 //! # What these rules do not close
@@ -331,12 +339,12 @@ fn has_allowed_scheme(value: &str) -> bool {
 /// text — several do occur in text and are refused anyway, and the section on
 /// carriage return below is the one that costs something.
 ///
-/// Tab and newline are kept. A snippet has indentation and lines, and
-/// [`MAX_COPY_TEXT`] is the most generous bound in the size budget precisely
-/// because copy text is allowed to be a chunk of prose rather than a label.
-/// Refusing a newline would mean an honest multi-line answer could not be
-/// copied at all, which is a bigger, likelier failure than the one it would
-/// avert.
+/// What is kept is [`ALLOWED_COPY_TEXT_CONTROLS`], and it is kept for honest
+/// content: a snippet has indentation and lines, and [`MAX_COPY_TEXT`] is the
+/// most generous bound in the size budget precisely because copy text is
+/// allowed to be a chunk of prose rather than a label. Refusing a line break
+/// would mean an honest multi-line answer could not be copied at all, which is
+/// a bigger, likelier failure than the one it would avert.
 ///
 /// Everything else in Unicode's `Cc` category — the rest of C0, DEL, and the C1
 /// controls — is refused. Most of it is device control with no meaning in a
@@ -445,6 +453,62 @@ mod tests {
 
     use super::*;
     use crate::wire::{DaemonMsg, ExecOutcome};
+
+    // --- The docs' pointers into this module --------------------------------
+
+    /// Whether a backticked token in a doc comment is shaped like one of this
+    /// module's test names: three or more `snake_case` words, and nothing in it
+    /// that could not be an identifier.
+    ///
+    /// Two words is the shape of the API this file also mentions in backticks
+    /// (`from_reader`, `copy_text`, `is_control`), which is why the bar is
+    /// three; anything with a `:`, a backslash or a capital is a path, an escape
+    /// or a constant rather than a test.
+    fn is_test_name_shaped(token: &str) -> bool {
+        token.split('_').count() >= 3
+            && token
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// Every test this file's docs name by hand must exist, so that renaming one
+    /// fails here instead of leaving a doc pointing at nothing.
+    ///
+    /// Those pointers are prose rather than intra-doc links on purpose. A link
+    /// to a `#[cfg(test)]` item cannot resolve in a doc build — there is no
+    /// `tests` module for rustdoc to find — so `cargo doc` answers each one with
+    /// `unresolved link`. On a *private* item that passes unnoticed, rustdoc
+    /// having no reason to process its docs, which is why the one link of this
+    /// kind in [`limits`] is silent; every pointer in this file is on a public
+    /// item, where the same link is a warning apiece and still never verified
+    /// against anything. This test is the verification that link would not have
+    /// been.
+    #[test]
+    fn every_test_this_file_names_in_its_docs_exists() {
+        let source = include_str!("content.rs");
+        let named: Vec<&str> = source
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("///") || line.starts_with("//!"))
+            // Odd-indexed pieces are what sat between a pair of backticks.
+            .flat_map(|line| line.split('`').skip(1).step_by(2))
+            .filter(|token| is_test_name_shaped(token))
+            .collect();
+
+        assert!(
+            named.len() >= 8,
+            "the docs name at least eight tests by hand; finding {} means this \
+             scan stopped matching rather than the docs stopping pointing",
+            named.len()
+        );
+
+        for name in named {
+            assert!(
+                source.contains(&format!("fn {name}(")),
+                "a doc comment names `{name}`, which no test in this file defines"
+            );
+        }
+    }
 
     // --- OpenUrl: what it accepts -------------------------------------------
 
@@ -708,10 +772,16 @@ mod tests {
 
     #[test]
     fn copy_text_refuses_carriage_return_even_though_it_allows_newline() {
-        // The pair that decides the policy: a newline is ordinary text, a
-        // carriage return is not, and allowing one must not allow the other.
+        // The asymmetry the policy turns on, asserted against the allow-list
+        // itself so that flipping either membership fails here rather than
+        // leaving these three cases quietly testing the wrong pair.
+        assert!(ALLOWED_COPY_TEXT_CONTROLS.contains(&'\n'));
+        assert!(!ALLOWED_COPY_TEXT_CONTROLS.contains(&'\r'));
+
         assert!(CopyText::new("a\nb").is_ok());
         assert!(CopyText::new("a\rb").is_err());
+        // CRLF is refused whole: the pair is not a unit here, and the carriage
+        // return half is enough on its own.
         assert!(CopyText::new("a\r\nb").is_err());
     }
 
