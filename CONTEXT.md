@@ -159,12 +159,20 @@ normalization, or a silent fix.
 ## Redaction
 
 **Redaction** — printing a marker in place of the value, optionally with a
-bounded fact about it such as its byte length. What that fact costs is priced
-on the type that discloses it, never assumed to be free.
-It applies to *formatting*, not to transport: a redacted value is still
-serialized and sent whole. A bound restricts how long a value may be, a content
-rule what it may contain, and a redaction what formatting it discloses; the
-three live in `hop-protocol`'s `limits`, `content` and `redaction` modules.
+bounded fact about it such as its byte length. Redaction applies to
+*formatting*, not to transport: a redacted value is still serialized and sent
+whole. A bound restricts how long a value may be, a content rule what it may
+contain, and a redaction what formatting it discloses; the three live in
+`hop-protocol`'s `limits`, `content` and `redaction` modules.
+
+**`# What ... costs`** — the literal doc-heading form under which a type prices
+something it gives up: what an adversary gets, and what was rejected instead. A
+redaction that discloses a fact about the value carries one, so that "a
+disclosure nobody priced" is a grep rather than a reviewer's memory. Grep for
+the heading, not for the wording between. `QueryText`'s `# What reporting the
+length costs` is the worked example; `content`'s `# What refusing a carriage
+return costs` is the same heading spent on a rule's cost rather than a
+disclosure's.
 
 **Redacting newtype** — a validating newtype that also carries its own `Debug`,
 so the redaction travels with the value: a field formatted on its own prints the

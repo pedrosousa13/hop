@@ -84,23 +84,31 @@ use crate::limits::{self, BoundError, MAX_QUERY_TEXT, check_len};
 /// credential. That is what reaches the journal here, and it is not nothing.
 ///
 /// Bucketing is the alternative, and it was considered: report `empty` against
-/// `non-empty`, or round the count to an order of magnitude. It keeps both
-/// diagnostics above and drops the exact figure. It is rejected here, for three
-/// reasons worth writing down so the next reader sees a decision:
+/// `non-empty`, or round the count to an order of magnitude. The
+/// order-of-magnitude form keeps both diagnostics above, the second one
+/// approximately; the `empty`/`non-empty` form keeps only the first. Either
+/// drops the exact figure. It is rejected here, for three reasons worth writing
+/// down so the next reader sees a decision:
 ///
-/// - A count in bytes is the figure that can be read against
-///   [`MAX_QUERY_TEXT`], which is a byte count too, and a refusal of an
-///   over-long value already prints that value's exact byte count beside the
-///   bound — so bucketing would leave the two ways of learning about a query's
-///   size disagreeing on units.
+/// - The exact byte count is what a refusal already reports:
+///   [`BoundError::TooLong`] names the offending value's `actual` bytes against
+///   the maximum it broke. That refusal describes only a value *over* the
+///   bound, so it is not a second way of reading a given query's length — but
+///   it fixes the unit and the precision a size is reported in here, and a
+///   bucketed redaction would report one differently from the refusal beside
+///   it.
 /// - Bucketing does not buy back the paste-versus-typing distinction. That
-///   shape is in the *number* of frames, not in their lengths: N keystrokes
-///   are N frames and a paste is one, whatever each frame reports.
+///   shape is in the *number* of frames, not in their lengths: N keystrokes are
+///   N frames and a paste is one, whatever each frame reports. What bucketing
+///   would hide is narrower than it first looks — a *pasted* value's exact
+///   length.
 /// - What this type exists to close is the text.
 ///
-/// That reasoning is about this field. A field whose length is itself the
-/// sensitive part is a different trade, and none of the above argues against
-/// bucketing there.
+/// The second and third reasons are about this field. The first is not: it
+/// argues the same way for any bounded value, including one whose length is
+/// itself the sensitive part. Such a field is a different trade, and the case
+/// for bucketing it has to be made against this crate's reporting convention
+/// rather than around it.
 ///
 /// # No `Display`
 ///
