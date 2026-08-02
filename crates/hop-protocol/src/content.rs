@@ -26,32 +26,52 @@
 //!
 //! # How a refused character arrives
 //!
-//! Worth writing down because it decides which parse path has to hold. A C0
-//! control character (U+0000–U+001F) cannot appear raw inside a JSON string:
-//! the grammar forbids it and serde_json refuses the document before any
-//! visitor runs. Copy text carrying one therefore always arrives *escaped* —
-//! and by the routing table in [`limits`], an escaped string
-//! inside an internally-tagged frame is exactly the case that reaches the arm
-//! taking an owned `String`. DEL (U+007F) and the C1 controls (U+0080–U+009F)
-//! carry no such requirement: they pass the JSON parser raw and reach the arm
-//! taking a borrowed `&str`. Both arms therefore meet refusable input in
-//! ordinary traffic, which is why the rules live in the constructor both arms
-//! call rather than in either one. Measured with a probe visitor over both
-//! shapes, and pinned by the three tests named
+//! Worth writing down because it decides which parse path has to hold.
+//!
+//! A C0 control character (U+0000–U+001F) cannot appear raw inside a JSON
+//! string: the grammar forbids it and serde_json refuses the document before
+//! any visitor runs. Copy text carrying one therefore always arrives
+//! *escaped*. DEL (U+007F) and the C1 controls (U+0080–U+009F) carry no such
+//! requirement and can arrive raw.
+//!
+//! Which visitor arm either of those reaches is a property of the parse, not of
+//! the character. The routing table in [`limits`] states it qualified by input
+//! source, and that qualification is load-bearing here. Re-measured with a
+//! probe visitor for the shape this module's values travel in — a `copy_text`
+//! outcome inside the internally-tagged `executed` frame:
+//!
+//! ```text
+//!   from_str / from_slice, raw (a control or not)  ->  borrowed arm
+//!   from_str / from_slice, escaped                 ->  owned arm
+//!   from_reader,           raw or escaped          ->  owned arm
+//! ```
+//!
+//! So no single arm sees everything: a `from_str` parse meets refusable input
+//! on both, and a `from_reader` parse — the likelier shape of a socket
+//! transport, which cannot borrow from a buffer it is still filling — hands
+//! every string to the owned one. That is why the rules live in the constructor
+//! both arms call rather than in either one. Pinned by the tests
 //! `an_escaped_control_character_is_refused_inside_a_tagged_frame`,
-//! `a_raw_control_character_is_refused_inside_a_tagged_frame` and
+//! `a_raw_control_character_is_refused_inside_a_tagged_frame`,
+//! `a_refused_value_is_refused_through_from_reader_too` and
 //! `a_raw_c0_control_never_reaches_the_content_check`.
 //!
 //! # What these rules do not close
 //!
-//! They make a value well-formed *for its sink*, not safe *at its sink*. A URL
-//! with an allowed scheme is still an arbitrary web address a browser will
-//! fetch, and accepted copy text is still arbitrary text a terminal will paste.
-//! What is removed is the class of value whose whole purpose is to be read as
-//! something other than what the variant says it is: a local file dressed as a
-//! URL, a command-line option dressed as a URL, a terminal control sequence
-//! dressed as text. The client's own launching and clipboard handling is the
-//! other half of this, and it is not in this crate.
+//! They decide which *sink* a value can reach and whether it can be read as
+//! something other than an operand. They do not make it safe once it gets
+//! there. A URL with an allowed scheme is still an arbitrary web address a
+//! browser will fetch, and accepted copy text is still arbitrary text a
+//! terminal will paste.
+//!
+//! What is removed is narrower than "anything dangerous": a local file dressed
+//! as a URL, a command-line option dressed as a URL, a terminal control
+//! sequence dressed as text. A value that is exactly what its variant says it
+//! is can still be hostile — accepted copy text may hold a newline and so a
+//! second line, which [`CopyText`]'s own section on that says plainly, and an
+//! accepted URL is unparsed past its scheme, which [`OpenUrl`]'s does. The
+//! client's own launching and clipboard handling is the other half of this, and
+//! it is not in this crate.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -87,14 +107,13 @@ pub const ALLOWED_URL_SCHEMES: &[&str] = &["http", "https", "mailto"];
 
 /// The control characters a [`CopyText`] may carry, by exception.
 ///
-/// Tab and newline are the two control characters that occur in ordinary
-/// human-readable text — the indentation and the line breaks of the snippet or
-/// multi-line answer that [`MAX_COPY_TEXT`] is sized for. Refusing them would
-/// refuse honest content, which is the one failure mode worse than a loose
-/// rule. Every other control character means something to a device rather than
-/// to a reader, and none of them has any business in text on its way to a
-/// clipboard. See [`CopyText`] for what allowing these two does and does not
-/// cost.
+/// Tab and newline are the indentation and the line breaks of the snippet or
+/// multi-line answer that [`MAX_COPY_TEXT`] is sized for, so refusing them
+/// would refuse honest content — the one failure mode worse than a loose rule.
+///
+/// This is a trade and not a classification: carriage return occurs in ordinary
+/// text too, as the CR of CRLF, and it is refused anyway. [`CopyText`] carries
+/// what allowing these two costs, and what refusing that one costs.
 pub const ALLOWED_COPY_TEXT_CONTROLS: &[char] = &['\t', '\n'];
 
 /// A value refused by a content rule in [`content`](self).
@@ -171,15 +190,43 @@ pub enum ContentError {
 ///    ASCII-case-insensitively. The scheme is what precedes the *first* `:`, so
 ///    an allowed scheme appearing later in the value does not rescue a refused
 ///    one.
-/// 4. **No ASCII space and no control character.** RFC 3986 admits neither in
-///    a URL — both have to be percent-encoded to appear in one — so a value
-///    carrying either is not a URL that lost something in transit but a value
-///    shaped to be split, truncated or re-read by whatever it is passed to.
-///    "Control character" is [`char::is_control`], Unicode's `Cc` category.
+/// 4. **No ASCII space and no control character.** These two are what let a
+///    value be split, truncated or re-read by whatever it is passed to: a space
+///    is where an argument ends for anything that builds a command line by
+///    splitting, and a control character ends a line or steers a terminal. That
+///    is the whole of what this rule targets. It is *not* a rule that a URL
+///    must hold only characters RFC 3986 allows unencoded — plenty that the RFC
+///    also requires percent-encoded are accepted here: every non-ASCII
+///    character, so `https://example.com/café` passes, and `<`, `>`, `"`, `{`,
+///    `}`, `|`, `\`, `^` and a backtick besides, because refusing those would
+///    refuse URLs that browsers open every day. "Control character" is
+///    [`char::is_control`], Unicode's `Cc` category. Pinned by the test
+///    `open_url_accepts_characters_rfc_3986_would_percent_encode`.
 ///
 /// Nothing here normalises, trims or percent-encodes. An accepted URL is passed
 /// on exactly as it arrived, so what a client opens is what the provider sent,
 /// and a rule that reads the value cannot disagree with a later reader of it.
+///
+/// # What is not checked
+///
+/// The rules above decide which handler a value can reach and whether it can be
+/// read as something other than an operand. They do not parse the URL, and
+/// three consequences are worth naming here rather than leaving to be
+/// discovered:
+///
+/// - **No authority is required.** A bare `https:` is accepted, as are
+///   `https://` and `http:example.com`, whose path is opaque. What refuses
+///   those is whatever tries to open them, not this type.
+/// - **Userinfo is not inspected.** `https://evil.com@good.com/` is accepted.
+///   Its host is `good.com`, but a user reading it sees `evil.com` first.
+/// - **Hosts are neither compared nor normalised**, so a punycode or homograph
+///   host that renders like a familiar one passes unremarked.
+///
+/// All three are display-and-phishing problems belonging to whatever shows or
+/// opens the URL, and closing them needs a URL parser this crate deliberately
+/// does not carry. Pinned by the test
+/// `open_url_does_not_check_what_follows_the_scheme`, so a later widening of
+/// the rules updates this list rather than silently contradicting it.
 ///
 /// The newtype does not change the wire form: a URL is still a bare JSON
 /// string, never an object or a wrapper.
@@ -262,11 +309,12 @@ fn has_allowed_scheme(value: &str) -> bool {
 ///
 /// # Which control characters are allowed, and why
 ///
-/// The threat is a paste into a shell, so the question is which control
-/// characters have a meaning in *text* and which have a meaning to the *device*
-/// the text is pasted into.
+/// The threat is a paste into a shell, so the rule sorts control characters by
+/// what they do to the *device* the text lands in, not by whether they occur in
+/// text — several do occur in text and are refused anyway, and the section on
+/// carriage return below is the one that costs something.
 ///
-/// Tab and newline are text. A snippet has indentation and lines, and
+/// Tab and newline are kept. A snippet has indentation and lines, and
 /// [`MAX_COPY_TEXT`] is the most generous bound in the size budget precisely
 /// because copy text is allowed to be a chunk of prose rather than a label.
 /// Refusing a newline would mean an honest multi-line answer could not be
@@ -274,15 +322,31 @@ fn has_allowed_scheme(value: &str) -> bool {
 /// avert.
 ///
 /// Everything else in Unicode's `Cc` category — the rest of C0, DEL, and the C1
-/// controls — is refused. None of them is text. `ESC` opens a terminal control
-/// sequence, so it is the character that turns pasted text into instructions to
-/// the terminal rather than input to the shell. A carriage return is a line
-/// terminator to some readers and a return-to-column-zero to a terminal, which
-/// makes it the one character that can both end a line and overwrite what was
-/// shown of it; it is refused although newline is allowed, and that pair is
-/// what the policy turns on. The remainder are device controls with no meaning
-/// in a clipboard at all, and refusing the category wholesale is both simpler
-/// to state and safer than enumerating the ones known to be dangerous today.
+/// controls — is refused. Most of it is device control with no meaning in a
+/// clipboard at all, and refusing the category wholesale is both simpler to
+/// state and safer than enumerating the members known to be dangerous today.
+/// `ESC` is the one that matters most: it opens a terminal control sequence, so
+/// it is what turns pasted text into instructions to the terminal rather than
+/// input to whatever is reading.
+///
+/// # What refusing a carriage return costs
+///
+/// One member of that category is not device control, and the rule charges for
+/// it. As the CR of CRLF, a carriage return is ordinary in text of Windows
+/// origin, in HTTP bodies, and in `\r\n`-terminated files — so a provider that
+/// copies such text through unchanged has the value refused, and because the
+/// refusal happens at the parse, the whole frame refused with it. That is the
+/// same "silently break honest providers" failure that argues for allowing a
+/// newline two paragraphs up, and here it is accepted rather than avoided: a
+/// carriage return returns a terminal to column zero, which makes it the one
+/// character that can overwrite what was already shown of a line, and a paste
+/// able to hide what it contains is worth more than CRLF convenience.
+///
+/// It is a judgement and not a boundary, and it should not be read as one. A
+/// pasted newline submits a line to a line-oriented reader much as a carriage
+/// return would, so refusing CR buys the column-zero overwrite and little
+/// besides. A provider holding CRLF content should translate it to LF before
+/// sending rather than expect this type to take it.
 ///
 /// # What allowing a newline does not close
 ///
@@ -398,6 +462,44 @@ mod tests {
     }
 
     #[test]
+    fn open_url_accepts_characters_rfc_3986_would_percent_encode() {
+        // Rule 4 is about the two characters that let a value be split or
+        // re-read, not about RFC 3986 legality. These all require encoding to
+        // appear in a URL and are all accepted, which is what keeps the rule
+        // from being read as "RFC-legal characters only".
+        for url in [
+            "https://example.com/café",
+            "https://example.com/a<b>c",
+            "https://example.com/a\"b",
+            "https://example.com/{a}|b",
+            "https://example.com/a\\b^c`d",
+        ] {
+            assert!(
+                OpenUrl::new(url).is_ok(),
+                "this rule refuses only space and control characters, refused {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_url_does_not_check_what_follows_the_scheme() {
+        // Pins the documented gap rather than an intended feature: nothing here
+        // parses the URL, so an absent authority, a misleading userinfo and a
+        // homograph host all pass. Each belongs to whatever shows or opens the
+        // URL, and closing them needs a parser this crate does not carry.
+        for url in [
+            "https:",
+            "https://",
+            "http:example.com",
+            "https://evil.com@good.com/",
+            "https://xn--80ak6aa92e.com/",
+            "https://ехample.com/",
+        ] {
+            assert!(OpenUrl::new(url).is_ok(), "unexpectedly refused {url:?}");
+        }
+    }
+
+    #[test]
     fn open_url_keeps_the_value_it_was_given_whole() {
         // Nothing here normalises, trims or percent-encodes: an accepted URL is
         // handed on exactly as it arrived, so what a client opens is what the
@@ -426,9 +528,12 @@ mod tests {
             "data:text/html;base64,PHNjcmlwdD4=",
             "vbscript:msgbox(1)",
         ] {
-            assert!(
-                OpenUrl::new(url).is_err(),
-                "a scheme outside the allow-list must be refused, accepted {url}"
+            assert_eq!(
+                OpenUrl::new(url).unwrap_err(),
+                ContentError::SchemeNotAllowed {
+                    field: OpenUrl::FIELD
+                },
+                "the scheme must be what is named as refused, for {url}"
             );
         }
     }
@@ -663,6 +768,64 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_character_in_a_url_cannot_be_produced_by_parsing() {
+        // The other two URL rules are covered above; this is the one whose
+        // refusal the parse had no test for, on either shape.
+        for url in ["https://example.com/a b", "https://example.com/a\u{7f}b"] {
+            for parsed in [
+                serde_json::from_str::<ExecOutcome>(&json!({ "open_url": url }).to_string())
+                    .err()
+                    .map(|e| e.to_string()),
+                serde_json::from_str::<DaemonMsg>(&executed_frame(json!({ "open_url": url })))
+                    .err()
+                    .map(|e| e.to_string()),
+            ] {
+                let err = parsed.unwrap_or_else(|| panic!("parsing must refuse {url:?}"));
+                assert!(err.contains(OpenUrl::FIELD), "got: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_copy_text_cannot_be_produced_by_parsing() {
+        // Both other copy-text parse tests go through a frame; this is the bare
+        // value, which the routing measurements say takes the borrowed arm
+        // whichever reader is used.
+        let escaped =
+            serde_json::from_str::<ExecOutcome>(&json!({ "copy_text": "a\rb" }).to_string())
+                .expect_err("an escaped carriage return must be refused off a bare value");
+        assert!(
+            escaped.to_string().contains(CopyText::FIELD),
+            "got: {escaped}"
+        );
+
+        let raw = serde_json::from_str::<ExecOutcome>("{\"copy_text\":\"a\u{7f}b\"}")
+            .expect_err("a raw DEL must be refused off a bare value");
+        assert!(raw.to_string().contains(CopyText::FIELD), "got: {raw}");
+    }
+
+    #[test]
+    fn a_refused_value_is_refused_through_from_reader_too() {
+        // Measured: a `from_reader` parse of a tagged frame hands every string
+        // to the owned arm, raw or escaped — so the raw case, which `from_str`
+        // routes to the borrowed arm, is only exercised on the owned arm here.
+        let raw_del = format!(
+            r#"{{"type":"executed","query_id":1,"outcome":{{"copy_text":"a{}b"}}}}"#,
+            '\u{7f}'
+        );
+        for frame in [
+            raw_del,
+            executed_frame(json!({ "copy_text": "a\rb" })),
+            executed_frame(json!({ "open_url": "file:///etc/passwd" })),
+        ] {
+            assert!(
+                serde_json::from_reader::<_, DaemonMsg>(frame.as_bytes()).is_err(),
+                "the rules must hold whichever reader parsed the frame: {frame:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_parse_checks_the_length_before_the_content_too() {
         // The ordering is claimed of the parse as well as of the constructor,
         // and the parse applies the two gates in two different places, so it is
@@ -686,8 +849,8 @@ mod tests {
     #[test]
     fn an_escaped_control_character_is_refused_inside_a_tagged_frame() {
         // A C0 control cannot appear raw in JSON, so this is the only way one
-        // arrives — and it is the parse path that hands the visitor an owned
-        // string, which is a different arm from the one every raw value takes.
+        // arrives. Under `from_str` an escaped string is what reaches the arm
+        // taking an owned `String`, so this is that arm's case.
         let err =
             serde_json::from_str::<DaemonMsg>(&executed_frame(json!({ "copy_text": "a\rb" })))
                 .unwrap_err();
@@ -696,9 +859,10 @@ mod tests {
 
     #[test]
     fn a_raw_control_character_is_refused_inside_a_tagged_frame() {
-        // DEL and C1 need no escaping in JSON, so they reach the check raw, on
-        // the borrowing arm. Written out rather than built with `json!`, whose
-        // serializer would escape nothing here but is not what is under test.
+        // DEL and C1 need no escaping in JSON, so under `from_str` they reach
+        // the check raw, on the arm taking a borrowed `&str`. Written out
+        // rather than built with `json!`, whose serializer would escape nothing
+        // here but is not what is under test.
         for raw in ["\u{7f}", "\u{85}"] {
             let frame = format!(
                 r#"{{"type":"executed","query_id":1,"outcome":{{"copy_text":"a{raw}b"}}}}"#
