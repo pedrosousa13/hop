@@ -21,6 +21,16 @@ use crate::router::{Mode, RoutedQuery};
 /// [`should_query`] is the one piece of scheduling logic that lives at M1;
 /// budget enforcement, cancellation propagation and parallel dispatch are
 /// M2 daemon work.
+///
+/// `id` and `kinds` are what
+/// [`crate::pipeline::CheckedItems::check`] holds each of this provider's
+/// items to, so a manifest is a promise the provider's own output is checked
+/// against, not just a hint to a scheduler.
+///
+/// `Clone` because [`Provider::manifest`] hands a caller its own value —
+/// implementors that keep one prepared can return a copy of it rather than
+/// rebuilding it per query.
+#[derive(Clone)]
 pub struct ProviderManifest {
     pub id: &'static str,
     pub kinds: Vec<Kind>,
@@ -145,6 +155,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::pipeline::{CheckedItems, ProviderOutput};
     use crate::router::route;
 
     fn manifest(modes: Vec<Mode>, min_term_len: usize) -> ProviderManifest {
@@ -203,11 +214,23 @@ mod tests {
     /// with the native async-in-trait syntax and runnable on a real
     /// executor — a trait nobody has implemented is a trait that might not
     /// compile for implementors.
+    ///
+    /// It is also the tree's one worked example of a well-behaved provider,
+    /// so its manifest `id` and the `provider` string on the items its
+    /// `query` returns must agree, and every item's kind must be one the
+    /// manifest declares. Those are exactly the two things
+    /// [`crate::pipeline::CheckedItems::check`] holds a provider to; an
+    /// example that failed its own checks would be a template for getting
+    /// this wrong. Pinned by
+    /// [`tests::a_providers_own_output_passes_its_own_manifests_checks`].
     struct FakeProvider;
 
     impl Provider for FakeProvider {
         fn manifest(&self) -> ProviderManifest {
-            manifest(vec![Mode::All], 0)
+            ProviderManifest {
+                id: "fake",
+                ..manifest(vec![Mode::All], 0)
+            }
         }
 
         async fn query(&self, q: &RoutedQuery, ctx: &QueryCtx) -> Result<Vec<Item>, ProviderError> {
@@ -254,6 +277,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, ExecOutcome::Done);
+    }
+
+    /// The provider seam end to end, and the only test that exercises the
+    /// association [`crate::pipeline::ProviderOutput`] carries with items a
+    /// [`Provider`] really returned: dispatch a provider, pair what it
+    /// answered with itself, and both manifest checks pass.
+    ///
+    /// This is what makes the association *right* rather than merely present.
+    /// `ProviderOutput::from_provider` reads the manifest off the object it
+    /// is handed, so this fails the moment `FakeProvider::query` returns an
+    /// item whose `provider` string or kind disagrees with what
+    /// `FakeProvider::manifest` declares — which is precisely the mistake a
+    /// real provider is most likely to make.
+    #[tokio::test]
+    async fn a_providers_own_output_passes_its_own_manifests_checks() {
+        let provider = FakeProvider;
+        let ctx = QueryCtx {
+            cancel: CancellationFlag::default(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let items = provider.query(&route("firefox"), &ctx).await.unwrap();
+        assert_eq!(items.len(), 1, "the fixture must actually produce an item");
+
+        let checked = CheckedItems::check(vec![ProviderOutput::from_provider(&provider, items)]);
+        assert_eq!(
+            checked.rejections(),
+            &[],
+            "a provider's own honest output must survive its own manifest"
+        );
+        assert_eq!(checked.items().len(), 1);
     }
 
     #[tokio::test]

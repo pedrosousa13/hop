@@ -17,7 +17,7 @@ use hop_protocol::{Item, ItemId, Kind};
 
 use crate::aliases::Aliases;
 use crate::learning::Learning;
-use crate::provider::ProviderManifest;
+use crate::provider::{Provider, ProviderManifest};
 use crate::rank::{Boosts, Ranker, Weights};
 use crate::router::{Mode, RoutedQuery, route};
 
@@ -33,12 +33,51 @@ use crate::router::{Mode, RoutedQuery, route};
 /// type is what a scheduler hands to [`CheckedItems::check`], one value per
 /// provider that answered.
 ///
-/// The manifest is borrowed rather than owned because a manifest is a
-/// provider's static self-description, held by the caller for the life of the
-/// query; the checks only read `id` and `kinds` from it.
-pub struct ProviderOutput<'a> {
-    pub manifest: &'a ProviderManifest,
-    pub items: Vec<Item>,
+/// ## Why the manifest cannot be supplied by the caller
+///
+/// Both fields are private and [`ProviderOutput::from_provider`] is the only
+/// constructor, because a manifest a caller can name is a manifest a forged
+/// item can select. The failure that shape invites is not hypothetical: a
+/// scheduler holding a flat `Vec<Item>` would naturally group it for checking
+/// by reading each item's own `provider` string and looking the matching
+/// manifest up by that id — at which point both checks are tautologies. The
+/// provenance check would compare a claimed id against a manifest chosen *by*
+/// that claimed id, and the kind check would run against the impersonated
+/// provider's declared kinds. Every abuse in issue #31 would be back, with
+/// the checks still nominally in place.
+///
+/// Taking the dispatched [`Provider`] itself removes the string from the
+/// path: the manifest comes from [`Provider::manifest`] on the object that
+/// was asked, so nothing an item says about itself can influence which
+/// manifest it is checked against. The one freedom left to a caller is which
+/// provider object it hands over alongside which items, and that is a pairing
+/// made where the provider is in hand — not something derivable from item
+/// data, and not something `dyn Provider` can launder either, since
+/// [`Provider`]'s RPITIT methods make it dyn-incompatible by construction.
+///
+/// The manifest is owned rather than borrowed because [`Provider::manifest`]
+/// returns a fresh value. That is one small allocation per provider per
+/// query, on a path that then fuzzy-matches every item that provider
+/// returned.
+pub struct ProviderOutput {
+    manifest: ProviderManifest,
+    items: Vec<Item>,
+}
+
+impl ProviderOutput {
+    /// Pairs `items` with the manifest of the provider that produced them,
+    /// asking `provider` for that manifest directly. See the type's docs for
+    /// why this is the only way to build one.
+    ///
+    /// `items` is what this provider's own [`Provider::query`] returned;
+    /// dispatching providers, honouring their budgets and collecting their
+    /// answers is M2 daemon work that happens upstream of this crate.
+    pub fn from_provider<P: Provider>(provider: &P, items: Vec<Item>) -> Self {
+        ProviderOutput {
+            manifest: provider.manifest(),
+            items,
+        }
+    }
 }
 
 /// Which of the two manifest checks an item failed. See [`Rejection`].
@@ -89,18 +128,32 @@ pub struct Rejection {
 ///
 /// This is the only item collection [`Pipeline::assemble`] accepts, its
 /// fields are private, and [`CheckedItems::check`] is its only constructor.
-/// That shape is the enforcement: a caller cannot route unchecked items into
-/// ranking, because there is no way to build the value that ranking's entry
-/// point demands except by running the checks. A free function that returns
-/// `Vec<Item>` — or public fields here — would leave the checks advisory, and
-/// a caller could skip them by simply not calling, which is exactly the
-/// failure mode this seam exists to remove. The compiler enforces it instead
-/// of a reviewer noticing.
+/// That shape is the enforcement: unchecked items cannot travel the assembly
+/// path, because there is no way to build the value `assemble` demands except
+/// by running the checks. A free function that returns `Vec<Item>` — or
+/// public fields here — would leave the checks advisory, and a caller could
+/// skip them by simply not calling, which is exactly the failure mode this
+/// seam exists to remove. The compiler enforces it instead of a reviewer
+/// noticing.
 ///
-/// The rejections ride along inside the value rather than being handed back
-/// separately, so that they arrive at assembly and leave in its return value:
-/// what assembly refused is part of assembly's outcome, and splitting it off
-/// would let a caller drop it on the floor without noticing.
+/// The guarantee is scoped to that seam, and deliberately not claimed for
+/// scoring in general: [`Ranker::rank`] is public, takes a bare `Vec<Item>`,
+/// and [`Pipeline::ranker`] is a public field, so `pipeline.ranker.rank(…)`
+/// still reaches the fuzzy matcher and the title-dedupe with items no
+/// manifest vouched for. What this type guarantees is that *assembly* — the
+/// nine-step contract the daemon calls per query, where boosts, the exclusive
+/// filter and the pinned tail all live — has no unchecked entrance.
+///
+/// The rejections ride along inside the value, and come back out in
+/// [`Assembly`], rather than being handed back from `check` separately: what
+/// assembly refused belongs to the query it refused them for, so one call
+/// yields one outcome. It is worth being precise about what that does *not*
+/// buy, since it would be easy to read as more: nothing obliges a caller to
+/// look at them. [`Assembly`]'s fields are public and `.items` discards the
+/// rejections in one character, which is exactly what the tests below do.
+/// Until there is a logging seam (issue #34) that makes ignoring them a real
+/// mistake, this shape keeps rejections available and attached to their
+/// query — it does not make them unignorable.
 pub struct CheckedItems {
     items: Vec<Item>,
     rejections: Vec<Rejection>,
@@ -129,11 +182,18 @@ impl CheckedItems {
     /// provider's namespace. Boosts keyed on the bare id string are what make
     /// that collision worth something, and giving them a provider dimension
     /// is separate work.
-    pub fn check(outputs: Vec<ProviderOutput<'_>>) -> Self {
+    pub fn check(outputs: Vec<ProviderOutput>) -> Self {
         let mut items = Vec::new();
         let mut rejections = Vec::new();
 
         for output in outputs {
+            // Each item is checked against `output.manifest` and nothing
+            // else. Hoisting the declared kinds or the ids out of this loop —
+            // into one set spanning every provider that answered — would look
+            // like a harmless optimisation and would silently restore both
+            // abuses: any answering provider's kind would vouch for any item,
+            // and any answering provider's id would satisfy provenance. See
+            // `tests::an_item_is_checked_against_its_own_producer_not_the_union_of_every_manifest`.
             for item in output.items {
                 let failed = if !output.manifest.kinds.contains(&item.kind) {
                     Some(FailedCheck::Kind)
@@ -382,13 +442,14 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use hop_protocol::{Action, ActionId, ActionKind, ItemId};
+    use crate::provider::{ProviderError, QueryCtx};
+    use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId};
     use std::time::Duration;
 
-    /// Every [`Kind`] there is. `test_manifest` vouches for all of them, so
-    /// the ordering, filtering, promotion and truncation tests below can keep
-    /// using items of whatever kind the behaviour under test needs without
-    /// each one having to spell out a manifest.
+    /// Every [`Kind`] there is. The `test` provider below declares all of
+    /// them, so the ordering, filtering, promotion and truncation tests can
+    /// keep using items of whatever kind the behaviour under test needs
+    /// without each one having to stand up a provider of its own.
     const ALL_KINDS: [Kind; 10] = [
         Kind::App,
         Kind::Window,
@@ -402,31 +463,61 @@ mod tests {
         Kind::Action,
     ];
 
-    fn manifest(id: &'static str, kinds: Vec<Kind>) -> ProviderManifest {
-        ProviderManifest {
-            id,
-            kinds,
-            modes: vec![Mode::All],
-            min_term_len: 0,
-            budget: Duration::from_millis(50),
+    /// A provider that exists only to be a provider: [`ProviderOutput`] can
+    /// be built no other way, so a test that wants to pair items with a
+    /// manifest has to have something implementing [`Provider`] to ask. Its
+    /// `query` is never called — assembly's input is items a provider has
+    /// *already* returned, and these tests hand-write those items so they can
+    /// forge the claims the checks are about.
+    struct FakeProvider {
+        manifest: ProviderManifest,
+    }
+
+    impl Provider for FakeProvider {
+        fn manifest(&self) -> ProviderManifest {
+            self.manifest.clone()
+        }
+
+        async fn query(
+            &self,
+            _q: &RoutedQuery,
+            _ctx: &QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        async fn execute(
+            &self,
+            _item_id: &ItemId,
+            _action_id: &ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
         }
     }
 
-    /// The manifest of the one provider the `item` helper's output claims to
-    /// come from: id `test`, and every kind.
-    fn test_manifest() -> ProviderManifest {
-        manifest("test", ALL_KINDS.to_vec())
+    fn provider(id: &'static str, kinds: Vec<Kind>) -> FakeProvider {
+        FakeProvider {
+            manifest: ProviderManifest {
+                id,
+                kinds,
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(50),
+            },
+        }
+    }
+
+    /// One provider's answer: the items `id` claims to have produced, paired
+    /// with `id`'s own manifest the only way [`ProviderOutput`] allows.
+    fn output(id: &'static str, kinds: Vec<Kind>, items: Vec<Item>) -> ProviderOutput {
+        ProviderOutput::from_provider(&provider(id, kinds), items)
     }
 
     /// Checks well-behaved output from the single fake provider most tests
     /// here share, and asserts nothing was rejected — so a test written about
     /// ordering can never quietly turn into a test about rejection.
     fn checked(items: Vec<Item>) -> CheckedItems {
-        let manifest = test_manifest();
-        let checked = CheckedItems::check(vec![ProviderOutput {
-            manifest: &manifest,
-            items,
-        }]);
+        let checked = CheckedItems::check(vec![output("test", ALL_KINDS.to_vec(), items)]);
         assert!(
             checked.rejections().is_empty(),
             "this helper is for well-behaved provider output only"
@@ -805,7 +896,6 @@ mod tests {
     #[test]
     fn item_whose_kind_is_outside_its_producers_declared_kinds_is_rejected() {
         let mut pipeline = Pipeline::default();
-        let calculator = manifest("calc", vec![Kind::Calculator]);
         let items = vec![
             Item {
                 provider: "calc".into(),
@@ -818,10 +908,7 @@ mod tests {
         ];
         let out = pipeline.assemble(
             "",
-            CheckedItems::check(vec![ProviderOutput {
-                manifest: &calculator,
-                items,
-            }]),
+            CheckedItems::check(vec![output("calc", vec![Kind::Calculator], items)]),
             10,
         );
         assert_eq!(
@@ -836,7 +923,6 @@ mod tests {
     #[test]
     fn item_whose_provider_string_does_not_match_its_producer_is_rejected() {
         let mut pipeline = Pipeline::default();
-        let apps = manifest("apps", vec![Kind::App]);
         let items = vec![
             Item {
                 provider: "apps".into(),
@@ -849,10 +935,7 @@ mod tests {
         ];
         let out = pipeline.assemble(
             "",
-            CheckedItems::check(vec![ProviderOutput {
-                manifest: &apps,
-                items,
-            }]),
+            CheckedItems::check(vec![output("apps", vec![Kind::App], items)]),
             10,
         );
         assert_eq!(ids(&out.items), vec!["app:files"]);
@@ -873,27 +956,27 @@ mod tests {
             .unwrap(),
             ..Default::default()
         };
-        let apps = manifest("apps", vec![Kind::App]);
-        let evil = manifest("evil", vec![Kind::App]);
         let out = pipeline.assemble(
             "fire",
             CheckedItems::check(vec![
-                ProviderOutput {
-                    manifest: &apps,
-                    items: vec![Item {
+                output(
+                    "apps",
+                    vec![Kind::App],
+                    vec![Item {
                         provider: "apps".into(),
                         ..item(Kind::App, "app:fireplace", "Fireplace")
                     }],
-                },
-                ProviderOutput {
-                    manifest: &evil,
-                    // Produced by `evil`, but claiming to be the apps
-                    // provider's work — the forged item from the issue.
-                    items: vec![Item {
+                ),
+                // Produced by `evil`, but claiming to be the apps provider's
+                // work — the forged item from the issue.
+                output(
+                    "evil",
+                    vec![Kind::App],
+                    vec![Item {
                         provider: "apps".into(),
                         ..item(Kind::App, "app:firefox", "Firefox Impostor")
                     }],
-                },
+                ),
             ]),
             10,
         );
@@ -918,25 +1001,25 @@ mod tests {
                 .learning
                 .record_launch("firefox", &ItemId("app:evil".into()));
         }
-        let apps = manifest("apps", vec![Kind::App]);
-        let evil = manifest("evil", vec![Kind::App]);
         let out = pipeline.assemble(
             "firefox",
             CheckedItems::check(vec![
-                ProviderOutput {
-                    manifest: &apps,
-                    items: vec![Item {
+                output(
+                    "apps",
+                    vec![Kind::App],
+                    vec![Item {
                         provider: "apps".into(),
                         ..item(Kind::App, "app:firefox", "Firefox")
                     }],
-                },
-                ProviderOutput {
-                    manifest: &evil,
-                    items: vec![Item {
+                ),
+                output(
+                    "evil",
+                    vec![Kind::App],
+                    vec![Item {
                         provider: "apps".into(),
                         ..item(Kind::App, "app:evil", "Firefox")
                     }],
-                },
+                ),
             ]),
             10,
         );
@@ -955,25 +1038,25 @@ mod tests {
     #[test]
     fn a_rejected_item_cannot_survive_an_exclusive_mode_filter() {
         let mut pipeline = Pipeline::default();
-        let windows = manifest("windows", vec![Kind::Window]);
-        let calculator = manifest("calc", vec![Kind::Calculator]);
         let out = pipeline.assemble(
             "w fire",
             CheckedItems::check(vec![
-                ProviderOutput {
-                    manifest: &windows,
-                    items: vec![Item {
+                output(
+                    "windows",
+                    vec![Kind::Window],
+                    vec![Item {
                         provider: "windows".into(),
                         ..item(Kind::Window, "window:1", "Firefox")
                     }],
-                },
-                ProviderOutput {
-                    manifest: &calculator,
-                    items: vec![Item {
+                ),
+                output(
+                    "calc",
+                    vec![Kind::Calculator],
+                    vec![Item {
                         provider: "calc".into(),
                         ..item(Kind::Window, "window:evil", "Firefox Impostor")
                     }],
-                },
+                ),
             ]),
             10,
         );
@@ -994,25 +1077,25 @@ mod tests {
     #[test]
     fn a_rejected_append_to_end_item_is_rejected_too() {
         let mut pipeline = Pipeline::default();
-        let web = manifest("web", vec![Kind::WebSearch]);
-        let evil = manifest("evil", vec![Kind::WebSearch]);
         let out = pipeline.assemble(
             "w fire",
             CheckedItems::check(vec![
-                ProviderOutput {
-                    manifest: &web,
-                    items: vec![Item {
+                output(
+                    "web",
+                    vec![Kind::WebSearch],
+                    vec![Item {
                         provider: "web".into(),
                         ..pinned(Kind::WebSearch, "web:search", "Search the web for firefox")
                     }],
-                },
-                ProviderOutput {
-                    manifest: &evil,
-                    items: vec![Item {
+                ),
+                output(
+                    "evil",
+                    vec![Kind::WebSearch],
+                    vec![Item {
                         provider: "web".into(),
                         ..pinned(Kind::WebSearch, "web:evil", "Search the web, evilly")
                     }],
-                },
+                ),
             ]),
             10,
         );
@@ -1030,16 +1113,16 @@ mod tests {
     #[test]
     fn a_rejection_names_the_item_the_claim_the_producer_and_the_failed_check() {
         let mut pipeline = Pipeline::default();
-        let evil = manifest("evil", vec![Kind::Calculator]);
         let out = pipeline.assemble(
             "",
-            CheckedItems::check(vec![ProviderOutput {
-                manifest: &evil,
-                items: vec![Item {
+            CheckedItems::check(vec![output(
+                "evil",
+                vec![Kind::Calculator],
+                vec![Item {
                     provider: "apps".into(),
                     ..item(Kind::Window, "app:firefox", "Firefox")
                 }],
-            }]),
+            )]),
             10,
         );
         assert!(out.items.is_empty());
@@ -1055,34 +1138,107 @@ mod tests {
         );
     }
 
-    /// Each item is checked against *its own* producer's manifest, not
-    /// against the union of every manifest that answered: both items below
-    /// are well-behaved, and each would be rejected by the other's producer.
+    /// Each item is checked against *its own* producer's manifest, never
+    /// against the union of every manifest that answered. Both impostors here
+    /// are well-behaved by the union's standards and rejected by their own
+    /// producer's: `apps` emits a Calculator item, a kind `calc` (also
+    /// answering) declares; `calc` emits an item claiming provider `apps`, an
+    /// id `apps` (also answering) really has. An implementation that hoisted
+    /// the declared kinds or the ids into one set spanning `outputs` — an
+    /// easy thing to reach for with many providers — would let both through
+    /// while keeping every other test in this module green.
     #[test]
-    fn each_providers_items_are_checked_against_that_providers_own_manifest() {
-        let apps = manifest("apps", vec![Kind::App]);
-        let calculator = manifest("calc", vec![Kind::Calculator]);
+    fn an_item_is_checked_against_its_own_producer_not_the_union_of_every_manifest() {
         let checked = CheckedItems::check(vec![
-            ProviderOutput {
-                manifest: &apps,
-                items: vec![Item {
-                    provider: "apps".into(),
-                    ..item(Kind::App, "app:firefox", "Firefox")
-                }],
-            },
-            ProviderOutput {
-                manifest: &calculator,
-                items: vec![Item {
-                    provider: "calc".into(),
-                    ..item(Kind::Calculator, "calc:2+2", "2+2 = 4")
-                }],
-            },
+            output(
+                "apps",
+                vec![Kind::App],
+                vec![
+                    Item {
+                        provider: "apps".into(),
+                        ..item(Kind::App, "app:firefox", "Firefox")
+                    },
+                    Item {
+                        provider: "apps".into(),
+                        ..item(Kind::Calculator, "calc:evil", "2+2 = 5")
+                    },
+                ],
+            ),
+            output(
+                "calc",
+                vec![Kind::Calculator],
+                vec![
+                    Item {
+                        provider: "calc".into(),
+                        ..item(Kind::Calculator, "calc:2+2", "2+2 = 4")
+                    },
+                    Item {
+                        provider: "apps".into(),
+                        ..item(Kind::Calculator, "calc:impostor", "2+2 = 6")
+                    },
+                ],
+            ),
         ]);
-        assert!(checked.rejections().is_empty());
+
         assert_eq!(
             ids(checked.items()),
             vec!["app:firefox", "calc:2+2"],
-            "checking must not reorder what the providers returned"
+            "only each provider's own honest items survive, in the order the \
+             providers returned them"
         );
+        assert_eq!(
+            checked.rejections(),
+            vec![
+                Rejection {
+                    item_id: ItemId("calc:evil".into()),
+                    claimed_kind: Kind::Calculator,
+                    claimed_provider: "apps".into(),
+                    producer_id: "apps".into(),
+                    check: FailedCheck::Kind,
+                },
+                Rejection {
+                    item_id: ItemId("calc:impostor".into()),
+                    claimed_kind: Kind::Calculator,
+                    claimed_provider: "apps".into(),
+                    producer_id: "calc".into(),
+                    check: FailedCheck::Provenance,
+                },
+            ],
+            "a kind another answering provider declares does not vouch for \
+             this one's item, and neither does another answering provider's id"
+        );
+    }
+
+    /// The association is only worth anything if it is the *right* manifest:
+    /// [`ProviderOutput::from_provider`] must take it from the provider it is
+    /// handed, not from anywhere the caller could substitute. Pairing the
+    /// same items with a different provider rejects every one of them, which
+    /// is what makes the pairing load-bearing rather than decorative.
+    #[test]
+    fn from_provider_takes_the_manifest_from_the_provider_it_is_given() {
+        let items = vec![Item {
+            provider: "apps".into(),
+            ..item(Kind::App, "app:firefox", "Firefox")
+        }];
+
+        let own = CheckedItems::check(vec![ProviderOutput::from_provider(
+            &provider("apps", vec![Kind::App]),
+            items.clone(),
+        )]);
+        assert!(own.rejections().is_empty());
+        assert_eq!(ids(own.items()), vec!["app:firefox"]);
+
+        let someone_elses = CheckedItems::check(vec![ProviderOutput::from_provider(
+            &provider("windows", vec![Kind::App]),
+            items,
+        )]);
+        assert!(someone_elses.items().is_empty());
+        assert_eq!(
+            someone_elses.rejections()[0].producer_id,
+            "windows",
+            "the manifest checked against is the one the given provider \
+             describes itself with"
+        );
+        assert_eq!(someone_elses.rejections()[0].check, FailedCheck::Provenance);
     }
 }
