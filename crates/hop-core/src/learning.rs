@@ -143,11 +143,13 @@ fn apply_decay(raw: i32, last_ms: u64, now: u64) -> i32 {
 /// comment): an out-of-range count should cap out, not flip sign.
 ///
 /// This is the one place that ceiling is defined. `deserialize_saturating_count`
-/// applies it at the point a [`LearningEntry`] is deserialized, and
+/// applies it at the point a [`LearningEntry`] is deserialized,
 /// [`Learning::query_boost`] / [`Learning::frequency_boost`] apply it again
-/// themselves — so a count is safe whether it just came off disk, was built
-/// directly in memory (a test, say), or grew past the line via `record`'s
-/// `saturating_add`, none of which routes back through deserialization.
+/// themselves, and `canonicalized_global_frequency` applies it once more on
+/// the way back out to disk (see its own doc comment for why) — so a count
+/// is safe whether it just came off disk, was built directly in memory (a
+/// test, say), grew past the line via `record`'s `saturating_add`, or was
+/// just merged from two counts that were each already at the line.
 fn saturating_count_i32(count: u32) -> i32 {
     count.min(i32::MAX as u32) as i32
 }
