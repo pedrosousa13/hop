@@ -55,11 +55,19 @@
 //! buffer in between, reaches the borrowed arm with a slice of serde_json's own
 //! scratch buffer — measured, and the reason the table above is scoped to the
 //! frame. That is why the rules live in the constructor both arms call rather
-//! than in either one. Pinned by the tests
+//! than in either one. That conclusion is what the tests
 //! `an_escaped_control_character_is_refused_inside_a_tagged_frame`,
 //! `a_raw_control_character_is_refused_inside_a_tagged_frame`,
 //! `a_refused_value_is_refused_through_from_reader_too` and
-//! `a_raw_c0_control_never_reaches_the_content_check`.
+//! `a_raw_c0_control_never_reaches_the_content_check` hold: a refusal fires
+//! whichever of these paths a value arrives by.
+//!
+//! The table itself is not held that way, and deliberately is not. Nothing here
+//! observes which arm a parse reached — that is serde's internal routing, which
+//! this crate neither controls nor should pin — so if that routing changed, the
+//! table would go stale while every test above stayed green. It is a
+//! measurement, dated by the commit that took it, and the conclusion drawn from
+//! it is one that holds however the routing moves.
 //!
 //! # What these rules do not close
 //!
@@ -340,9 +348,9 @@ fn has_allowed_scheme(value: &str) -> bool {
 ///
 /// # What refusing a carriage return costs
 ///
-/// One member of that category is not device control, and the rule charges for
-/// it. As the CR of CRLF, a carriage return is ordinary in text of Windows
-/// origin, in HTTP bodies, and in `\r\n`-terminated files — so a provider that
+/// One member of that category occurs in ordinary text as well, and the rule
+/// charges for it. As the CR of CRLF, a carriage return is common in text of
+/// Windows origin, in HTTP bodies, and in `\r\n`-terminated files — so a provider that
 /// copies such text through unchanged has the value refused, and because the
 /// refusal happens at the parse, the whole frame refused with it. That is the
 /// same "silently break honest providers" failure that argues for allowing a
@@ -483,9 +491,9 @@ mod tests {
             "https://example.com/{a}|b",
             "https://example.com/a\\b^c`d",
             // Non-ASCII is accepted up to, and only up to, `Cc`: a no-break
-            // space, a line separator, a bidi override and characters outside
-            // the BMP all pass, while the C1 controls beside them do not — see
-            // the companion test below.
+            // space, a line separator, a bidi override, and an emoji above the
+            // BMP beside an ideograph inside it all pass, while the C1 controls
+            // beside them do not — see the companion test below.
             "https://example.com/a\u{a0}b",
             "https://example.com/a\u{2028}b",
             "https://example.com/a\u{202e}b",
