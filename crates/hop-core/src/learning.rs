@@ -1219,10 +1219,13 @@ mod tests {
         assert_eq!(names.len(), MAX_TEMP_FILE_ATTEMPTS as usize);
     }
 
-    // `temp_file_name`'s doc comment claims distinctness "by construction"
-    // across attempts; this is what proves that claim true for the actual
-    // sequence a save offers, rather than trusting the reasoning without a
-    // test behind it.
+    // A weaker, end-to-end sanity check than the trailing-component test
+    // below: confirms the five names actually offered are distinct in
+    // practice. On its own this would not reliably catch `attempt` being
+    // dropped from `temp_file_name`'s format string, since the clock also
+    // varies across the five calls and would usually paper over that —
+    // the trailing-component test below is what pins the by-construction
+    // guarantee specifically.
     #[test]
     fn temp_file_candidates_are_pairwise_distinct() {
         let names: Vec<String> = temp_file_candidates("learning.json").collect();
@@ -1232,5 +1235,29 @@ mod tests {
             names.len(),
             "every attempt must pick a different name"
         );
+    }
+
+    // `temp_file_name`'s doc comment claims distinctness holds "by
+    // construction": `attempt` is threaded through as an explicit,
+    // strictly-increasing component, not left to the clock. Pin that claim
+    // itself — each candidate's trailing `-`-delimited component must be
+    // its own attempt index — rather than a downstream consequence
+    // (distinctness) that the clock could also satisfy on its own. If
+    // `attempt` stops being threaded through, the trailing component
+    // becomes the nanosecond reading instead: always a many-digit number,
+    // never equal to a single-digit attempt index, so this fails on every
+    // run rather than only on the runs where the clock doesn't happen to
+    // mask the regression.
+    #[test]
+    fn temp_file_candidates_carry_their_attempt_index_as_the_trailing_component() {
+        let names: Vec<String> = temp_file_candidates("learning.json").collect();
+        for (attempt, name) in names.iter().enumerate() {
+            let trailing = name.rsplit('-').next().unwrap();
+            assert_eq!(
+                trailing,
+                attempt.to_string(),
+                "candidate {attempt} must carry its own attempt index as the trailing component, got {name:?}"
+            );
+        }
     }
 }
