@@ -33,7 +33,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -435,9 +435,10 @@ fn serialize_and_persist<T: Serialize>(path: &Path, value: &T) -> io::Result<()>
 /// if it is missing, write `payload` to a temp file beside the destination,
 /// rename it into place, and narrow the result to 0600 on unix.
 ///
-/// Layered over [`write_and_rename`], which is only the temp-file half of
-/// the sequence; this is the function that owns the surrounding directory
-/// and permission steps, and the temp file's cleanup on failure.
+/// Layered over [`write_and_rename`], which is only the temp-file
+/// creation-through-rename half of the sequence and owns that temp file's
+/// cleanup on failure; this is the function that owns the surrounding
+/// directory and destination-permission steps.
 fn persist_atomically(path: &Path, payload: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         // A directory this code creates is narrowed to 0700; one that was
@@ -491,43 +492,125 @@ fn persist_atomically(path: &Path, payload: &str) -> io::Result<()> {
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "path has no valid file name")
         })?;
-    let temp_name = format!(
-        ".{}.tmp-{}-{}",
-        file_name,
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let temp_path = parent.join(temp_name);
 
-    let result = write_and_rename(&temp_path, path, payload.as_bytes());
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result?;
+    write_and_rename(parent, file_name, path, payload.as_bytes())?;
 
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
-/// Write `payload` to `temp_path` (create/truncate, mode 0600 on unix),
-/// fsync it, then rename it onto `dest`. Split out of [`persist_atomically`]
-/// purely to keep the `?`-propagation linear; the caller is responsible for
-/// cleaning up `temp_path` on error.
-fn write_and_rename(temp_path: &Path, dest: &Path, payload: &[u8]) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(temp_path)?;
-    file.write_all(payload)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(temp_path, dest)?;
-    Ok(())
+/// Create a temp file beside `dest` (see [`create_temp_file_exclusive`]),
+/// write `payload` to it, fsync it, then rename it onto `dest`. Split out of
+/// [`persist_atomically`] purely to keep the `?`-propagation linear.
+///
+/// Owns cleanup of the temp file for the whole of its own lifetime: once
+/// [`create_temp_file_exclusive`] has picked a name and created it, this is
+/// the only function that knows which name that was, so a failure in the
+/// write, fsync or rename below removes that exact path before returning. A
+/// collision during creation itself needs no such cleanup — nothing was
+/// created — which is why that case is handled entirely inside
+/// [`create_temp_file_exclusive`] instead.
+fn write_and_rename(parent: &Path, file_name: &str, dest: &Path, payload: &[u8]) -> io::Result<()> {
+    let candidate_names =
+        (0..MAX_TEMP_FILE_ATTEMPTS).map(|attempt| temp_file_name(file_name, attempt));
+    let (temp_path, mut file) = create_temp_file_exclusive(parent, candidate_names)?;
+
+    let result = (|| -> io::Result<()> {
+        file.write_all(payload)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temp_path, dest)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+/// How many fresh names [`create_temp_file_exclusive`] will try before
+/// giving up. A collision means something already sits at the name an
+/// attempt picked; each name mixes the pid, a nanosecond clock reading and
+/// the attempt index (see [`temp_file_name`]), so two temp-file creations
+/// racing each other collide only if all three happen to match — in
+/// practice, the same process retrying with the same pid against a clock
+/// that read the same nanosecond twice. One retry already recovers from
+/// that; 5 leaves headroom for it to happen a few times over (a coarse
+/// clock on some platform, say) without turning a transient collision into
+/// a hard failure, while still giving up long before it could look like a
+/// hang.
+const MAX_TEMP_FILE_ATTEMPTS: u32 = 5;
+
+/// Build the `attempt`th candidate temp-file name for `file_name`. The pid
+/// and the clock reading are carried over from the pre-#40 name purely for
+/// on-disk diagnostic value, if a leftover temp file is ever found; neither
+/// is what makes two names in the same retry sequence distinct. Nothing
+/// forces the clock to have ticked forward between two attempts
+/// nanoseconds apart, so re-reading it alone would not guarantee that —
+/// `attempt` is threaded through as an explicit, strictly-increasing
+/// component so distinctness holds by construction instead. See
+/// [`create_temp_file_exclusive`] for where that distinctness matters.
+fn temp_file_name(file_name: &str, attempt: u32) -> String {
+    format!(
+        ".{}.tmp-{}-{}-{}",
+        file_name,
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        attempt
+    )
+}
+
+/// Try each name in `candidate_names`, in order, as a temp file inside
+/// `parent`, opened with `create_new` (`O_EXCL`) so that anything already at
+/// the path — a pre-existing file *or* a symlink, which `create_new` refuses
+/// to open through regardless of what it points at — fails the open instead
+/// of being written to. Only that specific failure (`AlreadyExists`) moves
+/// on to the next name; any other error returns immediately, since a fresh
+/// name would not fix a permission error or a full disk.
+///
+/// The retry bound lives entirely in how many names `candidate_names`
+/// yields — see [`MAX_TEMP_FILE_ATTEMPTS`] and [`temp_file_name`] for where
+/// production draws that line and what makes successive names distinct. If
+/// every name collides, the last collision is returned as-is: it already
+/// accurately describes what went wrong, and synthesizing a "gave up after
+/// N attempts" error in its place would only discard that.
+///
+/// Extracted to take `parent` plus a name sequence, rather than being
+/// folded into [`write_and_rename`], specifically so a test can drive the
+/// real retry loop with names it controls. Production's names come from the
+/// pid and the clock, which a test cannot predict precisely enough to
+/// pre-plant a collision at the exact path the next save will pick — the
+/// same problem [`serialize_and_persist`]'s doc comment solves for
+/// serialization failures, solved here by making the input the seam instead
+/// of the timing.
+fn create_temp_file_exclusive(
+    parent: &Path,
+    candidate_names: impl Iterator<Item = String>,
+) -> io::Result<(PathBuf, fs::File)> {
+    let mut last_collision = None;
+    for name in candidate_names {
+        let candidate = parent.join(name);
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                last_collision = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_collision.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no temp file candidate names were supplied",
+        )
+    }))
 }
 
 // --- Tests ---
@@ -1037,5 +1120,79 @@ mod tests {
 
         let l = Learning::load(&path);
         assert!(l.save(&path).is_err());
+    }
+
+    // --- Temp file exclusivity (issue #40). ---
+    //
+    // `create_temp_file_exclusive` is `write_and_rename`'s real
+    // open-and-retry step, called directly here for the reason its own doc
+    // comment gives: production's candidate names come from the pid and the
+    // clock, which a test cannot predict closely enough to pre-plant a
+    // collision at the exact path a real save would pick. Driving the
+    // function with names the test controls keeps these tests on the real
+    // retry code while sidestepping that problem.
+
+    // A pre-existing file at the first candidate name must not be written
+    // through — `create_new` refuses to open it at all — and the retry must
+    // land on the next name and succeed, still at mode 0600.
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_file_exclusive_skips_a_pre_existing_file_and_retries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("taken"), b"attacker-planted content").unwrap();
+
+        let names = vec!["taken".to_string(), "fresh".to_string()];
+        let (path, file) = create_temp_file_exclusive(dir.path(), names.into_iter()).unwrap();
+
+        assert_eq!(path, dir.path().join("fresh"));
+        assert_eq!(
+            std::fs::read(dir.path().join("taken")).unwrap(),
+            b"attacker-planted content",
+            "the pre-existing file must not receive the payload"
+        );
+        assert_eq!(
+            file.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the file created on the retry must still be mode 0600"
+        );
+    }
+
+    // A symlink at the first candidate name must not be followed —
+    // `create_new` fails on it the same way it fails on a plain file — and
+    // its target must be left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_file_exclusive_does_not_follow_a_symlinked_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-target");
+        std::fs::write(&target, b"do not touch me").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("taken")).unwrap();
+
+        let names = vec!["taken".to_string(), "fresh".to_string()];
+        let (path, _file) = create_temp_file_exclusive(dir.path(), names.into_iter()).unwrap();
+
+        assert_eq!(path, dir.path().join("fresh"));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"do not touch me",
+            "the symlinked candidate's target must not receive the payload"
+        );
+    }
+
+    // Once every candidate has collided, the function gives up and returns
+    // the collision itself — not a synthesized error — rather than looping
+    // forever.
+    #[test]
+    fn create_temp_file_exclusive_returns_the_collision_when_every_candidate_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"").unwrap();
+        std::fs::write(dir.path().join("b"), b"").unwrap();
+
+        let names = vec!["a".to_string(), "b".to_string()];
+        let err = create_temp_file_exclusive(dir.path(), names.into_iter()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 }
