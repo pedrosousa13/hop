@@ -20,9 +20,12 @@
 //! - [`Learning::record_launch`] and [`Learning::boost_for`] are new,
 //!   `ItemId`-keyed public entry points. `boost_for` sums the salvage's
 //!   `query_boost` and `frequency_boost`, clamped to
-//!   `0.0..=LEARNING_BOOST_CAP` — that clamp is the only place the cap
-//!   applies; `query_boost`/`frequency_boost` keep their original `i32`
-//!   scale and internal caps (150, 60) unmodified.
+//!   `0.0..=LEARNING_BOOST_CAP` — `LEARNING_BOOST_CAP` itself is applied
+//!   nowhere else. `query_boost`/`frequency_boost` keep their original
+//!   `i32` scale and internal cap values (150, 60) unmodified, but each now
+//!   clamps its own result to that cap rather than only bounding the upper
+//!   end with `.min` — the non-negative floor used to be exclusively
+//!   `boost_for`'s property, and now is not.
 //! - `reset` no longer self-persists (it has no path to persist to); it only
 //!   clears in-memory state now.
 //!
@@ -70,6 +73,8 @@ const PERSIST_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LearningEntry {
+    /// Saturated at deserialization — see [`saturating_count_i32`] for why.
+    #[serde(deserialize_with = "deserialize_saturating_count")]
     count: u32,
     last_ms: u64,
 }
@@ -122,6 +127,42 @@ fn apply_decay(raw: i32, last_ms: u64, now: u64) -> i32 {
     } else {
         raw / 4
     }
+}
+
+/// Saturating conversion from a persisted or in-memory `count` to the `i32`
+/// scale [`Learning::query_boost`] and [`Learning::frequency_boost`] do
+/// their arithmetic in.
+///
+/// A plain `as i32` cast wraps negative once `count` exceeds `i32::MAX` —
+/// `4_000_000_000_u32 as i32` is roughly `-294_967_296` — and every step
+/// downstream (`saturating_mul`, [`apply_decay`], the final cap) treats that
+/// as a genuine negative amount rather than an error, so one corrupted or
+/// overgrown count could suppress a boost outright instead of merely
+/// capping it. Saturating instead of rejecting matches [`Learning::load`]'s
+/// own policy of degrading bad data rather than discarding it (see its doc
+/// comment): an out-of-range count should cap out, not flip sign.
+///
+/// This is the one place that ceiling is defined. `deserialize_saturating_count`
+/// applies it at the point a [`LearningEntry`] is deserialized,
+/// [`Learning::query_boost`] / [`Learning::frequency_boost`] apply it again
+/// themselves, and `canonicalized_global_frequency` applies it once more on
+/// the way back out to disk (see its own doc comment for why) — so a count
+/// is safe whether it just came off disk, was built directly in memory (a
+/// test, say), grew past the line via `record`'s `saturating_add`, or was
+/// just merged from two counts that were each already at the line.
+fn saturating_count_i32(count: u32) -> i32 {
+    count.min(i32::MAX as u32) as i32
+}
+
+/// Bounds `count` to what [`saturating_count_i32`] can convert without
+/// wrapping, at the point a [`LearningEntry`] is deserialized — see its doc
+/// comment for why saturating rather than rejecting is correct here.
+fn deserialize_saturating_count<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = u32::deserialize(deserializer)?;
+    Ok(saturating_count_i32(raw) as u32)
 }
 
 /// Evict least-recently-used entries from an inner map (result_id -> LearningEntry)
@@ -177,6 +218,14 @@ fn canonicalize_result_id(result_id: &str) -> String {
     result_id.to_string()
 }
 
+/// Merging two already-bounded counts on the raw `u32` would let the sum
+/// exceed what [`saturating_count_i32`] can round-trip (two entries near
+/// `i32::MAX` sum to something only `u32` can hold), writing a count to disk
+/// that the next [`Learning::load`] would have to saturate right back down.
+/// Routing the merge through [`saturating_count_i32`] itself — out to `i32`
+/// and back — keeps the aggregate on the same `i32::MAX` ceiling everything
+/// else in this module already uses, so nothing this function writes ever
+/// needs saturating again on the way back in.
 fn canonicalized_global_frequency(
     input: &HashMap<String, LearningEntry>,
 ) -> HashMap<String, LearningEntry> {
@@ -187,7 +236,8 @@ fn canonicalized_global_frequency(
             count: 0,
             last_ms: 0,
         });
-        aggregate.count = aggregate.count.saturating_add(entry.count);
+        aggregate.count = (saturating_count_i32(aggregate.count)
+            .saturating_add(saturating_count_i32(entry.count))) as u32;
         aggregate.last_ms = aggregate.last_ms.max(entry.last_ms);
     }
     out
@@ -321,7 +371,13 @@ impl Learning {
     /// - A shorter stored key that is a prefix of `query` contributes.
     /// - A longer stored key that starts with `query` also contributes.
     ///
-    /// The boost is count * QUERY_BOOST_PER_COUNT, with recency decay, capped at QUERY_BOOST_CAP.
+    /// The boost is count * QUERY_BOOST_PER_COUNT, with recency decay,
+    /// clamped to `0..=QUERY_BOOST_CAP`. Non-negative is a property of this
+    /// function itself, not of `boost_for`'s later clamp: `count` is
+    /// converted via [`saturating_count_i32`] rather than a bare `as i32`
+    /// (see its doc comment for why), and the result below is a `.clamp`
+    /// rather than a `.min` so that floor is enforced explicitly instead of
+    /// resting on every step above happening to stay non-negative.
     fn query_boost(&self, query: &str, result_id: &str) -> i32 {
         let normalized = query.trim().to_lowercase();
         if normalized.is_empty() {
@@ -339,20 +395,23 @@ impl Learning {
                 continue;
             }
             if let Some(entry) = inner.get(result_id) {
-                let raw = (entry.count as i32).saturating_mul(QUERY_BOOST_PER_COUNT);
+                let raw = saturating_count_i32(entry.count).saturating_mul(QUERY_BOOST_PER_COUNT);
                 total = total.saturating_add(apply_decay(raw, entry.last_ms, now));
             }
         }
 
-        total.min(QUERY_BOOST_CAP)
+        total.clamp(0, QUERY_BOOST_CAP)
     }
 
-    /// Compute a global frequency boost for `result_id`, with recency decay, capped at FREQ_BOOST_CAP.
+    /// Compute a global frequency boost for `result_id`, with recency decay,
+    /// clamped to `0..=FREQ_BOOST_CAP` — the same non-negative-and-capped
+    /// property as [`Learning::query_boost`], for the same reason; see its
+    /// doc comment.
     fn frequency_boost(&self, result_id: &str) -> i32 {
         let now = now_ms();
         if let Some(entry) = self.global_frequency.get(result_id) {
-            let raw = (entry.count as i32).saturating_mul(FREQ_BOOST_PER_COUNT);
-            apply_decay(raw, entry.last_ms, now).min(FREQ_BOOST_CAP)
+            let raw = saturating_count_i32(entry.count).saturating_mul(FREQ_BOOST_PER_COUNT);
+            apply_decay(raw, entry.last_ms, now).clamp(0, FREQ_BOOST_CAP)
         } else {
             0
         }
@@ -960,6 +1019,180 @@ mod tests {
             0,
             "the first save's data should not survive being replaced by the second"
         );
+    }
+
+    // --- Unvalidated persisted count (issue #44). ---
+    //
+    // `query_boost` and `frequency_boost` each convert `entry.count`
+    // through `saturating_count_i32` — see its doc comment for why, and for
+    // the `i32::MAX` ceiling `canonicalized_global_frequency` shares. The
+    // tests below pin three independent properties: a deserialization
+    // boundary that saturates a persisted count on the way in, each boost
+    // function staying correct on its own for *any* `LearningEntry`
+    // (including one built in memory that never touched the boundary at
+    // all), and that same ceiling holding on the way back out to disk.
+
+    // Pins the deserialization boundary itself: if
+    // `#[serde(deserialize_with = "deserialize_saturating_count")]` were
+    // removed, `serde_json` still parses `4000000000` into `count: u32`
+    // unchanged — nothing about deserializing a `u32` wraps — and both
+    // boost functions would go on saturating it themselves regardless (see
+    // `loading_a_store_with_an_out_of_range_count_produces_a_non_negative_capped_frequency_boost`
+    // below), so no boost-level assertion could ever catch the attribute
+    // being removed. Deserializing a `LearningEntry` directly and reading
+    // `count` back is what can.
+    #[test]
+    fn deserializing_an_out_of_range_count_saturates_it_to_i32_max() {
+        let entry: LearningEntry =
+            serde_json::from_str(r#"{"count":4000000000,"last_ms":0}"#).unwrap();
+        assert_eq!(entry.count, i32::MAX as u32);
+    }
+
+    // `query_boost` considered on its own: an entry built directly in
+    // memory, bypassing `LearningEntry`'s deserialization boundary
+    // entirely, so this fails unless `query_boost` itself is safe — it
+    // cannot be passing only because some upstream boundary happened to
+    // saturate the count first.
+    #[test]
+    fn query_boost_is_non_negative_and_capped_for_an_in_memory_out_of_range_count() {
+        let mut l = Learning::empty();
+        l.selections.insert(
+            "fire".to_string(),
+            HashMap::from([(
+                "app:firefox".to_string(),
+                LearningEntry {
+                    count: u32::MAX,
+                    last_ms: now_ms(),
+                },
+            )]),
+        );
+
+        let boost = l.query_boost("fire", "app:firefox");
+        assert!(
+            boost >= 0,
+            "query_boost must never go negative, got {boost}"
+        );
+        assert_eq!(boost, QUERY_BOOST_CAP);
+    }
+
+    // `frequency_boost` considered on its own, same shape as the test
+    // above. `boost_for` is never called here, so this cannot be passing
+    // because of its caller's clamp.
+    #[test]
+    fn frequency_boost_is_non_negative_and_capped_for_an_in_memory_out_of_range_count() {
+        let mut l = Learning::empty();
+        l.global_frequency.insert(
+            "app:firefox".to_string(),
+            LearningEntry {
+                count: u32::MAX,
+                last_ms: now_ms(),
+            },
+        );
+
+        let boost = l.frequency_boost("app:firefox");
+        assert!(
+            boost >= 0,
+            "frequency_boost must never go negative, got {boost}"
+        );
+        assert_eq!(boost, FREQ_BOOST_CAP);
+    }
+
+    // The disk-reachable path end to end: a store *loaded from disk* with a
+    // count past `i32::MAX`. Per-query selections are never persisted (see
+    // `PersistedLearningStore`'s doc comment), so a real load can only ever
+    // hand a bad count to `global_frequency` — this is what makes
+    // `frequency_boost` the one reachable through `Learning::load` here.
+    // Asserted through `frequency_boost` directly (not `boost_for`), so a
+    // regression that reintroduced the caller's clamp as the only guard
+    // would still be caught. This stays green even with only one of the two
+    // production fixes in place — the deserialization boundary and
+    // `frequency_boost`'s own saturation are both independently sufficient
+    // for this specific path — which is why the boundary is pinned
+    // separately above, and `frequency_boost`'s isolation is pinned
+    // separately below.
+    #[test]
+    fn loading_a_store_with_an_out_of_range_count_produces_a_non_negative_capped_frequency_boost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"global_frequency":{"app:firefox":{"count":4000000000,"last_ms":18446744073709551615}}}"#,
+        )
+        .unwrap();
+
+        let l = Learning::load(&path);
+        let boost = l.frequency_boost("app:firefox");
+        assert!(
+            boost >= 0,
+            "frequency_boost must never go negative, got {boost}"
+        );
+        assert_eq!(boost, FREQ_BOOST_CAP);
+    }
+
+    // The ceiling has to hold on the way back out too: two ids that
+    // canonicalize to the same key (see `canonicalize_result_id`), each
+    // already at `i32::MAX`, must not sum past it when `save` merges them.
+    // `canonicalized_global_frequency` is what `save` calls to do that
+    // merge — entered directly here, since going through a real `save`
+    // would only add a filesystem round trip without changing what this
+    // pins.
+    #[test]
+    fn canonicalizing_global_frequency_saturates_a_merged_count_at_i32_max() {
+        let mut input: HashMap<String, LearningEntry> = HashMap::new();
+        input.insert(
+            "utility:calculator:1+1".to_string(),
+            LearningEntry {
+                count: i32::MAX as u32,
+                last_ms: 1,
+            },
+        );
+        input.insert(
+            "utility:calculator:2+2".to_string(),
+            LearningEntry {
+                count: i32::MAX as u32,
+                last_ms: 2,
+            },
+        );
+
+        let merged = canonicalized_global_frequency(&input);
+        let entry = merged.get("utility:calculator").unwrap();
+        assert_eq!(
+            entry.count,
+            i32::MAX as u32,
+            "a merged count must not exceed what a later load would saturate it back down to"
+        );
+    }
+
+    // Ordinary counts must produce exactly the values they did before this
+    // fix — pinning concrete numbers here means a regression can't hide
+    // behind "still returns something positive".
+    #[test]
+    fn ordinary_counts_produce_unchanged_query_and_frequency_boosts() {
+        let mut l = Learning::empty();
+        let now = now_ms();
+        l.selections.insert(
+            "fire".to_string(),
+            HashMap::from([(
+                "app:firefox".to_string(),
+                LearningEntry {
+                    count: 2,
+                    last_ms: now,
+                },
+            )]),
+        );
+        l.global_frequency.insert(
+            "app:firefox".to_string(),
+            LearningEntry {
+                count: 2,
+                last_ms: now,
+            },
+        );
+
+        assert_eq!(
+            l.query_boost("fire", "app:firefox"),
+            2 * QUERY_BOOST_PER_COUNT
+        );
+        assert_eq!(l.frequency_boost("app:firefox"), 2 * FREQ_BOOST_PER_COUNT);
     }
 
     #[test]
