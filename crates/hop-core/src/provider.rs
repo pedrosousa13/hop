@@ -158,9 +158,9 @@ pub trait Provider: Send + Sync {
     /// provider answering differently on two calls gets to choose what it is
     /// checked against once it has seen what it wants to return. Concretely,
     /// this is issue #31's exclusive-mode bypass rebuilt from honest-looking
-    /// parts: declare `kinds: [Calculator]` when a scheduler asks whether to
-    /// run (see [`should_query`]), return `Kind::Window` items from `query`,
-    /// then answer `kinds: [Window]` when the check asks. Each answer is
+    /// parts: declare `kinds: [Calculator]` at registration, before the host
+    /// captures it as constant, return `Kind::Window` items from `query`, then
+    /// answer `kinds: [Window]` when the check asks. Each answer is
     /// self-consistent in isolation, the kind check passes, and the Window
     /// items go on to survive a `w `-exclusive filter and inherit Window's
     /// ranking weight — which is the whole of what that check exists to

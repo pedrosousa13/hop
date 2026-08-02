@@ -176,12 +176,11 @@ impl Default for Weights {
 ///   `selections` map), both keyed on the bare id string.
 ///   DECISION: kept unscoped, deliberately. The persisted learning store's
 ///   id namespace is out of scope for this change — adding a provider
-///   dimension to `global_frequency` is
-///   a persisted-format migration on the same load path issues #37/#38
-///   already target, not an in-memory rekey; `selections` is deferred
-///   alongside it rather than resolved on its own. Filed as issue #72; see
-///   the comment at the call site in `Pipeline::assemble` where this field
-///   is populated.
+///   dimension to `global_frequency` is a persisted-format migration on the
+///   same load path issues #37/#38 already target, not an in-memory rekey;
+///   `selections` is deferred alongside it rather than resolved on its own.
+///   Filed as issue #72; see the comment at the call site in
+///   `Pipeline::assemble` where this field is populated.
 ///
 /// One further boundary neither dimension closes: `CheckedItems::check`
 /// never requires that two answering providers declare *distinct*

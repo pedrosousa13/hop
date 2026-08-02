@@ -771,10 +771,10 @@ mod tests {
 
         // The competing `ALIAS_BOOST` beats the learning boost (capped at
         // `LEARNING_BOOST_CAP`) on the other item. The alias targets
-        // `app:winner`, which
-        // the `"fire" -> {"appId":"winner"}` alias means as the apps
-        // provider's item — so, unlike the sanity check above, this item
-        // must actually come from that provider for the boost to land.
+        // `app:winner`, which the `"fire" -> {"appId":"winner"}` alias means
+        // as the apps provider's item — so, unlike the sanity check above,
+        // this item must actually come from that provider for the boost to
+        // land.
         let assembly = pipeline.assemble(
             "fire",
             CheckedItems::check(vec![
