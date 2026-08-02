@@ -317,8 +317,8 @@ where
 /// too. The `max` passed in is only a pre-filter; it uses the same constant the
 /// constructor does, so it can only ever reject what the constructor would also
 /// reject. The constructor's answer is what counts. Its error type is only
-/// required to be `Display`, so a newtype whose rules go beyond length reports
-/// them through the same path.
+/// required to be `Display`, so a newtype whose rules go beyond length — see
+/// [`content`](crate::content) — reports them through the same path.
 ///
 /// What the pre-filter buys is as narrow as it is for [`BoundedString`], and
 /// for the same reason. On [`Validated::visit_str`] it refuses an over-long
@@ -462,6 +462,14 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
 // One `deserialize_with` target per bounded field. They are spelled out rather
 // than generated so that `grep`ping a constant finds every field it governs,
 // and so that each error names the field it came from.
+//
+// Not every bounded field is here. A field whose type is a validating newtype
+// carries its bound in that type's own `Deserialize`, through `validated`
+// above, so that the bound and the type's other rules are one gate rather than
+// two: `MAX_ITEM_ID` and `MAX_ACTION_ID` are applied by `crate::item`,
+// `MAX_OPEN_URL` and the outcome half of `MAX_COPY_TEXT` by `crate::content`.
+// Grepping a constant still finds every field it governs; it just finds some of
+// them in the module that owns the type.
 
 pub(crate) fn de_query_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string(d, "ClientMsg::Query.text", MAX_QUERY_TEXT)
@@ -497,14 +505,6 @@ pub(crate) fn de_item_copy_text<'de, D: Deserializer<'de>>(
     opt_string(d, "Item.copy_text", MAX_COPY_TEXT)
 }
 
-pub(crate) fn de_outcome_copy_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    string(d, "ExecOutcome::CopyText", MAX_COPY_TEXT)
-}
-
-pub(crate) fn de_outcome_open_url<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    string(d, "ExecOutcome::OpenUrl", MAX_OPEN_URL)
-}
-
 pub(crate) fn de_error_message<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string(d, "ProtoError.message", MAX_ERROR_MESSAGE)
 }
@@ -529,6 +529,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::content::{CopyText, OpenUrl};
     use crate::item::Item;
     use crate::wire::{ClientMsg, DaemonMsg, ExecOutcome, ProtoError};
 
@@ -569,14 +570,34 @@ mod tests {
     where
         T: Serialize + for<'de> Deserialize<'de> + fmt::Debug,
     {
-        // "é" is two bytes, so `max / 2` of them sit exactly on the bound; a
+        assert_string_boundary_with_prefix::<T>(max, "", build);
+    }
+
+    /// [`assert_string_boundary`] for a field that also has to satisfy a
+    /// content rule to parse at all: `prefix` opens every candidate, and counts
+    /// against the bound like any other bytes, so what is being tested either
+    /// side of the bound is still the length and only the length.
+    fn assert_string_boundary_with_prefix<T>(
+        max: usize,
+        prefix: &str,
+        build: impl Fn(&str) -> Value,
+    ) where
+        T: Serialize + for<'de> Deserialize<'de> + fmt::Debug,
+    {
+        // "é" is two bytes, so `filler / 2` of them sit exactly on the bound; a
         // trailing ASCII byte then puts the value one byte — not one character —
-        // over it. Every bound in this module is even, so the halving is exact.
-        assert_eq!(max % 2, 0, "the multi-byte candidate assumes an even bound");
-        let multi_byte = "é".repeat(max / 2);
+        // over it. Every bound in this module is even, so the halving is exact
+        // for an empty or even-length prefix.
+        let filler = max - prefix.len();
+        assert_eq!(
+            filler % 2,
+            0,
+            "the multi-byte candidate assumes an even filler"
+        );
+        let multi_byte = format!("{prefix}{}", "é".repeat(filler / 2));
         assert_eq!(multi_byte.len(), max);
 
-        for at_bound in ["a".repeat(max), multi_byte] {
+        for at_bound in [format!("{prefix}{}", "a".repeat(filler)), multi_byte] {
             let parsed: T = serde_json::from_str(&build(&at_bound).to_string())
                 .unwrap_or_else(|e| panic!("a value of exactly {max} bytes must parse, got: {e}"));
             assert!(
@@ -720,7 +741,13 @@ mod tests {
 
     #[test]
     fn outcome_open_url_bound_holds_on_both_sides() {
-        assert_string_boundary::<ExecOutcome>(MAX_OPEN_URL, |v| json!({ "open_url": v }));
+        // A URL has to open with an allowed scheme to get as far as its length
+        // being the reason it is refused.
+        assert_string_boundary_with_prefix::<ExecOutcome>(
+            MAX_OPEN_URL,
+            "https://",
+            |v| json!({ "open_url": v }),
+        );
     }
 
     #[test]
@@ -867,7 +894,7 @@ mod tests {
     fn outcome_and_error_bounds_fire_through_their_tagged_frames() {
         let cases = [
             (
-                "ExecOutcome::CopyText",
+                CopyText::FIELD,
                 json!({
                     "type": "executed",
                     "query_id": 1,
@@ -875,11 +902,13 @@ mod tests {
                 }),
             ),
             (
-                "ExecOutcome::OpenUrl",
+                OpenUrl::FIELD,
                 json!({
                     "type": "executed",
                     "query_id": 1,
-                    "outcome": { "open_url": "a".repeat(MAX_OPEN_URL + 1) },
+                    "outcome": {
+                        "open_url": format!("https://{}", "a".repeat(MAX_OPEN_URL + 1 - "https://".len())),
+                    },
                 }),
             ),
             (
