@@ -307,27 +307,29 @@ where
     })
 }
 
-/// Deserializes an id newtype by handing the parsed value to `build` — the
-/// type's own validating constructor.
+/// Deserializes a validating newtype by handing the parsed value to `build` —
+/// the type's own constructor.
 ///
 /// The point is that there is **one** gate, not two that happen to agree: a
 /// rule added to the constructor later (rejecting the empty string, say, or
 /// normalising Unicode so learning-store keys cannot split on encoding form)
-/// applies to ids off the socket without anybody remembering to add it here
+/// applies to values off the socket without anybody remembering to add it here
 /// too. The `max` passed in is only a pre-filter; it uses the same constant the
 /// constructor does, so it can only ever reject what the constructor would also
-/// reject. The constructor's answer is what counts.
+/// reject. The constructor's answer is what counts. Its error type is only
+/// required to be `Display`, so a newtype whose rules go beyond length reports
+/// them through the same path.
 ///
 /// What the pre-filter buys is as narrow as it is for [`BoundedString`], and
-/// for the same reason. On [`BoundedId::visit_str`] it refuses an over-long
+/// for the same reason. On [`Validated::visit_str`] it refuses an over-long
 /// value before `to_owned` copies it into an owned `String`. On
-/// [`BoundedId::visit_string`] it buys nothing at all: the `String` is already
+/// [`Validated::visit_string`] it buys nothing at all: the `String` is already
 /// allocated before the visitor is entered. The routing table on [`string`]
-/// says which parses reach which arm — for an id inside a tagged frame, an
+/// says which parses reach which arm — for a value inside a tagged frame, an
 /// escape is enough to make it the allocating one. The check sits at the parse
 /// because that is the right *place* to refuse, not because it makes the
 /// refusal free.
-pub(crate) fn id<'de, D, T, F>(
+pub(crate) fn validated<'de, D, T, B, F>(
     deserializer: D,
     field: &'static str,
     max: usize,
@@ -335,9 +337,10 @@ pub(crate) fn id<'de, D, T, F>(
 ) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
-    F: FnOnce(String) -> Result<T, BoundError>,
+    B: fmt::Display,
+    F: FnOnce(String) -> Result<T, B>,
 {
-    deserializer.deserialize_string(BoundedId {
+    deserializer.deserialize_string(Validated {
         field,
         max,
         build,
@@ -345,21 +348,26 @@ where
     })
 }
 
-struct BoundedId<T, F> {
+struct Validated<T, F> {
     field: &'static str,
     max: usize,
     build: F,
     marker: std::marker::PhantomData<T>,
 }
 
-impl<T, F> Visitor<'_> for BoundedId<T, F>
+impl<T, B, F> Visitor<'_> for Validated<T, F>
 where
-    F: FnOnce(String) -> Result<T, BoundError>,
+    B: fmt::Display,
+    F: FnOnce(String) -> Result<T, B>,
 {
     type Value = T;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "an id string of at most {} bytes", self.max)
+        write!(
+            f,
+            "a string of at most {} bytes that its type accepts",
+            self.max
+        )
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
