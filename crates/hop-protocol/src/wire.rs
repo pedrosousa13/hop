@@ -5,11 +5,17 @@ use serde::{Deserialize, Serialize};
 use crate::content::{CopyText, OpenUrl};
 use crate::item::{ActionId, Item, ItemId};
 use crate::limits;
+use crate::redaction::QueryText;
 
 /// Messages sent from a client to the daemon.
 ///
 /// Every variable-length field is bounded at the deserialization boundary; the
 /// bounds and their reasoning live in [`limits`].
+///
+/// This enum derives `Debug`, and one of its fields holds text the user typed.
+/// That field is a [`QueryText`], whose `Debug` prints a marker and a byte
+/// count in place of the text, so formatting a frame does not reproduce the
+/// keystrokes — see [`redaction`](crate::redaction).
 ///
 /// # The tag buffers before these bounds apply
 ///
@@ -29,12 +35,16 @@ pub enum ClientMsg {
     },
     Query {
         id: u64,
-        /// Bounded at [`MAX_QUERY_TEXT`](crate::limits::MAX_QUERY_TEXT) bytes on
-        /// the way in. This is the string that flows into the search path and
-        /// that the learning store keeps resident as an in-memory key. It never
-        /// reaches disk — only the item-id-keyed frequency table is persisted.
-        #[serde(deserialize_with = "limits::de_query_text")]
-        text: String,
+        /// What the user typed, held as a [`QueryText`] rather than a `String`
+        /// so that formatting this frame does not print it — see
+        /// [`redaction`](crate::redaction). The type also carries the
+        /// [`MAX_QUERY_TEXT`](crate::limits::MAX_QUERY_TEXT) bound applied on
+        /// the way in.
+        ///
+        /// This is the string that flows into the search path and that the
+        /// learning store keeps resident as an in-memory key. It never reaches
+        /// disk — only the item-id-keyed frequency table is persisted.
+        text: QueryText,
     },
     Cancel {
         id: u64,
@@ -153,11 +163,29 @@ mod tests {
     fn client_msg_round_trips() {
         let msg = ClientMsg::Query {
             id: 7,
-            text: "fire".into(),
+            text: QueryText::new("fire").unwrap(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"query""#));
         assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn formatting_a_query_frame_does_not_disclose_its_text() {
+        let typed = "correct horse battery staple";
+        let msg = ClientMsg::Query {
+            id: 7,
+            text: QueryText::new(typed).unwrap(),
+        };
+        let formatted = format!("{msg:?}");
+        assert!(
+            !formatted.contains(typed),
+            "a formatted query frame must not carry what was typed, got: {formatted}"
+        );
+        // The field is still there to be read about, and the frame's other
+        // fields are still diagnostic: what a log line loses is the value.
+        assert!(formatted.contains("text"), "got: {formatted}");
+        assert!(formatted.contains("id: 7"), "got: {formatted}");
     }
 
     #[test]

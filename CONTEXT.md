@@ -141,7 +141,8 @@ applied at the deserialization boundary, and the bound is applied first.
 **Validating newtype** — a type wrapping a private `String` whose only
 constructor applies every rule, and whose `Deserialize` hands the parsed string
 to that same constructor. One gate, not two: a value that exists has passed the
-rules however it was made. `ItemId`, `ActionId`, `CopyText` and `OpenUrl`.
+rules however it was made. `ItemId`, `ActionId`, `CopyText`, `OpenUrl` and
+`QueryText`.
 
 **Allowed scheme** — a URL scheme an `OpenUrl` may carry, from the allow-list
 `ALLOWED_URL_SCHEMES`. An allow-list, never a deny-list: a scheme that is not on
@@ -154,6 +155,20 @@ sinks the whole frame. Distinct from a **rejection**, which is an *item* that
 assembly declined: a rejection is data returned alongside the items that
 survived, so a query with one still answers. Neither is ever a truncation, a
 normalization, or a silent fix.
+
+## Redaction
+
+**Redaction** — printing a marker and a value's byte length in place of the
+value. It applies to *formatting*, not to transport: a redacted value is still
+serialized and sent whole. A bound restricts how long a value may be, a content
+rule what it may contain, and a redaction what formatting it discloses; the
+three live in `hop-protocol`'s `limits`, `content` and `redaction` modules.
+
+**Redacting newtype** — a validating newtype that also carries its own `Debug`,
+so the redaction travels with the value: a field formatted on its own prints the
+same marker it prints inside its frame, and a field added to a frame later is
+redacted by having the type. `QueryText`, the type of `ClientMsg::Query.text`,
+which holds keystrokes typed into the launcher overlay.
 
 ## Conventions
 
