@@ -16,6 +16,19 @@ use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, Kind};
 
 use crate::router::{Mode, RoutedQuery};
 
+/// The [`ProviderManifest::id`] the apps provider will answer to once it
+/// exists (M2.5, issue #57). That provider isn't implemented yet, but
+/// [`AliasTarget::AppBoost`](crate::aliases::AliasTarget::AppBoost) already
+/// needs to name the namespace it targets — `Aliases::apply` tags every
+/// `AppBoost` it resolves with this id, and [`crate::rank::Boosts`] only
+/// applies that boost to an item whose own (already-verified) `provider`
+/// matches it. Defined here, ahead of the provider it names, so both sides
+/// share one constant instead of a string literal each has to remember to
+/// keep in sync. **Issue #57 must construct its `ProviderManifest` with
+/// `id: APPS_PROVIDER_ID`**, not a repeated `"apps"` literal, or every
+/// existing app alias silently stops boosting anything.
+pub const APPS_PROVIDER_ID: &str = "apps";
+
 /// Static description of what a provider serves and how the (future)
 /// scheduler should treat it. Nothing here is enforced by this module —
 /// [`should_query`] is the one piece of scheduling logic that lives at M1;

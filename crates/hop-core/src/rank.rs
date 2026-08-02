@@ -138,11 +138,31 @@ impl Default for Weights {
     }
 }
 
-/// Learned/aliased per-item score bumps, keyed by [`ItemId`]. Empty by
-/// default — where boosts come from (aliases in M1.6, learning in M1.5) is
-/// out of scope for this slice.
+/// Learned/aliased per-item score bumps. Empty by default. Two dimensions,
+/// summed at lookup time in `Ranker::rank_matching`:
+///
+/// - `by_provider_item`: an **alias** boost, keyed by `(provider, ItemId)`
+///   and applied only to the item actually produced by that provider (per
+///   [`Item::provider`], trustworthy here precisely because
+///   [`crate::pipeline::CheckedItems::check`] already verified it against
+///   the producer's own manifest before this item could reach ranking at
+///   all). A bare `ItemId` key cannot express this: two items can
+///   legitimately share an id while coming from two different, individually
+///   honest providers — an id-namespace collision, not the impersonation the
+///   manifest checks already catch — and only one of them is who the alias
+///   actually means. See
+///   `tests::provider_scoped_boost_only_applies_to_the_matching_producer`.
+/// - `by_item_id`: a **learning** boost, applied to any item bearing this id
+///   regardless of which provider produced it.
+///   DECISION: kept unscoped, deliberately. The maintainer's issue #31 scope
+///   decision put the persisted learning store's id namespace out of scope
+///   for this change — adding a provider dimension there is a persisted-
+///   format migration on the same load path issues #37/#38 already target,
+///   not an in-memory rekey. Filed as issue #72; see the comment at the call
+///   site in `Pipeline::assemble` where this field is populated.
 #[derive(Default)]
 pub struct Boosts {
+    pub by_provider_item: HashMap<(String, ItemId), f32>,
     pub by_item_id: HashMap<ItemId, f32>,
 }
 
@@ -262,7 +282,13 @@ impl Ranker {
                 };
 
                 let weight = kind_weight(weights, &item.kind);
-                let boost = boosts.by_item_id.get(&item.id).copied().unwrap_or(0.0);
+                let provider_boost = boosts
+                    .by_provider_item
+                    .get(&(item.provider.clone(), item.id.clone()))
+                    .copied()
+                    .unwrap_or(0.0);
+                let learning_boost = boosts.by_item_id.get(&item.id).copied().unwrap_or(0.0);
+                let boost = provider_boost + learning_boost;
                 Some(Ranked {
                     score: fuzzy + weight + boost,
                     item,
@@ -874,6 +900,42 @@ mod tests {
             .insert(ItemId("app:scattered".into()), 40.0);
         let boosted = ranker.rank(build_items(), &query, &Weights::default(), &boosts);
         assert_eq!(boosted[0].item.id, ItemId("app:scattered".into()));
+    }
+
+    /// Issue #31's boost-theft gap, closed for aliases: two items can
+    /// legitimately share an [`ItemId`] while being produced by two
+    /// different, individually honest providers — an id-namespace
+    /// collision, not the impersonation `CheckedItems::check` already
+    /// catches (each item's `provider` field agrees with its own producer).
+    /// A boost meant for one provider's item must not land on the other's
+    /// just because the id string matches.
+    #[test]
+    fn provider_scoped_boost_only_applies_to_the_matching_producer() {
+        let query = route("firefox");
+        let items = vec![
+            Item {
+                provider: "apps".into(),
+                ..item(Kind::App, "app:firefox", "Firefox", None)
+            },
+            Item {
+                provider: "evil".into(),
+                ..item(Kind::Window, "app:firefox", "Firefox", None)
+            },
+        ];
+        // Weight alone puts Window (30) ahead of App (20) on this tie; the
+        // boost is keyed to "apps" specifically and must flip that only for
+        // the item "apps" actually produced.
+        let mut boosts = Boosts::default();
+        boosts
+            .by_provider_item
+            .insert(("apps".to_string(), ItemId("app:firefox".into())), 180.0);
+        let mut ranker = Ranker::new();
+        let ranked = ranker.rank(items, &query, &Weights::default(), &boosts);
+        assert_eq!(
+            ranked[0].item.provider, "apps",
+            "the boost keyed to \"apps\" must not lift the identically-id'd \
+             item the \"evil\" provider produced"
+        );
     }
 
     #[test]

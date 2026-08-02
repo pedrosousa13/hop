@@ -353,9 +353,21 @@ impl Pipeline {
         // records real launches and can observe how users actually expect
         // aliased queries to be learned from.
         let mut boosts = Boosts::default();
-        for (id, boost) in &alias_effect.boosts {
-            *boosts.by_item_id.entry(id.clone()).or_insert(0.0) += *boost;
+        for ((provider, id), boost) in &alias_effect.boosts {
+            *boosts
+                .by_provider_item
+                .entry((provider.clone(), id.clone()))
+                .or_insert(0.0) += *boost;
         }
+        // DECISION: the learning boost stays keyed on the bare item id, with
+        // no provider dimension, unlike the alias boost above. Issue #31's
+        // boost-theft criterion is only *partially* met here on purpose —
+        // `Learning`'s persisted `global_frequency` map is keyed on the bare
+        // id string on disk, and giving it a provider dimension is a
+        // persisted-format migration (version bump, load-path migration) on
+        // the same load path issues #37/#38 already target, not an in-memory
+        // rekey like `Boosts::by_provider_item` above. Filed as issue #72;
+        // see the maintainer's scope decision in the plan for this issue.
         for item in &provider_items {
             let learned = self.learning.boost_for(&routed.term, &item.id);
             if learned != 0.0 {
@@ -442,7 +454,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::provider::{ProviderError, QueryCtx};
+    use crate::provider::{APPS_PROVIDER_ID, ProviderError, QueryCtx};
     use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId};
     use std::time::Duration;
 
@@ -719,8 +731,31 @@ mod tests {
         );
 
         // The competing alias boost (180) beats the learning boost (capped
-        // at 85) on the other item.
-        let out = pipeline.assemble("fire", checked(items), 10).items;
+        // at 85) on the other item. The alias targets `app:winner`, which
+        // the `"fire" -> {"appId":"winner"}` alias means as the apps
+        // provider's item — so, unlike the sanity check above, this item
+        // must actually come from that provider for the boost to land.
+        let out = pipeline
+            .assemble(
+                "fire",
+                CheckedItems::check(vec![
+                    output(
+                        "test",
+                        ALL_KINDS.to_vec(),
+                        vec![item(Kind::App, "app:learned", "Fireplace")],
+                    ),
+                    output(
+                        APPS_PROVIDER_ID,
+                        vec![Kind::App],
+                        vec![Item {
+                            provider: APPS_PROVIDER_ID.into(),
+                            ..item(Kind::App, "app:winner", "Fire Alarm")
+                        }],
+                    ),
+                ]),
+                10,
+            )
+            .items;
         assert_eq!(
             out[0].id,
             ItemId("app:winner".into()),
@@ -985,6 +1020,120 @@ mod tests {
             vec!["app:fireplace"],
             "the impostor must not appear at all, let alone lead on an alias \
              boost keyed to the id it forged"
+        );
+    }
+
+    // --- Task 2: alias boosts scoped to their target provider. ---
+    //
+    // A gap the two manifest checks above cannot close on their own: a
+    // provider that declares itself *honestly* — `id: "evil"`, its own
+    // `kinds` — can still emit an item whose id collides with the apps
+    // provider's namespace an `AppBoost` alias targets. That item passes
+    // both manifest checks cleanly (its `provider` field agrees with its
+    // own producer), so it survives into `CheckedItems::items()` right
+    // alongside the genuine apps-provider item sharing its id. Only
+    // `Boosts::by_provider_item`'s provider dimension (via
+    // `AliasEffect::boosts` tagging every `AppBoost` with
+    // [`APPS_PROVIDER_ID`]) tells the two apart at scoring time.
+
+    /// The acceptance case named directly in the plan: an alias boost
+    /// configured for the apps provider must not land on an identically-id'd
+    /// item a different, honestly self-declared provider produced.
+    #[test]
+    fn alias_boost_does_not_land_on_an_identically_id_item_from_a_different_provider() {
+        let mut pipeline = Pipeline {
+            aliases: Aliases::from_json(
+                r#"[{"alias":"fire","type":"app","target":{"appId":"firefox"}}]"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        let out = pipeline.assemble(
+            "fire",
+            CheckedItems::check(vec![
+                output(
+                    APPS_PROVIDER_ID,
+                    vec![Kind::App],
+                    vec![Item {
+                        provider: APPS_PROVIDER_ID.into(),
+                        ..item(Kind::App, "app:firefox", "Firefox")
+                    }],
+                ),
+                // Honestly declares itself as a Window provider — no
+                // impersonation, so this item passes both manifest checks —
+                // but happens to reuse the id "app:firefox" the alias above
+                // targets.
+                output(
+                    "windows",
+                    vec![Kind::Window],
+                    vec![Item {
+                        provider: "windows".into(),
+                        ..item(Kind::Window, "app:firefox", "Firefox")
+                    }],
+                ),
+            ]),
+            10,
+        );
+        assert!(
+            out.rejections.is_empty(),
+            "both providers are honest about their own output; neither should be rejected"
+        );
+        assert_eq!(
+            out.items[0].kind,
+            Kind::App,
+            "without the fix, the boost keyed only to the id would also lift \
+             the Window item — weight 30 to App's 20 — and it would stay on \
+             top despite not being who the alias actually targets"
+        );
+    }
+
+    /// The other half: the fix must not stop the boost from landing on the
+    /// item it is actually for. Same shape as
+    /// `rank::tests::boost_applies_to_the_right_item`, run through the full
+    /// pipeline with the apps provider now spelled out explicitly, so the
+    /// resulting order is provably unchanged from before this change scoped
+    /// the boost to a provider.
+    #[test]
+    fn alias_boost_still_lands_on_the_genuine_apps_item_same_order_as_before() {
+        let mut pipeline = Pipeline {
+            aliases: Aliases::from_json(
+                r#"[{"alias":"fire","type":"app","target":{"appId":"firefox"}}]"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        // Without the boost, Window (weight 30) would outrank App (weight
+        // 20) on this tie — the alias boost (180) must still flip it.
+        let out = pipeline
+            .assemble(
+                "fire",
+                CheckedItems::check(vec![
+                    output(
+                        APPS_PROVIDER_ID,
+                        vec![Kind::App],
+                        vec![Item {
+                            provider: APPS_PROVIDER_ID.into(),
+                            ..item(Kind::App, "app:firefox", "Firefox")
+                        }],
+                    ),
+                    output(
+                        "windows",
+                        vec![Kind::Window],
+                        vec![Item {
+                            provider: "windows".into(),
+                            ..item(Kind::Window, "window:1", "Firefox")
+                        }],
+                    ),
+                ]),
+                10,
+            )
+            .items;
+        assert_eq!(
+            out[0].id,
+            ItemId("app:firefox".into()),
+            "the genuine apps-provider item still receives its alias boost \
+             and outranks the higher-weighted Window item, exactly as it did \
+             before the boost was scoped to a provider"
         );
     }
 
