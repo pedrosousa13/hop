@@ -20,9 +20,12 @@
 //! - [`Learning::record_launch`] and [`Learning::boost_for`] are new,
 //!   `ItemId`-keyed public entry points. `boost_for` sums the salvage's
 //!   `query_boost` and `frequency_boost`, clamped to
-//!   `0.0..=LEARNING_BOOST_CAP` — that clamp is the only place the cap
-//!   applies; `query_boost`/`frequency_boost` keep their original `i32`
-//!   scale and internal caps (150, 60) unmodified.
+//!   `0.0..=LEARNING_BOOST_CAP` — `LEARNING_BOOST_CAP` itself is applied
+//!   nowhere else. `query_boost`/`frequency_boost` keep their original
+//!   `i32` scale and internal cap values (150, 60) unmodified, but each now
+//!   clamps its own result to that cap rather than only bounding the upper
+//!   end with `.min` — the non-negative floor used to be exclusively
+//!   `boost_for`'s property, and now is not.
 //! - `reset` no longer self-persists (it has no path to persist to); it only
 //!   clears in-memory state now.
 //!
@@ -70,10 +73,7 @@ const PERSIST_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LearningEntry {
-    /// Saturated to `i32::MAX` at deserialization — see
-    /// `deserialize_saturating_count` — so a corrupted or adversarial store
-    /// can never hand downstream boost arithmetic a count that wraps
-    /// negative when converted to `i32`.
+    /// Saturated at deserialization — see [`saturating_count_i32`] for why.
     #[serde(deserialize_with = "deserialize_saturating_count")]
     count: u32,
     last_ms: u64,
@@ -216,6 +216,14 @@ fn canonicalize_result_id(result_id: &str) -> String {
     result_id.to_string()
 }
 
+/// Merging two already-bounded counts on the raw `u32` would let the sum
+/// exceed what [`saturating_count_i32`] can round-trip (two entries near
+/// `i32::MAX` sum to something only `u32` can hold), writing a count to disk
+/// that the next [`Learning::load`] would have to saturate right back down.
+/// Routing the merge through [`saturating_count_i32`] itself — out to `i32`
+/// and back — keeps the aggregate on the same `i32::MAX` ceiling everything
+/// else in this module already uses, so nothing this function writes ever
+/// needs saturating again on the way back in.
 fn canonicalized_global_frequency(
     input: &HashMap<String, LearningEntry>,
 ) -> HashMap<String, LearningEntry> {
@@ -226,7 +234,8 @@ fn canonicalized_global_frequency(
             count: 0,
             last_ms: 0,
         });
-        aggregate.count = aggregate.count.saturating_add(entry.count);
+        aggregate.count = (saturating_count_i32(aggregate.count)
+            .saturating_add(saturating_count_i32(entry.count))) as u32;
         aggregate.last_ms = aggregate.last_ms.max(entry.last_ms);
     }
     out
@@ -1012,15 +1021,30 @@ mod tests {
 
     // --- Unvalidated persisted count (issue #44). ---
     //
-    // `count` is deserialized as a plain `u32`, and both boost functions
-    // used to convert it with a bare `as i32`. Above `i32::MAX` that cast
-    // wraps negative; `saturating_mul` then saturates further negative
-    // instead of catching the wrap; and the final `.min(CAP)` — a `min`, not
-    // a `clamp` — passes a negative result straight through. The three
-    // tests below pin the two independent properties the fix needs: a
-    // boundary that saturates a persisted count on the way in, and each
-    // boost function staying correct on its own for *any* `LearningEntry`,
-    // including one built in memory that never touched the boundary at all.
+    // `query_boost` and `frequency_boost` each convert `entry.count`
+    // through `saturating_count_i32` — see its doc comment for why, and for
+    // the `i32::MAX` ceiling `canonicalized_global_frequency` shares. The
+    // tests below pin three independent properties: a deserialization
+    // boundary that saturates a persisted count on the way in, each boost
+    // function staying correct on its own for *any* `LearningEntry`
+    // (including one built in memory that never touched the boundary at
+    // all), and that same ceiling holding on the way back out to disk.
+
+    // Pins the deserialization boundary itself: if
+    // `#[serde(deserialize_with = "deserialize_saturating_count")]` were
+    // removed, `serde_json` still parses `4000000000` into `count: u32`
+    // unchanged — nothing about deserializing a `u32` wraps — and both
+    // boost functions would go on saturating it themselves regardless (see
+    // `loading_a_store_with_an_out_of_range_count_produces_a_non_negative_capped_frequency_boost`
+    // below), so no boost-level assertion could ever catch the attribute
+    // being removed. Deserializing a `LearningEntry` directly and reading
+    // `count` back is what can.
+    #[test]
+    fn deserializing_an_out_of_range_count_saturates_it_to_i32_max() {
+        let entry: LearningEntry =
+            serde_json::from_str(r#"{"count":4000000000,"last_ms":0}"#).unwrap();
+        assert_eq!(entry.count, i32::MAX as u32);
+    }
 
     // `query_boost` considered on its own: an entry built directly in
     // memory, bypassing `LearningEntry`'s deserialization boundary
@@ -1071,14 +1095,19 @@ mod tests {
         assert_eq!(boost, FREQ_BOOST_CAP);
     }
 
-    // The boundary half: a store *loaded from disk* with a count past
-    // `i32::MAX`. Per-query selections are never persisted (see
+    // The disk-reachable path end to end: a store *loaded from disk* with a
+    // count past `i32::MAX`. Per-query selections are never persisted (see
     // `PersistedLearningStore`'s doc comment), so a real load can only ever
     // hand a bad count to `global_frequency` — this is what makes
     // `frequency_boost` the one reachable through `Learning::load` here.
     // Asserted through `frequency_boost` directly (not `boost_for`), so a
     // regression that reintroduced the caller's clamp as the only guard
-    // would still be caught.
+    // would still be caught. This stays green even with only one of the two
+    // production fixes in place — the deserialization boundary and
+    // `frequency_boost`'s own saturation are both independently sufficient
+    // for this specific path — which is why the boundary is pinned
+    // separately above, and `frequency_boost`'s isolation is pinned
+    // separately below.
     #[test]
     fn loading_a_store_with_an_out_of_range_count_produces_a_non_negative_capped_frequency_boost() {
         let dir = tempfile::tempdir().unwrap();
@@ -1096,6 +1125,40 @@ mod tests {
             "frequency_boost must never go negative, got {boost}"
         );
         assert_eq!(boost, FREQ_BOOST_CAP);
+    }
+
+    // The ceiling has to hold on the way back out too: two ids that
+    // canonicalize to the same key (see `canonicalize_result_id`), each
+    // already at `i32::MAX`, must not sum past it when `save` merges them.
+    // `canonicalized_global_frequency` is what `save` calls to do that
+    // merge — entered directly here, since going through a real `save`
+    // would only add a filesystem round trip without changing what this
+    // pins.
+    #[test]
+    fn canonicalizing_global_frequency_saturates_a_merged_count_at_i32_max() {
+        let mut input: HashMap<String, LearningEntry> = HashMap::new();
+        input.insert(
+            "utility:calculator:1+1".to_string(),
+            LearningEntry {
+                count: i32::MAX as u32,
+                last_ms: 1,
+            },
+        );
+        input.insert(
+            "utility:calculator:2+2".to_string(),
+            LearningEntry {
+                count: i32::MAX as u32,
+                last_ms: 2,
+            },
+        );
+
+        let merged = canonicalized_global_frequency(&input);
+        let entry = merged.get("utility:calculator").unwrap();
+        assert_eq!(
+            entry.count,
+            i32::MAX as u32,
+            "a merged count must not exceed what a later load would saturate it back down to"
+        );
     }
 
     // Ordinary counts must produce exactly the values they did before this
