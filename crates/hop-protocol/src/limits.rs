@@ -66,6 +66,10 @@
 //! breaks one field bound is still buffered whole before it is refused. The
 //! frame-level cap in issue #21 is therefore load-bearing, not belt-and-braces,
 //! and this arithmetic is the number it has to be set against.
+//!
+//! Both totals are recomputed from the constants themselves by the test
+//! `the_documented_worst_case_is_what_the_constants_compose_to`, so retuning any
+//! bound above fails a test rather than quietly rotting this table.
 
 use std::fmt;
 
@@ -77,8 +81,14 @@ use thiserror::Error;
 ///
 /// A launcher query is a few words typed against a keystroke-latency budget.
 /// 1 KiB still admits a generous accidental paste while keeping the string that
-/// flows into the search path — and, via `hop-core`'s learning store, onto disk
-/// as a persisted key — small enough that a hostile client cannot grow either.
+/// flows into the search path — and that `hop-core`'s learning store then holds
+/// resident as an in-memory key — small enough that a hostile client cannot
+/// grow either.
+///
+/// This is a search-path and resident-memory bound, not a disk one. Query text
+/// never reaches disk: `hop-core`'s learning store persists only its global
+/// launch-frequency table, which is keyed by item id (see [`MAX_ITEM_ID`]), and
+/// deliberately leaves the query-keyed half of its state unserialized.
 pub const MAX_QUERY_TEXT: usize = 1_024;
 
 /// Maximum bytes of an [`ItemId`](crate::item::ItemId).
@@ -304,10 +314,19 @@ where
 /// rule added to the constructor later (rejecting the empty string, say, or
 /// normalising Unicode so learning-store keys cannot split on encoding form)
 /// applies to ids off the socket without anybody remembering to add it here
-/// too. The `max` passed in is only a pre-filter, and it exists solely so an
-/// over-long value is refused before it is copied into an owned `String`; it
-/// uses the same constant the constructor does, so it can only ever reject what
-/// the constructor would also reject. The constructor's answer is what counts.
+/// too. The `max` passed in is only a pre-filter; it uses the same constant the
+/// constructor does, so it can only ever reject what the constructor would also
+/// reject. The constructor's answer is what counts.
+///
+/// What the pre-filter buys is as narrow as it is for [`BoundedString`], and
+/// for the same reason. On [`BoundedId::visit_str`] it refuses an over-long
+/// value before `to_owned` copies it into an owned `String`. On
+/// [`BoundedId::visit_string`] it buys nothing at all: the `String` is already
+/// allocated before the visitor is entered. The routing table on [`string`]
+/// says which parses reach which arm — for an id inside a tagged frame, an
+/// escape is enough to make it the allocating one. The check sits at the parse
+/// because that is the right *place* to refuse, not because it makes the
+/// refusal free.
 pub(crate) fn id<'de, D, T, F>(
     deserializer: D,
     field: &'static str,
@@ -929,6 +948,36 @@ mod tests {
         assert_eq!(items[0].subtitle, None);
         assert_eq!(items[0].copy_text, None);
         assert_eq!(items[0].icon, None);
+    }
+
+    // The budget table in this module's docs is the only place the composed
+    // worst case is stated, and prose does not recompute itself when a constant
+    // is retuned. This is the same arithmetic read off the constants, so a
+    // changed bound fails here instead of leaving that table quietly wrong.
+    // Both totals are literals on purpose: they are what the docs claim, and a
+    // test that recomputed them on both sides would assert nothing.
+    #[test]
+    fn the_documented_worst_case_is_what_the_constants_compose_to() {
+        let per_item = MAX_ITEM_ID
+            + MAX_TITLE
+            + MAX_SUBTITLE
+            + MAX_ICON_NAME
+            + MAX_ICON_PATH
+            + MAX_COPY_TEXT
+            + MAX_PROVIDER_ID
+            + MAX_ACTION_ID
+            + MAX_ACTIONS_PER_ITEM * (MAX_ACTION_ID + MAX_ACTION_LABEL);
+        assert_eq!(
+            per_item, 84_416,
+            "the per-item total in this module's budget table no longer matches the constants"
+        );
+
+        let per_frame = per_item * MAX_ITEMS_PER_RESULTS_FRAME;
+        assert_eq!(
+            per_frame / 1_000_000,
+            84,
+            "the ~84 MB per-frame figure in this module's budget table no longer holds"
+        );
     }
 
     #[test]

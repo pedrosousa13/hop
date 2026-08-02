@@ -12,10 +12,12 @@ use crate::limits::{self, BoundError, MAX_ACTION_ID, MAX_ITEM_ID, check_len};
 /// refuses anything over [`MAX_ITEM_ID`] bytes. That is the whole point of the
 /// newtype: an `ItemId` that exists is an `ItemId` within its bound, whether it
 /// was built by a provider or parsed off the socket, and no later caller has to
-/// remember to check. Deserialization hands the parsed string to that same
-/// constructor rather than repeating its check, so a rule added to `new` later
-/// governs ids off the socket too, and a hostile peer cannot produce one by
-/// parsing.
+/// remember to check. Deserialization runs a length pre-filter against that
+/// same constant and then hands the string to that same constructor, whose
+/// answer is the one that decides; the pre-filter can only ever reject what
+/// `new` would reject too. So a rule added to `new` later governs ids off the
+/// socket without being repeated at the parse, and a hostile peer cannot
+/// produce an out-of-bound id by parsing.
 ///
 /// The wire form is unchanged by any of this: an id is still a bare JSON
 /// string, never an object or a wrapper.
@@ -166,11 +168,17 @@ pub struct IconSpec {
 ///
 /// Every variable-length field here is bounded at the deserialization boundary,
 /// so an `Item` that was parsed is an `Item` within budget. The bounds are in
-/// [`limits`](crate::limits), which also records what they do *not* guarantee.
+/// [`limits`], which also records what they do *not* guarantee.
 ///
-/// Every `Option` field is optional by absence as well as by explicit null, and
-/// each pairs `default` with its `deserialize_with` to keep it that way — see
-/// [`IconSpec`] for why the pairing is load-bearing.
+/// The three `Option` fields are all optional by absence as well as by explicit
+/// null, but they arrive there two different ways. `subtitle` and `copy_text`
+/// each carry a `deserialize_with`, which suppresses the missing-field fallback
+/// serde's derive would otherwise give an `Option`, so each pairs it with an
+/// explicit `default` to put that fallback back — see [`IconSpec`] for why the
+/// pairing is load-bearing. `icon` carries neither attribute, so it still has
+/// that implicit fallback, which is precisely the mechanism the other two are
+/// restoring. It is also the one field here with no "Bounded at…" line, because
+/// it holds no bytes of its own: its two strings are bounded on [`IconSpec`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub id: ItemId,

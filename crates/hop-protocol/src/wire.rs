@@ -8,7 +8,7 @@ use crate::limits;
 /// Messages sent from a client to the daemon.
 ///
 /// Every variable-length field is bounded at the deserialization boundary; the
-/// bounds and their reasoning live in [`limits`](crate::limits).
+/// bounds and their reasoning live in [`limits`].
 ///
 /// # The tag buffers before these bounds apply
 ///
@@ -29,8 +29,9 @@ pub enum ClientMsg {
     Query {
         id: u64,
         /// Bounded at [`MAX_QUERY_TEXT`](crate::limits::MAX_QUERY_TEXT) bytes on
-        /// the way in. This is the string that flows into the search path and,
-        /// via the learning store, onto disk as a persisted key.
+        /// the way in. This is the string that flows into the search path and
+        /// that the learning store keeps resident as an in-memory key. It never
+        /// reaches disk — only the item-id-keyed frequency table is persisted.
         #[serde(deserialize_with = "limits::de_query_text")]
         text: String,
     },
@@ -48,7 +49,7 @@ pub enum ClientMsg {
 ///
 /// A client trusts its daemon no more than the daemon trusts its clients, so
 /// these are bounded in the same way and for the same reason: see
-/// [`limits`](crate::limits), and the buffering caveat on [`ClientMsg`], which
+/// [`limits`], and the buffering caveat on [`ClientMsg`], which
 /// applies identically here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

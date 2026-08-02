@@ -22,6 +22,24 @@
 //! skipping it would leave an alias that looks configured and never fires;
 //! [`Aliases::from_json`] refuses the config instead.
 //!
+//! ## Why an over-long id is not treated like a typo
+//!
+//! Those two paragraphs pull in opposite directions, and the tension is real:
+//! one entry sinking every other alias is exactly what skipping malformed
+//! entries exists to prevent. The difference is what the entry *says*. A typo
+//! is ambiguous — `"typ": "app"` may be a misspelled `type` or a key a later
+//! version will define — and the only honest reading of it is that nothing was
+//! asked for, so skipping it loses nothing.
+//!
+//! An over-long app id is not ambiguous. It names exactly which app to boost,
+//! and that boost cannot be built, because [`ItemId::new`] is fallible and
+//! [`Aliases::apply`] runs on every keystroke with no `Result` to report a
+//! failure through. So the choice is not "tolerate or refuse" but "fail once,
+//! loudly, at load" against "produce no boost for that alias, silently,
+//! forever" — an alias that quietly stopped working is the harder bug of the
+//! two, and the only one the user cannot act on. Load-time rejection is the
+//! deliberate answer; it is not tolerance being forgotten here.
+//!
 //! ## Window aliases — the one thing `apply` cannot do
 //!
 //! See the doc comment on [`Aliases::apply`].
@@ -715,6 +733,10 @@ mod tests {
         );
     }
 
+    // DIVERGENCE: the JS had no bounded id type, so it had no equivalent of
+    // this case — every `app` record it parsed produced a usable boost, and
+    // nothing an entry could contain was fatal to the config.
+    //
     // An over-long app id is a *fatal* config error, unlike the malformed
     // entries `one_malformed_entry_does_not_sink_the_rest` skips. The
     // distinction is deliberate: a skipped entry is one the JS also skipped,

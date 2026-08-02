@@ -345,18 +345,26 @@ impl Learning {
     /// refused, never truncated: a shortened query is a different query, and
     /// would collect launches that were never made under it.
     ///
-    /// # Which bound protects which caller
+    /// # The wire bound does not subsume this one
     ///
-    /// `ClientMsg::Query.text` carries this same maximum at `hop-protocol`'s
-    /// deserialization boundary (issue #22), so a query that arrived over the
-    /// socket was refused there and cannot reach this one. That is the first
-    /// line, and it is the only one the daemon's own clients need.
+    /// `ClientMsg::Query.text` carries the same constant at `hop-protocol`'s
+    /// deserialization boundary (issue #22), but the two checks measure
+    /// different strings: the wire counts the raw bytes that arrived, this one
+    /// counts the normalized key and nothing else. Normalization can *grow* a
+    /// key past a length the wire already accepted — `İ` (U+0130) is two bytes
+    /// and lowercases to three, so 512 of them are 1 024 raw bytes, exactly on
+    /// the wire bound, and normalize to a 1 536-byte key that is refused here.
+    /// A wire-legal query can therefore reach this check and be refused by it,
+    /// silently dropping its per-query learning; only the global launch count
+    /// below survives. The test
+    /// `a_query_whose_key_grows_past_the_bound_when_normalized_is_refused` is
+    /// that counterexample, spelled out.
     ///
-    /// This bound exists for the other caller: `hop-core` is a library, and
-    /// something that builds a [`Learning`] and calls this method directly
-    /// never crossed the wire. For that caller this is not defence in depth —
-    /// it is the only bound there is. `MAX_QUERIES` is no help, because it
-    /// bounds how *many* query keys the map holds, never how large one is.
+    /// The bound is also the *only* one for the other caller: `hop-core` is a
+    /// library, and something that builds a [`Learning`] and calls this method
+    /// directly never crossed the wire at all, so no upstream check of any kind
+    /// ran. `MAX_QUERIES` is no help either way, because it bounds how *many*
+    /// query keys the map holds, never how large one is.
     ///
     /// # What it does not bound
     ///
@@ -381,7 +389,7 @@ impl Learning {
         // Update per-query selections, unless the key would be over its bound
         // — see `Learning::record_launch` for what that bound is and is not.
         // The launch is still counted globally below: that table is keyed by
-        // the result id, which `ItemId::new` bounds separately, so refusing it
+        // the item id, which `ItemId::new` bounds separately, so refusing it
         // too would discard a real signal over a hazard belonging to this
         // table alone.
         if let Some(normalized) = bounded_query_key(query) {
