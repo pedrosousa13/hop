@@ -578,17 +578,17 @@ mod tests {
 
     fn item(kind: Kind, id: &str, title: &str) -> Item {
         Item {
-            id: ItemId(id.to_string()),
+            id: ItemId::new(id).unwrap(),
             kind,
             title: title.to_string(),
             subtitle: None,
             icon: None,
             actions: vec![Action {
-                id: ActionId("open".into()),
+                id: ActionId::new("open").unwrap(),
                 kind: ActionKind::Open,
                 label: "Open".into(),
             }],
-            default_action: ActionId("open".into()),
+            default_action: ActionId::new("open").unwrap(),
             copy_text: None,
             append_to_end: false,
             provider: "test".into(),
@@ -675,7 +675,7 @@ mod tests {
             Kind::App,
             "the ranked app must come first even though WebSearch (25) outweighs App (20)"
         );
-        assert_eq!(out[1].id, ItemId("web:search".into()));
+        assert_eq!(out[1].id, ItemId::new("web:search").unwrap());
     }
 
     #[test]
@@ -745,7 +745,7 @@ mod tests {
         for _ in 0..10 {
             pipeline
                 .learning
-                .record_launch("fire", &ItemId("app:learned".into()));
+                .record_launch("fire", &ItemId::new("app:learned").unwrap());
         }
         let items = vec![
             item(Kind::App, "app:learned", "Fireplace"),
@@ -758,14 +758,14 @@ mod tests {
         for _ in 0..10 {
             unaliased_pipeline
                 .learning
-                .record_launch("fire", &ItemId("app:learned".into()));
+                .record_launch("fire", &ItemId::new("app:learned").unwrap());
         }
         let sanity = unaliased_pipeline
             .assemble("fire", checked(items.clone()), 10)
             .items;
         assert_eq!(
             sanity[0].id,
-            ItemId("app:learned".into()),
+            ItemId::new("app:learned").unwrap(),
             "learning boost alone should move its item to the front"
         );
 
@@ -807,7 +807,7 @@ mod tests {
         );
         assert_eq!(
             assembly.items[0].id,
-            ItemId("app:winner".into()),
+            ItemId::new("app:winner").unwrap(),
             "an alias boost on a competing item must still win over learning"
         );
     }
@@ -828,7 +828,7 @@ mod tests {
         );
         assert_eq!(
             out[2].id,
-            ItemId("web:search".into()),
+            ItemId::new("web:search").unwrap(),
             "the pinned item stays last"
         );
     }
@@ -889,7 +889,7 @@ mod tests {
             item(Kind::File, "file:2", "Echo"),
         ];
         promote_kinds(&mut items, &[Kind::Calculator]);
-        let ids: Vec<_> = items.iter().map(|i| i.id.0.as_str()).collect();
+        let ids: Vec<_> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["calc:1", "calc:2", "file:1", "app:1", "file:2"],
@@ -943,7 +943,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(
             out.last().unwrap().id,
-            ItemId("web:search".into()),
+            ItemId::new("web:search").unwrap(),
             "the pinned WebSearch item survives a Windows-exclusive filter \
              because step 4 already removed it from consideration by step 5"
         );
@@ -974,7 +974,7 @@ mod tests {
     /// Convenience for the tests below: the ids of the assembled items, which
     /// is what "never appears in the assembled output" is asserted against.
     fn ids(items: &[Item]) -> Vec<&str> {
-        items.iter().map(|i| i.id.0.as_str()).collect()
+        items.iter().map(|i| i.id.as_str()).collect()
     }
 
     #[test]
@@ -1205,7 +1205,7 @@ mod tests {
         for _ in 0..10 {
             pipeline
                 .learning
-                .record_launch("firefox", &ItemId("app:evil".into()));
+                .record_launch("firefox", &ItemId::new("app:evil").unwrap());
         }
         let out = pipeline.assemble(
             "firefox",
@@ -1307,7 +1307,7 @@ mod tests {
         );
         assert_eq!(ids(&out.items), vec!["web:search"]);
         assert_eq!(out.rejections.len(), 1);
-        assert_eq!(out.rejections[0].item_id, ItemId("web:evil".into()));
+        assert_eq!(out.rejections[0].item_id, ItemId::new("web:evil").unwrap());
         assert_eq!(out.rejections[0].check, FailedCheck::Provenance);
     }
 
@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(
             out.rejections,
             vec![Rejection {
-                item_id: ItemId("app:firefox".into()),
+                item_id: ItemId::new("app:firefox").unwrap(),
                 claimed_kind: Kind::Window,
                 claimed_provider: APPS_PROVIDER_ID.into(),
                 producer_id: "evil".into(),
@@ -1396,14 +1396,14 @@ mod tests {
             checked.rejections(),
             vec![
                 Rejection {
-                    item_id: ItemId("calc:evil".into()),
+                    item_id: ItemId::new("calc:evil").unwrap(),
                     claimed_kind: Kind::Calculator,
                     claimed_provider: APPS_PROVIDER_ID.into(),
                     producer_id: APPS_PROVIDER_ID.into(),
                     check: FailedCheck::Kind,
                 },
                 Rejection {
-                    item_id: ItemId("calc:impostor".into()),
+                    item_id: ItemId::new("calc:impostor").unwrap(),
                     claimed_kind: Kind::Calculator,
                     claimed_provider: APPS_PROVIDER_ID.into(),
                     producer_id: "calc".into(),

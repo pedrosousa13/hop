@@ -16,13 +16,19 @@
 //! instead. Everything else about tolerant parsing is preserved — a single
 //! malformed *entry* inside an otherwise-valid array is skipped, not fatal.
 //!
+//! There is one more fatal case the JS had no equivalent of, because it had no
+//! bounded id type: an `app` record whose synthesized item id breaks
+//! [`hop_protocol::MAX_ITEM_ID`] (issue #22). That record is well-formed, so
+//! skipping it would leave an alias that looks configured and never fires;
+//! [`Aliases::from_json`] refuses the config instead.
+//!
 //! ## Window aliases — the one thing `apply` cannot do
 //!
 //! See the doc comment on [`Aliases::apply`].
 
 use std::collections::HashMap;
 
-use hop_protocol::ItemId;
+use hop_protocol::{BoundError, ItemId};
 use serde_json::Value;
 
 use crate::provider::APPS_PROVIDER_ID;
@@ -40,7 +46,15 @@ pub enum AliasTarget {
     /// Replace the ranking term with this query text.
     Rewrite(String),
     /// Boost the app item `app:<appId>`.
-    AppBoost(String),
+    ///
+    /// Carries the synthesized [`ItemId`] rather than the raw app id, because
+    /// [`ItemId::new`] is fallible ([`hop_protocol::MAX_ITEM_ID`], issue #22)
+    /// and [`Aliases::apply`] — which builds this boost on every keystroke —
+    /// returns no `Result`. Building the id here, at parse time, is what lets
+    /// `apply` stay infallible: an `AppBoost` that exists names an id that was
+    /// already accepted, so the only two bad outcomes available at query time,
+    /// a panic or a boost that silently never fires, are both off the table.
+    AppBoost(ItemId),
     /// Boost windows matching an app id and/or a substring of their title.
     /// Faithfully parsed and stored, but never resolved by
     /// [`Aliases::apply`] — see that method's doc comment.
@@ -60,11 +74,32 @@ pub struct Aliases {
     by_key: HashMap<String, Vec<AliasTarget>>,
 }
 
-/// The alias config was not valid JSON at all. Carries the underlying parse
-/// message.
+/// Why an alias config could not be loaded at all.
+///
+/// Both variants are fatal for the whole config, which is what separates them
+/// from the malformed *entries* [`Aliases::from_json`] skips one by one: a
+/// skipped entry is one the JS skipped too, whereas each of these is a config
+/// the user meant and that cannot be honoured.
 #[derive(Debug, thiserror::Error)]
-#[error("aliases config is not valid JSON: {0}")]
-pub struct AliasError(String);
+pub enum AliasError {
+    /// The config was not valid JSON at all. Carries the underlying parse
+    /// message.
+    #[error("aliases config is not valid JSON: {0}")]
+    InvalidJson(String),
+    /// An `app` alias names an app id whose synthesized item id
+    /// (`app:<appId>`) breaks [`hop_protocol::MAX_ITEM_ID`].
+    ///
+    /// Names the alias, because the app id is by definition thousands of bytes
+    /// long and the alias key is what the user has to go and edit.
+    #[error("alias {alias:?} names an app whose item id is unusable: {source}")]
+    AppItemIdTooLong {
+        /// The alias key the offending record was registered under.
+        alias: String,
+        /// The bound that was broken.
+        #[source]
+        source: BoundError,
+    },
+}
 
 /// The result of applying aliases to a raw search term.
 #[derive(Debug, Clone, PartialEq)]
@@ -106,21 +141,37 @@ fn str_field<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> Option<&
 }
 
 /// Parses one alias record out of a `serde_json::Value`, per
-/// `parseAliasRecord` in the JS. Returns `None` for anything malformed:
+/// `parseAliasRecord` in the JS. Returns `Ok(None)` for anything malformed:
 /// not an object, an empty or whitespace-containing alias, an unrecognized
-/// `type`, or a target missing its required field(s). Never fails the
-/// caller's loop — that tolerance is the point.
-fn parse_record(value: &Value) -> Option<(String, AliasTarget)> {
+/// `type`, or a target missing its required field(s). That tolerance is the
+/// point — one typo must not disable every other alias.
+///
+/// # Errors
+///
+/// The one thing it will not skip is an `app` record whose synthesized item
+/// id breaks [`hop_protocol::MAX_ITEM_ID`]: that returns
+/// [`AliasError::AppItemIdTooLong`] and sinks the whole config. The record is
+/// well-formed and unambiguous about what the user wanted; it simply cannot be
+/// honoured, and the alternative — skipping it — would leave an alias that
+/// looks configured and never fires. Failing once at load beats failing
+/// invisibly on every keystroke.
+fn parse_record(value: &Value) -> Result<Option<(String, AliasTarget)>, AliasError> {
     // A bare number, string, or array element that isn't an object at all
     // is a malformed entry: skip it rather than failing the whole parse.
-    let obj = value.as_object()?;
+    let Some(obj) = value.as_object() else {
+        return Ok(None);
+    };
 
-    let alias = normalize_token(str_field(obj, "alias")?);
+    let Some(alias) = str_field(obj, "alias").map(normalize_token) else {
+        return Ok(None);
+    };
     if alias.is_empty() || alias.chars().any(char::is_whitespace) {
-        return None;
+        return Ok(None);
     }
 
-    let kind = normalize_token(str_field(obj, "type")?);
+    let Some(kind) = str_field(obj, "type").map(normalize_token) else {
+        return Ok(None);
+    };
     let target_obj = obj.get("target").and_then(Value::as_object);
 
     let target = match kind.as_str() {
@@ -131,7 +182,7 @@ fn parse_record(value: &Value) -> Option<(String, AliasTarget)> {
                 .trim()
                 .to_string();
             if query.is_empty() {
-                return None;
+                return Ok(None);
             }
             AliasTarget::Rewrite(query)
         }
@@ -142,9 +193,17 @@ fn parse_record(value: &Value) -> Option<(String, AliasTarget)> {
                 .trim()
                 .to_string();
             if app_id.is_empty() {
-                return None;
+                return Ok(None);
             }
-            AliasTarget::AppBoost(app_id)
+            // The id `apply` will boost, built and checked here so `apply`
+            // cannot fail — see `AliasTarget::AppBoost`'s doc comment.
+            let item_id = ItemId::new(format!("app:{app_id}")).map_err(|source| {
+                AliasError::AppItemIdTooLong {
+                    alias: alias.clone(),
+                    source,
+                }
+            })?;
+            AliasTarget::AppBoost(item_id)
         }
         "window" => {
             let app_id = target_obj
@@ -157,17 +216,17 @@ fn parse_record(value: &Value) -> Option<(String, AliasTarget)> {
                 .map(normalize_token)
                 .unwrap_or_default();
             if app_id.is_empty() && title_contains.is_empty() {
-                return None;
+                return Ok(None);
             }
             AliasTarget::WindowBoost {
                 app_id: (!app_id.is_empty()).then_some(app_id),
                 title_contains: (!title_contains.is_empty()).then_some(title_contains),
             }
         }
-        _ => return None,
+        _ => return Ok(None),
     };
 
-    Some((alias, target))
+    Ok(Some((alias, target)))
 }
 
 impl Aliases {
@@ -183,13 +242,26 @@ impl Aliases {
     ///   shape, missing required fields, an unrecognized `type`, a
     ///   non-object element) is skipped rather than failing the whole
     ///   config, so one typo can't silently disable every other alias.
+    /// - The one entry-level problem that is *not* skipped is an `app` record
+    ///   whose item id would break [`hop_protocol::MAX_ITEM_ID`]: it returns
+    ///   [`AliasError::AppItemIdTooLong`], naming the alias. Every item id an
+    ///   alias can ever boost is therefore built and checked here, once at
+    ///   load, rather than on every keystroke inside [`Aliases::apply`] — see
+    ///   [`AliasTarget::AppBoost`] for why that is where the check has to
+    ///   live.
+    ///
+    /// # Errors
+    ///
+    /// [`AliasError::InvalidJson`] if `json` does not parse at all, or
+    /// [`AliasError::AppItemIdTooLong`] per the bullets above.
     pub fn from_json(json: &str) -> Result<Aliases, AliasError> {
-        let value: Value = serde_json::from_str(json).map_err(|err| AliasError(err.to_string()))?;
+        let value: Value =
+            serde_json::from_str(json).map_err(|err| AliasError::InvalidJson(err.to_string()))?;
 
         let mut by_key: HashMap<String, Vec<AliasTarget>> = HashMap::new();
         if let Value::Array(items) = value {
             for item in &items {
-                if let Some((alias, target)) = parse_record(item) {
+                if let Some((alias, target)) = parse_record(item)? {
                     by_key.entry(alias).or_default().push(target);
                 }
             }
@@ -215,6 +287,10 @@ impl Aliases {
     ///    provider's item for this app id, not any item that happens to
     ///    share the id string; see the doc comment on [`AliasEffect::boosts`].
     ///    Two records boosting the same id sum.
+    ///
+    /// Infallible and pure, deliberately: this runs on every keystroke, and
+    /// the one fallible step it would otherwise have to take — synthesizing
+    /// the boosted [`ItemId`] — already happened in [`Aliases::from_json`].
     ///
     /// ### Window aliases are not resolved here
     ///
@@ -246,10 +322,9 @@ impl Aliases {
         let effective_term = rewrite.unwrap_or_else(|| term.to_string());
 
         for target in targets {
-            if let AliasTarget::AppBoost(app_id) = target {
-                let id = ItemId(format!("app:{app_id}"));
+            if let AliasTarget::AppBoost(item_id) = target {
                 *boosts
-                    .entry((APPS_PROVIDER_ID.to_string(), id))
+                    .entry((APPS_PROVIDER_ID.to_string(), item_id.clone()))
                     .or_insert(0.0) += ALIAS_BOOST;
             }
             // AliasTarget::WindowBoost: deliberately not resolved here —
@@ -266,6 +341,8 @@ impl Aliases {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    use hop_protocol::MAX_ITEM_ID;
 
     use super::*;
 
@@ -320,7 +397,7 @@ mod tests {
         assert_eq!(
             effect.boosts.get(&(
                 APPS_PROVIDER_ID.to_string(),
-                ItemId("app:org.gnome.Terminal.desktop".into())
+                ItemId::new("app:org.gnome.Terminal.desktop").unwrap()
             )),
             Some(&ALIAS_BOOST)
         );
@@ -344,9 +421,10 @@ mod tests {
         // The positive half: the boost really is there, under the tag this
         // test is named for.
         assert_eq!(
-            effect
-                .boosts
-                .get(&(APPS_PROVIDER_ID.to_string(), ItemId("app:terminal".into()))),
+            effect.boosts.get(&(
+                APPS_PROVIDER_ID.to_string(),
+                ItemId::new("app:terminal").unwrap()
+            )),
             Some(&ALIAS_BOOST),
             "the boost must be present, tagged with the apps provider"
         );
@@ -357,7 +435,7 @@ mod tests {
         assert_eq!(
             effect
                 .boosts
-                .get(&("not-apps".to_string(), ItemId("app:terminal".into()))),
+                .get(&("not-apps".to_string(), ItemId::new("app:terminal").unwrap())),
             None,
             "the boost must be keyed to the apps provider specifically, not \
              to any provider that happens to answer with this id"
@@ -452,7 +530,7 @@ mod tests {
         assert_eq!(
             effect.boosts.get(&(
                 APPS_PROVIDER_ID.to_string(),
-                ItemId("app:org.example.Github".into())
+                ItemId::new("app:org.example.Github").unwrap()
             )),
             Some(&ALIAS_BOOST)
         );
@@ -478,7 +556,7 @@ mod tests {
         assert_eq!(
             aliases.apply("good2").boosts.get(&(
                 APPS_PROVIDER_ID.to_string(),
-                ItemId("app:org.example.App".into())
+                ItemId::new("app:org.example.App").unwrap()
             )),
             Some(&ALIAS_BOOST)
         );
@@ -517,7 +595,7 @@ mod tests {
         assert_eq!(
             effect.boosts.get(&(
                 APPS_PROVIDER_ID.to_string(),
-                ItemId("app:org.example.App".into())
+                ItemId::new("app:org.example.App").unwrap()
             )),
             Some(&(2.0 * ALIAS_BOOST))
         );
@@ -535,10 +613,72 @@ mod tests {
         assert_eq!(
             effect.boosts.get(&(
                 APPS_PROVIDER_ID.to_string(),
-                ItemId("app:org.example.App".into())
+                ItemId::new("app:org.example.App").unwrap()
             )),
             Some(&ALIAS_BOOST)
         );
+    }
+
+    // --- The item-id bound on a synthesized boost target (issue #22). ---
+    //
+    // `apply` runs on every keystroke and returns no `Result`, so the item id
+    // it boosts — `app:<appId>` — has to be known-good before it gets there.
+    // These pin that the check happens at load, loudly and once, rather than
+    // at query time where the only options would be a panic or a boost that
+    // silently never fires.
+
+    #[test]
+    fn an_app_alias_whose_item_id_would_exceed_the_bound_is_rejected_at_load() {
+        // `app:` + this is one byte over MAX_ITEM_ID.
+        let app_id = "a".repeat(MAX_ITEM_ID - "app:".len() + 1);
+        let json =
+            format!(r#"[{{"alias":"toolong","type":"app","target":{{"appId":"{app_id}"}}}}]"#);
+
+        let err = Aliases::from_json(&json)
+            .expect_err("an app id whose item id breaks the bound must fail the load");
+        assert!(
+            err.to_string().contains("toolong"),
+            "the error must name the offending alias so the user can find it, got: {err}"
+        );
+    }
+
+    // The other side of the bound: an app id that sits exactly on it loads
+    // and boosts as usual. Without this, rejecting every app alias would pass
+    // the test above.
+    #[test]
+    fn an_app_alias_exactly_on_the_item_id_bound_still_loads_and_boosts() {
+        let app_id = "a".repeat(MAX_ITEM_ID - "app:".len());
+        let json =
+            format!(r#"[{{"alias":"ontheline","type":"app","target":{{"appId":"{app_id}"}}}}]"#);
+
+        let aliases = Aliases::from_json(&json).unwrap();
+        let effect = aliases.apply("ontheline");
+        assert_eq!(
+            effect.boosts.get(&(
+                APPS_PROVIDER_ID.to_string(),
+                ItemId::new(format!("app:{app_id}")).unwrap()
+            )),
+            Some(&ALIAS_BOOST)
+        );
+    }
+
+    // An over-long app id is a *fatal* config error, unlike the malformed
+    // entries `one_malformed_entry_does_not_sink_the_rest` skips. The
+    // distinction is deliberate: a skipped entry is one the JS also skipped,
+    // whereas this one parsed fine and would have produced a boost that could
+    // never land — a failure the user would otherwise only notice as an alias
+    // that quietly stopped working.
+    #[test]
+    fn an_over_long_app_id_sinks_the_whole_config_rather_than_being_skipped() {
+        let app_id = "a".repeat(MAX_ITEM_ID);
+        let json = format!(
+            r#"[
+                {{"alias":"good","type":"rewrite","target":{{"query":"github"}}}},
+                {{"alias":"toolong","type":"app","target":{{"appId":"{app_id}"}}}}
+            ]"#
+        );
+
+        assert!(Aliases::from_json(&json).is_err());
     }
 
     // --- The precedence constant ---
