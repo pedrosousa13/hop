@@ -48,9 +48,14 @@
 //!
 //! So no single arm sees everything: a `from_str` parse meets refusable input
 //! on both, and a `from_reader` parse — the likelier shape of a socket
-//! transport, which cannot borrow from a buffer it is still filling — hands
-//! every string to the owned one. That is why the rules live in the constructor
-//! both arms call rather than in either one. Pinned by the tests
+//! transport — hands every string to the owned one. What routes it there is
+//! the tagged frame's `Content` buffer rather than the reader itself, as
+//! [`limits`] sets out: the buffer owns any string it cannot borrow for `'de`,
+//! and a reader can lend none. The same reader parsing a *bare* value, with no
+//! buffer in between, reaches the borrowed arm with a slice of serde_json's own
+//! scratch buffer — measured, and the reason the table above is scoped to the
+//! frame. That is why the rules live in the constructor both arms call rather
+//! than in either one. Pinned by the tests
 //! `an_escaped_control_character_is_refused_inside_a_tagged_frame`,
 //! `a_raw_control_character_is_refused_inside_a_tagged_frame`,
 //! `a_refused_value_is_refused_through_from_reader_too` and
@@ -197,11 +202,15 @@ pub enum ContentError {
 ///    is the whole of what this rule targets. It is *not* a rule that a URL
 ///    must hold only characters RFC 3986 allows unencoded — plenty that the RFC
 ///    also requires percent-encoded are accepted here: every non-ASCII
-///    character, so `https://example.com/café` passes, and `<`, `>`, `"`, `{`,
-///    `}`, `|`, `\`, `^` and a backtick besides, because refusing those would
-///    refuse URLs that browsers open every day. "Control character" is
-///    [`char::is_control`], Unicode's `Cc` category. Pinned by the test
-///    `open_url_accepts_characters_rfc_3986_would_percent_encode`.
+///    character outside `Cc`, so `https://example.com/café` passes, and `<`,
+///    `>`, `"`, `{`, `}`, `|`, `\`, `^` and a backtick besides, because
+///    refusing those would refuse URLs that browsers open every day. The
+///    `Cc` exception is not a nicety: "control character" here is
+///    [`char::is_control`], Unicode's `Cc` category, which reaches past ASCII
+///    to the C1 controls at U+0080–U+009F, and those this rule does refuse.
+///    Pinned by the test
+///    `open_url_accepts_characters_rfc_3986_would_percent_encode` on one side
+///    and `open_url_refuses_a_space_or_a_control_character` on the other.
 ///
 /// Nothing here normalises, trims or percent-encodes. An accepted URL is passed
 /// on exactly as it arrived, so what a client opens is what the provider sent,
@@ -352,10 +361,10 @@ fn has_allowed_scheme(value: &str) -> bool {
 ///
 /// It leaves copy text able to hold more than one line, and a consumer that
 /// treats a line ending as "run this" would run both. This type does not claim
-/// to make a paste safe, and no rule available to it could: what it removes is
-/// the characters that have no meaning as text, and what it keeps is the two
-/// that do. Making a paste safe is the client's clipboard handling, which is
-/// not in this crate.
+/// to make a paste safe, and no rule available to it could while a newline is
+/// allowed at all — which is the trade the two sections above set out, not a
+/// property of the characters. Making a paste safe is the client's clipboard
+/// handling, which is not in this crate.
 ///
 /// # What is not refused
 ///
@@ -473,6 +482,14 @@ mod tests {
             "https://example.com/a\"b",
             "https://example.com/{a}|b",
             "https://example.com/a\\b^c`d",
+            // Non-ASCII is accepted up to, and only up to, `Cc`: a no-break
+            // space, a line separator, a bidi override and characters outside
+            // the BMP all pass, while the C1 controls beside them do not — see
+            // the companion test below.
+            "https://example.com/a\u{a0}b",
+            "https://example.com/a\u{2028}b",
+            "https://example.com/a\u{202e}b",
+            "https://example.com/a\u{1f600}\u{4e2d}b",
         ] {
             assert!(
                 OpenUrl::new(url).is_ok(),
@@ -586,7 +603,12 @@ mod tests {
             "https://example.com/a\rb",
             "https://example.com/a\u{0}b",
             "https://example.com/a\u{7f}b",
+            // The C1 controls are non-ASCII and are refused all the same, at
+            // both ends of the range. This is the half of rule 4 that the
+            // accepting test above must not be read as contradicting.
+            "https://example.com/a\u{80}b",
             "https://example.com/a\u{85}b",
+            "https://example.com/a\u{9f}b",
         ] {
             let err = OpenUrl::new(url).unwrap_err();
             assert!(
