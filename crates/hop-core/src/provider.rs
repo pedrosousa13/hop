@@ -289,13 +289,13 @@ mod tests {
                 return Err(ProviderError::Cancelled);
             }
             Ok(vec![Item {
-                id: ItemId("app:fake".into()),
+                id: ItemId::new("app:fake").unwrap(),
                 kind: Kind::App,
                 title: q.term.clone(),
                 subtitle: None,
                 icon: None,
                 actions: vec![],
-                default_action: ActionId("open".into()),
+                default_action: ActionId::new("open").unwrap(),
                 copy_text: None,
                 append_to_end: false,
                 provider: "fake".into(),
@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(items[0].title, "firefox");
 
         let outcome = provider
-            .execute(&items[0].id, &ActionId("open".into()))
+            .execute(&items[0].id, &ActionId::new("open").unwrap())
             .await
             .unwrap();
         assert_eq!(outcome, ExecOutcome::Done);

@@ -28,6 +28,11 @@
 //!   `boost_for`'s property, and now is not.
 //! - `reset` no longer self-persists (it has no path to persist to); it only
 //!   clears in-memory state now.
+//! - The recorded query key is bounded (issue #22). The salvage accepted a
+//!   query of any size as a `selections` key; a key over [`MAX_QUERY_TEXT`]
+//!   bytes is now refused. [`Learning::record_launch`] says which caller that
+//!   bound is the *only* protection for, and what it deliberately does not
+//!   bound.
 //!
 //! Nothing outside `load` and `save` touches the filesystem.
 
@@ -41,7 +46,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use hop_protocol::ItemId;
+use hop_protocol::{ItemId, MAX_QUERY_TEXT};
 
 /// The maximum boost [`Learning::boost_for`] can ever return. Must sit
 /// strictly below the alias boost constant (180.0, arriving with the
@@ -243,6 +248,21 @@ fn canonicalized_global_frequency(
     out
 }
 
+/// The `selections` key for `query`, or `None` if that key would be over
+/// [`MAX_QUERY_TEXT`] bytes. See [`Learning::record_launch`] for what the bound
+/// is for and which caller it protects.
+///
+/// The check is against the *normalized* key — the trimmed, lowercased string
+/// that actually lands in the map — and against nothing else. Checking the raw
+/// text as well would refuse queries whose key would have fit: trimming and
+/// lowercasing can both shrink a string (`ẞ` is three bytes and lowercases to
+/// two, and `  …  firefox` is mostly whitespace), and a refusal here is
+/// permanent and silent, so the exact test is the right one.
+fn bounded_query_key(query: &str) -> Option<String> {
+    let normalized = query.trim().to_lowercase();
+    (normalized.len() <= MAX_QUERY_TEXT).then_some(normalized)
+}
+
 /// Entries in `global_frequency` older than the retention cutoff, purged.
 /// Split out of `save` so it can be applied to a local clone rather than
 /// mutating `self` (see the module docs — `save` takes `&self`).
@@ -317,30 +337,76 @@ impl Learning {
     }
 
     /// Record a launch: the user reached `item_id` while typing `query`.
+    ///
+    /// The launch always counts toward `item_id`'s global launch frequency.
+    /// It is additionally learned *against this query* only if the query's
+    /// normalized form — trimmed and lowercased, which is the key it would be
+    /// stored under — is at most [`MAX_QUERY_TEXT`] bytes. A longer one is
+    /// refused, never truncated: a shortened query is a different query, and
+    /// would collect launches that were never made under it.
+    ///
+    /// # The wire bound does not subsume this one
+    ///
+    /// `ClientMsg::Query.text` carries the same constant at `hop-protocol`'s
+    /// deserialization boundary (issue #22), but the two checks measure
+    /// different strings: the wire counts the raw bytes that arrived, this one
+    /// counts the normalized key and nothing else. Normalization can *grow* a
+    /// key past a length the wire already accepted — `İ` (U+0130) is two bytes
+    /// and lowercases to three, so 512 of them are 1 024 raw bytes, exactly on
+    /// the wire bound, and normalize to a 1 536-byte key that is refused here.
+    /// A wire-legal query can therefore reach this check and be refused by it,
+    /// silently dropping its per-query learning; only the global launch count
+    /// below survives. The test
+    /// `a_query_whose_key_grows_past_the_bound_when_normalized_is_refused` is
+    /// that counterexample, spelled out.
+    ///
+    /// The bound is also the *only* one for the other caller: `hop-core` is a
+    /// library, and something that builds a [`Learning`] and calls this method
+    /// directly never crossed the wire at all, so no upstream check of any kind
+    /// ran. `MAX_QUERIES` is no help either way, because it bounds how *many*
+    /// query keys the map holds, never how large one is.
+    ///
+    /// # What it does not bound
+    ///
+    /// Storage only. It is not an allocation guard, and this crate does not
+    /// have one: the key is normalized (allocating a lowercased copy) before
+    /// its size is known, and [`Learning::boost_for`] normalizes the query
+    /// again on every lookup with no bound at all — which
+    /// `Pipeline::assemble` invokes once per candidate item, so an over-long
+    /// term costs a lowercased copy *per item* on that keystroke. Refusing to
+    /// store the key does nothing about any of that. A caller that must bound
+    /// the memory a query can cost has to bound the query itself, upstream, as
+    /// the wire boundary does.
     pub fn record_launch(&mut self, query: &str, item_id: &ItemId) {
-        self.record(query, &item_id.0);
+        self.record(query, item_id.as_str());
     }
 
     /// Record a selection: the user chose `result_id` while typing `query`.
     fn record(&mut self, query: &str, result_id: &str) {
         self.purge_expired();
         let ts = now_ms();
-        let normalized = query.trim().to_lowercase();
 
-        // Update per-query selections
-        let inner = self.selections.entry(normalized).or_default();
-        let entry = inner.entry(result_id.to_string()).or_insert(LearningEntry {
-            count: 0,
-            last_ms: 0,
-        });
-        entry.count = entry.count.saturating_add(1);
-        entry.last_ms = ts;
+        // Update per-query selections, unless the key would be over its bound
+        // — see `Learning::record_launch` for what that bound is and is not.
+        // The launch is still counted globally below: that table is keyed by
+        // the item id, which `ItemId::new` bounds separately, so refusing it
+        // too would discard a real signal over a hazard belonging to this
+        // table alone.
+        if let Some(normalized) = bounded_query_key(query) {
+            let inner = self.selections.entry(normalized).or_default();
+            let entry = inner.entry(result_id.to_string()).or_insert(LearningEntry {
+                count: 0,
+                last_ms: 0,
+            });
+            entry.count = entry.count.saturating_add(1);
+            entry.last_ms = ts;
 
-        // Evict inner map if too large
-        evict_lru_map(inner, MAX_ITEMS_PER_QUERY);
+            // Evict inner map if too large
+            evict_lru_map(inner, MAX_ITEMS_PER_QUERY);
 
-        // Evict outer map if too large
-        evict_lru_outer(&mut self.selections, MAX_QUERIES);
+            // Evict outer map if too large
+            evict_lru_outer(&mut self.selections, MAX_QUERIES);
+        }
 
         // Update global frequency
         let global = self
@@ -421,7 +487,8 @@ impl Learning {
     /// `query_boost` and `frequency_boost`, clamped to
     /// `0.0..=LEARNING_BOOST_CAP`. This is the value the ranker consumes.
     pub fn boost_for(&self, query: &str, item_id: &ItemId) -> f32 {
-        let total = self.query_boost(query, &item_id.0) + self.frequency_boost(&item_id.0);
+        let total =
+            self.query_boost(query, item_id.as_str()) + self.frequency_boost(item_id.as_str());
         (total as f32).clamp(0.0, LEARNING_BOOST_CAP)
     }
 
@@ -919,9 +986,9 @@ mod tests {
     fn boost_capped_below_alias_boost() {
         let mut l = Learning::load(Path::new("/nonexistent"));
         for _ in 0..10_000 {
-            l.record_launch("fire", &ItemId("app:firefox".into()));
+            l.record_launch("fire", &ItemId::new("app:firefox").unwrap());
         }
-        let b = l.boost_for("fire", &ItemId("app:firefox".into()));
+        let b = l.boost_for("fire", &ItemId::new("app:firefox").unwrap());
         assert!(b <= LEARNING_BOOST_CAP && b > 0.0);
         assert!(b < 180.0, "alias boost (180) must always beat learning");
     }
@@ -932,7 +999,7 @@ mod tests {
         let p = dir.path().join("learning.json");
         std::fs::write(&p, "{not json").unwrap();
         let l = Learning::load(&p);
-        assert_eq!(l.boost_for("x", &ItemId("y".into())), 0.0);
+        assert_eq!(l.boost_for("x", &ItemId::new("y").unwrap()), 0.0);
     }
 
     #[test]
@@ -940,14 +1007,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("learning.json");
         let mut l = Learning::load(&p);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
         l.save(&p).unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(Learning::load(&p).boost_for("q", &ItemId("app:a".into())) > 0.0);
+        assert!(Learning::load(&p).boost_for("q", &ItemId::new("app:a").unwrap()) > 0.0);
     }
 
     // --- Coverage neither source reaches. ---
@@ -958,7 +1025,7 @@ mod tests {
         let p = dir.path().join("never-written.json");
         let l = Learning::load(&p);
         assert!(l.is_empty());
-        assert_eq!(l.boost_for("anything", &ItemId("app:x".into())), 0.0);
+        assert_eq!(l.boost_for("anything", &ItemId::new("app:x").unwrap()), 0.0);
     }
 
     #[test]
@@ -981,7 +1048,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let mut l = Learning::load(&path);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
         l.save(&path).unwrap();
 
         let entries: Vec<_> = std::fs::read_dir(dir.path())
@@ -997,7 +1064,7 @@ mod tests {
         let path = dir.path().join("learning.json");
 
         let mut first = Learning::load(&path);
-        first.record_launch("q", &ItemId("app:a".into()));
+        first.record_launch("q", &ItemId::new("app:a").unwrap());
         first.save(&path).unwrap();
 
         // Load fresh, wipe it, and record something entirely different. If
@@ -1005,7 +1072,7 @@ mod tests {
         // would still carry "app:a"'s entry alongside the new one.
         let mut second = Learning::load(&path);
         second.reset();
-        second.record_launch("other", &ItemId("app:b".into()));
+        second.record_launch("other", &ItemId::new("app:b").unwrap());
         second.save(&path).unwrap();
 
         let reloaded = Learning::load(&path);
@@ -1200,11 +1267,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let mut l = Learning::load(&path);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
 
         // A pairing that was never recorded: "app:never-seen" has no
         // query-specific or global-frequency history at all.
-        assert_eq!(l.boost_for("q", &ItemId("app:never-seen".into())), 0.0);
+        assert_eq!(
+            l.boost_for("q", &ItemId::new("app:never-seen").unwrap()),
+            0.0
+        );
     }
 
     // `query_boost` early-returns zero for an empty (post-trim) query, but
@@ -1219,9 +1289,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let mut l = Learning::load(&path);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
 
-        let boost = l.boost_for("", &ItemId("app:a".into()));
+        let boost = l.boost_for("", &ItemId::new("app:a").unwrap());
         assert!(
             boost > 0.0,
             "frequency_boost doesn't consider the query text, so a recorded \
@@ -1232,6 +1302,122 @@ mod tests {
             l.frequency_boost("app:a") as f32,
             "with an empty query, boost_for is exactly the frequency component"
         );
+    }
+
+    // --- The bound on a recorded query key (issue #22). ---
+    //
+    // `selections` is keyed by query text, and `MAX_QUERIES` bounds how many
+    // keys there are, not how large one is. These pin the size bound on the key
+    // itself — see `Learning::record_launch` for how it relates to the wire
+    // bound on `ClientMsg::Query.text`, which caller each one protects, and
+    // what this one deliberately does not bound.
+    //
+    // The bound is measured on the normalized key and on nothing else, so the
+    // last two below are as load-bearing as the first two: they are what keeps
+    // a cheaper raw-text pre-check from being reintroduced, since such a check
+    // passes the refusal tests while silently refusing queries whose key would
+    // have fit.
+
+    #[test]
+    fn an_over_long_query_does_not_become_a_selection_key() {
+        let mut l = Learning::empty();
+        let query = "a".repeat(MAX_QUERY_TEXT + 1);
+
+        l.record_launch(&query, &ItemId::new("app:a").unwrap());
+
+        assert!(
+            l.selections.is_empty(),
+            "a query over the bound must not be stored as a key, not even truncated"
+        );
+    }
+
+    // The other side of the bound: a query of exactly `MAX_QUERY_TEXT` bytes
+    // is recorded as usual. Without this, refusing every query would satisfy
+    // the test above.
+    #[test]
+    fn a_query_exactly_on_the_bound_is_still_recorded() {
+        let mut l = Learning::empty();
+        let query = "a".repeat(MAX_QUERY_TEXT);
+
+        l.record_launch(&query, &ItemId::new("app:a").unwrap());
+
+        assert!(
+            l.selections.contains_key(&query),
+            "a query exactly on the bound is legitimate and must still be learned"
+        );
+        assert!(l.query_boost(&query, "app:a") > 0);
+    }
+
+    // Only the query key is refused. The launch itself still happened, and
+    // the table it lands in is keyed by the item id, which `ItemId::new` has
+    // already bounded — so there is no reason to discard that half, and doing
+    // so would lose real signal over a hazard that concerns the other table.
+    #[test]
+    fn an_over_long_query_still_counts_the_launch_in_global_frequency() {
+        let mut l = Learning::empty();
+        let query = "a".repeat(MAX_QUERY_TEXT + 1);
+
+        l.record_launch(&query, &ItemId::new("app:a").unwrap());
+
+        assert!(
+            l.frequency_boost("app:a") > 0,
+            "the launch is real; only the query key is refused"
+        );
+    }
+
+    // Normalization can push a key *over* the bound: "İ" (U+0130) is two bytes
+    // and lowercases to three ("i" plus a combining dot). This query is within
+    // the bound as typed and over it once normalized, so a raw-text-only check
+    // would store an over-sized key.
+    #[test]
+    fn a_query_whose_key_grows_past_the_bound_when_normalized_is_refused() {
+        let query = "İ".repeat(MAX_QUERY_TEXT / 2);
+        assert!(query.len() <= MAX_QUERY_TEXT, "within bound as typed");
+        assert!(
+            query.trim().to_lowercase().len() > MAX_QUERY_TEXT,
+            "but normalizing grows it past the bound"
+        );
+
+        let mut l = Learning::empty();
+        l.record_launch(&query, &ItemId::new("app:a").unwrap());
+
+        assert!(l.selections.is_empty());
+    }
+
+    // And normalization can pull a key back *under* it, which is the case a
+    // raw-text pre-check gets wrong: trimming discards the padding entirely,
+    // so this query's key is seven bytes. Refusing it would drop a perfectly
+    // ordinary pasted query — silently, and for good, since nothing retries a
+    // launch that was already recorded.
+    #[test]
+    fn a_query_that_only_trimming_brings_within_the_bound_is_still_recorded() {
+        let query = format!("{}firefox", " ".repeat(MAX_QUERY_TEXT * 2));
+        assert!(query.len() > MAX_QUERY_TEXT, "over the bound as typed");
+
+        let mut l = Learning::empty();
+        l.record_launch(&query, &ItemId::new("app:a").unwrap());
+
+        assert!(
+            l.selections.contains_key("firefox"),
+            "the key is what is bounded, and this key is seven bytes"
+        );
+    }
+
+    // The same case for shrinking under lowercase rather than under trim, so
+    // the rule is pinned as "the normalized key, whatever normalization did to
+    // it" rather than as a special case for whitespace. "ẞ" (U+1E9E) is three
+    // bytes and lowercases to "ß" (U+00DF), two.
+    #[test]
+    fn a_query_that_only_lowercasing_brings_within_the_bound_is_still_recorded() {
+        let query = "ẞ".repeat(MAX_QUERY_TEXT / 2);
+        assert!(query.len() > MAX_QUERY_TEXT, "over the bound as typed");
+        let key = query.trim().to_lowercase();
+        assert!(key.len() <= MAX_QUERY_TEXT, "but its key fits");
+
+        let mut l = Learning::empty();
+        l.record_launch(&query, &ItemId::new("app:a").unwrap());
+
+        assert!(l.selections.contains_key(&key));
     }
 
     // --- Parent-directory permissions (issue #36). ---
@@ -1253,7 +1439,7 @@ mod tests {
 
         let path = parent.join("learning.json");
         let mut l = Learning::load(&path);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
         l.save(&path).unwrap();
 
         assert_eq!(
@@ -1282,7 +1468,7 @@ mod tests {
         let path = leaf.join("learning.json");
 
         let mut l = Learning::load(&path);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
         l.save(&path).unwrap();
 
         assert_eq!(
@@ -1317,7 +1503,7 @@ mod tests {
 
         let path = link.join("learning.json");
         let mut l = Learning::load(&path);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
         l.save(&path).unwrap();
 
         assert_eq!(
@@ -1350,7 +1536,7 @@ mod tests {
         let path = dir.path().join("learning.json");
 
         let mut l = Learning::load(&path);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
         l.save(&path).unwrap();
         let before = std::fs::read(&path).unwrap();
 
@@ -1579,7 +1765,7 @@ mod tests {
 
         let path = dir.path().join("learning.json");
         let mut l = Learning::load(&path);
-        l.record_launch("q", &ItemId("app:a".into()));
+        l.record_launch("q", &ItemId::new("app:a").unwrap());
         // One successful save first, so the directory already holds the
         // destination file and the next save's rename is an overwrite
         // rather than a fresh create — neither needs anything the

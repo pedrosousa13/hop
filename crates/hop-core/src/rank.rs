@@ -534,17 +534,17 @@ mod tests {
     /// stay readable.
     fn item(kind: Kind, id: &str, title: &str, subtitle: Option<&str>) -> Item {
         Item {
-            id: ItemId(id.to_string()),
+            id: ItemId::new(id).unwrap(),
             kind,
             title: title.to_string(),
             subtitle: subtitle.map(str::to_string),
             icon: None,
             actions: vec![Action {
-                id: ActionId("open".into()),
+                id: ActionId::new("open").unwrap(),
                 kind: ActionKind::Open,
                 label: "Open".into(),
             }],
-            default_action: ActionId("open".into()),
+            default_action: ActionId::new("open").unwrap(),
             copy_text: None,
             append_to_end: false,
             provider: "test".into(),
@@ -811,10 +811,12 @@ mod tests {
         // Without the boost, Window (weight 30) outranks App (weight 20)
         // on this tie. +50 flips it.
         let mut boosts = Boosts::default();
-        boosts.by_item_id.insert(ItemId("app:firefox".into()), 50.0);
+        boosts
+            .by_item_id
+            .insert(ItemId::new("app:firefox").unwrap(), 50.0);
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &boosts);
-        assert_eq!(ranked[0].item.id, ItemId("app:firefox".into()));
+        assert_eq!(ranked[0].item.id, ItemId::new("app:firefox").unwrap());
     }
 
     /// Ports "ranking filters non-empty query matches under
@@ -1004,9 +1006,9 @@ mod tests {
         let mut boosts = Boosts::default();
         boosts
             .by_item_id
-            .insert(ItemId("app:scattered".into()), 40.0);
+            .insert(ItemId::new("app:scattered").unwrap(), 40.0);
         let boosted = ranker.rank(build_items(), &query, &Weights::default(), &boosts);
-        assert_eq!(boosted[0].item.id, ItemId("app:scattered".into()));
+        assert_eq!(boosted[0].item.id, ItemId::new("app:scattered").unwrap());
     }
 
     /// Issue #31's boost-theft gap, closed for aliases: two items can
@@ -1034,7 +1036,10 @@ mod tests {
         // only for the item that provider actually produced.
         let mut boosts = Boosts::default();
         boosts.by_provider_item.insert(
-            (APPS_PROVIDER_ID.to_string(), ItemId("app:firefox".into())),
+            (
+                APPS_PROVIDER_ID.to_string(),
+                ItemId::new("app:firefox").unwrap(),
+            ),
             ALIAS_BOOST,
         );
         let mut ranker = Ranker::new();
@@ -1056,7 +1061,9 @@ mod tests {
         ];
         // 12 (File) + 25 = 37, enough to outrank Window's 30.
         let mut boosts = Boosts::default();
-        boosts.by_item_id.insert(ItemId("file:a".into()), 25.0);
+        boosts
+            .by_item_id
+            .insert(ItemId::new("file:a").unwrap(), 25.0);
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &boosts);
         let titles: Vec<_> = ranked.iter().map(|r| r.item.title.as_str()).collect();

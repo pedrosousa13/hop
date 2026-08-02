@@ -3,8 +3,23 @@
 use serde::{Deserialize, Serialize};
 
 use crate::item::{ActionId, Item, ItemId};
+use crate::limits;
 
 /// Messages sent from a client to the daemon.
+///
+/// Every variable-length field is bounded at the deserialization boundary; the
+/// bounds and their reasoning live in [`limits`].
+///
+/// # The tag buffers before these bounds apply
+///
+/// This enum is internally tagged, so serde must read the whole JSON value into
+/// an in-memory buffer before it can dispatch on `type` and hand the fields to
+/// the deserializers that enforce the bounds. A 200 MB `query` frame is
+/// therefore *rejected*, but only after 200 MB has been buffered. Closing that
+/// gap needs a cap on the frame length applied by the transport before serde
+/// sees a byte — issue #21. The representation is deliberately left as it is:
+/// the tagged form is the wire contract, and changing it to dodge the buffering
+/// would be a breaking change that still would not bound the frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
@@ -13,6 +28,11 @@ pub enum ClientMsg {
     },
     Query {
         id: u64,
+        /// Bounded at [`MAX_QUERY_TEXT`](crate::limits::MAX_QUERY_TEXT) bytes on
+        /// the way in. This is the string that flows into the search path and
+        /// that the learning store keeps resident as an in-memory key. It never
+        /// reaches disk — only the item-id-keyed frequency table is persisted.
+        #[serde(deserialize_with = "limits::de_query_text")]
         text: String,
     },
     Cancel {
@@ -26,6 +46,11 @@ pub enum ClientMsg {
 }
 
 /// Messages sent from the daemon to a client.
+///
+/// A client trusts its daemon no more than the daemon trusts its clients, so
+/// these are bounded in the same way and for the same reason: see
+/// [`limits`], and the buffering caveat on [`ClientMsg`], which
+/// applies identically here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMsg {
@@ -35,6 +60,11 @@ pub enum DaemonMsg {
     Results {
         query_id: u64,
         partial: bool,
+        /// Bounded at
+        /// [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME)
+        /// items on the way in. This bounds one frame, not one query: a daemon
+        /// may send several partial `results` frames for the same `query_id`.
+        #[serde(deserialize_with = "limits::de_results_items")]
         items: Vec<Item>,
     },
     QueryDone {
@@ -55,14 +85,21 @@ pub enum DaemonMsg {
 #[serde(rename_all = "snake_case")]
 pub enum ExecOutcome {
     Done,
-    CopyText(String),
-    OpenUrl(String),
+    /// Text for the client to put on the clipboard, bounded at
+    /// [`MAX_COPY_TEXT`](crate::limits::MAX_COPY_TEXT) bytes on the way in.
+    CopyText(#[serde(deserialize_with = "limits::de_outcome_copy_text")] String),
+    /// A URL for the client to open, bounded at
+    /// [`MAX_OPEN_URL`](crate::limits::MAX_OPEN_URL) bytes on the way in.
+    OpenUrl(#[serde(deserialize_with = "limits::de_outcome_open_url")] String),
 }
 
 /// A protocol-level error reported by the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProtoError {
     pub code: ErrorCode,
+    /// Bounded at [`MAX_ERROR_MESSAGE`](crate::limits::MAX_ERROR_MESSAGE) bytes
+    /// on the way in — an error headed for a UI is not a payload channel.
+    #[serde(deserialize_with = "limits::de_error_message")]
     pub message: String,
 }
 
@@ -86,7 +123,7 @@ mod tests {
 
     fn sample_item() -> Item {
         Item {
-            id: ItemId("app:firefox".into()),
+            id: ItemId::new("app:firefox").unwrap(),
             kind: Kind::App,
             title: "Firefox".into(),
             subtitle: Some("Web Browser".into()),
@@ -95,11 +132,11 @@ mod tests {
                 path: None,
             }),
             actions: vec![Action {
-                id: ActionId("open".into()),
+                id: ActionId::new("open").unwrap(),
                 kind: ActionKind::Open,
                 label: "Open".into(),
             }],
-            default_action: ActionId("open".into()),
+            default_action: ActionId::new("open").unwrap(),
             copy_text: None,
             append_to_end: false,
             provider: "apps".into(),
@@ -137,8 +174,8 @@ mod tests {
     fn client_msg_execute_round_trips() {
         let msg = ClientMsg::Execute {
             query_id: 7,
-            item_id: ItemId("app:firefox".into()),
-            action_id: ActionId("open".into()),
+            item_id: ItemId::new("app:firefox").unwrap(),
+            action_id: ActionId::new("open").unwrap(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
