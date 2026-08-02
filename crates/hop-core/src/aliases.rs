@@ -83,9 +83,8 @@ pub struct AliasEffect {
     /// for this app id" (see [`AliasTarget::AppBoost`]'s doc comment). A
     /// bare `ItemId` key would let an item from a *different*, honestly
     /// self-declared provider collect this boost merely by sharing the id
-    /// string — an id-namespace collision the maintainer's issue #31 scope
-    /// decision calls out explicitly, distinct from (and not caught by) the
-    /// impersonation [`crate::pipeline::CheckedItems::check`] already
+    /// string — an id-namespace collision, distinct from (and not caught by)
+    /// the impersonation [`crate::pipeline::CheckedItems::check`] already
     /// rejects. Consumed by [`crate::rank::Boosts::by_provider_item`], which
     /// applies each entry only to the item whose own producer matches.
     pub boosts: HashMap<(String, ItemId), f32>,

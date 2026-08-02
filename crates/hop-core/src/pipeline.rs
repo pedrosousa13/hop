@@ -60,6 +60,7 @@ use crate::router::{Mode, RoutedQuery, route};
 /// query — `ProviderManifest`'s clone copies both its `kinds` and `modes`
 /// `Vec`s — on a path that then fuzzy-matches every item that provider
 /// returned.
+#[derive(Debug)]
 pub struct ProviderOutput {
     manifest: ProviderManifest,
     items: Vec<Item>,
@@ -73,6 +74,30 @@ impl ProviderOutput {
     /// `items` is what this provider's own [`Provider::query`] returned;
     /// dispatching providers, honouring their budgets and collecting their
     /// answers is M2 daemon work that happens upstream of this crate.
+    ///
+    /// ## When the manifest is read, and what that costs
+    ///
+    /// Now — *after* `query` has already returned. This call is the only
+    /// [`Provider::manifest`] call anywhere on this crate's path, so the
+    /// manifest an item is checked against is whatever the provider chooses
+    /// to answer with at check time, and nothing here can tell that apart
+    /// from the manifest the same provider gave at registration. That the two
+    /// agree is [`Provider::manifest`]'s documented stability requirement —
+    /// a contract this constructor rests on and does not enforce. Read that
+    /// method's docs for the abuse a provider that ignores it recovers.
+    ///
+    /// It cannot be enforced from here: `hop-core` has no registry and no
+    /// scheduler, so there is no earlier, trusted manifest in this crate to
+    /// compare against. A host that keeps one is in a strictly stronger
+    /// position — a manifest captured once at registration cannot be
+    /// re-minted in response to what a provider decided to return — and such
+    /// a host should compare its captured manifest against
+    /// [`Provider::manifest`] and refuse the provider on any mismatch. What
+    /// it must not do is hand the captured manifest to this crate to be
+    /// checked against: a constructor taking a caller-supplied manifest is
+    /// the hole the section above exists to keep closed, and it does not stop
+    /// being that hole because this particular caller would have passed a
+    /// trustworthy value.
     pub fn from_provider<P: Provider>(provider: &P, items: Vec<Item>) -> Self {
         ProviderOutput {
             manifest: provider.manifest(),
@@ -155,6 +180,7 @@ pub struct Rejection {
 /// Until there is a logging seam (issue #34) that makes ignoring them a real
 /// mistake, this shape keeps rejections available and attached to their
 /// query — it does not make them unignorable.
+#[derive(Debug)]
 pub struct CheckedItems {
     items: Vec<Item>,
     rejections: Vec<Rejection>,
@@ -236,8 +262,15 @@ impl CheckedItems {
 
 /// What [`Pipeline::assemble`] returns: the ordered, capped item list, and
 /// every [`Rejection`] the manifest checks produced for the same query.
+#[derive(Debug)]
 pub struct Assembly {
+    /// The final result list: the ranked body followed by the pinned tail,
+    /// truncated to the `max_results` the call asked for.
     pub items: Vec<Item>,
+    /// Every item the manifest checks refused for this query, in the order
+    /// [`CheckedItems::check`] rejected them. Empty when every provider was
+    /// honest about its own output. Nothing obliges a caller to read this —
+    /// see [`CheckedItems`] on what that does and does not buy.
     pub rejections: Vec<Rejection>,
 }
 
@@ -373,8 +406,7 @@ impl Pipeline {
         // load-path migration) on the same load path issues #37/#38 already
         // target, not an in-memory rekey like `Boosts::by_provider_item`
         // above; `selections` is deferred alongside it rather than resolved
-        // on its own. Filed as issue #72; see the maintainer's scope
-        // decision in the plan for this issue.
+        // on its own. Filed as issue #72.
         for item in &provider_items {
             let learned = self.learning.boost_for(&routed.term, &item.id);
             if learned != 0.0 {
@@ -737,8 +769,9 @@ mod tests {
             "learning boost alone should move its item to the front"
         );
 
-        // The competing alias boost (180) beats the learning boost (capped
-        // at 85) on the other item. The alias targets `app:winner`, which
+        // The competing `ALIAS_BOOST` beats the learning boost (capped at
+        // `LEARNING_BOOST_CAP`) on the other item. The alias targets
+        // `app:winner`, which
         // the `"fire" -> {"appId":"winner"}` alias means as the apps
         // provider's item — so, unlike the sanity check above, this item
         // must actually come from that provider for the boost to land.
@@ -976,7 +1009,7 @@ mod tests {
         let mut pipeline = Pipeline::default();
         let items = vec![
             Item {
-                provider: "apps".into(),
+                provider: APPS_PROVIDER_ID.into(),
                 ..item(Kind::App, "app:files", "Files")
             },
             Item {
@@ -986,7 +1019,7 @@ mod tests {
         ];
         let out = pipeline.assemble(
             "",
-            CheckedItems::check(vec![output("apps", vec![Kind::App], items)]),
+            CheckedItems::check(vec![output(APPS_PROVIDER_ID, vec![Kind::App], items)]),
             10,
         );
         assert_eq!(ids(&out.items), vec!["app:files"]);
@@ -1011,10 +1044,10 @@ mod tests {
             "fire",
             CheckedItems::check(vec![
                 output(
-                    "apps",
+                    APPS_PROVIDER_ID,
                     vec![Kind::App],
                     vec![Item {
-                        provider: "apps".into(),
+                        provider: APPS_PROVIDER_ID.into(),
                         ..item(Kind::App, "app:fireplace", "Fireplace")
                     }],
                 ),
@@ -1024,7 +1057,7 @@ mod tests {
                     "evil",
                     vec![Kind::App],
                     vec![Item {
-                        provider: "apps".into(),
+                        provider: APPS_PROVIDER_ID.into(),
                         ..item(Kind::App, "app:firefox", "Firefox Impostor")
                     }],
                 ),
@@ -1052,7 +1085,7 @@ mod tests {
     // `AliasEffect::boosts` tagging every `AppBoost` with
     // [`APPS_PROVIDER_ID`]) tells the two apart at scoring time.
 
-    /// The acceptance case named directly in the plan: an alias boost
+    /// The acceptance case this scoping exists for: an alias boost
     /// configured for the apps provider must not land on an identically-id'd
     /// item a different, honestly self-declared provider produced.
     #[test]
@@ -1119,7 +1152,7 @@ mod tests {
             ..Default::default()
         };
         // Without the boost, Window (weight 30) would outrank App (weight
-        // 20) on this tie — the alias boost (180) must still flip it.
+        // 20) on this tie — `ALIAS_BOOST` must still flip it.
         let assembly = pipeline.assemble(
             "fire",
             CheckedItems::check(vec![
@@ -1178,10 +1211,10 @@ mod tests {
             "firefox",
             CheckedItems::check(vec![
                 output(
-                    "apps",
+                    APPS_PROVIDER_ID,
                     vec![Kind::App],
                     vec![Item {
-                        provider: "apps".into(),
+                        provider: APPS_PROVIDER_ID.into(),
                         ..item(Kind::App, "app:firefox", "Firefox")
                     }],
                 ),
@@ -1189,7 +1222,7 @@ mod tests {
                     "evil",
                     vec![Kind::App],
                     vec![Item {
-                        provider: "apps".into(),
+                        provider: APPS_PROVIDER_ID.into(),
                         ..item(Kind::App, "app:evil", "Firefox")
                     }],
                 ),
@@ -1292,7 +1325,7 @@ mod tests {
                 "evil",
                 vec![Kind::Calculator],
                 vec![Item {
-                    provider: "apps".into(),
+                    provider: APPS_PROVIDER_ID.into(),
                     ..item(Kind::Window, "app:firefox", "Firefox")
                 }],
             )]),
@@ -1304,7 +1337,7 @@ mod tests {
             vec![Rejection {
                 item_id: ItemId("app:firefox".into()),
                 claimed_kind: Kind::Window,
-                claimed_provider: "apps".into(),
+                claimed_provider: APPS_PROVIDER_ID.into(),
                 producer_id: "evil".into(),
                 check: FailedCheck::Kind,
             }]
@@ -1324,15 +1357,15 @@ mod tests {
     fn an_item_is_checked_against_its_own_producer_not_the_union_of_every_manifest() {
         let checked = CheckedItems::check(vec![
             output(
-                "apps",
+                APPS_PROVIDER_ID,
                 vec![Kind::App],
                 vec![
                     Item {
-                        provider: "apps".into(),
+                        provider: APPS_PROVIDER_ID.into(),
                         ..item(Kind::App, "app:firefox", "Firefox")
                     },
                     Item {
-                        provider: "apps".into(),
+                        provider: APPS_PROVIDER_ID.into(),
                         ..item(Kind::Calculator, "calc:evil", "2+2 = 5")
                     },
                 ],
@@ -1346,7 +1379,7 @@ mod tests {
                         ..item(Kind::Calculator, "calc:2+2", "2+2 = 4")
                     },
                     Item {
-                        provider: "apps".into(),
+                        provider: APPS_PROVIDER_ID.into(),
                         ..item(Kind::Calculator, "calc:impostor", "2+2 = 6")
                     },
                 ],
@@ -1365,14 +1398,14 @@ mod tests {
                 Rejection {
                     item_id: ItemId("calc:evil".into()),
                     claimed_kind: Kind::Calculator,
-                    claimed_provider: "apps".into(),
-                    producer_id: "apps".into(),
+                    claimed_provider: APPS_PROVIDER_ID.into(),
+                    producer_id: APPS_PROVIDER_ID.into(),
                     check: FailedCheck::Kind,
                 },
                 Rejection {
                     item_id: ItemId("calc:impostor".into()),
                     claimed_kind: Kind::Calculator,
-                    claimed_provider: "apps".into(),
+                    claimed_provider: APPS_PROVIDER_ID.into(),
                     producer_id: "calc".into(),
                     check: FailedCheck::Provenance,
                 },
@@ -1390,12 +1423,12 @@ mod tests {
     #[test]
     fn from_provider_takes_the_manifest_from_the_provider_it_is_given() {
         let items = vec![Item {
-            provider: "apps".into(),
+            provider: APPS_PROVIDER_ID.into(),
             ..item(Kind::App, "app:firefox", "Firefox")
         }];
 
         let own = CheckedItems::check(vec![ProviderOutput::from_provider(
-            &provider("apps", vec![Kind::App]),
+            &provider(APPS_PROVIDER_ID, vec![Kind::App]),
             items.clone(),
         )]);
         assert!(own.rejections().is_empty());

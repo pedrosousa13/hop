@@ -174,9 +174,9 @@ impl Default for Weights {
 ///   `Learning::frequency_boost` (backed by the persisted `global_frequency`
 ///   map) and `Learning::query_boost` (backed by the in-memory, per-query
 ///   `selections` map), both keyed on the bare id string.
-///   DECISION: kept unscoped, deliberately. The maintainer's issue #31 scope
-///   decision put the persisted learning store's id namespace out of scope
-///   for this change — adding a provider dimension to `global_frequency` is
+///   DECISION: kept unscoped, deliberately. The persisted learning store's
+///   id namespace is out of scope for this change — adding a provider
+///   dimension to `global_frequency` is
 ///   a persisted-format migration on the same load path issues #37/#38
 ///   already target, not an in-memory rekey; `selections` is deferred
 ///   alongside it rather than resolved on its own. Filed as issue #72; see
@@ -526,6 +526,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::aliases::ALIAS_BOOST;
+    use crate::provider::APPS_PROVIDER_ID;
     use crate::router::route;
     use hop_protocol::{Action, ActionId, ActionKind};
 
@@ -1020,7 +1022,7 @@ mod tests {
         let query = route("firefox");
         let items = vec![
             Item {
-                provider: "apps".into(),
+                provider: APPS_PROVIDER_ID.into(),
                 ..item(Kind::App, "app:firefox", "Firefox", None)
             },
             Item {
@@ -1029,18 +1031,19 @@ mod tests {
             },
         ];
         // Weight alone puts Window (30) ahead of App (20) on this tie; the
-        // boost is keyed to "apps" specifically and must flip that only for
-        // the item "apps" actually produced.
+        // boost is keyed to the apps provider specifically and must flip that
+        // only for the item that provider actually produced.
         let mut boosts = Boosts::default();
-        boosts
-            .by_provider_item
-            .insert(("apps".to_string(), ItemId("app:firefox".into())), 180.0);
+        boosts.by_provider_item.insert(
+            (APPS_PROVIDER_ID.to_string(), ItemId("app:firefox".into())),
+            ALIAS_BOOST,
+        );
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &boosts);
         assert_eq!(
-            ranked[0].item.provider, "apps",
-            "the boost keyed to \"apps\" must not lift the identically-id'd \
-             item the \"evil\" provider produced"
+            ranked[0].item.provider, APPS_PROVIDER_ID,
+            "the boost keyed to the apps provider must not lift the \
+             identically-id'd item the \"evil\" provider produced"
         );
     }
 

@@ -58,7 +58,7 @@ pub const APPS_PROVIDER_ID: &str = "apps";
 /// `Clone` because [`Provider::manifest`] hands a caller its own value —
 /// implementors that keep one prepared can return a copy of it rather than
 /// rebuilding it per query.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ProviderManifest {
     pub id: &'static str,
     pub kinds: Vec<Kind>,
@@ -142,6 +142,29 @@ pub enum ProviderError {
 /// higher-ranked bound was needed for either method to compile.
 pub trait Provider: Send + Sync {
     /// This provider's static description — see [`ProviderManifest`].
+    ///
+    /// **Stability is part of this contract: every call must return the same
+    /// manifest.** A host may call this once — at registration, before any
+    /// query has run — and treat the value as constant for the life of the
+    /// provider. Returning a stored manifest, or rebuilding one fixed value
+    /// per call, satisfies this; deriving any field from state that changes
+    /// while the provider is alive does not, whatever the intent.
+    ///
+    /// Nothing in this crate enforces that, and it is
+    /// [`crate::pipeline::CheckedItems::check`] that an implementation
+    /// breaking it defeats.
+    /// [`ProviderOutput::from_provider`](crate::pipeline::ProviderOutput::from_provider)
+    /// reads the manifest *after* [`Provider::query`] has returned, so a
+    /// provider answering differently on two calls gets to choose what it is
+    /// checked against once it has seen what it wants to return. Concretely,
+    /// this is issue #31's exclusive-mode bypass rebuilt from honest-looking
+    /// parts: declare `kinds: [Calculator]` when a scheduler asks whether to
+    /// run (see [`should_query`]), return `Kind::Window` items from `query`,
+    /// then answer `kinds: [Window]` when the check asks. Each answer is
+    /// self-consistent in isolation, the kind check passes, and the Window
+    /// items go on to survive a `w `-exclusive filter and inherit Window's
+    /// ranking weight — which is the whole of what that check exists to
+    /// prevent.
     fn manifest(&self) -> ProviderManifest;
 
     /// Answers a routed query with the items this provider can find.
