@@ -56,8 +56,9 @@ use crate::router::{Mode, RoutedQuery, route};
 /// [`Provider`]'s RPITIT methods make it dyn-incompatible by construction.
 ///
 /// The manifest is owned rather than borrowed because [`Provider::manifest`]
-/// returns a fresh value. That is one small allocation per provider per
-/// query, on a path that then fuzzy-matches every item that provider
+/// returns a fresh value. That is two small allocations per provider per
+/// query — `ProviderManifest`'s clone copies both its `kinds` and `modes`
+/// `Vec`s — on a path that then fuzzy-matches every item that provider
 /// returned.
 pub struct ProviderOutput {
     manifest: ProviderManifest,
@@ -179,9 +180,11 @@ impl CheckedItems {
     /// Note what this does *not* check: that the producing manifest itself is
     /// truthful. A provider that honestly declares `id: "evil"` and `kinds:
     /// [App]` can still return an item whose id collides with another
-    /// provider's namespace. Boosts keyed on the bare id string are what make
-    /// that collision worth something, and giving them a provider dimension
-    /// is separate work.
+    /// provider's namespace. *Alias* boosts got that provider dimension in
+    /// this branch (`Boosts::by_provider_item`, tagged via
+    /// `AliasEffect::boosts`); learning boosts deliberately did not — see the
+    /// DECISION at the learning-boost call site in `Pipeline::assemble`, and
+    /// issue #72.
     pub fn check(outputs: Vec<ProviderOutput>) -> Self {
         let mut items = Vec::new();
         let mut rejections = Vec::new();
@@ -362,12 +365,16 @@ impl Pipeline {
         // DECISION: the learning boost stays keyed on the bare item id, with
         // no provider dimension, unlike the alias boost above. Issue #31's
         // boost-theft criterion is only *partially* met here on purpose —
-        // `Learning`'s persisted `global_frequency` map is keyed on the bare
-        // id string on disk, and giving it a provider dimension is a
-        // persisted-format migration (version bump, load-path migration) on
-        // the same load path issues #37/#38 already target, not an in-memory
-        // rekey like `Boosts::by_provider_item` above. Filed as issue #72;
-        // see the maintainer's scope decision in the plan for this issue.
+        // `Learning::boost_for` sums `frequency_boost` (from the persisted
+        // `global_frequency` map) and `query_boost` (from the per-query
+        // `selections` map, kept in memory only, never written to disk), and
+        // both are keyed on the bare id string. Giving `global_frequency` a
+        // provider dimension is a persisted-format migration (version bump,
+        // load-path migration) on the same load path issues #37/#38 already
+        // target, not an in-memory rekey like `Boosts::by_provider_item`
+        // above; `selections` is deferred alongside it rather than resolved
+        // on its own. Filed as issue #72; see the maintainer's scope
+        // decision in the plan for this issue.
         for item in &provider_items {
             let learned = self.learning.boost_for(&routed.term, &item.id);
             if learned != 0.0 {

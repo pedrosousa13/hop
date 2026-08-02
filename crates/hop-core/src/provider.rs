@@ -25,8 +25,9 @@ use crate::router::{Mode, RoutedQuery};
 /// matches it. Defined here, ahead of the provider it names, so both sides
 /// share one constant instead of a string literal each has to remember to
 /// keep in sync. **Issue #57 must construct its `ProviderManifest` with
-/// `id: APPS_PROVIDER_ID`**, not a repeated `"apps"` literal, or every
-/// existing app alias silently stops boosting anything.
+/// `id: APPS_PROVIDER_ID`**; a hand-written literal that ever drifts from
+/// this constant silently stops every existing app alias from boosting
+/// anything.
 ///
 /// **This constant identifies a namespace, not a specific provider, and that
 /// distinction is load-bearing.** [`crate::pipeline::CheckedItems::check`]

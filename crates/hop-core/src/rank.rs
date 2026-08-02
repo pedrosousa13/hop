@@ -170,13 +170,18 @@ impl Default for Weights {
 ///   `CheckedItems`, it inherits that hole; this comment is the only thing
 ///   telling it so.
 /// - `by_item_id`: a **learning** boost, applied to any item bearing this id
-///   regardless of which provider produced it.
+///   regardless of which provider produced it — the sum of
+///   `Learning::frequency_boost` (backed by the persisted `global_frequency`
+///   map) and `Learning::query_boost` (backed by the in-memory, per-query
+///   `selections` map), both keyed on the bare id string.
 ///   DECISION: kept unscoped, deliberately. The maintainer's issue #31 scope
 ///   decision put the persisted learning store's id namespace out of scope
-///   for this change — adding a provider dimension there is a persisted-
-///   format migration on the same load path issues #37/#38 already target,
-///   not an in-memory rekey. Filed as issue #72; see the comment at the call
-///   site in `Pipeline::assemble` where this field is populated.
+///   for this change — adding a provider dimension to `global_frequency` is
+///   a persisted-format migration on the same load path issues #37/#38
+///   already target, not an in-memory rekey; `selections` is deferred
+///   alongside it rather than resolved on its own. Filed as issue #72; see
+///   the comment at the call site in `Pipeline::assemble` where this field
+///   is populated.
 ///
 /// One further boundary neither dimension closes: `CheckedItems::check`
 /// never requires that two answering providers declare *distinct*
@@ -451,7 +456,7 @@ fn haystack_of(item: &Item) -> String {
 /// An app, by contrast, is identified for the user by its title, not by
 /// whichever id its provider's index happened to assign it; nothing stops
 /// two different ids from naming the same real application as far as the
-/// user can see, and title is the only thing the user *can* see (see
+/// user can see, and title is what the user identifies an app by (see
 /// `tests::duplicate_apps_deduped_by_title`, which merges two `App` items
 /// with different ids and an identical title on exactly that basis).
 /// Dropping id from the app key is what makes that merge happen.
@@ -477,11 +482,16 @@ fn haystack_of(item: &Item) -> String {
 /// `pipeline.rs`). What that guarantee honestly does *not* cover: two
 /// genuinely-declared `App` items from the same honest provider that happen
 /// to share a title still collapse to one — that is this rule working as
-/// intended, not a residual hole — and the guarantee only holds on the
-/// `Pipeline::assemble` path. `Ranker::rank` is `pub`, takes a bare
-/// `Vec<Item>`, and nothing stops a caller from invoking it directly on
-/// items no manifest ever checked; on that path this function dedupes
-/// exactly as trustingly as it did before issue #31.
+/// intended, not a residual hole — and two genuinely-declared `App` items
+/// sharing a title from two *different* honest providers collapse the same
+/// way, with no requirement that the survivor be the genuine one: equal
+/// scores tie-break to input order. That residual is not intended behaviour;
+/// closing it means changing the dedupe rule, which #31 puts out of scope.
+/// The guarantee also only holds on the `Pipeline::assemble` path.
+/// `Ranker::rank` is `pub`, takes a bare `Vec<Item>`, and nothing stops a
+/// caller from invoking it directly on items no manifest ever checked; on
+/// that path this function dedupes exactly as trustingly as it did before
+/// issue #31.
 ///
 /// DECISION: this rule — apps by title alone, everything else by kind, id
 /// and title — is deliberate and pinned by
