@@ -217,20 +217,49 @@ pub(crate) fn check_len(field: &'static str, max: usize, actual: usize) -> Resul
 
 /// Deserializes a `String`, refusing one over `max` bytes.
 ///
-/// The check runs inside the visitor rather than after it, which saves a copy on
-/// exactly one of the three paths in: [`BoundedString::visit_str`] is handed a
-/// slice borrowed from the input and checks it before copying, so an over-long
-/// value costs no allocation of its own there. It buys nothing on the other two.
-/// [`BoundedString::visit_string`] is handed a `String` that has already been
-/// allocated — the path taken when the reader cannot lend out a borrowed slice
-/// (`from_reader`, say) or when the JSON string contains an escape sequence.
-/// Note that the internally-tagged `Content` buffer does *not* force it:
-/// `Content::Str` borrows from the input and `ContentDeserializer` forwards to
-/// `visit_borrowed_str`, so an ordinary field inside a real frame parsed by
-/// `from_str` still takes the borrowed `visit_str` path. And the buffering
-/// caveat in this module's docs sits above all three regardless. The check is
-/// placed here because the parse is the right *place* to refuse, not because it
-/// makes the refusal free.
+/// The check runs inside the visitor rather than after it, so that where the
+/// value is still borrowed it is refused before being copied. Which of
+/// [`BoundedString`]'s two arms a given parse reaches is not obvious, and a
+/// wrong guess in either direction is dangerous, so it is written out rather
+/// than reasoned about. Measured with a probe visitor over both message shapes
+/// this crate has:
+///
+/// ```text
+///   plain struct field, from_str,    no escape  ->  visit_str
+///   plain struct field, from_str,    escaped    ->  visit_str
+///   plain struct field, from_reader, either     ->  visit_str
+///   internally tagged,  from_str,    no escape  ->  visit_str
+///   internally tagged,  from_str,    escaped    ->  visit_string
+///   internally tagged,  from_reader, either     ->  visit_string
+/// ```
+///
+/// So there is exactly one way into [`BoundedString::visit_string`]: the
+/// internally-tagged `Content` buffer, holding an owned `Content::String`.
+/// `ContentVisitor` produces that whenever it cannot borrow from the input —
+/// any string carrying an escape, and every string read through `from_reader` —
+/// and `ContentDeserializer::deserialize_string` hands it straight to
+/// `visit_string`. [`ClientMsg`](crate::wire::ClientMsg) and
+/// [`DaemonMsg`](crate::wire::DaemonMsg) are both `#[serde(tag = "type")]`, so
+/// **every escaped string in every real frame takes that path**. Its
+/// `check_len` is load-bearing, not a defensive duplicate of the other arm: a
+/// 5 KiB window title containing a single `\n` or `\"` reaches it and nothing
+/// else, and dropping the check there would let that title past [`MAX_TITLE`]
+/// untested. [`tests::an_over_long_escaped_title_is_refused_inside_a_tagged_frame`]
+/// pins it.
+///
+/// The rows that land in [`BoundedString::visit_str`] do so for two different
+/// reasons, and neither is "the value is always borrowed". A `from_reader`
+/// parse cannot borrow at all; serde_json hands the visitor a slice of its own
+/// scratch buffer. And the buffered row that *does* borrow arrives as
+/// `visit_borrowed_str`, reaching `visit_str` only because this visitor does
+/// not override that method and serde's default forwards it there.
+///
+/// What the placement buys is therefore narrow: one copy avoided, on the rows
+/// above that reach `visit_str` with a genuinely borrowed slice. It buys
+/// nothing on `visit_string`, where the `String` is already allocated, and the
+/// buffering caveat in this module's docs sits above every row regardless. The
+/// check is placed here because the parse is the right *place* to refuse, not
+/// because it makes the refusal free.
 fn string<'de, D>(deserializer: D, field: &'static str, max: usize) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -841,6 +870,45 @@ mod tests {
                 .expect_err("the over-long value must be refused inside a frame");
             assert!(err.to_string().contains(field), "got: {err}");
         }
+    }
+
+    // Every other string test in this module uses escape-free values, and per
+    // the routing table on `string` all of those reach `BoundedString` through
+    // `visit_str` — including the ones that go through a tagged frame. That
+    // leaves the `visit_string` arm, and the only way in is an escaped string
+    // inside a tagged frame. This is not an exotic input: a window title
+    // holding a quote or a newline is ordinary traffic, and without these two
+    // cases the check on that arm could be deleted with every test still
+    // green.
+
+    #[test]
+    fn an_over_long_escaped_title_is_refused_inside_a_tagged_frame() {
+        let mut item = item_json();
+        // The trailing newline is what serde escapes on the way out, which is
+        // what forces the buffered content to be owned rather than borrowed.
+        item["title"] = json!(format!("{}\n", "a".repeat(MAX_TITLE)));
+
+        let err = serde_json::from_str::<DaemonMsg>(&results_frame(item))
+            .expect_err("an over-long title must be refused however it is encoded");
+        assert!(err.to_string().contains("Item.title"), "got: {err}");
+    }
+
+    #[test]
+    fn an_escaped_title_on_the_bound_still_parses_whole_inside_a_tagged_frame() {
+        let title = format!("{}\n", "a".repeat(MAX_TITLE - 1));
+        assert_eq!(title.len(), MAX_TITLE);
+        let mut item = item_json();
+        item["title"] = json!(title);
+
+        let msg: DaemonMsg = serde_json::from_str(&results_frame(item))
+            .unwrap_or_else(|e| panic!("a value of exactly {MAX_TITLE} bytes must parse: {e}"));
+        let DaemonMsg::Results { items, .. } = msg else {
+            panic!("expected a results frame");
+        };
+        assert_eq!(
+            items[0].title, title,
+            "the escape must be decoded and the value must survive whole"
+        );
     }
 
     #[test]
