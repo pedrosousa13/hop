@@ -342,6 +342,19 @@ mod tests {
         )
         .unwrap();
         let effect = aliases.apply("term");
+        // The positive half: the boost really is there, under the tag this
+        // test is named for.
+        assert_eq!(
+            effect
+                .boosts
+                .get(&(APPS_PROVIDER_ID.to_string(), ItemId("app:terminal".into()))),
+            Some(&ALIAS_BOOST),
+            "the boost must be present, tagged with the apps provider"
+        );
+        // The negative half: it is *not* also reachable under some other
+        // provider's tag — an implementation that emitted no boost at all
+        // would satisfy this assertion alone without earning the test name,
+        // which is why both halves must live here together.
         assert_eq!(
             effect
                 .boosts

@@ -27,6 +27,20 @@ use crate::router::{Mode, RoutedQuery};
 /// keep in sync. **Issue #57 must construct its `ProviderManifest` with
 /// `id: APPS_PROVIDER_ID`**, not a repeated `"apps"` literal, or every
 /// existing app alias silently stops boosting anything.
+///
+/// **This constant identifies a namespace, not a specific provider, and that
+/// distinction is load-bearing.** [`crate::pipeline::CheckedItems::check`]
+/// checks each item against its own producer's manifest, but never checks
+/// that two answering providers declare *distinct* `id`s — nothing in this
+/// crate enforces manifest-id uniqueness across a query's `ProviderOutput`s.
+/// If a future provider registry ever lets two providers both declare
+/// `id: APPS_PROVIDER_ID`, both pass `CheckedItems::check` and both collect
+/// every alias boost this constant tags — the exact boost-theft failure
+/// issue #31 exists to close, just moved one level up, from "which item" to
+/// "which provider". **Rejecting a second registration under an id already
+/// in use is load-bearing for boost correctness**, not just registry
+/// hygiene, and whatever builds the M2 provider registry needs to enforce
+/// it.
 pub const APPS_PROVIDER_ID: &str = "apps";
 
 /// Static description of what a provider serves and how the (future)

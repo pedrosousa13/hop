@@ -142,16 +142,33 @@ impl Default for Weights {
 /// summed at lookup time in `Ranker::rank_matching`:
 ///
 /// - `by_provider_item`: an **alias** boost, keyed by `(provider, ItemId)`
-///   and applied only to the item actually produced by that provider (per
-///   [`Item::provider`], trustworthy here precisely because
-///   [`crate::pipeline::CheckedItems::check`] already verified it against
-///   the producer's own manifest before this item could reach ranking at
-///   all). A bare `ItemId` key cannot express this: two items can
+///   and applied only to the item whose own [`Item::provider`] equals that
+///   key's provider. A bare `ItemId` key cannot express this: two items can
 ///   legitimately share an id while coming from two different, individually
-///   honest providers — an id-namespace collision, not the impersonation the
-///   manifest checks already catch — and only one of them is who the alias
-///   actually means. See
+///   honest providers — an id-namespace collision, not the impersonation
+///   [`crate::pipeline::CheckedItems::check`] catches — and only one of them
+///   is who the alias actually means. See
 ///   `tests::provider_scoped_boost_only_applies_to_the_matching_producer`.
+///
+///   **This is a documented boundary, not an enforced one, and it holds only
+///   for one calling path.** `Item::provider` is self-asserted; matching
+///   against it here is safe *only* when every item reaching this lookup
+///   already passed [`crate::pipeline::CheckedItems::check`], which verifies
+///   `item.provider` against the actual producer's own manifest before the
+///   item can become part of a [`crate::pipeline::CheckedItems`]. That is
+///   true for items reaching this struct through
+///   [`crate::pipeline::Pipeline::assemble`] — the *only* path this
+///   guarantee covers — and true for nothing else. [`Ranker::rank`] itself is
+///   `pub`, takes a bare `Vec<Item>` with no such check, and
+///   [`crate::pipeline::Pipeline::ranker`] is a public field: nothing stops
+///   a caller from building a `Boosts` and calling
+///   `pipeline.ranker.rank(raw_items, …, &boosts)` directly on items no
+///   manifest ever vouched for, at which point `item.provider` is exactly as
+///   trustworthy as it was before issue #31 — i.e. not at all — and boost
+///   theft is back in full. If a future caller adds a second ranking path
+///   (a preview pane, a re-rank, a benchmark harness) that skips
+///   `CheckedItems`, it inherits that hole; this comment is the only thing
+///   telling it so.
 /// - `by_item_id`: a **learning** boost, applied to any item bearing this id
 ///   regardless of which provider produced it.
 ///   DECISION: kept unscoped, deliberately. The maintainer's issue #31 scope
@@ -160,6 +177,14 @@ impl Default for Weights {
 ///   format migration on the same load path issues #37/#38 already target,
 ///   not an in-memory rekey. Filed as issue #72; see the comment at the call
 ///   site in `Pipeline::assemble` where this field is populated.
+///
+/// One further boundary neither dimension closes: `CheckedItems::check`
+/// never requires that two answering providers declare *distinct*
+/// `manifest.id`s. `by_provider_item`'s guarantee is really "the item came
+/// from whichever provider declared this id", not "the item came from *the*
+/// provider everyone means by that id" — see [`crate::provider::APPS_PROVIDER_ID`]'s
+/// doc comment for what that costs if a provider registry ever allows two
+/// providers to share an id.
 #[derive(Default)]
 pub struct Boosts {
     pub by_provider_item: HashMap<(String, ItemId), f32>,
@@ -282,11 +307,28 @@ impl Ranker {
                 };
 
                 let weight = kind_weight(weights, &item.kind);
-                let provider_boost = boosts
-                    .by_provider_item
-                    .get(&(item.provider.clone(), item.id.clone()))
-                    .copied()
-                    .unwrap_or(0.0);
+                // `by_provider_item` is empty on virtually every keystroke —
+                // `Aliases::apply` only ever populates it when the routed
+                // term matches an alias key exactly. `HashMap::get` already
+                // short-circuits on an empty map before hashing, but
+                // building the lookup key clones two `String`s
+                // (`item.provider` and the `ItemId`'s inner `String`), and
+                // that allocation happens unconditionally as soon as the key
+                // expression is evaluated — before `get` ever runs. Guarding
+                // on `is_empty()` skips constructing the key at all on the
+                // overwhelmingly common empty-map path, which is the only
+                // per-item allocation this loop would otherwise do for an
+                // empty query term (the `Matching::Everything` arm above
+                // does no `haystack_of` allocation).
+                let provider_boost = if boosts.by_provider_item.is_empty() {
+                    0.0
+                } else {
+                    boosts
+                        .by_provider_item
+                        .get(&(item.provider.clone(), item.id.clone()))
+                        .copied()
+                        .unwrap_or(0.0)
+                };
                 let learning_boost = boosts.by_item_id.get(&item.id).copied().unwrap_or(0.0);
                 let boost = provider_boost + learning_boost;
                 Some(Ranked {

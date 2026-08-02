@@ -735,29 +735,38 @@ mod tests {
         // the `"fire" -> {"appId":"winner"}` alias means as the apps
         // provider's item — so, unlike the sanity check above, this item
         // must actually come from that provider for the boost to land.
-        let out = pipeline
-            .assemble(
-                "fire",
-                CheckedItems::check(vec![
-                    output(
-                        "test",
-                        ALL_KINDS.to_vec(),
-                        vec![item(Kind::App, "app:learned", "Fireplace")],
-                    ),
-                    output(
-                        APPS_PROVIDER_ID,
-                        vec![Kind::App],
-                        vec![Item {
-                            provider: APPS_PROVIDER_ID.into(),
-                            ..item(Kind::App, "app:winner", "Fire Alarm")
-                        }],
-                    ),
-                ]),
-                10,
-            )
-            .items;
+        let assembly = pipeline.assemble(
+            "fire",
+            CheckedItems::check(vec![
+                output(
+                    "test",
+                    ALL_KINDS.to_vec(),
+                    vec![item(Kind::App, "app:learned", "Fireplace")],
+                ),
+                output(
+                    APPS_PROVIDER_ID,
+                    vec![Kind::App],
+                    vec![Item {
+                        provider: APPS_PROVIDER_ID.into(),
+                        ..item(Kind::App, "app:winner", "Fire Alarm")
+                    }],
+                ),
+            ]),
+            10,
+        );
+        // Restores the guard `checked()` gives every other test in this
+        // file for free: without it, this is an ordering test that could
+        // quietly become a rejection test instead (e.g. if a future change
+        // to the manifest/provider wiring above started rejecting
+        // "app:winner", the assertion below on a *shorter* `out` could still
+        // find `out[0]` equal to itself trivially wrong in a way this guard
+        // catches immediately).
+        assert!(
+            assembly.rejections.is_empty(),
+            "both providers here are self-consistent; neither should be rejected"
+        );
         assert_eq!(
-            out[0].id,
+            assembly.items[0].id,
             ItemId("app:winner".into()),
             "an alias boost on a competing item must still win over learning"
         );
@@ -1104,33 +1113,41 @@ mod tests {
         };
         // Without the boost, Window (weight 30) would outrank App (weight
         // 20) on this tie — the alias boost (180) must still flip it.
-        let out = pipeline
-            .assemble(
-                "fire",
-                CheckedItems::check(vec![
-                    output(
-                        APPS_PROVIDER_ID,
-                        vec![Kind::App],
-                        vec![Item {
-                            provider: APPS_PROVIDER_ID.into(),
-                            ..item(Kind::App, "app:firefox", "Firefox")
-                        }],
-                    ),
-                    output(
-                        "windows",
-                        vec![Kind::Window],
-                        vec![Item {
-                            provider: "windows".into(),
-                            ..item(Kind::Window, "window:1", "Firefox")
-                        }],
-                    ),
-                ]),
-                10,
-            )
-            .items;
+        let assembly = pipeline.assemble(
+            "fire",
+            CheckedItems::check(vec![
+                output(
+                    APPS_PROVIDER_ID,
+                    vec![Kind::App],
+                    vec![Item {
+                        provider: APPS_PROVIDER_ID.into(),
+                        ..item(Kind::App, "app:firefox", "Firefox")
+                    }],
+                ),
+                output(
+                    "windows",
+                    vec![Kind::Window],
+                    vec![Item {
+                        provider: "windows".into(),
+                        ..item(Kind::Window, "window:1", "Firefox")
+                    }],
+                ),
+            ]),
+            10,
+        );
+        assert!(
+            assembly.rejections.is_empty(),
+            "both providers are self-consistent; neither should be rejected"
+        );
+        // The full order, not just who's first: an assertion on `out[0]`
+        // alone would still pass if the Window item vanished entirely
+        // (dropped by a future exclusive-filter change, a CheckedItems
+        // regression, ...) without the alias boost ever applying — proving
+        // nothing about the boost. Asserting both positions is what actually
+        // pins "the same resulting order as before this change".
         assert_eq!(
-            out[0].id,
-            ItemId("app:firefox".into()),
+            ids(&assembly.items),
+            vec!["app:firefox", "window:1"],
             "the genuine apps-provider item still receives its alias boost \
              and outranks the higher-weighted Window item, exactly as it did \
              before the boost was scoped to a provider"
