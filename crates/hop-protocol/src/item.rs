@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::limits::{self, BoundError, MAX_ACTION_ID, MAX_ITEM_ID, check_len};
 
@@ -12,14 +12,22 @@ use crate::limits::{self, BoundError, MAX_ACTION_ID, MAX_ITEM_ID, check_len};
 /// refuses anything over [`MAX_ITEM_ID`] bytes. That is the whole point of the
 /// newtype: an `ItemId` that exists is an `ItemId` within its bound, whether it
 /// was built by a provider or parsed off the socket, and no later caller has to
-/// remember to check. Deserialization routes through the same constructor, so a
-/// hostile peer cannot produce one by parsing either.
+/// remember to check. Deserialization hands the parsed string to that same
+/// constructor rather than repeating its check, so a rule added to `new` later
+/// governs ids off the socket too, and a hostile peer cannot produce one by
+/// parsing.
 ///
 /// The wire form is unchanged by any of this: an id is still a bare JSON
 /// string, never an object or a wrapper.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct ItemId(#[serde(deserialize_with = "limits::de_item_id")] String);
+pub struct ItemId(String);
+
+impl<'de> Deserialize<'de> for ItemId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        limits::id(deserializer, "ItemId", MAX_ITEM_ID, ItemId::new)
+    }
+}
 
 impl ItemId {
     /// Builds an id, refusing a value over [`MAX_ITEM_ID`] bytes.
@@ -54,10 +62,17 @@ impl fmt::Display for ItemId {
 
 /// The stable identifier of an [`Action`], opaque to clients.
 ///
-/// Bounded and constructed exactly as [`ItemId`] is, at [`MAX_ACTION_ID`] bytes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Bounded and constructed exactly as [`ItemId`] is, at [`MAX_ACTION_ID`] bytes,
+/// and deserialized through [`ActionId::new`] for the same reason.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct ActionId(#[serde(deserialize_with = "limits::de_action_id")] String);
+pub struct ActionId(String);
+
+impl<'de> Deserialize<'de> for ActionId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        limits::id(deserializer, "ActionId", MAX_ACTION_ID, ActionId::new)
+    }
+}
 
 impl ActionId {
     /// Builds an id, refusing a value over [`MAX_ACTION_ID`] bytes.
@@ -128,13 +143,22 @@ pub struct Action {
 }
 
 /// How to render an [`Item`]'s icon.
+///
+/// Both fields are optional by *absence* as well as by explicit null. That is
+/// what the `default` in each attribute buys: serde's derive gives an
+/// `Option<T>` field its missing-field fallback only while the field has no
+/// `deserialize_with`, so adding one without `default` would quietly turn an
+/// optional field into a mandatory one and refuse `{"name":"firefox"}` for a
+/// missing `path`. Nothing in this crate omits a field when serializing, so no
+/// round-trip test would notice; a future client written against the documented
+/// shape would.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IconSpec {
     /// Bounded at [`MAX_ICON_NAME`](crate::limits::MAX_ICON_NAME) bytes on the way in.
-    #[serde(deserialize_with = "limits::de_icon_name")]
+    #[serde(default, deserialize_with = "limits::de_icon_name")]
     pub name: Option<String>,
     /// Bounded at [`MAX_ICON_PATH`](crate::limits::MAX_ICON_PATH) bytes on the way in.
-    #[serde(deserialize_with = "limits::de_icon_path")]
+    #[serde(default, deserialize_with = "limits::de_icon_path")]
     pub path: Option<String>,
 }
 
@@ -143,6 +167,10 @@ pub struct IconSpec {
 /// Every variable-length field here is bounded at the deserialization boundary,
 /// so an `Item` that was parsed is an `Item` within budget. The bounds are in
 /// [`limits`](crate::limits), which also records what they do *not* guarantee.
+///
+/// Every `Option` field is optional by absence as well as by explicit null, and
+/// each pairs `default` with its `deserialize_with` to keep it that way — see
+/// [`IconSpec`] for why the pairing is load-bearing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub id: ItemId,
@@ -151,7 +179,7 @@ pub struct Item {
     #[serde(deserialize_with = "limits::de_title")]
     pub title: String,
     /// Bounded at [`MAX_SUBTITLE`](crate::limits::MAX_SUBTITLE) bytes on the way in.
-    #[serde(deserialize_with = "limits::de_subtitle")]
+    #[serde(default, deserialize_with = "limits::de_subtitle")]
     pub subtitle: Option<String>,
     pub icon: Option<IconSpec>,
     /// Bounded at [`MAX_ACTIONS_PER_ITEM`](crate::limits::MAX_ACTIONS_PER_ITEM)
@@ -160,7 +188,7 @@ pub struct Item {
     pub actions: Vec<Action>,
     pub default_action: ActionId,
     /// Bounded at [`MAX_COPY_TEXT`](crate::limits::MAX_COPY_TEXT) bytes on the way in.
-    #[serde(deserialize_with = "limits::de_item_copy_text")]
+    #[serde(default, deserialize_with = "limits::de_item_copy_text")]
     pub copy_text: Option<String>,
     /// Pinned after ranked results (web search actions), rather than ranked among them.
     pub append_to_end: bool,
@@ -230,6 +258,73 @@ mod tests {
 
         let over = "a".repeat(MAX_ACTION_ID + 1);
         assert!(ActionId::new(&over).is_err());
+    }
+
+    /// An item as JSON with every field present, for a test to remove one from.
+    fn full_item_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "app:firefox",
+            "kind": "app",
+            "title": "Firefox",
+            "subtitle": "Web Browser",
+            "icon": { "name": "firefox", "path": "/usr/share/icons/firefox.png" },
+            "actions": [{ "id": "open", "kind": "open", "label": "Open" }],
+            "default_action": "open",
+            "copy_text": "https://example.com",
+            "append_to_end": false,
+            "provider": "apps"
+        })
+    }
+
+    fn item_without(field: &str) -> Item {
+        let mut json = full_item_json();
+        let object = json.as_object_mut().unwrap();
+        object
+            .remove(field)
+            .unwrap_or_else(|| panic!("no field {field} to remove"));
+        serde_json::from_str(&json.to_string())
+            .unwrap_or_else(|e| panic!("omitting {field} must still parse, got: {e}"))
+    }
+
+    fn icon_without(field: &str) -> IconSpec {
+        let mut json = serde_json::json!({ "name": "firefox", "path": "/icons/firefox.png" });
+        let object = json.as_object_mut().unwrap();
+        object
+            .remove(field)
+            .unwrap_or_else(|| panic!("no field {field} to remove"));
+        serde_json::from_str(&json.to_string())
+            .unwrap_or_else(|e| panic!("omitting {field} must still parse, got: {e}"))
+    }
+
+    // An optional field is optional by *absence*, not only by explicit null. A
+    // client that omits one is the motivating case: it parsed before these
+    // bounds existed, and adding a `deserialize_with` must not have quietly
+    // made it mandatory. hop's own serializer never omits a field, so no
+    // round-trip test can catch this — these four have to say it directly.
+
+    #[test]
+    fn item_subtitle_is_none_when_omitted() {
+        assert_eq!(item_without("subtitle").subtitle, None);
+    }
+
+    #[test]
+    fn item_copy_text_is_none_when_omitted() {
+        assert_eq!(item_without("copy_text").copy_text, None);
+    }
+
+    #[test]
+    fn item_icon_is_none_when_omitted() {
+        assert_eq!(item_without("icon").icon, None);
+    }
+
+    #[test]
+    fn icon_name_is_none_when_omitted() {
+        assert_eq!(icon_without("name").name, None);
+    }
+
+    #[test]
+    fn icon_path_is_none_when_omitted() {
+        assert_eq!(icon_without("path").path, None);
     }
 
     #[test]
