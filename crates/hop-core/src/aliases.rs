@@ -337,10 +337,9 @@ mod tests {
     // half.
     #[test]
     fn app_alias_boost_is_tagged_with_the_apps_provider_not_a_bare_item_id() {
-        let aliases = Aliases::from_json(
-            r#"[{"alias":"term","type":"app","target":{"appId":"terminal"}}]"#,
-        )
-        .unwrap();
+        let aliases =
+            Aliases::from_json(r#"[{"alias":"term","type":"app","target":{"appId":"terminal"}}]"#)
+                .unwrap();
         let effect = aliases.apply("term");
         // The positive half: the boost really is there, under the tag this
         // test is named for.
