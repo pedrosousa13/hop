@@ -8,14 +8,10 @@
 //! plugin seam every later extension tier adapts to, so "the daemon is trusted"
 //! does not reach them: it degrades to "every installed provider is trusted".
 //!
-//! They are not the only values in the contract that a client acts on.
 //! [`Item`](crate::item::Item)'s `copy_text` reaches the same clipboard by a
-//! different route, and it is still a plain bounded `String` — it wants
+//! different route, and it is still a plain bounded `String`. It wants
 //! [`CopyText`] too, and giving it one changes the item model rather than the
-//! outcome, so it is deliberately left for its own change. What is true of
-//! these two and of nothing else is that acting on them is *all* they are for:
-//! an outcome is not displayed, so there is no reading of either that is merely
-//! text.
+//! outcome, so it is deliberately left for its own change.
 //!
 //! [`limits`] says how *long* these values may be; this module
 //! says what they may *contain*. The two compose rather than replace one
@@ -64,11 +60,11 @@
 //! scratch buffer — measured, and the reason the table above is scoped to the
 //! frame. That is why the rules live in the constructor both arms call rather
 //! than in either one. That conclusion is what the tests
-//! `an_escaped_control_character_is_refused_inside_a_tagged_frame`,
-//! `a_raw_control_character_is_refused_inside_a_tagged_frame`,
-//! `a_refused_value_is_refused_through_from_reader_too` and
-//! `a_raw_c0_control_never_reaches_the_content_check` hold: a refusal fires
-//! whichever of these paths a value arrives by.
+//! `tests::an_escaped_control_character_is_refused_inside_a_tagged_frame`,
+//! `tests::a_raw_control_character_is_refused_inside_a_tagged_frame`,
+//! `tests::a_refused_value_is_refused_through_from_reader_too` and
+//! `tests::a_raw_c0_control_never_reaches_the_content_check` hold: a refusal
+//! fires whichever of these paths a value arrives by.
 //!
 //! The table itself is not held that way, and deliberately is not. Nothing here
 //! observes which arm a parse reached — that is serde's internal routing, which
@@ -146,11 +142,11 @@ pub const ALLOWED_COPY_TEXT_CONTROLS: &[char] = &['\t', '\n'];
 /// a *different* value, and quietly acting on something the peer did not send
 /// is the failure this type exists to prevent.
 ///
-/// Each variant names the wire field it came from and nothing else. In
-/// particular no variant carries the offending text: these values are
-/// peer-controlled, an error made from one travels into logs and diagnostics,
-/// and the field plus the rule is what a reader needs. The one exception is a
-/// code point, which is a number.
+/// Every variant names the wire field it came from, and none carries the
+/// offending text: these values are peer-controlled, an error made from one
+/// travels into logs and diagnostics, and the field plus the rule is what a
+/// reader needs. [`ContentError::ForbiddenChar`] carries a code point besides,
+/// which is a number rather than a piece of the value.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ContentError {
     /// A value over its byte maximum, from the size budget in
@@ -203,10 +199,10 @@ pub enum ContentError {
 ///    that builds an argument vector would read a leading `-` as an option
 ///    rather than as the URL. Rule 3 already excludes every such value, because
 ///    no scheme in [`ALLOWED_URL_SCHEMES`] starts with anything but a letter —
-///    pinned by the test `no_allowed_scheme_could_be_read_as_a_flag`. It is
-///    kept as a rule of its own regardless: it is what has to survive a later
-///    edit to the allow-list, and it names the actual hazard in the refusal
-///    instead of reporting a strange scheme.
+///    pinned by the test `tests::no_allowed_scheme_could_be_read_as_a_flag`.
+///    It is kept as a rule of its own regardless: it is what has to survive a
+///    later edit to the allow-list, and it names the actual hazard in the
+///    refusal instead of reporting a strange scheme.
 /// 3. **A scheme from [`ALLOWED_URL_SCHEMES`]**, compared
 ///    ASCII-case-insensitively. The scheme is what precedes the *first* `:`, so
 ///    an allowed scheme appearing later in the value does not rescue a refused
@@ -224,9 +220,10 @@ pub enum ContentError {
 ///    `Cc` exception is not a nicety: "control character" here is
 ///    [`char::is_control`], Unicode's `Cc` category, which reaches past ASCII
 ///    to the C1 controls at U+0080–U+009F, and those this rule does refuse.
-///    Pinned by the test
-///    `open_url_accepts_characters_rfc_3986_would_percent_encode` on one side
-///    and `open_url_refuses_a_space_or_a_control_character` on the other.
+///    Pinned by the tests
+///    `tests::open_url_accepts_characters_rfc_3986_would_percent_encode` on
+///    one side and `tests::open_url_refuses_a_space_or_a_control_character` on
+///    the other.
 ///
 /// Nothing here normalises, trims or percent-encodes. An accepted URL is passed
 /// on exactly as it arrived, so what a client opens is what the provider sent,
@@ -250,8 +247,9 @@ pub enum ContentError {
 /// All three are display-and-phishing problems belonging to whatever shows or
 /// opens the URL, and closing them needs a URL parser this crate deliberately
 /// does not carry. Pinned by the test
-/// `open_url_does_not_check_what_follows_the_scheme`, so a later widening of
-/// the rules updates this list rather than silently contradicting it.
+/// `tests::open_url_does_not_check_what_follows_the_scheme`, so a later
+/// widening of the rules updates this list rather than silently contradicting
+/// it.
 ///
 /// The newtype does not change the wire form: a URL is still a bare JSON
 /// string, never an object or a wrapper.
@@ -358,14 +356,14 @@ fn has_allowed_scheme(value: &str) -> bool {
 ///
 /// One member of that category occurs in ordinary text as well, and the rule
 /// charges for it. As the CR of CRLF, a carriage return is common in text of
-/// Windows origin, in HTTP bodies, and in `\r\n`-terminated files — so a provider that
-/// copies such text through unchanged has the value refused, and because the
-/// refusal happens at the parse, the whole frame refused with it. That is the
-/// same "silently break honest providers" failure that argues for allowing a
-/// newline two paragraphs up, and here it is accepted rather than avoided: a
-/// carriage return returns a terminal to column zero, which makes it the one
-/// character that can overwrite what was already shown of a line, and a paste
-/// able to hide what it contains is worth more than CRLF convenience.
+/// Windows origin, in HTTP bodies, and in `\r\n`-terminated files — so a
+/// provider that copies such text through unchanged has the value refused, and
+/// because the refusal happens at the parse, the whole frame refused with it.
+/// That is the same "silently break honest providers" failure that argues for
+/// allowing a newline two paragraphs up, and here it is accepted rather than
+/// avoided: a carriage return returns a terminal to column zero, which makes it
+/// the one character that can overwrite what was already shown of a line, and a
+/// paste able to hide what it contains is worth more than CRLF convenience.
 ///
 /// It is a judgement and not a boundary, and it should not be read as one. A
 /// pasted newline submits a line to a line-oriented reader much as a carriage
@@ -391,8 +389,8 @@ fn has_allowed_scheme(value: &str) -> bool {
 /// display-spoofing concern rather than a terminal-control one; this type does
 /// not address display spoofing, and saying so is better than implying a
 /// guarantee it does not make. Pinned by the test
-/// `copy_text_does_not_refuse_the_non_cc_separators_and_format_characters`, so
-/// a later widening of the rule updates this paragraph rather than silently
+/// `tests::copy_text_does_not_refuse_the_non_cc_separators_and_format_characters`,
+/// so a later widening of the rule updates this paragraph rather than silently
 /// contradicting it.
 ///
 /// The newtype does not change the wire form: copy text is still a bare JSON
@@ -456,27 +454,19 @@ mod tests {
 
     // --- The docs' pointers into this module --------------------------------
 
-    /// Whether a backticked token in a doc comment is shaped like one of this
-    /// module's test names: three or more `snake_case` words, and nothing in it
-    /// that could not be an identifier.
-    ///
-    /// Two words is the shape of the API this file also mentions in backticks
-    /// (`from_reader`, `copy_text`, `is_control`), which is why the bar is
-    /// three; anything with a `:`, a backslash or a capital is a path, an escape
-    /// or a constant rather than a test.
-    fn is_test_name_shaped(token: &str) -> bool {
-        token.split('_').count() >= 3
-            && token
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-    }
-
     /// Every test this file's docs name by hand must exist, so that renaming one
     /// fails here instead of leaving a doc pointing at nothing.
     ///
-    /// Those pointers are prose rather than intra-doc links on purpose. A link
-    /// to a `#[cfg(test)]` item cannot resolve in a doc build — there is no
-    /// `tests` module for rustdoc to find — so `cargo doc` answers each one with
+    /// A pointer is a backticked `tests::` followed by the test's name. The
+    /// qualifier is what makes it findable: it marks a backticked token as a
+    /// pointer into this module rather than one of the API names the same docs
+    /// mention in backticks, so nothing this file says about `append_to_end`,
+    /// `de_item_copy_text` or any other multi-word identifier can be mistaken
+    /// for one. It also reads as the path it is.
+    ///
+    /// The pointers are prose rather than intra-doc links on purpose. A link to
+    /// a `#[cfg(test)]` item cannot resolve in a doc build — there is no `tests`
+    /// module for rustdoc to find — so `cargo doc` answers each one with
     /// `unresolved link`. On a *private* item that passes unnoticed, rustdoc
     /// having no reason to process its docs, which is why the one link of this
     /// kind in [`limits`] is silent; every pointer in this file is on a public
@@ -492,7 +482,16 @@ mod tests {
             .filter(|line| line.starts_with("///") || line.starts_with("//!"))
             // Odd-indexed pieces are what sat between a pair of backticks.
             .flat_map(|line| line.split('`').skip(1).step_by(2))
-            .filter(|token| is_test_name_shaped(token))
+            .filter_map(|token| token.strip_prefix("tests::"))
+            // What follows the qualifier has to be an identifier to be a
+            // pointer; this is what keeps the marker's own mention above, and
+            // any prose placeholder, out of the scan.
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
             .collect();
 
         assert!(
@@ -505,7 +504,7 @@ mod tests {
         for name in named {
             assert!(
                 source.contains(&format!("fn {name}(")),
-                "a doc comment names `{name}`, which no test in this file defines"
+                "a doc comment names `tests::{name}`, which no test in this file defines"
             );
         }
     }
@@ -977,7 +976,8 @@ mod tests {
     fn a_raw_c0_control_never_reaches_the_content_check() {
         // Pins the measured fact the docs rest on: serde_json refuses the
         // document itself, so no rule in this module ever sees an unescaped C0
-        // control and the escaped path is the only one that has to hold.
+        // control. For a character of that range, and not for DEL or C1, the
+        // escaped path is the one that has to hold.
         let frame = "{\"type\":\"executed\",\"query_id\":1,\"outcome\":{\"copy_text\":\"a\rb\"}}";
         let err = serde_json::from_str::<DaemonMsg>(frame)
             .expect_err("a raw C0 control is not valid JSON");

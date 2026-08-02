@@ -110,7 +110,7 @@ its producer declared, and every item's provider string is its producer's
 manifest id. Assembly accepts nothing else, so an item's self-description is
 never taken on trust.
 
-**Rejection** — one item assembly refused, and which of the two checks it
+**Rejection** — one item assembly declined, and which of the two checks it
 failed. Returned as data alongside the assembled items, never logged — there
 is no logging seam yet, and the query path may not have side effects.
 
@@ -148,11 +148,12 @@ rules however it was made. `ItemId`, `ActionId`, `CopyText` and `OpenUrl`.
 it is refused, so a handler the contract has never heard of cannot be reached by
 installing a provider that names it.
 
-**Refusal** — a value the parse would not build, named for the rule it broke.
-Distinct from a **rejection**, which is an *item* that assembly declined: a
-rejection is data returned alongside the items that survived, so a query with
-one still answers, while a refusal is a parse error that sinks the whole frame.
-Neither is ever a truncation, a normalization, or a silent fix.
+**Refusal** — a value either gate would not build, named for the rule it broke:
+a constructor returns it as an error, and off the parse it becomes an error that
+sinks the whole frame. Distinct from a **rejection**, which is an *item* that
+assembly declined: a rejection is data returned alongside the items that
+survived, so a query with one still answers. Neither is ever a truncation, a
+normalization, or a silent fix.
 
 ## Conventions
 
