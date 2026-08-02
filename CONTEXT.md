@@ -110,7 +110,7 @@ its producer declared, and every item's provider string is its producer's
 manifest id. Assembly accepts nothing else, so an item's self-description is
 never taken on trust.
 
-**Rejection** — one item assembly refused, and which of the two checks it
+**Rejection** — one item assembly declined, and which of the two checks it
 failed. Returned as data alongside the assembled items, never logged — there
 is no logging seam yet, and the query path may not have side effects.
 
@@ -124,6 +124,36 @@ split off before ranking and never scored.
 together. A body that alone fills the cap squeezes the tail out; the old
 extension reserved room for the tail instead, and that difference is a recorded
 divergence.
+
+## Content rules
+
+**Command-shaped outcome** — an `ExecOutcome` variant that tells a client to
+*act* rather than reporting what happened: `CopyText` and `OpenUrl`. Both come
+from a provider, so neither is trusted. `Done` is not one, and an item's
+`copy_text` is not one either — it reaches the same clipboard, but by way of an
+item rather than an outcome.
+
+**Content rule** — a restriction on what a wire value may *contain*, as against
+a **bound**, which restricts how long it may be. Content rules live in
+`hop-protocol`'s `content` module, bounds in its `limits` module; both are
+applied at the deserialization boundary, and the bound is applied first.
+
+**Validating newtype** — a type wrapping a private `String` whose only
+constructor applies every rule, and whose `Deserialize` hands the parsed string
+to that same constructor. One gate, not two: a value that exists has passed the
+rules however it was made. `ItemId`, `ActionId`, `CopyText` and `OpenUrl`.
+
+**Allowed scheme** — a URL scheme an `OpenUrl` may carry, from the allow-list
+`ALLOWED_URL_SCHEMES`. An allow-list, never a deny-list: a scheme that is not on
+it is refused, so a handler the contract has never heard of cannot be reached by
+installing a provider that names it.
+
+**Refusal** — a value either gate would not build, named for the rule it broke:
+a constructor returns it as an error, and off the parse it becomes an error that
+sinks the whole frame. Distinct from a **rejection**, which is an *item* that
+assembly declined: a rejection is data returned alongside the items that
+survived, so a query with one still answers. Neither is ever a truncation, a
+normalization, or a silent fix.
 
 ## Conventions
 

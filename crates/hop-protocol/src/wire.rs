@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::content::{CopyText, OpenUrl};
 use crate::item::{ActionId, Item, ItemId};
 use crate::limits;
 
@@ -81,16 +82,21 @@ pub enum DaemonMsg {
 }
 
 /// The result of executing an action.
+///
+/// [`CopyText`] and [`OpenUrl`] are the two variants that tell a client to act
+/// rather than describing what happened, so both carry a validating type rather
+/// than a `String`: what may be in one is decided once, in
+/// [`content`](crate::content), and cannot be sidestepped by sending a frame.
+/// The wire form is a bare JSON string in both cases, as it was before those
+/// types existed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecOutcome {
     Done,
-    /// Text for the client to put on the clipboard, bounded at
-    /// [`MAX_COPY_TEXT`](crate::limits::MAX_COPY_TEXT) bytes on the way in.
-    CopyText(#[serde(deserialize_with = "limits::de_outcome_copy_text")] String),
-    /// A URL for the client to open, bounded at
-    /// [`MAX_OPEN_URL`](crate::limits::MAX_OPEN_URL) bytes on the way in.
-    OpenUrl(#[serde(deserialize_with = "limits::de_outcome_open_url")] String),
+    /// Text for the client to put on the clipboard.
+    CopyText(CopyText),
+    /// A URL for the client to open.
+    OpenUrl(OpenUrl),
 }
 
 /// A protocol-level error reported by the daemon.
@@ -227,7 +233,7 @@ mod tests {
     fn daemon_msg_executed_round_trips_with_non_done_outcome() {
         let msg = DaemonMsg::Executed {
             query_id: 7,
-            outcome: ExecOutcome::CopyText("hello".into()),
+            outcome: ExecOutcome::CopyText(CopyText::new("hello").unwrap()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
@@ -278,12 +284,12 @@ mod tests {
         assert_eq!(json, r#""done""#);
         assert_eq!(serde_json::from_str::<ExecOutcome>(&json).unwrap(), done);
 
-        let copy = ExecOutcome::CopyText("hello".into());
+        let copy = ExecOutcome::CopyText(CopyText::new("hello").unwrap());
         let json = serde_json::to_string(&copy).unwrap();
         assert_eq!(json, r#"{"copy_text":"hello"}"#);
         assert_eq!(serde_json::from_str::<ExecOutcome>(&json).unwrap(), copy);
 
-        let open = ExecOutcome::OpenUrl("https://example.com".into());
+        let open = ExecOutcome::OpenUrl(OpenUrl::new("https://example.com").unwrap());
         let json = serde_json::to_string(&open).unwrap();
         assert_eq!(json, r#"{"open_url":"https://example.com"}"#);
         assert_eq!(serde_json::from_str::<ExecOutcome>(&json).unwrap(), open);

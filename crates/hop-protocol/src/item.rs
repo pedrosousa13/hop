@@ -27,7 +27,7 @@ pub struct ItemId(String);
 
 impl<'de> Deserialize<'de> for ItemId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        limits::id(deserializer, "ItemId", MAX_ITEM_ID, ItemId::new)
+        limits::validated(deserializer, "ItemId", MAX_ITEM_ID, ItemId::new)
     }
 }
 
@@ -72,7 +72,7 @@ pub struct ActionId(String);
 
 impl<'de> Deserialize<'de> for ActionId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        limits::id(deserializer, "ActionId", MAX_ACTION_ID, ActionId::new)
+        limits::validated(deserializer, "ActionId", MAX_ACTION_ID, ActionId::new)
     }
 }
 
