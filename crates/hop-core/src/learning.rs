@@ -512,9 +512,8 @@ fn persist_atomically(path: &Path, payload: &str) -> io::Result<()> {
 /// created — which is why that case is handled entirely inside
 /// [`create_temp_file_exclusive`] instead.
 fn write_and_rename(parent: &Path, file_name: &str, dest: &Path, payload: &[u8]) -> io::Result<()> {
-    let candidate_names =
-        (0..MAX_TEMP_FILE_ATTEMPTS).map(|attempt| temp_file_name(file_name, attempt));
-    let (temp_path, mut file) = create_temp_file_exclusive(parent, candidate_names)?;
+    let (temp_path, mut file) =
+        create_temp_file_exclusive(parent, temp_file_candidates(file_name))?;
 
     let result = (|| -> io::Result<()> {
         file.write_all(payload)?;
@@ -541,15 +540,26 @@ fn write_and_rename(parent: &Path, file_name: &str, dest: &Path, payload: &[u8])
 /// hang.
 const MAX_TEMP_FILE_ATTEMPTS: u32 = 5;
 
+/// The exact name sequence [`write_and_rename`] offers
+/// [`create_temp_file_exclusive`]: one [`temp_file_name`] per attempt, for
+/// attempts `0..MAX_TEMP_FILE_ATTEMPTS`. Named and tested on its own so that
+/// wiring — offering the documented number of attempts, each genuinely
+/// distinct from the last — is pinned directly, rather than resting on
+/// [`write_and_rename`] still doing so correctly being read off a `map`
+/// call embedded in a longer function.
+fn temp_file_candidates(file_name: &str) -> impl Iterator<Item = String> + '_ {
+    (0..MAX_TEMP_FILE_ATTEMPTS).map(move |attempt| temp_file_name(file_name, attempt))
+}
+
 /// Build the `attempt`th candidate temp-file name for `file_name`. The pid
-/// and the clock reading are carried over from the pre-#40 name purely for
-/// on-disk diagnostic value, if a leftover temp file is ever found; neither
-/// is what makes two names in the same retry sequence distinct. Nothing
-/// forces the clock to have ticked forward between two attempts
-/// nanoseconds apart, so re-reading it alone would not guarantee that —
-/// `attempt` is threaded through as an explicit, strictly-increasing
-/// component so distinctness holds by construction instead. See
-/// [`create_temp_file_exclusive`] for where that distinctness matters.
+/// and the clock reading carry only on-disk diagnostic value, if a leftover
+/// temp file is ever found; neither is what makes two names in the same
+/// retry sequence distinct. Nothing forces the clock to have ticked forward
+/// between two attempts nanoseconds apart, so re-reading it alone would not
+/// guarantee that — `attempt` is threaded through as an explicit,
+/// strictly-increasing component so distinctness holds by construction
+/// instead. See [`create_temp_file_exclusive`] for where that distinctness
+/// matters.
 fn temp_file_name(file_name: &str, attempt: u32) -> String {
     format!(
         ".{}.tmp-{}-{}-{}",
@@ -572,8 +582,8 @@ fn temp_file_name(file_name: &str, attempt: u32) -> String {
 /// name would not fix a permission error or a full disk.
 ///
 /// The retry bound lives entirely in how many names `candidate_names`
-/// yields — see [`MAX_TEMP_FILE_ATTEMPTS`] and [`temp_file_name`] for where
-/// production draws that line and what makes successive names distinct. If
+/// yields — see [`temp_file_candidates`] for where production draws that
+/// line and what makes successive names distinct. If
 /// every name collides, the last collision is returned as-is: it already
 /// accurately describes what went wrong, and synthesizing a "gave up after
 /// N attempts" error in its place would only discard that.
@@ -1125,12 +1135,8 @@ mod tests {
     // --- Temp file exclusivity (issue #40). ---
     //
     // `create_temp_file_exclusive` is `write_and_rename`'s real
-    // open-and-retry step, called directly here for the reason its own doc
-    // comment gives: production's candidate names come from the pid and the
-    // clock, which a test cannot predict closely enough to pre-plant a
-    // collision at the exact path a real save would pick. Driving the
-    // function with names the test controls keeps these tests on the real
-    // retry code while sidestepping that problem.
+    // open-and-retry step, called directly here — see its doc comment for
+    // why entering there, with test-supplied names, is what a test needs.
 
     // A pre-existing file at the first candidate name must not be written
     // through — `create_new` refuses to open it at all — and the retry must
@@ -1194,5 +1200,37 @@ mod tests {
         let err = create_temp_file_exclusive(dir.path(), names.into_iter()).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    // `temp_file_candidates` is the exact wiring `write_and_rename` uses to
+    // feed `create_temp_file_exclusive` — the two tests below pin it
+    // directly, rather than trusting the one-line `map` call at its
+    // definition to keep threading `MAX_TEMP_FILE_ATTEMPTS` and
+    // `temp_file_name` correctly. A regression that shrank the attempt count
+    // (hardcoding a single attempt, say) would not be caught by any save
+    // exercised end to end, since a save that never collides only ever
+    // needs its first candidate.
+
+    // The wiring offers exactly as many names as the documented retry
+    // bound, not more and not fewer.
+    #[test]
+    fn temp_file_candidates_offers_exactly_max_temp_file_attempts_names() {
+        let names: Vec<String> = temp_file_candidates("learning.json").collect();
+        assert_eq!(names.len(), MAX_TEMP_FILE_ATTEMPTS as usize);
+    }
+
+    // `temp_file_name`'s doc comment claims distinctness "by construction"
+    // across attempts; this is what proves that claim true for the actual
+    // sequence a save offers, rather than trusting the reasoning without a
+    // test behind it.
+    #[test]
+    fn temp_file_candidates_are_pairwise_distinct() {
+        let names: Vec<String> = temp_file_candidates("learning.json").collect();
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "every attempt must pick a different name"
+        );
     }
 }
