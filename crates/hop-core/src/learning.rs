@@ -1325,9 +1325,8 @@ mod tests {
     // Root (and some sandboxes) bypass unix permission checks entirely, in
     // which case stripping read permission below would not actually block
     // anything. Probe for that empirically with a throwaway file rather
-    // than assuming, and skip if the probe shows permissions aren't
-    // enforced here — asserting `PermissionDenied` in that environment
-    // would be asserting something the test can't actually cause.
+    // than assuming — see the first assertion below for why an unenforced
+    // probe fails the test outright instead of skipping it.
     #[cfg(unix)]
     #[test]
     fn save_surfaces_an_error_when_the_directory_sync_fails() {
@@ -1337,13 +1336,13 @@ mod tests {
         let probe = dir.path().join("probe");
         std::fs::write(&probe, b"x").unwrap();
         std::fs::set_permissions(&probe, fs::Permissions::from_mode(0o300)).unwrap();
-        if std::fs::File::open(&probe).is_ok() {
-            eprintln!(
-                "skipping save_surfaces_an_error_when_the_directory_sync_fails: \
-                 unix permission checks are not enforced in this environment"
-            );
-            return;
-        }
+        assert!(
+            std::fs::File::open(&probe).is_err(),
+            "unix permission checks are not enforced in this environment (running as \
+             root, or a sandbox that bypasses them) — this crate only supports Linux \
+             under a non-root CI user, so this probe failing is a signal about the \
+             environment, not a condition this test can quietly tolerate"
+        );
 
         let path = dir.path().join("learning.json");
         let mut l = Learning::load(&path);
