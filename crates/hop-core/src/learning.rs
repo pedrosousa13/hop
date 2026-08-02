@@ -238,8 +238,9 @@ impl Learning {
         Self::empty()
     }
 
-    /// Persist to disk via a temp file + atomic rename, mode 0600. Creates
-    /// the parent directory if it doesn't exist yet, at mode 0700 on unix —
+    /// Persist to disk via a temp file + atomic rename + directory fsync,
+    /// mode 0600. Creates the parent directory if it doesn't exist yet, at
+    /// mode 0700 on unix —
     /// but a parent that already exists is left exactly as found, whatever
     /// its mode. `persist_atomically`'s `DirBuilder` block says why that
     /// asymmetry is load-bearing.
@@ -433,12 +434,16 @@ fn serialize_and_persist<T: Serialize>(path: &Path, value: &T) -> io::Result<()>
 
 /// The filesystem half of [`Learning::save`]: create the parent directory
 /// if it is missing, write `payload` to a temp file beside the destination,
-/// rename it into place, and narrow the result to 0600 on unix.
+/// rename it into place, sync the containing directory so that rename
+/// survives a crash, and narrow the result to 0600 on unix.
 ///
 /// Layered over [`write_and_rename`], which is only the temp-file
 /// creation-through-rename half of the sequence and owns that temp file's
 /// cleanup on failure; this is the function that owns the surrounding
-/// directory and destination-permission steps.
+/// directory and destination-permission steps — the directory sync belongs
+/// here, alongside the `mkdir` above, for the same reason: both are about
+/// the directory `write_and_rename`'s temp file happens to sit in, not
+/// about that temp file itself.
 fn persist_atomically(path: &Path, payload: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         // A directory this code creates is narrowed to 0700; one that was
@@ -495,9 +500,36 @@ fn persist_atomically(path: &Path, payload: &str) -> io::Result<()> {
 
     write_and_rename(parent, file_name, path, payload.as_bytes())?;
 
+    // Sync the directory immediately after the rename it is making durable,
+    // and before the chmod below. The chmod mutates the destination file's
+    // inode, not the directory entry `fs::rename` just changed, so it has
+    // no bearing on what this sync guarantees either way — ordering it
+    // first just keeps the directory's one call next to the one operation
+    // it is about, rather than splitting them across an unrelated step.
+    #[cfg(unix)]
+    sync_parent_directory(parent)?;
+
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+/// Open the directory at `parent` and fsync it. `fs::rename` mutates the
+/// directory's entry, not the file it moves — [`write_and_rename`]'s
+/// `file.sync_all()` already makes the file's own contents durable, but
+/// leaves the rename itself resting on the filesystem's own commit
+/// interval. This closes that gap: once this returns `Ok`, the rename
+/// [`persist_atomically`] just performed is durable too.
+///
+/// unix-only, gated the same way every other unix-specific step in this
+/// module is (`DirBuilderExt`, `OpenOptionsExt`, `PermissionsExt`, the 0600
+/// chmod above): `File::open` succeeds on a directory on unix but not on
+/// Windows, where a directory cannot be opened as a file at all. The gate
+/// reflects that platform difference in how to even attempt this, not a
+/// decision that directory durability stops mattering off unix.
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
 }
 
 /// Create a temp file beside `dest` (see [`create_temp_file_exclusive`]),
@@ -1259,5 +1291,75 @@ mod tests {
                 "candidate {attempt} must carry its own attempt index as the trailing component, got {name:?}"
             );
         }
+    }
+
+    // --- Directory fsync after rename (issue #42). ---
+    //
+    // A directory fsync has no observable side effect on a successful run,
+    // so the first two tests below enter through `sync_parent_directory`
+    // directly — see its doc comment for why it is its own function. The
+    // third drives a real `save` end to end and is the stronger evidence:
+    // it shows a directory-sync failure surfacing as an `Err` from `save`
+    // rather than being swallowed.
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_directory_succeeds_on_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(sync_parent_directory(dir.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_directory_returns_err_rather_than_panicking_on_an_unopenable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(sync_parent_directory(&missing).is_err());
+    }
+
+    // A directory with no read permission cannot be opened for the fsync,
+    // which must fail the whole save rather than being ignored. This drives
+    // the real `save` path, not a re-implementation of it, so it also
+    // covers the second acceptance criterion directly.
+    //
+    // Root (and some sandboxes) bypass unix permission checks entirely, in
+    // which case stripping read permission below would not actually block
+    // anything. Probe for that empirically with a throwaway file rather
+    // than assuming — see the first assertion below for why an unenforced
+    // probe fails the test outright instead of skipping it.
+    #[cfg(unix)]
+    #[test]
+    fn save_surfaces_an_error_when_the_directory_sync_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::set_permissions(&probe, fs::Permissions::from_mode(0o300)).unwrap();
+        assert!(
+            std::fs::File::open(&probe).is_err(),
+            "unix permission checks are not enforced in this environment (running as \
+             root, or a sandbox that bypasses them) — this crate only supports Linux \
+             under a non-root CI user, so this probe failing is a signal about the \
+             environment, not a condition this test can quietly tolerate"
+        );
+
+        let path = dir.path().join("learning.json");
+        let mut l = Learning::load(&path);
+        l.record_launch("q", &ItemId("app:a".into()));
+        // One successful save first, so the directory already holds the
+        // destination file and the next save's rename is an overwrite
+        // rather than a fresh create — neither needs anything the
+        // directory's write+execute bits (kept below) don't already give.
+        l.save(&path).unwrap();
+
+        std::fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        let result = l.save(&path);
+        // Restore before any assertion can fail out of this test and skip
+        // cleanup of the tempdir.
+        std::fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = result.expect_err("a directory that cannot be opened must fail the save");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 }
