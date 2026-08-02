@@ -16,11 +16,49 @@ use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, Kind};
 
 use crate::router::{Mode, RoutedQuery};
 
+/// The [`ProviderManifest::id`] the apps provider will answer to once it
+/// exists (M2.5, issue #57). That provider isn't implemented yet, but
+/// [`AliasTarget::AppBoost`](crate::aliases::AliasTarget::AppBoost) already
+/// needs to name the namespace it targets — `Aliases::apply` tags every
+/// `AppBoost` it resolves with this id, and [`crate::rank::Boosts`] only
+/// applies that boost to an item whose own (already-verified) `provider`
+/// matches it. Defined here, ahead of the provider it names, so both sides
+/// share one constant instead of a string literal each has to remember to
+/// keep in sync. **Issue #57 must construct its `ProviderManifest` with
+/// `id: APPS_PROVIDER_ID`**; a hand-written literal that ever drifts from
+/// this constant silently stops every existing app alias from boosting
+/// anything.
+///
+/// **This constant identifies a namespace, not a specific provider, and that
+/// distinction is load-bearing.** [`crate::pipeline::CheckedItems::check`]
+/// checks each item against its own producer's manifest, but never checks
+/// that two answering providers declare *distinct* `id`s — nothing in this
+/// crate enforces manifest-id uniqueness across a query's `ProviderOutput`s.
+/// If a future provider registry ever lets two providers both declare
+/// `id: APPS_PROVIDER_ID`, both pass `CheckedItems::check` and both collect
+/// every alias boost this constant tags — the exact boost-theft failure
+/// issue #31 exists to close, just moved one level up, from "which item" to
+/// "which provider". **Rejecting a second registration under an id already
+/// in use is load-bearing for boost correctness**, not just registry
+/// hygiene, and whatever builds the M2 provider registry needs to enforce
+/// it.
+pub const APPS_PROVIDER_ID: &str = "apps";
+
 /// Static description of what a provider serves and how the (future)
 /// scheduler should treat it. Nothing here is enforced by this module —
 /// [`should_query`] is the one piece of scheduling logic that lives at M1;
 /// budget enforcement, cancellation propagation and parallel dispatch are
 /// M2 daemon work.
+///
+/// `id` and `kinds` are what
+/// [`crate::pipeline::CheckedItems::check`] holds each of this provider's
+/// items to, so a manifest is a promise the provider's own output is checked
+/// against, not just a hint to a scheduler.
+///
+/// `Clone` because [`Provider::manifest`] hands a caller its own value —
+/// implementors that keep one prepared can return a copy of it rather than
+/// rebuilding it per query.
+#[derive(Debug, Clone)]
 pub struct ProviderManifest {
     pub id: &'static str,
     pub kinds: Vec<Kind>,
@@ -104,6 +142,29 @@ pub enum ProviderError {
 /// higher-ranked bound was needed for either method to compile.
 pub trait Provider: Send + Sync {
     /// This provider's static description — see [`ProviderManifest`].
+    ///
+    /// **Stability is part of this contract: every call must return the same
+    /// manifest.** A host may call this once — at registration, before any
+    /// query has run — and treat the value as constant for the life of the
+    /// provider. Returning a stored manifest, or rebuilding one fixed value
+    /// per call, satisfies this; deriving any field from state that changes
+    /// while the provider is alive does not, whatever the intent.
+    ///
+    /// Nothing in this crate enforces that, and it is
+    /// [`crate::pipeline::CheckedItems::check`] that an implementation
+    /// breaking it defeats.
+    /// [`ProviderOutput::from_provider`](crate::pipeline::ProviderOutput::from_provider)
+    /// reads the manifest *after* [`Provider::query`] has returned, so a
+    /// provider answering differently on two calls gets to choose what it is
+    /// checked against once it has seen what it wants to return. Concretely,
+    /// this is issue #31's exclusive-mode bypass rebuilt from honest-looking
+    /// parts: declare `kinds: [Calculator]` at registration, before the host
+    /// captures it as constant, return `Kind::Window` items from `query`, then
+    /// answer `kinds: [Window]` when the check asks. Each answer is
+    /// self-consistent in isolation, the kind check passes, and the Window
+    /// items go on to survive a `w `-exclusive filter and inherit Window's
+    /// ranking weight — which is the whole of what that check exists to
+    /// prevent.
     fn manifest(&self) -> ProviderManifest;
 
     /// Answers a routed query with the items this provider can find.
@@ -145,6 +206,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::pipeline::{CheckedItems, ProviderOutput};
     use crate::router::route;
 
     fn manifest(modes: Vec<Mode>, min_term_len: usize) -> ProviderManifest {
@@ -203,11 +265,23 @@ mod tests {
     /// with the native async-in-trait syntax and runnable on a real
     /// executor — a trait nobody has implemented is a trait that might not
     /// compile for implementors.
+    ///
+    /// It is also the tree's one worked example of a well-behaved provider,
+    /// so its manifest `id` and the `provider` string on the items its
+    /// `query` returns must agree, and every item's kind must be one the
+    /// manifest declares. Those are exactly the two things
+    /// [`crate::pipeline::CheckedItems::check`] holds a provider to; an
+    /// example that failed its own checks would be a template for getting
+    /// this wrong. Pinned by
+    /// [`tests::a_providers_own_output_passes_its_own_manifests_checks`].
     struct FakeProvider;
 
     impl Provider for FakeProvider {
         fn manifest(&self) -> ProviderManifest {
-            manifest(vec![Mode::All], 0)
+            ProviderManifest {
+                id: "fake",
+                ..manifest(vec![Mode::All], 0)
+            }
         }
 
         async fn query(&self, q: &RoutedQuery, ctx: &QueryCtx) -> Result<Vec<Item>, ProviderError> {
@@ -254,6 +328,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, ExecOutcome::Done);
+    }
+
+    /// The provider seam end to end, and the only test that exercises the
+    /// association [`crate::pipeline::ProviderOutput`] carries with items a
+    /// [`Provider`] really returned: dispatch a provider, pair what it
+    /// answered with itself, and both manifest checks pass.
+    ///
+    /// This is what makes the association *right* rather than merely present.
+    /// `ProviderOutput::from_provider` reads the manifest off the object it
+    /// is handed, so this fails the moment `FakeProvider::query` returns an
+    /// item whose `provider` string or kind disagrees with what
+    /// `FakeProvider::manifest` declares — which is precisely the mistake a
+    /// real provider is most likely to make.
+    #[tokio::test]
+    async fn a_providers_own_output_passes_its_own_manifests_checks() {
+        let provider = FakeProvider;
+        let ctx = QueryCtx {
+            cancel: CancellationFlag::default(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let items = provider.query(&route("firefox"), &ctx).await.unwrap();
+        assert_eq!(items.len(), 1, "the fixture must actually produce an item");
+
+        let checked = CheckedItems::check(vec![ProviderOutput::from_provider(&provider, items)]);
+        assert_eq!(
+            checked.rejections(),
+            &[],
+            "a provider's own honest output must survive its own manifest"
+        );
+        assert_eq!(checked.items().len(), 1);
     }
 
     #[tokio::test]

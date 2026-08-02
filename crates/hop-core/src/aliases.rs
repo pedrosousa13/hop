@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use hop_protocol::ItemId;
 use serde_json::Value;
 
+use crate::provider::APPS_PROVIDER_ID;
+
 /// The boost [`Aliases::apply`] contributes for each matching `AppBoost`
 /// record. Must sit strictly above [`crate::learning::LEARNING_BOOST_CAP`]
 /// (85.0) — an explicit alias is a direct user instruction and must always
@@ -71,10 +73,22 @@ pub struct AliasEffect {
     /// passed to [`Aliases::apply`], byte-for-byte, unless a `Rewrite`
     /// alias matched.
     pub effective_term: String,
-    /// Additional per-item score contributions, keyed by [`ItemId`]. Empty
-    /// when no alias matched, or when only a `WindowBoost` matched (see
-    /// [`Aliases::apply`]).
-    pub boosts: HashMap<ItemId, f32>,
+    /// Additional per-item score contributions, keyed by `(provider,
+    /// ItemId)` rather than a bare [`ItemId`]. Empty when no alias matched,
+    /// or when only a `WindowBoost` matched (see [`Aliases::apply`]).
+    ///
+    /// The provider half of the key is [`APPS_PROVIDER_ID`] for every entry
+    /// here today — `AppBoost` is the only [`AliasTarget`] variant `apply`
+    /// resolves into a boost, and it always means "the apps provider's item
+    /// for this app id" (see [`AliasTarget::AppBoost`]'s doc comment). A
+    /// bare `ItemId` key would let an item from a *different*, honestly
+    /// self-declared provider collect this boost merely by sharing the id
+    /// string — an id-namespace collision the maintainer's issue #31 scope
+    /// decision calls out explicitly, distinct from (and not caught by) the
+    /// impersonation [`crate::pipeline::CheckedItems::check`] already rejects.
+    /// Consumed by [`crate::rank::Boosts::by_provider_item`], which
+    /// applies each entry only to the item whose own producer matches.
+    pub boosts: HashMap<(String, ItemId), f32>,
 }
 
 /// Trim, then lowercase — the normalization `parseAliasRecord` and
@@ -197,7 +211,10 @@ impl Aliases {
     ///    not the normalized lookup key — original case and surrounding
     ///    whitespace intact. This is what the ranker receives.
     /// 4. Every matching [`AliasTarget::AppBoost`] adds [`ALIAS_BOOST`] to
-    ///    item id `app:<appId>`; two records boosting the same id sum.
+    ///    item id `app:<appId>`, tagged with [`APPS_PROVIDER_ID`] — that
+    ///    provider's item for this app id, not any item that happens to
+    ///    share the id string; see the doc comment on [`AliasEffect::boosts`].
+    ///    Two records boosting the same id sum.
     ///
     /// ### Window aliases are not resolved here
     ///
@@ -213,7 +230,7 @@ impl Aliases {
     /// [`tests::window_alias_matches_but_apply_emits_no_boost_by_design`].
     pub fn apply(&self, term: &str) -> AliasEffect {
         let key = normalize_token(term);
-        let mut boosts: HashMap<ItemId, f32> = HashMap::new();
+        let mut boosts: HashMap<(String, ItemId), f32> = HashMap::new();
 
         let Some(targets) = self.by_key.get(&key) else {
             return AliasEffect {
@@ -231,7 +248,9 @@ impl Aliases {
         for target in targets {
             if let AliasTarget::AppBoost(app_id) = target {
                 let id = ItemId(format!("app:{app_id}"));
-                *boosts.entry(id).or_insert(0.0) += ALIAS_BOOST;
+                *boosts
+                    .entry((APPS_PROVIDER_ID.to_string(), id))
+                    .or_insert(0.0) += ALIAS_BOOST;
             }
             // AliasTarget::WindowBoost: deliberately not resolved here —
             // see the doc comment above.
@@ -299,12 +318,50 @@ mod tests {
         let effect = aliases.apply("term");
         assert_eq!(effect.effective_term, "term");
         assert_eq!(
-            effect
-                .boosts
-                .get(&ItemId("app:org.gnome.Terminal.desktop".into())),
+            effect.boosts.get(&(
+                APPS_PROVIDER_ID.to_string(),
+                ItemId("app:org.gnome.Terminal.desktop".into())
+            )),
             Some(&ALIAS_BOOST)
         );
         assert_eq!(effect.boosts.len(), 1);
+    }
+
+    // Pins the provider dimension itself: the key an `AppBoost` registers
+    // under is *tagged* with `APPS_PROVIDER_ID`, not a bare `ItemId`. An
+    // item sharing the same id but produced by a different, honestly
+    // self-declared provider must not satisfy this key — see
+    // `crate::rank::Boosts` and
+    // `pipeline::tests::alias_boost_does_not_land_on_an_identically_id_item_from_a_different_provider`
+    // for why that distinction is the whole point of this issue's boost
+    // half.
+    #[test]
+    fn app_alias_boost_is_tagged_with_the_apps_provider_not_a_bare_item_id() {
+        let aliases =
+            Aliases::from_json(r#"[{"alias":"term","type":"app","target":{"appId":"terminal"}}]"#)
+                .unwrap();
+        let effect = aliases.apply("term");
+        // The positive half: the boost really is there, under the tag this
+        // test is named for.
+        assert_eq!(
+            effect
+                .boosts
+                .get(&(APPS_PROVIDER_ID.to_string(), ItemId("app:terminal".into()))),
+            Some(&ALIAS_BOOST),
+            "the boost must be present, tagged with the apps provider"
+        );
+        // The negative half: it is *not* also reachable under some other
+        // provider's tag — an implementation that emitted no boost at all
+        // would satisfy this assertion alone without earning the test name,
+        // which is why both halves must live here together.
+        assert_eq!(
+            effect
+                .boosts
+                .get(&("not-apps".to_string(), ItemId("app:terminal".into()))),
+            None,
+            "the boost must be keyed to the apps provider specifically, not \
+             to any provider that happens to answer with this id"
+        );
     }
 
     // Cannot port "buildAliasContext boosts only matching open window
@@ -393,7 +450,10 @@ mod tests {
              case and whitespace, not the normalized \"gh\""
         );
         assert_eq!(
-            effect.boosts.get(&ItemId("app:org.example.Github".into())),
+            effect.boosts.get(&(
+                APPS_PROVIDER_ID.to_string(),
+                ItemId("app:org.example.Github".into())
+            )),
             Some(&ALIAS_BOOST)
         );
     }
@@ -416,10 +476,10 @@ mod tests {
 
         assert_eq!(aliases.apply("good1").effective_term, "one");
         assert_eq!(
-            aliases
-                .apply("good2")
-                .boosts
-                .get(&ItemId("app:org.example.App".into())),
+            aliases.apply("good2").boosts.get(&(
+                APPS_PROVIDER_ID.to_string(),
+                ItemId("app:org.example.App".into())
+            )),
             Some(&ALIAS_BOOST)
         );
 
@@ -455,7 +515,10 @@ mod tests {
         let aliases = Aliases::from_json(json).unwrap();
         let effect = aliases.apply("gh");
         assert_eq!(
-            effect.boosts.get(&ItemId("app:org.example.App".into())),
+            effect.boosts.get(&(
+                APPS_PROVIDER_ID.to_string(),
+                ItemId("app:org.example.App".into())
+            )),
             Some(&(2.0 * ALIAS_BOOST))
         );
     }
@@ -470,7 +533,10 @@ mod tests {
         let effect = aliases.apply("gh");
         assert_eq!(effect.effective_term, "github");
         assert_eq!(
-            effect.boosts.get(&ItemId("app:org.example.App".into())),
+            effect.boosts.get(&(
+                APPS_PROVIDER_ID.to_string(),
+                ItemId("app:org.example.App".into())
+            )),
             Some(&ALIAS_BOOST)
         );
     }

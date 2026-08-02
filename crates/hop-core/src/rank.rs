@@ -138,11 +138,60 @@ impl Default for Weights {
     }
 }
 
-/// Learned/aliased per-item score bumps, keyed by [`ItemId`]. Empty by
-/// default — where boosts come from (aliases in M1.6, learning in M1.5) is
-/// out of scope for this slice.
+/// Learned/aliased per-item score bumps. Empty by default. Two dimensions,
+/// summed at lookup time in `Ranker::rank_matching`:
+///
+/// - `by_provider_item`: an **alias** boost, keyed by `(provider, ItemId)`
+///   and applied only to the item whose own [`Item::provider`] equals that
+///   key's provider. A bare `ItemId` key cannot express this: two items can
+///   legitimately share an id while coming from two different, individually
+///   honest providers — an id-namespace collision, not the impersonation
+///   [`crate::pipeline::CheckedItems::check`] catches — and only one of them
+///   is who the alias actually means. See
+///   `tests::provider_scoped_boost_only_applies_to_the_matching_producer`.
+///
+///   **This is a documented boundary, not an enforced one, and it holds only
+///   for one calling path.** `Item::provider` is self-asserted; matching
+///   against it here is safe *only* when every item reaching this lookup
+///   already passed [`crate::pipeline::CheckedItems::check`], which verifies
+///   `item.provider` against the actual producer's own manifest before the
+///   item can become part of a [`crate::pipeline::CheckedItems`]. That is
+///   true for items reaching this struct through
+///   [`crate::pipeline::Pipeline::assemble`] — the *only* path this
+///   guarantee covers — and true for nothing else. [`Ranker::rank`] itself is
+///   `pub`, takes a bare `Vec<Item>` with no such check, and
+///   [`crate::pipeline::Pipeline::ranker`] is a public field: nothing stops
+///   a caller from building a `Boosts` and calling
+///   `pipeline.ranker.rank(raw_items, …, &boosts)` directly on items no
+///   manifest ever vouched for, at which point `item.provider` is exactly as
+///   trustworthy as it was before issue #31 — i.e. not at all — and boost
+///   theft is back in full. If a future caller adds a second ranking path
+///   (a preview pane, a re-rank, a benchmark harness) that skips
+///   `CheckedItems`, it inherits that hole; this comment is the only thing
+///   telling it so.
+/// - `by_item_id`: a **learning** boost, applied to any item bearing this id
+///   regardless of which provider produced it — the sum of
+///   `Learning::frequency_boost` (backed by the persisted `global_frequency`
+///   map) and `Learning::query_boost` (backed by the in-memory, per-query
+///   `selections` map), both keyed on the bare id string.
+///   DECISION: kept unscoped, deliberately. The persisted learning store's
+///   id namespace is out of scope for this change — adding a provider
+///   dimension to `global_frequency` is a persisted-format migration on the
+///   same load path issues #37/#38 already target, not an in-memory rekey;
+///   `selections` is deferred alongside it rather than resolved on its own.
+///   Filed as issue #72; see the comment at the call site in
+///   `Pipeline::assemble` where this field is populated.
+///
+/// One further boundary neither dimension closes: `CheckedItems::check`
+/// never requires that two answering providers declare *distinct*
+/// `manifest.id`s. `by_provider_item`'s guarantee is really "the item came
+/// from whichever provider declared this id", not "the item came from *the*
+/// provider everyone means by that id" — see [`crate::provider::APPS_PROVIDER_ID`]'s
+/// doc comment for what that costs if a provider registry ever allows two
+/// providers to share an id.
 #[derive(Default)]
 pub struct Boosts {
+    pub by_provider_item: HashMap<(String, ItemId), f32>,
     pub by_item_id: HashMap<ItemId, f32>,
 }
 
@@ -210,7 +259,10 @@ impl Ranker {
     ///   them after the ranked block instead of ranking them here.
     /// - Results are deduped after sorting, keeping the first (best-
     ///   scoring) occurrence: apps key on title alone; every other kind
-    ///   keys on kind, id and title together.
+    ///   keys on kind, id and title together. This split is deliberate and
+    ///   security-relevant, not an oversight — see the doc comment on
+    ///   `dedupe` for why apps drop id from the key, what that costs, and
+    ///   what `CheckedItems::check` does and does not contain about it.
     /// - No result cap — callers that need one (the pipeline, in a later
     ///   slice) apply it themselves.
     pub fn rank(
@@ -262,7 +314,30 @@ impl Ranker {
                 };
 
                 let weight = kind_weight(weights, &item.kind);
-                let boost = boosts.by_item_id.get(&item.id).copied().unwrap_or(0.0);
+                // `by_provider_item` is empty on virtually every keystroke —
+                // `Aliases::apply` only ever populates it when the routed
+                // term matches an alias key exactly. `HashMap::get` already
+                // short-circuits on an empty map before hashing, but
+                // building the lookup key clones two `String`s
+                // (`item.provider` and the `ItemId`'s inner `String`), and
+                // that allocation happens unconditionally as soon as the key
+                // expression is evaluated — before `get` ever runs. Guarding
+                // on `is_empty()` skips constructing the key at all on the
+                // overwhelmingly common empty-map path, which is the only
+                // per-item allocation this loop would otherwise do for an
+                // empty query term (the `Matching::Everything` arm above
+                // does no `haystack_of` allocation).
+                let provider_boost = if boosts.by_provider_item.is_empty() {
+                    0.0
+                } else {
+                    boosts
+                        .by_provider_item
+                        .get(&(item.provider.clone(), item.id.clone()))
+                        .copied()
+                        .unwrap_or(0.0)
+                };
+                let learning_boost = boosts.by_item_id.get(&item.id).copied().unwrap_or(0.0);
+                let boost = provider_boost + learning_boost;
                 Some(Ranked {
                     score: fuzzy + weight + boost,
                     item,
@@ -369,6 +444,62 @@ fn haystack_of(item: &Item) -> String {
 /// scoring) occurrence of each key. Apps key on title alone; every other
 /// kind keys on kind, id and title together (the issue's wording, not the
 /// JS's — the JS also folded `secondaryText` into the key, this doesn't).
+///
+/// DECISION: apps drop id from the key and everyone else keeps it, because a
+/// title collision means opposite things in the two cases. Two `Window`s (or
+/// `File`s, `Action`s, ...) that happen to share a title are almost always
+/// genuinely different things a user might want to pick between — two
+/// windows both called "Terminal" in two workspaces are two windows, not one
+/// duplicated — so their distinct ids keep both in the result (see
+/// `tests::non_app_kinds_with_same_title_and_different_ids_both_survive_dedupe`).
+/// An app, by contrast, is identified for the user by its title, not by
+/// whichever id its provider's index happened to assign it; nothing stops
+/// two different ids from naming the same real application as far as the
+/// user can see, and title is what the user identifies an app by (see
+/// `tests::duplicate_apps_deduped_by_title`, which merges two `App` items
+/// with different ids and an identical title on exactly that basis).
+/// Dropping id from the app key is what makes that merge happen.
+///
+/// The cost: dedupe runs on an already best-first-sorted list and keeps only
+/// the first match per key, so *any* two `App` items that share a title
+/// collapse into whichever one sorted first — not just the honest
+/// duplicates above. A higher-scoring item, for any reason, evicts a
+/// lower-scoring, genuinely different `App` outright: not ranked below it,
+/// not flagged, simply absent from the result with nothing left to show it
+/// was ever there. This is issue #31's "eviction" abuse: a forged item
+/// claiming `kind: App` and the real Firefox's title, boosted past the
+/// genuine item's score by stolen boosts, used to delete the genuine
+/// Firefox from the list this way.
+///
+/// [`crate::pipeline::CheckedItems::check`] narrows who can cause that; it
+/// does not close it. An item reaching this function via
+/// [`crate::pipeline::Pipeline::assemble`] is now guaranteed to be a
+/// genuinely-declared `App` — its kind checked against its own producer's
+/// manifest `kinds`, and its `provider` string checked against that
+/// manifest's `id` — before it can evict anything (see
+/// `tests::a_rejected_item_cannot_evict_a_genuine_item_through_dedupe` in
+/// `pipeline.rs`). What that guarantee honestly does *not* cover: two
+/// genuinely-declared `App` items from the same honest provider that happen
+/// to share a title still collapse to one — that is this rule working as
+/// intended, not a residual hole — and two genuinely-declared `App` items
+/// sharing a title from two *different* honest providers collapse the same
+/// way, with no requirement that the survivor be the genuine one: equal
+/// scores tie-break to input order. That residual is not intended behaviour;
+/// closing it means changing the dedupe rule, which #31 puts out of scope.
+/// The guarantee also only holds on the `Pipeline::assemble` path.
+/// `Ranker::rank` is `pub`, takes a bare `Vec<Item>`, and nothing stops a
+/// caller from invoking it directly on items no manifest ever checked; on
+/// that path this function dedupes exactly as trustingly as it did before
+/// issue #31.
+///
+/// DECISION: this rule — apps by title alone, everything else by kind, id
+/// and title — is deliberate and pinned by
+/// `tests::duplicate_apps_deduped_by_title` and
+/// `tests::non_app_kinds_with_same_title_and_different_ids_both_survive_dedupe`.
+/// Changing it (folding id into the app key, say, to close the eviction gap
+/// outright) is a separate decision with its own cost — it would stop
+/// merging the honest duplicate-id case above — and is out of issue #31's
+/// scope. Do not "fix" it here in passing.
 fn dedupe(ranked: Vec<Ranked>) -> Vec<Ranked> {
     let mut seen = HashSet::new();
     ranked
@@ -394,6 +525,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::aliases::ALIAS_BOOST;
+    use crate::provider::APPS_PROVIDER_ID;
     use crate::router::route;
     use hop_protocol::{Action, ActionId, ActionKind};
 
@@ -874,6 +1007,43 @@ mod tests {
             .insert(ItemId("app:scattered".into()), 40.0);
         let boosted = ranker.rank(build_items(), &query, &Weights::default(), &boosts);
         assert_eq!(boosted[0].item.id, ItemId("app:scattered".into()));
+    }
+
+    /// Issue #31's boost-theft gap, closed for aliases: two items can
+    /// legitimately share an [`ItemId`] while being produced by two
+    /// different, individually honest providers — an id-namespace
+    /// collision, not the impersonation `CheckedItems::check` already
+    /// catches (each item's `provider` field agrees with its own producer).
+    /// A boost meant for one provider's item must not land on the other's
+    /// just because the id string matches.
+    #[test]
+    fn provider_scoped_boost_only_applies_to_the_matching_producer() {
+        let query = route("firefox");
+        let items = vec![
+            Item {
+                provider: APPS_PROVIDER_ID.into(),
+                ..item(Kind::App, "app:firefox", "Firefox", None)
+            },
+            Item {
+                provider: "evil".into(),
+                ..item(Kind::Window, "app:firefox", "Firefox", None)
+            },
+        ];
+        // Weight alone puts Window (30) ahead of App (20) on this tie; the
+        // boost is keyed to the apps provider specifically and must flip that
+        // only for the item that provider actually produced.
+        let mut boosts = Boosts::default();
+        boosts.by_provider_item.insert(
+            (APPS_PROVIDER_ID.to_string(), ItemId("app:firefox".into())),
+            ALIAS_BOOST,
+        );
+        let mut ranker = Ranker::new();
+        let ranked = ranker.rank(items, &query, &Weights::default(), &boosts);
+        assert_eq!(
+            ranked[0].item.provider, APPS_PROVIDER_ID,
+            "the boost keyed to the apps provider must not lift the \
+             identically-id'd item the \"evil\" provider produced"
+        );
     }
 
     #[test]

@@ -104,6 +104,16 @@ a query, decayed by how long ago. Not "history", not "MRU".
 
 ## Result assembly
 
+**Checked items** — provider output that has been checked against the
+manifest of the provider that actually produced it: every item's kind is one
+its producer declared, and every item's provider string is its producer's
+manifest id. Assembly accepts nothing else, so an item's self-description is
+never taken on trust.
+
+**Rejection** — one item assembly refused, and which of the two checks it
+failed. Returned as data alongside the assembled items, never logged — there
+is no logging seam yet, and the query path may not have side effects.
+
 **Ranked body** — the scored, ordered items.
 
 **Pinned tail** — items flagged `append_to_end`, which always follow the ranked
