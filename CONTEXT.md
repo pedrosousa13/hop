@@ -158,8 +158,10 @@ normalization, or a silent fix.
 
 ## Redaction
 
-**Redaction** — printing a marker and a value's byte length in place of the
-value. It applies to *formatting*, not to transport: a redacted value is still
+**Redaction** — printing a marker in place of the value, optionally with a
+bounded fact about it such as its byte length. What that fact costs is priced
+on the type that discloses it, never assumed to be free.
+It applies to *formatting*, not to transport: a redacted value is still
 serialized and sent whole. A bound restricts how long a value may be, a content
 rule what it may contain, and a redaction what formatting it discloses; the
 three live in `hop-protocol`'s `limits`, `content` and `redaction` modules.

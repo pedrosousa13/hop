@@ -68,9 +68,39 @@ use crate::limits::{self, BoundError, MAX_QUERY_TEXT, check_len};
 ///
 /// Length is what survives, and it survives on purpose: "the client sent an
 /// empty query" and "the client sent 800 bytes" are answerable from a redacted
-/// frame, and neither answer needs the characters. It is still something about
-/// the value — a redacted frame says how much was typed — and that is the trade
-/// this type makes rather than printing a bare marker.
+/// frame, and neither answer needs the characters.
+///
+/// # What reporting the length costs
+///
+/// It is a disclosure, and for this field it is worth pricing rather than
+/// filing under "something about the value".
+///
+/// A launcher that searches as the user types sends a `query` frame per
+/// keystroke. So typing a secret into the overlay produces a run of frames
+/// whose byte counts climb toward N a character at a time, and pasting the same
+/// secret produces one frame that goes straight to N. A log of redacted frames
+/// tells those two apart, and in the paste case it records the pasted value's
+/// exact length on a single line. A known length narrows the search space for a
+/// credential. That is what reaches the journal here, and it is not nothing.
+///
+/// Bucketing is the alternative, and it was considered: report `empty` against
+/// `non-empty`, or round the count to an order of magnitude. It keeps both
+/// diagnostics above and drops the exact figure. It is rejected here, for three
+/// reasons worth writing down so the next reader sees a decision:
+///
+/// - A count in bytes is the figure that can be read against
+///   [`MAX_QUERY_TEXT`], which is a byte count too, and a refusal of an
+///   over-long value already prints that value's exact byte count beside the
+///   bound — so bucketing would leave the two ways of learning about a query's
+///   size disagreeing on units.
+/// - Bucketing does not buy back the paste-versus-typing distinction. That
+///   shape is in the *number* of frames, not in their lengths: N keystrokes
+///   are N frames and a paste is one, whatever each frame reports.
+/// - What this type exists to close is the text.
+///
+/// That reasoning is about this field. A field whose length is itself the
+/// sensitive part is a different trade, and none of the above argues against
+/// bucketing there.
 ///
 /// # No `Display`
 ///
@@ -87,8 +117,8 @@ use crate::limits::{self, BoundError, MAX_QUERY_TEXT, check_len};
 /// [`QueryText::into_string`], which is a visible act at the call site rather
 /// than a formatting default. Pinned by the test
 /// `tests::query_text_does_not_implement_display`, which asserts in a `const`
-/// block, so adding the impl fails the build rather than silently reopening the
-/// path.
+/// block, so adding the impl fails the crate's test build rather than silently
+/// reopening the path.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct QueryText(String);

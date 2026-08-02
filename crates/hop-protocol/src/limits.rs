@@ -463,10 +463,10 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
 // than generated so that `grep`ping a constant finds every field it governs,
 // and so that each error names the field it came from.
 //
-// Not every bounded field is here. A field whose type is a newtype over a
-// private string carries its bound in that type's own `Deserialize`, through
-// `validated` above, so that the bound and whatever else the type promises are
-// one gate rather than two: `MAX_ITEM_ID` and `MAX_ACTION_ID` are applied by
+// Not every bounded field is here. A field whose type is a validating newtype
+// carries its bound in that type's own `Deserialize`, through `validated`
+// above, so that the bound and whatever else the type promises are one gate
+// rather than two: `MAX_ITEM_ID` and `MAX_ACTION_ID` are applied by
 // `crate::item`, `MAX_OPEN_URL` and the outcome half of `MAX_COPY_TEXT` by
 // `crate::content`, and `MAX_QUERY_TEXT` by `crate::redaction`. Grepping a
 // constant still finds every field it governs; it just finds some of them in
