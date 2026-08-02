@@ -58,6 +58,16 @@ pub enum AliasTarget {
     /// Boost windows matching an app id and/or a substring of their title.
     /// Faithfully parsed and stored, but never resolved by
     /// [`Aliases::apply`] — see that method's doc comment.
+    ///
+    /// **Neither field is bounded**, unlike [`AliasTarget::AppBoost`]'s id.
+    /// They are raw config strings that no id is built from today, precisely
+    /// because `apply` cannot resolve this variant into an item id at all.
+    /// Whoever closes that gap — resolving window aliases against a live
+    /// candidate list — synthesizes an [`ItemId`] here for the first time, and
+    /// inherits the same problem `AppBoost` solved: the id has to be built and
+    /// checked at load, in [`Aliases::from_json`], or `apply` stops being
+    /// infallible. Stated on the type because it is a property of the type,
+    /// not of the work that will use it.
     WindowBoost {
         app_id: Option<String>,
         title_contains: Option<String>,
@@ -80,7 +90,13 @@ pub struct Aliases {
 /// from the malformed *entries* [`Aliases::from_json`] skips one by one: a
 /// skipped entry is one the JS skipped too, whereas each of these is a config
 /// the user meant and that cannot be honoured.
+///
+/// `#[non_exhaustive]` because the list is not finished: [`AliasTarget`]'s
+/// window ids are still unbounded, and bounding them adds a variant here. There
+/// are no consumers outside this crate yet, so paying for that now costs
+/// nothing and makes the next variant a non-breaking addition.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AliasError {
     /// The config was not valid JSON at all. Carries the underlying parse
     /// message.
@@ -89,11 +105,17 @@ pub enum AliasError {
     /// An `app` alias names an app id whose synthesized item id
     /// (`app:<appId>`) breaks [`hop_protocol::MAX_ITEM_ID`].
     ///
-    /// Names the alias, because the app id is by definition thousands of bytes
-    /// long and the alias key is what the user has to go and edit.
-    #[error("alias {alias:?} names an app whose item id is unusable: {source}")]
+    /// Names the alias **as the user wrote it** — not the normalized lookup
+    /// key — because the app id is by definition thousands of bytes long, so
+    /// the alias is what the user has to search their config for, and
+    /// `"Slack"` is not findable by searching for `"slack"`.
+    ///
+    /// The bound itself is carried as a `#[source]` rather than interpolated
+    /// into the message: reporters that walk the chain (`{:#}` under `anyhow`,
+    /// say) would otherwise print it twice.
+    #[error("alias {alias:?} names an app whose item id is over the id bound")]
     AppItemIdTooLong {
-        /// The alias key the offending record was registered under.
+        /// The offending record's alias, exactly as it appears in the config.
         alias: String,
         /// The bound that was broken.
         #[source]
@@ -162,9 +184,14 @@ fn parse_record(value: &Value) -> Result<Option<(String, AliasTarget)>, AliasErr
         return Ok(None);
     };
 
-    let Some(alias) = str_field(obj, "alias").map(normalize_token) else {
+    // Both spellings are kept: `alias` is the normalized lookup key, and
+    // `raw_alias` is what the user actually typed, which is the only version
+    // that can be found by searching their config file. Only the error below
+    // uses the raw one.
+    let Some(raw_alias) = str_field(obj, "alias") else {
         return Ok(None);
     };
+    let alias = normalize_token(raw_alias);
     if alias.is_empty() || alias.chars().any(char::is_whitespace) {
         return Ok(None);
     }
@@ -199,7 +226,7 @@ fn parse_record(value: &Value) -> Result<Option<(String, AliasTarget)>, AliasErr
             // cannot fail — see `AliasTarget::AppBoost`'s doc comment.
             let item_id = ItemId::new(format!("app:{app_id}")).map_err(|source| {
                 AliasError::AppItemIdTooLong {
-                    alias: alias.clone(),
+                    alias: raw_alias.to_string(),
                     source,
                 }
             })?;
@@ -627,18 +654,44 @@ mod tests {
     // at query time where the only options would be a panic or a boost that
     // silently never fires.
 
+    // The alias is spelled `"Slack"` here, with a capital, because the error
+    // has to quote it the way the user wrote it. Lookup keys are normalized,
+    // so an error built from the key would say `"slack"` — which is not what
+    // is in the file, and not what a search of the file will find.
     #[test]
     fn an_app_alias_whose_item_id_would_exceed_the_bound_is_rejected_at_load() {
         // `app:` + this is one byte over MAX_ITEM_ID.
         let app_id = "a".repeat(MAX_ITEM_ID - "app:".len() + 1);
-        let json =
-            format!(r#"[{{"alias":"toolong","type":"app","target":{{"appId":"{app_id}"}}}}]"#);
+        let json = format!(r#"[{{"alias":"Slack","type":"app","target":{{"appId":"{app_id}"}}}}]"#);
 
         let err = Aliases::from_json(&json)
             .expect_err("an app id whose item id breaks the bound must fail the load");
         assert!(
-            err.to_string().contains("toolong"),
-            "the error must name the offending alias so the user can find it, got: {err}"
+            err.to_string().contains("\"Slack\""),
+            "the error must name the alias as written, so the user can find it \
+             in their config, got: {err}"
+        );
+    }
+
+    // The bound's own message is carried as a `#[source]` and not interpolated
+    // into this error's `Display`, so a reporter that walks the chain prints it
+    // once rather than twice. Both halves are asserted: the message does not
+    // restate it, and the chain really does carry it.
+    #[test]
+    fn the_load_error_carries_the_bound_as_a_source_not_in_its_own_message() {
+        let app_id = "a".repeat(MAX_ITEM_ID);
+        let json = format!(r#"[{{"alias":"big","type":"app","target":{{"appId":"{app_id}"}}}}]"#);
+
+        let err = Aliases::from_json(&json).unwrap_err();
+        assert!(
+            !err.to_string().contains("maximum"),
+            "the message must not restate what the source already says, got: {err}"
+        );
+        let source = std::error::Error::source(&err)
+            .expect("the broken bound must be reachable as a source");
+        assert!(
+            source.to_string().contains("over its maximum of"),
+            "got: {source}"
         );
     }
 
