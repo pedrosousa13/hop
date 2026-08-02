@@ -974,8 +974,7 @@ mod tests {
 
         let per_frame = per_item * MAX_ITEMS_PER_RESULTS_FRAME;
         assert_eq!(
-            per_frame / 1_000_000,
-            84,
+            per_frame, 84_416_000,
             "the ~84 MB per-frame figure in this module's budget table no longer holds"
         );
     }

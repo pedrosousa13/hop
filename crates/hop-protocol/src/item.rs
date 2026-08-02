@@ -177,8 +177,9 @@ pub struct IconSpec {
 /// explicit `default` to put that fallback back — see [`IconSpec`] for why the
 /// pairing is load-bearing. `icon` carries neither attribute, so it still has
 /// that implicit fallback, which is precisely the mechanism the other two are
-/// restoring. It is also the one field here with no "Bounded at…" line, because
-/// it holds no bytes of its own: its two strings are bounded on [`IconSpec`].
+/// restoring. Of the three, `icon` is the one with no "Bounded at…" line,
+/// because it holds no bytes of its own: its two strings are bounded on
+/// [`IconSpec`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub id: ItemId,
