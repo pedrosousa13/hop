@@ -12,10 +12,10 @@ use crate::redaction::QueryText;
 /// Every variable-length field is bounded at the deserialization boundary; the
 /// bounds and their reasoning live in [`limits`].
 ///
-/// This enum derives `Debug`, and one of its fields holds text the user typed.
-/// That field is a [`QueryText`], whose `Debug` prints a marker and a byte
-/// count in place of the text, so formatting a frame does not reproduce the
-/// keystrokes — see [`redaction`](crate::redaction).
+/// This enum derives `Debug`, and one of its variants holds text the user
+/// typed. That field is a [`QueryText`], whose `Debug` prints a marker and a
+/// byte count in place of the text, so formatting a frame does not reproduce
+/// the keystrokes — see [`redaction`](crate::redaction).
 ///
 /// # The tag buffers before these bounds apply
 ///

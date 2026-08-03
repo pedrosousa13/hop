@@ -184,8 +184,10 @@ outside the repo.
 **`# What ... costs`** — the doc-heading form under which a type prices a
 decision: what is given up, and the alternative that was rejected instead.
 Only `# What` and `costs` are fixed, so the audit is
-`grep -rnE '# What .* costs'` rather than a grep for one literal string — and it
-is the heading that is greppable, not the wording between. A redaction that
+`grep -rnE '^\s*/// # What .* costs'` rather than a grep for one literal string
+— and it is the heading that is greppable, not the wording between. The anchor
+is what keeps the output to the headings themselves: without it the pattern also
+returns this file's own mentions of the form. A redaction that
 discloses a fact about the value **must** carry one, so that every priced
 disclosure is one grep away; anything else that gives something up **may**.
 `QueryText`'s `# What reporting the length costs` is the worked example, and
