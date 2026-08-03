@@ -102,6 +102,18 @@ asserted by referencing them rather than repeating their values.
 **Frecency** — the learning engine's model: how often an item was launched for
 a query, decayed by how long ago. Not "history", not "MRU".
 
+**Load report** — what one load of the learning store noticed: that it loaded,
+or which single fallback it took instead — absent, not a regular file,
+unreadable, over the byte ceiling, malformed, or on a store version this code
+does not write. One variant per condition, never two conditions sharing one.
+Returned as data beside the store by `Learning::load_reporting`, never logged —
+what a caller does with one is not decided yet; `Learning::load` is the same
+call with the report dropped, and still degrades to an empty store. A report
+names what the load *detected*, so a store forged to be plausible reports a
+successful load like any other. Distinct from a **refusal**, which is a gate
+declining to build a value, and from a **rejection**, which is an item assembly
+declined.
+
 ## Result assembly
 
 **Checked items** — provider output that has been checked against the

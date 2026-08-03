@@ -52,6 +52,17 @@
 //!   was. `save` writes `STORE_VERSION` rather than whatever version the
 //!   value in memory carries. The same three parts of `load`'s contract are
 //!   again unchanged.
+//! - Why a load fell back is now available (issue #43). The salvage funnelled
+//!   every fallback into the same empty value and said nothing, so an absent
+//!   store, one this process may not read, a damaged one and one written by a
+//!   later hop were a single outcome. [`Learning::load_reporting`] returns a
+//!   [`LoadReport`] beside the store, one variant per condition, and
+//!   [`Learning::load`] is that function with the report dropped — so its
+//!   contract is unchanged for the third time, and the load rules have one
+//!   implementation rather than two that can drift. What a caller should
+//!   *do* with a report is not decided here, and neither is preserving the
+//!   file a report is about: `save` still overwrites it, which
+//!   [`Learning::save`] says.
 //!
 //! Nothing outside `load` and `save` touches the filesystem.
 //!
@@ -106,10 +117,19 @@
 //!
 //! Refusing a written store outright means being able to tell that this
 //! module wrote it, which is a checksum or a message authentication code —
-//! a design decision of its own, deliberately out of scope for issue #38
-//! and implemented nowhere below. The store is better validated than it
-//! was. It is not trustworthy, and nothing here should be read as saying
-//! so.
+//! a design decision of its own, deliberately out of scope for issue #38,
+//! filed since as issue #88, and implemented nowhere below. The store is
+//! better validated than it was. It is not trustworthy, and nothing here
+//! should be read as saying so.
+//!
+//! [`LoadReport`] does not change that, and is easy to misread as though it
+//! did. It reports what a load *detected* — the guards above, plus the ones
+//! on reaching and parsing the file at all. A store forged to be plausible
+//! trips none of them and reports [`LoadReport::Loaded`], so a report never
+//! distinguishes a tampered store from an honest one. Distinguishing a
+//! tampered store from a merely damaged one is what #88 would buy; what #43
+//! bought is that a *damaged* store is no longer indistinguishable from a
+//! first run.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -147,6 +167,16 @@ pub const LEARNING_BOOST_CAP: f32 = 85.0;
 /// A store on any other version is refused whole — never read entry by
 /// entry under this version's semantics — and `load` falls back to an empty
 /// state, exactly as it does for a file it cannot parse.
+///
+/// The resulting *state* is the same as a parse failure's; the resulting
+/// *report* is not, and conflating the two would be wrong in the direction
+/// that matters. A store on another version is refused for what it announces
+/// rather than for being damaged — which is why the version is read on its own
+/// before any parse is attempted, so that a later format this code genuinely
+/// cannot parse is still reported as a version and not as damage. The version
+/// it claimed rides on [`LoadReport::UnrecognizedVersion`], so a caller can
+/// tell the two costs below apart: which of them a user is paying is exactly
+/// `found` against this constant.
 ///
 /// The refusal is not symmetric in what it costs. An *older* store is
 /// learning already lost to whichever change bumped the version. A *newer*
@@ -326,6 +356,207 @@ pub struct Learning {
 struct PersistedLearningStore {
     version: u32,
     global_frequency: HashMap<String, LearningEntry>,
+}
+
+/// The one thing read out of a store document before anything else: the
+/// `version` it announces. Every other field is ignored, so this parses
+/// whatever a later hop's format turns out to be, as long as it is a JSON
+/// object that still says which format it is.
+///
+/// Reading the version on its own is what makes the check a check. Both full
+/// parses below must deserialize a document *completely* before its `version`
+/// field is reachable, and a version is bumped precisely because the shape
+/// changed — so a store written by a later hop generally fails both parses,
+/// and checking the version afterwards would only ever catch the one v2 that
+/// happened to keep every v1 field. That is the reverse of what
+/// [`LoadReport::UnrecognizedVersion`] promises: the realistic later store
+/// would report [`LoadReport::Malformed`] and tell a user who downgraded that
+/// their live learning was damaged.
+///
+/// This also subsumes what issue #38 achieved by checking the version inside
+/// both parse branches. That guarded against the two shapes drifting apart;
+/// this does not depend on either shape at all, so the per-branch checks are
+/// gone rather than kept alongside it — two sites deciding one outcome is how
+/// they come to disagree.
+///
+/// What it deliberately does not do is treat every unparseable document as a
+/// version problem. A document with no `version` to read announces nothing and
+/// is not a store, so it stays [`LoadReport::Malformed`].
+#[derive(Deserialize)]
+struct StoreVersionProbe {
+    version: u32,
+}
+
+/// What a load noticed about the store it read: that it loaded, or which one
+/// of the fallbacks it took instead. [`Learning::load_reporting`] returns one
+/// alongside the store; [`Learning::load`] discards it.
+///
+/// One distinguishable outcome per condition that ends in an empty state, and
+/// no outcome shared by two of them — counting a variant's payload as part of
+/// the outcome, since [`LoadReport::Unreadable`] is one outcome per
+/// [`std::io::ErrorKind`] rather than one for every way a read can fail. That
+/// is the whole point (issue #43): before this existed, an absent file, an
+/// unreadable one, a damaged one and one written by a later hop all produced
+/// the identical value, so learning wiped by a corrupted disk was reported
+/// nowhere, and a state directory that had become unreadable was
+/// indistinguishable from a first run — every session, for ever.
+///
+/// # Why a report beside the store, rather than a `Result`
+///
+/// `load` returning `Result<Learning, LoadReport>` was the obvious shape and
+/// is the one rejected. A `Result` says the value on the error side does not
+/// exist, and here it always does: every condition below yields a usable
+/// empty store, which is the degradation the issue explicitly keeps. Modelling
+/// that as an error would put an `unwrap_or_else(|_| ...)` at every call site
+/// — reconstructing, per caller, the empty store this function already built —
+/// which is exactly the per-caller burden the brief rules out. A pair says
+/// what is true instead: there is always a store, and there is always
+/// something to say about where it came from.
+///
+/// Two variations were rejected for narrower reasons. Making `load` itself
+/// return the pair would force every caller to acknowledge a report it may not
+/// want, and `load`'s signature is fixed. Hanging the report off [`Learning`]
+/// as a field would make a property of one load event look like a property of
+/// the store, and would have to mean something for a `Learning` that never
+/// came from a file at all — `Learning::default()`, `record`'s output — where
+/// it means nothing.
+///
+/// This crate does not answer the question the same way everywhere, and the
+/// difference is the point rather than an inconsistency.
+/// `Aliases::from_json` does return a `Result` and does refuse a config it
+/// cannot read, because an alias is an explicit user instruction and one that
+/// quietly stopped working is a bug the user cannot act on — that module's
+/// docs argue it at length. Learning is inferred rather than instructed: it is
+/// rebuilt by using hop, and a store that cannot be read must not stop hop from
+/// starting. So degrading is right here where refusing is right there, and the
+/// report is what recovers the one thing refusing would have given for free.
+///
+/// # Not `#[non_exhaustive]`, deliberately
+///
+/// This matches what the crates already do: every public enum in `hop-core`
+/// and `hop-protocol` is exhaustive but `AliasError`, which opts in and says
+/// why. Following the default needs no argument of its own; departing from it
+/// would.
+///
+/// The reason not to depart is that `hop-core` is consumed only from inside
+/// this workspace, so the thing `#[non_exhaustive]` buys — adding a variant
+/// without breaking a downstream crate — is worth nothing here, while
+/// exhaustiveness does buy something: `cargo check` names every site that has
+/// to think again when a fallback path is added.
+///
+/// What that is *not* is a guarantee that no caller ever writes a `_` arm.
+/// [`std::io::ErrorKind`] is itself `#[non_exhaustive]`, so a caller that
+/// looks inside [`LoadReport::Unreadable`] writes one regardless of anything
+/// decided here.
+///
+/// # What a report is evidence of, and what it is not
+///
+/// It says what this load *detected*. It is not a verdict on the store.
+/// [`LoadReport::Loaded`] means the bytes passed every guard `load` applies —
+/// the byte ceiling, the version check, the parse, the key bound, the
+/// timestamp clamp — and nothing more. A store written by someone else with a
+/// plausible recent `last_ms` and a high `count` passes all of those and
+/// reports `Loaded`, because nothing here can tell it from learning this
+/// module recorded itself; the module docs work through what that buys an
+/// attacker. Telling a *tampered* store from a merely damaged one means being
+/// able to tell that this module wrote the bytes, which is a checksum or a
+/// message authentication code and is issue #88. Until that exists, no variant
+/// below reports tampering and none should be read as ruling it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadReport {
+    /// A store was read, parsed, and accepted. The state returned beside this
+    /// came off disk.
+    Loaded,
+    /// Nothing at the path — the ordinary first run. This is the report for an
+    /// I/O error of kind `NotFound` and nothing else, which is what separates
+    /// it from [`LoadReport::Unreadable`].
+    ///
+    /// `NotFound` is the OS's answer, not a claim about intent: a dangling
+    /// symlink and a state directory whose leading components do not exist
+    /// both arrive here too, and nothing on the load path tells those from a
+    /// user who has simply never launched anything.
+    Absent,
+    /// The path resolves to something that is not a regular file — a
+    /// directory, a FIFO, a device. Reported separately because such a path is
+    /// neither absent nor damaged: it exists, and it is not a store.
+    NotARegularFile,
+    /// The store could not be read, and the reason was not that it is absent.
+    /// Carries the [`std::io::ErrorKind`] that said so: `PermissionDenied` for
+    /// a file this process may not open or a directory it may not search,
+    /// `InvalidData` for bytes that are not UTF-8, and whatever else the
+    /// underlying I/O reported.
+    ///
+    /// Stated that way round on purpose. A permission denial on a leading
+    /// directory arrives here without anything having established that a store
+    /// is there at all, so "the file exists and cannot be read" would be a
+    /// claim this variant is in no position to make.
+    ///
+    /// `InvalidData` means the store's own bytes are not UTF-8, and not that
+    /// the bounded read cut one in half: the byte ceiling is applied before
+    /// anything is decoded, so an over-size file is [`LoadReport::TooLarge`]
+    /// before a decode is attempted. `read_bounded_store` has the ordering.
+    ///
+    /// The kind is carried rather than flattened because those are different
+    /// problems with different fixes, and the outcome this variant most needs
+    /// to stay distinct from is [`LoadReport::Absent`]: they are one
+    /// `io::ErrorKind` apart in the implementation and nothing alike to a user.
+    Unreadable(io::ErrorKind),
+    /// The file holds more than `MAX_STORE_BYTES`. Distinct from
+    /// [`LoadReport::Malformed`]: the bytes may be a flawless store, and are
+    /// refused for their size alone, which `MAX_STORE_BYTES` explains and
+    /// prices.
+    ///
+    /// "Size alone" is load-bearing and was once not true. The ceiling is
+    /// applied to the bytes before they are decoded, so an over-size store is
+    /// reported here whatever the bounded read's cut happened to land on;
+    /// `read_bounded_store` says what went wrong when the decode came first.
+    TooLarge,
+    /// The bytes are not a store document: truncated JSON, something that is
+    /// not JSON at all, valid JSON with no `version` field to read, or a
+    /// document on `STORE_VERSION` whose body this code cannot parse.
+    ///
+    /// A document that names a version this code does not write is *not* here
+    /// — it is [`LoadReport::UnrecognizedVersion`], however unparseable the
+    /// rest of it is. What is left for this variant is a document that never
+    /// said which format it was, or said this one and then was not it.
+    ///
+    /// Damage is the reachable cause, and this variant does not identify one.
+    /// It names what the parse could tell — that these bytes are not a store —
+    /// which is the same whether a disk corrupted them or somebody wrote them
+    /// deliberately.
+    Malformed,
+    /// The document announces a `version` that is not `STORE_VERSION`, so the
+    /// store is refused whole. `found` is the version it claimed.
+    ///
+    /// Emphatically not [`LoadReport::Malformed`], and for a document of any
+    /// shape: the version is read on its own before either full parse (see
+    /// `StoreVersionProbe`), so a store from a later hop is refused for what
+    /// it says about itself whether or not it still resembles this version's
+    /// layout — which it usually will not, a version being bumped precisely
+    /// because the layout changed. All this variant asserts is that the
+    /// document said which format it was and it was not this one.
+    ///
+    /// `found` is carried because the two directions cost a user quite
+    /// different things — `STORE_VERSION` prices each — and comparing it
+    /// against `STORE_VERSION` is the only way to tell an abandoned older
+    /// store from a live newer one this binary is too old to read.
+    UnrecognizedVersion { found: u32 },
+}
+
+impl LoadReport {
+    /// The report for an I/O error raised on the load path.
+    ///
+    /// `NotFound` is the single kind that means the store is *absent*;
+    /// everything else means it is there and this process could not read it.
+    /// That one line is what stops a permission denial from being reported as
+    /// a first run, and it is the whole of the distinction — there is no other
+    /// signal available at the point either error is raised.
+    fn from_io(err: &io::Error) -> Self {
+        match err.kind() {
+            io::ErrorKind::NotFound => LoadReport::Absent,
+            kind => LoadReport::Unreadable(kind),
+        }
+    }
 }
 
 // --- Helper functions (unchanged from the salvage) ---
@@ -543,12 +774,19 @@ impl Learning {
 
     /// Load from disk, falling back to an empty state on any error — a
     /// missing file, a path that is not a regular file, more bytes than
-    /// `MAX_STORE_BYTES`, unparseable bytes, valid JSON of the wrong shape,
-    /// or a `version` that is not `STORE_VERSION` all land here. Never
-    /// panics, and never reports which of those happened: a load failure is
-    /// indistinguishable from a first run, which is a known gap owed a
-    /// reporting channel of its own rather than something this function
-    /// decides per call.
+    /// `MAX_STORE_BYTES`, unreadable bytes, unparseable bytes, valid JSON of
+    /// the wrong shape, or a `version` that is not `STORE_VERSION` all land
+    /// here. Never panics.
+    ///
+    /// Which of those happened is discarded here rather than unavailable:
+    /// [`Learning::load_reporting`] does the work and returns a
+    /// [`LoadReport`] beside the store, and this is that function with the
+    /// report dropped. A caller that only wants a usable store keeps this
+    /// one-value signature; a caller that wants to know why it is empty calls
+    /// the sibling. There is one implementation of the load rules, so the two
+    /// cannot drift apart.
+    ///
+    /// Everything below is the behavior both entry points share.
     ///
     /// # The two things a store says about itself
     ///
@@ -557,17 +795,22 @@ impl Learning {
     /// used to be taken at face value, and they are dealt with differently
     /// because they are different claims.
     ///
-    /// The version is checked here, in *both* parse branches below, and a
-    /// mismatch refuses the whole store — see `STORE_VERSION` for why
-    /// refusing beats reinterpreting, and what refusing costs a user who
-    /// downgrades. The second branch is unreachable while the two shapes
-    /// agree: `PersistedLearningStore` and [`Learning`] require the same two
-    /// fields, so any document the second could accept the first accepted
-    /// already. It carries the check regardless, because a check that holds
-    /// only while two separately-maintained shapes coincide is not a check:
-    /// the day one of them grows a field the other lacks, the second branch
-    /// becomes reachable, and a guard on the first alone would be a hole
-    /// opened by an edit made somewhere else entirely.
+    /// The version is checked before either parse below, by reading it and
+    /// nothing else out of the document (`StoreVersionProbe`), and a mismatch
+    /// refuses the whole store — see `STORE_VERSION` for why refusing beats
+    /// reinterpreting, and what refusing costs a user who downgrades.
+    ///
+    /// Issue #38 checked it inside both parse branches instead, which was
+    /// weaker than it read. Both branches deserialize a document completely
+    /// before its `version` field is reachable, so the check only ever ran on
+    /// documents that already parsed as *this* version's shape — and a version
+    /// is bumped because the shape changed. A store from a later hop that
+    /// moved anything failed both parses and was reported as damaged, which is
+    /// the opposite of what the check was for. Reading the version first
+    /// depends on no shape at all, so it covers every document that says which
+    /// format it is, and it replaces the two per-branch checks rather than
+    /// joining them: one outcome decided at one site cannot come to disagree
+    /// with itself.
     ///
     /// The timestamps are not checked but corrected: `purge_and_bound`
     /// clamps a `last_ms` ahead of the load instant back to it, touching no
@@ -634,27 +877,69 @@ impl Learning {
     /// #38's out-of-scope half and is implemented nowhere here. The module
     /// docs say what that leaves standing.
     pub fn load(path: &Path) -> Learning {
-        let Some(data) = read_bounded_store(path) else {
-            return Self::empty();
+        Self::load_reporting(path).0
+    }
+
+    /// [`Learning::load`], plus a [`LoadReport`] saying what it noticed: that
+    /// the store loaded, or which single condition sent it back empty. This is
+    /// where both entry points' load rules actually live, and `load` is this
+    /// function with the report dropped — see [`Learning::load`] for the rules
+    /// themselves, and [`LoadReport`] for why the report rides beside the
+    /// store rather than replacing it with a `Result`.
+    ///
+    /// The store this returns is a usable one in every case, and the report
+    /// never changes it. A caller is free to ignore the report entirely, which
+    /// is precisely what `load` does.
+    ///
+    /// # Reporting is all this does
+    ///
+    /// It decides nothing on the strength of what it found. Nothing here logs,
+    /// counts, retries, quarantines the file it could not read, or treats one
+    /// report as more serious than another — what the daemon should do with a
+    /// report is deliberately left to whoever grows the first caller (issue
+    /// #43 produces the channel and stops there). In particular a report is
+    /// not a promise that the file is still there, or still says the same
+    /// thing, by the time it is read: it describes one load that has already
+    /// finished.
+    ///
+    /// # What the report cannot say
+    ///
+    /// [`LoadReport::Loaded`] is not a statement that the store is
+    /// trustworthy, only that it passed the guards this module applies.
+    /// [`LoadReport`] says what that leaves undetected, and why the missing
+    /// half is issue #88 rather than something this function could add.
+    pub fn load_reporting(path: &Path) -> (Learning, LoadReport) {
+        let data = match read_bounded_store(path) {
+            Ok(data) => data,
+            Err(report) => return (Self::empty(), report),
         };
+        // The version is read on its own, before either full parse, so that a
+        // store announcing a format this code does not understand is reported
+        // as that whatever else its shape turns out to be. See
+        // `StoreVersionProbe`.
+        let Ok(probe) = serde_json::from_str::<StoreVersionProbe>(&data) else {
+            return (Self::empty(), LoadReport::Malformed);
+        };
+        if probe.version != STORE_VERSION {
+            return (
+                Self::empty(),
+                LoadReport::UnrecognizedVersion {
+                    found: probe.version,
+                },
+            );
+        }
         if let Ok(persisted) = serde_json::from_str::<PersistedLearningStore>(&data) {
-            if persisted.version != STORE_VERSION {
-                return Self::empty();
-            }
             let mut store = Self::empty();
             store.global_frequency = persisted.global_frequency;
             store.purge_and_bound();
-            return store;
+            return (store, LoadReport::Loaded);
         }
         if let Ok(mut store) = serde_json::from_str::<Learning>(&data) {
-            if store.version != STORE_VERSION {
-                return Self::empty();
-            }
             store.selections.clear();
             store.purge_and_bound();
-            return store;
+            return (store, LoadReport::Loaded);
         }
-        Self::empty()
+        (Self::empty(), LoadReport::Malformed)
     }
 
     /// Everything a freshly parsed store owes before [`Learning::load`] hands
@@ -818,6 +1103,25 @@ impl Learning {
     /// nothing at all — no file, no directory — so whatever is already on
     /// disk survives intact. `serialize_and_persist` is where that ordering
     /// lives.
+    ///
+    /// # A save destroys the file a load reported on
+    ///
+    /// That protection covers a serialization failure and nothing else. A
+    /// save that *succeeds* replaces whatever was at `path`, and this
+    /// function neither reads the destination first nor takes a
+    /// [`LoadReport`], so it cannot know it is about to overwrite the store a
+    /// load just called [`LoadReport::Malformed`] or
+    /// [`LoadReport::UnrecognizedVersion`]. The rename is atomic, so the
+    /// original is not corrupted — it is gone, along with any chance of
+    /// examining what happened to it, and the copy hop later downgraded away
+    /// from goes the same way as one a disk damaged.
+    ///
+    /// Preserving or quarantining that file is deliberately not done here.
+    /// Issue #43 gave the load path a reporting channel and named this as the
+    /// half it was not fixing, so this paragraph is the record of a known gap
+    /// rather than a description of a guard: nothing below defends the
+    /// original, and a caller that wants one kept must copy it aside itself,
+    /// between the load that reported and the save that overwrites.
     ///
     /// This is the only other entry point (besides `load`) that touches the
     /// filesystem.
@@ -1030,16 +1334,36 @@ impl Learning {
     }
 }
 
-/// The bytes at `path`, or `None` if the path is not a regular file, if it
-/// holds more than `MAX_STORE_BYTES`, or if anything about reading it
-/// fails. [`Learning::load`]'s only way to reach the filesystem.
+/// The bytes at `path`, or the [`LoadReport`] for why there are none.
+/// [`Learning::load`]'s only way to reach the filesystem.
+///
+/// Four of the seven reports are decided here — [`LoadReport::Absent`],
+/// [`LoadReport::Unreadable`], [`LoadReport::NotARegularFile`] and
+/// [`LoadReport::TooLarge`] — and the mapping from guard to report is not
+/// one-to-one in either direction. `LoadReport::from_io` splits *one* guard,
+/// the stat, into two outcomes on `io::ErrorKind::NotFound`. And three sites
+/// can produce [`LoadReport::Unreadable`]: the stat, the open, and the UTF-8
+/// decode. The open is the one worth spelling out, because it is the same
+/// absent-against-unreadable pair once more: a `NotFound` there means the file
+/// was removed between the stat and the open, so it runs through `from_io`
+/// like any other I/O error and correctly reports `Absent`, not `Unreadable`.
+///
+/// All four were one `None` until issue #43, which is why this returns a
+/// `Result` over a report rather than an [`Option`] — the caller cannot
+/// recover the distinction once it is gone, and there is nowhere else it
+/// survives.
+///
+/// The remaining three ([`LoadReport::Loaded`], [`LoadReport::Malformed`],
+/// [`LoadReport::UnrecognizedVersion`]) are the parse's to decide, so
+/// [`Learning::load_reporting`] owns those. Nothing here reads the bytes for
+/// anything but their length and their encoding.
 ///
 /// `CONTEXT.md` scopes **bound** to a length rule on a wire value, living in
 /// `hop-protocol`'s `limits`; the word is used here in that same sense —
 /// a length, checked at a deserialization boundary — one boundary over, on a
 /// file rather than a frame, and not as some second meaning.
 ///
-/// # Two guards, in this order
+/// # Two guards and a decode, in this order
 ///
 /// **The stat comes first, and must.** Opening a FIFO for reading blocks
 /// until a writer appears — forever, for a store nobody is writing to — so
@@ -1061,14 +1385,24 @@ impl Learning {
 /// So the length from the stat is never consulted; [`std::io::Read::take`]
 /// bounds the read itself, and at most `MAX_STORE_BYTES + 1` bytes are ever
 /// read, whatever the stat said or did not say. The claim is about bytes
-/// read rather than bytes allocated: the `String` they land in is grown by
-/// `read_to_string` and may hold spare capacity past its length, which is a
-/// constant factor on a bounded number, not an unbounded one.
+/// read rather than bytes allocated: the `Vec<u8>` they land in is grown by
+/// `read_to_end` and may hold spare capacity past its length, which is a
+/// constant factor on a bounded number, not an unbounded one. The `String`
+/// this returns adds nothing to that — `String::from_utf8` takes the vector
+/// by value and keeps its buffer rather than copying it.
 ///
 /// The `+ 1` is what distinguishes a store sitting exactly on the
 /// ceiling — legitimate, and loaded — from one over it: at the ceiling the
 /// read returns `MAX_STORE_BYTES` bytes and stops of its own accord, and
 /// over it the extra byte comes back and the store is refused.
+///
+/// **Measured, then decoded — in that order.** The read is over bytes, and
+/// the ceiling is applied to them before any decode, because `take` cuts at a
+/// byte offset and can land inside a multibyte character. Decoding first made
+/// an over-size store whose character straddles the cut fail as invalid UTF-8,
+/// reporting [`LoadReport::Unreadable`] for a file that was refused for its
+/// size and was valid UTF-8 from end to end. Size does not need the bytes
+/// decoded to measure, so it is not measured on decoded bytes.
 ///
 /// # The window between them
 ///
@@ -1088,20 +1422,34 @@ impl Learning {
 /// a race an attacker who can write the store's directory has better uses
 /// for: writing a large regular file, which the ceiling refuses without any
 /// racing at all. It is left out deliberately rather than overlooked.
-fn read_bounded_store(path: &Path) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
+fn read_bounded_store(path: &Path) -> Result<String, LoadReport> {
+    let metadata = fs::metadata(path).map_err(|err| LoadReport::from_io(&err))?;
     if !metadata.is_file() {
-        return None;
+        return Err(LoadReport::NotARegularFile);
     }
 
-    let mut data = String::new();
+    let mut data = Vec::new();
     fs::File::open(path)
-        .ok()?
+        .map_err(|err| LoadReport::from_io(&err))?
         .take(MAX_STORE_BYTES + 1)
-        .read_to_string(&mut data)
-        .ok()?;
+        .read_to_end(&mut data)
+        .map_err(|err| LoadReport::from_io(&err))?;
 
-    (data.len() as u64 <= MAX_STORE_BYTES).then_some(data)
+    // The ceiling is checked on the bytes, before they are decoded, because
+    // size is a property of the bytes and needs nothing decoded to measure.
+    // Decoding first got this wrong in the one case it most needed to get
+    // right: `take` cuts at a byte offset, so an over-size store whose
+    // multibyte character straddles the cut comes back as invalid UTF-8 even
+    // though the file is valid throughout, and the decode failed before the
+    // ceiling was ever consulted — reporting `Unreadable` for a store that was
+    // refused for its size alone.
+    if data.len() as u64 > MAX_STORE_BYTES {
+        return Err(LoadReport::TooLarge);
+    }
+    // `InvalidData` names exactly what `read_to_string` reports for bytes that
+    // are not UTF-8, so a genuinely undecodable store keeps the report it had.
+    // Past the ceiling check, a decode failure is now that and only that.
+    String::from_utf8(data).map_err(|_| LoadReport::Unreadable(io::ErrorKind::InvalidData))
 }
 
 /// Serialize `value`, then persist it — and only in that order. A value
@@ -2778,5 +3126,326 @@ mod tests {
             a_minute_ago,
             "an honest stamp is not in the future and must not be touched"
         );
+    }
+
+    // --- Reporting why a load fell back to empty (issue #43). ---
+    //
+    // Each test for a single condition asserts a whole `LoadReport` by
+    // equality rather than "not `Loaded`". The defect this issue is about is
+    // *conditions collapsing together*, so a test that only distinguished
+    // failure from success would pass against the very code the issue was
+    // filed on. The last test is the exception and says why: it is about
+    // `load` still degrading, which is the same for every condition.
+    //
+    // Each also names the outcome it would most plausibly be confused with,
+    // because those pairings are the whole point: absent against unreadable,
+    // malformed against an unrecognized version, and the byte ceiling against
+    // both.
+
+    /// A store `save` itself would write, on disk at `path`.
+    fn write_ordinary_store(path: &Path) {
+        let mut store = Learning::empty();
+        store.record_launch("q", &ItemId::new("app:a").unwrap());
+        store.save(path).unwrap();
+    }
+
+    #[test]
+    fn a_store_that_loads_reports_that_it_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        write_ordinary_store(&path);
+
+        let (loaded, report) = Learning::load_reporting(&path);
+
+        assert_eq!(report, LoadReport::Loaded);
+        assert!(
+            loaded.frequency_boost("app:a") > 0,
+            "the reporting entry point returns the same store `load` would"
+        );
+    }
+
+    #[test]
+    fn an_absent_store_reports_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.json");
+
+        let (loaded, report) = Learning::load_reporting(&path);
+
+        assert_eq!(report, LoadReport::Absent);
+        assert!(loaded.is_empty(), "a first run still degrades to empty");
+    }
+
+    // The pairing that matters most. Both of these are one `fs::metadata`
+    // call, and reporting a permission denial as `Absent` would tell a user
+    // whose state directory is broken that this is their first run, every
+    // session, for ever.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_store_reports_unreadable_rather_than_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        write_ordinary_store(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Mode bits do not stop root, and some filesystems ignore them
+        // outright. Probing the open is what separates such a run from a real
+        // denial: where the open succeeds there is no denial to report, and
+        // asserting one would be asserting something this run cannot show.
+        if fs::File::open(&path).is_ok() {
+            eprintln!(
+                "skipped: 0o000 did not deny this process a read (running as root, or a \
+                 filesystem that ignores mode bits)"
+            );
+            return;
+        }
+
+        let (loaded, report) = Learning::load_reporting(&path);
+
+        assert_eq!(
+            report,
+            LoadReport::Unreadable(io::ErrorKind::PermissionDenied),
+            "a store that exists and cannot be read is not an absent one"
+        );
+        assert!(
+            loaded.is_empty(),
+            "reporting the denial does not stop the degradation"
+        );
+    }
+
+    // The other route into `Unreadable`, and the one that needs no unix gate
+    // and no permissions: bytes that are not UTF-8 fail in the decode rather
+    // than in the open. It is `Unreadable` and not `Malformed` because nothing
+    // was ever decoded to parse, so nothing here has an opinion on whether the
+    // bytes were a store — and it is not `TooLarge` either, which the test
+    // pairing this one under the ceiling covers from the other side.
+    #[test]
+    fn a_store_that_is_not_utf8_reports_unreadable_rather_than_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        assert_eq!(
+            Learning::load_reporting(&path).1,
+            LoadReport::Unreadable(io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn a_malformed_store_is_reported_rather_than_silently_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        let (loaded, report) = Learning::load_reporting(&path);
+
+        assert_eq!(report, LoadReport::Malformed);
+        assert!(
+            loaded.is_empty(),
+            "a malformed store still degrades to empty"
+        );
+    }
+
+    // Valid JSON of the wrong shape is malformed in exactly the same sense:
+    // these bytes are not a store, whether they parse as JSON or not.
+    #[test]
+    fn valid_json_of_the_wrong_shape_reports_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, "[1,2,3]").unwrap();
+
+        assert_eq!(Learning::load_reporting(&path).1, LoadReport::Malformed);
+    }
+
+    // The second pairing. A store on another version is *well-formed* — a v2
+    // file written by a later hop parses perfectly and is refused for what it
+    // says about itself, not for being damaged. Reporting it as `Malformed`
+    // would tell a user who downgraded that their store is corrupt.
+    #[test]
+    fn an_unrecognized_version_is_reported_separately_from_a_malformed_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let newer = STORE_VERSION + 1;
+        std::fs::write(&path, store_at_version(newer, now_ms())).unwrap();
+
+        let (loaded, report) = Learning::load_reporting(&path);
+
+        assert_eq!(report, LoadReport::UnrecognizedVersion { found: newer });
+        assert!(loaded.is_empty(), "the store is still refused whole");
+    }
+
+    // The test above writes a v2 that happens to keep every v1 field, which is
+    // the *least* likely v2 there is: a version is bumped precisely because
+    // the shape changed. So this is the case that decides whether the variant
+    // above means what it says. While the version was read only after a full
+    // parse had already succeeded, a v2 that moved its table failed both
+    // parses and came back `Malformed` — telling a user who downgraded that
+    // their live store was damaged.
+    #[test]
+    fn a_later_version_that_changed_shape_reports_the_version_and_not_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let newer = STORE_VERSION + 1;
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{newer},"entries":{{"app:a":{{"n":9}}}}}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            Learning::load_reporting(&path).1,
+            LoadReport::UnrecognizedVersion { found: newer },
+            "a store this code cannot parse because it is a later format is not a damaged one"
+        );
+    }
+
+    // The same claim reduced to the least a document can say: it announces a
+    // version and offers nothing else to parse.
+    #[test]
+    fn a_document_carrying_only_an_unrecognized_version_reports_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let newer = STORE_VERSION + 1;
+        std::fs::write(&path, format!(r#"{{"version":{newer}}}"#)).unwrap();
+
+        assert_eq!(
+            Learning::load_reporting(&path).1,
+            LoadReport::UnrecognizedVersion { found: newer }
+        );
+    }
+
+    // The other side of reading the version first, and the reason the probe is
+    // not simply "anything unparseable is a version problem": a document with
+    // no `version` to read announces nothing, so it is not a store, whatever
+    // else it holds. Without this, reporting `UnrecognizedVersion` for
+    // everything that fails to parse would satisfy the two tests above.
+    #[test]
+    fn a_document_with_no_version_field_reports_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, r#"{"global_frequency":{}}"#).unwrap();
+
+        assert_eq!(Learning::load_reporting(&path).1, LoadReport::Malformed);
+    }
+
+    // And the version being read first must not swallow the ordinary damage
+    // case: a document on the version this code does write, whose store body
+    // is not one, is `Malformed` and not a version problem.
+    #[test]
+    fn a_current_version_document_that_is_not_a_store_reports_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{STORE_VERSION},"global_frequency":[]}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(Learning::load_reporting(&path).1, LoadReport::Malformed);
+    }
+
+    // A FIFO, a directory or a character device is not damaged, absent or
+    // over any ceiling: the path simply does not name a store. `read_bounded_store`
+    // refuses it before the open, and the report says which of its guards did.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_a_regular_file_reports_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo should have created the FIFO");
+
+        assert_eq!(
+            Learning::load_reporting(&path).1,
+            LoadReport::NotARegularFile
+        );
+    }
+
+    // The third pairing. The bytes over the ceiling here are a perfectly
+    // well-formed store — `whitespace_padded_store` pads a real one — so
+    // reporting `Malformed` would name the wrong cause, and the file is
+    // plainly present, so reporting `Absent` would too.
+    #[test]
+    fn a_store_over_the_byte_ceiling_reports_the_ceiling_and_not_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, whitespace_padded_store(MAX_STORE_BYTES as usize + 1)).unwrap();
+
+        assert_eq!(Learning::load_reporting(&path).1, LoadReport::TooLarge);
+    }
+
+    // The ceiling must not depend on where a codepoint happens to fall. Every
+    // byte of the file below is valid UTF-8, but `take` cuts at a byte offset,
+    // and here the cut lands between the two bytes of `é` — so the bytes that
+    // came back were not valid UTF-8 even though the store was. Decoding
+    // before measuring reported `Unreadable(InvalidData)` for what is purely
+    // an over-size store, which is both fallbacks wearing one variant and is
+    // exactly the collapse this issue exists to end.
+    #[test]
+    fn a_store_over_the_ceiling_reports_the_ceiling_even_when_the_cut_splits_a_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+
+        // Padded to the ceiling exactly, then one two-byte character. `take`
+        // stops after `MAX_STORE_BYTES + 1` bytes, which is that character's
+        // first byte and not its second.
+        let mut bytes = whitespace_padded_store(MAX_STORE_BYTES as usize).into_bytes();
+        bytes.extend_from_slice("é".as_bytes());
+        assert_eq!(bytes.len() as u64, MAX_STORE_BYTES + 2);
+        assert!(
+            std::str::from_utf8(&bytes).is_ok(),
+            "the file itself must be valid UTF-8, or this would prove nothing"
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            Learning::load_reporting(&path).1,
+            LoadReport::TooLarge,
+            "an over-size store is over-size whatever the read's cut landed on"
+        );
+    }
+
+    // The acceptance criterion that the infallible entry point is unchanged,
+    // held against every condition the reporting one distinguishes: whatever
+    // the report would have said, `load` still hands back an empty store and
+    // still cannot fail.
+    #[test]
+    fn the_infallible_entry_point_still_degrades_to_empty_on_every_reported_condition() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = dir.path().join("never-written.json");
+
+        let malformed = dir.path().join("malformed.json");
+        std::fs::write(&malformed, "{not json").unwrap();
+
+        let wrong_version = dir.path().join("wrong-version.json");
+        std::fs::write(
+            &wrong_version,
+            store_at_version(STORE_VERSION + 1, now_ms()),
+        )
+        .unwrap();
+
+        let too_large = dir.path().join("too-large.json");
+        std::fs::write(
+            &too_large,
+            whitespace_padded_store(MAX_STORE_BYTES as usize + 1),
+        )
+        .unwrap();
+
+        for path in [&absent, &malformed, &wrong_version, &too_large] {
+            assert!(
+                Learning::load(path).is_empty(),
+                "`load` must still degrade to empty for {}",
+                path.display()
+            );
+            assert_ne!(
+                Learning::load_reporting(path).1,
+                LoadReport::Loaded,
+                "and the reporting sibling must still call it a fallback for {}",
+                path.display()
+            );
+        }
     }
 }
