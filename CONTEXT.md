@@ -171,8 +171,8 @@ applied at the deserialization boundary, and the bound is applied first.
 **Validating newtype** — a type wrapping a private `String` whose only
 constructor applies every rule, and whose `Deserialize` hands the parsed string
 to that same constructor. One gate, not two: a value that exists has passed the
-rules however it was made. `ItemId`, `ActionId`, `CopyText`, `OpenUrl` and
-`QueryText`.
+rules however it was made. `ItemId`, `ActionId`, `CopyText`, `OpenUrl`,
+`IconName`, `IconPath` and `QueryText`.
 
 **Allowed scheme** — a URL scheme an `OpenUrl` may carry, from the allow-list
 `ALLOWED_URL_SCHEMES`. An allow-list, never a deny-list: a scheme that is not on

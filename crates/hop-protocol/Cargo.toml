@@ -10,5 +10,20 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+# Only for the `O_NONBLOCK` flag on `IconPath::open_regular_file`, which is the
+# one place this crate touches the filesystem, and for `mkfifo` in the test that
+# covers it. std already links libc; this brings in the flag constant rather than
+# a second implementation of it.
+#
+# These two are the first dependencies the contract crate has taken beyond serde
+# and thiserror, and they arrive with no supply-chain gate on this workspace —
+# see issue #35, which is open for exactly that. Whoever picks it up should treat
+# these as in scope rather than grandfathered.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

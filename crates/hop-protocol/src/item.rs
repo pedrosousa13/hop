@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::content::{IconName, IconPath};
 use crate::limits::{self, BoundError, MAX_ACTION_ID, MAX_ITEM_ID, check_len};
 
 /// The stable identifier of an [`Item`], opaque to clients.
@@ -144,24 +145,79 @@ pub struct Action {
     pub label: String,
 }
 
-/// How to render an [`Item`]'s icon.
+/// How to render an [`Item`]'s icon: a theme name **or** a file, never both and
+/// never neither.
 ///
-/// Both fields are optional by *absence* as well as by explicit null. That is
-/// what the `default` in each attribute buys: serde's derive gives an
-/// `Option<T>` field its missing-field fallback only while the field has no
-/// `deserialize_with`, so adding one without `default` would quietly turn an
-/// optional field into a mandatory one and refuse `{"name":"firefox"}` for a
-/// missing `path`. Nothing in this crate omits a field when serializing, so no
-/// round-trip test would notice; a future client written against the documented
-/// shape would.
+/// # The wire form, and how it changed
+///
+/// An icon is a JSON object with exactly one key, naming which arm it is:
+///
+/// ```text
+///   {"name": "firefox"}
+///   {"path": "/usr/share/pixmaps/firefox.png"}
+/// ```
+///
+/// This is an **externally tagged** enum, which is serde's default for one, and
+/// the shape is doing the work rather than a validator — so an icon carrying
+/// both a name and a path, and an icon carrying neither, are values no frame can
+/// express. Pinned by the tests
+/// `tests::an_icon_carrying_both_a_name_and_a_path_does_not_parse` and
+/// `tests::an_icon_carrying_neither_a_name_nor_a_path_does_not_parse`. That is
+/// also why there is no documented precedence between the two: there is no state
+/// for a precedence rule to resolve.
+///
+/// Two layers produce that between them, and it is worth being exact about
+/// which does what, because only one of them is this crate's derive. The derive
+/// asks the deserializer for an enum and matches the single key it is handed to
+/// a variant, so an unknown key is the derive's `unknown variant` error. But a
+/// *second* key and *no* key are both `serde_json`'s: having deserialized the
+/// variant it looks for the end of the map, and finding anything else there is
+/// an error, as is a map that ended before a key could be read. Measured against
+/// serde_json 1.0.151, both of those report `expected value` — the first where
+/// the map should have ended, the second where a key should have been.
+///
+/// **This is a breaking change to the contract.** The previous form was an
+/// object with two optional fields — `{"name": "firefox", "path": null}`, or
+/// both set, or both null — and none of those parse now. A provider written
+/// against the old shape must send one key and drop the other rather than
+/// sending the other as null. An item with no icon is unaffected: that is still
+/// said by leaving `icon` out or sending `null` for it, which is a property of
+/// the `Option` on [`Item`] rather than of this type.
+///
+/// A third arm added later would be breaking in the same way, and in the
+/// opposite direction from [`Item`] itself: an `Item` ignores a field it does
+/// not know, for forward compatibility, while an icon arm this contract does not
+/// have is refused. Pinned by
+/// `tests::an_icon_naming_an_arm_this_contract_does_not_have_does_not_parse`.
+///
+/// # What each arm promises
+///
+/// Neither arm is a bare `String`, so the promise is the type rather than a note
+/// a client has to read. [`IconName`] is bounded and carries a content rule that
+/// keeps it from being a path in disguise. [`IconPath`] is bounded and must be
+/// absolute, free of any `..` component, and free of NUL and every other control
+/// character.
+///
+/// Two things an `IconSpec` does *not* promise about its path arm, because they
+/// are not rules the constructor applies. The roots an icon is expected to live
+/// under are **documented on [`IconPath`] and not enforced anywhere**, for
+/// reasons that type prices under its own heading — so a path outside all of
+/// them still parses. And the file is checked to be a regular file only by
+/// [`IconPath::open_regular_file`], which a client calls when it is about to
+/// read the icon; parsing an `IconSpec` makes no syscall and so says nothing
+/// about what, or whether, the path names.
+///
+/// What is true of both arms is that their gate is their constructor, and
+/// `Deserialize` routes through it: an `IconSpec` that exists carries a value
+/// that passed every rule its type applies, whether a provider built it or it
+/// arrived off the socket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IconSpec {
-    /// Bounded at [`MAX_ICON_NAME`](crate::limits::MAX_ICON_NAME) bytes on the way in.
-    #[serde(default, deserialize_with = "limits::de_icon_name")]
-    pub name: Option<String>,
-    /// Bounded at [`MAX_ICON_PATH`](crate::limits::MAX_ICON_PATH) bytes on the way in.
-    #[serde(default, deserialize_with = "limits::de_icon_path")]
-    pub path: Option<String>,
+#[serde(rename_all = "snake_case")]
+pub enum IconSpec {
+    /// A name to look up in the desktop's icon theme.
+    Name(IconName),
+    /// An absolute path to an icon file.
+    Path(IconPath),
 }
 
 /// A single query result: something a user can act on.
@@ -174,12 +230,15 @@ pub struct IconSpec {
 /// null, but they arrive there two different ways. `subtitle` and `copy_text`
 /// each carry a `deserialize_with`, which suppresses the missing-field fallback
 /// serde's derive would otherwise give an `Option`, so each pairs it with an
-/// explicit `default` to put that fallback back — see [`IconSpec`] for why the
-/// pairing is load-bearing. `icon` carries neither attribute, so it still has
-/// that implicit fallback, which is precisely the mechanism the other two are
-/// restoring. Of the three, `icon` is the one with no "Bounded at…" line,
-/// because it holds no bytes of its own: its two strings are bounded on
-/// [`IconSpec`].
+/// explicit `default` to put that fallback back. The pairing is load-bearing:
+/// without the `default`, adding a `deserialize_with` would quietly turn an
+/// optional field into a mandatory one, and nothing in this crate omits a field
+/// when serializing, so no round-trip test would notice — a client written
+/// against the documented shape would. `icon` carries neither attribute, so it
+/// still has that implicit fallback, which is precisely the mechanism the other
+/// two are restoring. Of the three, `icon` is the one with no "Bounded at…"
+/// line, because it holds no bytes of its own: whichever arm of [`IconSpec`] it
+/// carries is bounded by that arm's own type.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub id: ItemId,
@@ -246,6 +305,8 @@ pub struct Item {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use serde_json::json;
+
     use super::*;
 
     fn sample_item() -> Item {
@@ -254,10 +315,7 @@ mod tests {
             kind: Kind::App,
             title: "Firefox".into(),
             subtitle: Some("Web Browser".into()),
-            icon: Some(IconSpec {
-                name: Some("firefox".into()),
-                path: None,
-            }),
+            icon: Some(IconSpec::Name(IconName::new("firefox").unwrap())),
             actions: vec![Action {
                 id: ActionId::new("open").unwrap(),
                 kind: ActionKind::Open,
@@ -312,7 +370,7 @@ mod tests {
             "kind": "app",
             "title": "Firefox",
             "subtitle": "Web Browser",
-            "icon": { "name": "firefox", "path": "/usr/share/icons/firefox.png" },
+            "icon": { "name": "firefox" },
             "actions": [{ "id": "open", "kind": "open", "label": "Open" }],
             "default_action": "open",
             "copy_text": "https://example.com",
@@ -331,21 +389,16 @@ mod tests {
             .unwrap_or_else(|e| panic!("omitting {field} must still parse, got: {e}"))
     }
 
-    fn icon_without(field: &str) -> IconSpec {
-        let mut json = serde_json::json!({ "name": "firefox", "path": "/icons/firefox.png" });
-        let object = json.as_object_mut().unwrap();
-        object
-            .remove(field)
-            .unwrap_or_else(|| panic!("no field {field} to remove"));
-        serde_json::from_str(&json.to_string())
-            .unwrap_or_else(|e| panic!("omitting {field} must still parse, got: {e}"))
-    }
-
     // An optional field is optional by *absence*, not only by explicit null. A
     // client that omits one is the motivating case: it parsed before these
     // bounds existed, and adding a `deserialize_with` must not have quietly
     // made it mandatory. hop's own serializer never omits a field, so no
-    // round-trip test can catch this — these four have to say it directly.
+    // round-trip test can catch this — these three have to say it directly.
+    //
+    // `IconSpec` has no such field any more: it is an enum whose one key is
+    // mandatory by construction, which is what
+    // `an_icon_carrying_neither_a_name_nor_a_path_does_not_parse` asserts from
+    // the other side.
 
     #[test]
     fn item_subtitle_is_none_when_omitted() {
@@ -362,14 +415,133 @@ mod tests {
         assert_eq!(item_without("icon").icon, None);
     }
 
+    /// Every test this file's docs name by hand must exist, so that renaming one
+    /// fails here instead of leaving a doc pointing at nothing. The same check
+    /// `crate::content` and `crate::redaction` run over their own docs, and for
+    /// the same reason: a pointer to a `#[cfg(test)]` item cannot be an intra-doc
+    /// link, because rustdoc has no `tests` module to resolve it against.
+    ///
+    /// A pointer is a backticked `tests::` followed by an identifier.
     #[test]
-    fn icon_name_is_none_when_omitted() {
-        assert_eq!(icon_without("name").name, None);
+    fn every_test_this_file_names_in_its_docs_exists() {
+        let source = include_str!("item.rs");
+        let named: Vec<&str> = source
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("///") || line.starts_with("//!"))
+            // Odd-indexed pieces are what sat between a pair of backticks.
+            .flat_map(|line| line.split('`').skip(1).step_by(2))
+            .filter_map(|token| token.strip_prefix("tests::"))
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
+            .collect();
+
+        assert!(
+            named.len() >= 3,
+            "the docs name at least three tests by hand; finding {} means this \
+             scan stopped matching rather than the docs stopping pointing",
+            named.len()
+        );
+
+        for name in named {
+            assert!(
+                source.contains(&format!("fn {name}(")),
+                "a doc comment names `tests::{name}`, which no test in this file defines"
+            );
+        }
+    }
+
+    // --- IconSpec: a name or a path, never both and never neither -----------
+
+    #[test]
+    fn an_icon_travels_as_the_single_key_naming_which_arm_it_is() {
+        let name = IconSpec::Name(IconName::new("firefox").unwrap());
+        assert_eq!(
+            serde_json::to_string(&name).unwrap(),
+            r#"{"name":"firefox"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<IconSpec>(r#"{"name":"firefox"}"#).unwrap(),
+            name
+        );
+
+        let path = IconSpec::Path(IconPath::new("/usr/share/pixmaps/firefox.png").unwrap());
+        assert_eq!(
+            serde_json::to_string(&path).unwrap(),
+            r#"{"path":"/usr/share/pixmaps/firefox.png"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<IconSpec>(r#"{"path":"/usr/share/pixmaps/firefox.png"}"#)
+                .unwrap(),
+            path
+        );
     }
 
     #[test]
-    fn icon_path_is_none_when_omitted() {
-        assert_eq!(icon_without("path").path, None);
+    fn an_icon_carrying_both_a_name_and_a_path_does_not_parse() {
+        // The wire form is what makes the ambiguity unrepresentable rather than
+        // undocumented: there is no precedence to state because there is no
+        // frame that can ask for both.
+        let both = r#"{"name":"firefox","path":"/usr/share/pixmaps/firefox.png"}"#;
+        assert!(serde_json::from_str::<IconSpec>(both).is_err());
+    }
+
+    #[test]
+    fn an_icon_carrying_neither_a_name_nor_a_path_does_not_parse() {
+        // An item with no icon says so by leaving `icon` out or sending null,
+        // which `item_icon_is_none_when_omitted` covers. An icon object with
+        // nothing in it is a third state the type no longer has.
+        assert!(serde_json::from_str::<IconSpec>("{}").is_err());
+    }
+
+    #[test]
+    fn an_icon_whose_one_key_is_null_does_not_parse() {
+        // A different case from the one above, and stopped by a different
+        // thing. `{"name":null}` *is* a one-key map, so the enum's shape is
+        // satisfied and the arm is chosen; what refuses it is `IconName`'s own
+        // `Deserialize`, which wants a string. Worth its own test because the
+        // old two-optional-field form accepted this exact document.
+        let err = serde_json::from_str::<IconSpec>(r#"{"name":null}"#)
+            .expect_err("an arm carrying null is not an arm carrying a value");
+        assert!(
+            err.to_string().contains("invalid type: null"),
+            "the arm's own value type must be what objects, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_icon_naming_an_arm_this_contract_does_not_have_does_not_parse() {
+        // Worth pinning beside `item_tolerates_unknown_fields_for_forward_compat`,
+        // because it is the opposite answer: an `Item` ignores a field it does
+        // not know, but an icon arm it does not know is refused, and so a later
+        // third arm is a breaking change for an older client rather than
+        // something it can skip.
+        assert!(serde_json::from_str::<IconSpec>(r#"{"emoji":"🦊"}"#).is_err());
+    }
+
+    #[test]
+    fn an_icon_refused_by_its_own_rules_cannot_be_produced_by_parsing() {
+        // The rules are `IconName`'s and `IconPath`'s, and `crate::content`
+        // tests each one against its constructor. What is asserted here is that
+        // an item is the same gate: a refused value sinks the whole item rather
+        // than arriving inside one.
+        for icon in [
+            json!({ "path": "icons/firefox.png" }),
+            json!({ "path": "/usr/share/icons/../../../etc/shadow" }),
+            json!({ "name": "hicolor/firefox" }),
+            json!({ "name": "" }),
+        ] {
+            let mut item = full_item_json();
+            item["icon"] = icon.clone();
+            assert!(
+                serde_json::from_str::<Item>(&item.to_string()).is_err(),
+                "an item must not be able to carry a refused icon, accepted {icon}"
+            );
+        }
     }
 
     #[test]
