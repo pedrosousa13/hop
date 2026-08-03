@@ -221,14 +221,15 @@ pub struct Item {
     /// a whole query is in hand — as the **pin budget** in `hop-core`'s
     /// `pipeline` module, `MAX_PINNED_ITEMS_PER_PROVIDER` pinned items from
     /// any one producer and `MAX_PINNED_ITEMS_PER_QUERY` in all, honored in
-    /// the order the providers returned them, with the rest returned as
-    /// rejections. A provider that flags everything it returns gets its one
-    /// row, not the flood: being verbose wins it nothing, and cannot cost
-    /// another provider the row it asked for. Being *early* still can, though,
-    /// and the difference is worth keeping straight — the per-producer share
-    /// stops a provider taking a second row, while the per-query total is
-    /// shared and spent in the order the providers answered, so a provider
-    /// that answers early spends a slot a later provider might have had.
+    /// **provider-supplied order** — the order the outputs reached assembly,
+    /// each provider's items in the order it returned them — with the rest
+    /// returned as rejections. A provider that flags everything it returns
+    /// gets its one row, not the flood: being verbose wins it nothing, and
+    /// cannot cost another provider the row it asked for. Being *early* still
+    /// can, though, and the difference is worth keeping straight — the
+    /// per-producer share stops a provider taking a second row, while the
+    /// per-query total is shared and spent in provider-supplied order, so a
+    /// provider early in that order spends a slot a later one might have had.
     ///
     /// What the pin budget does not do is decide *who* may pin: the flag is a
     /// field on this type, so anything that can answer a query can set it, and
