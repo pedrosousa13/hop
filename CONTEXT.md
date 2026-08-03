@@ -110,15 +110,33 @@ its producer declared, and every item's provider string is its producer's
 manifest id. Assembly accepts nothing else, so an item's self-description is
 never taken on trust.
 
-**Rejection** — one item assembly declined, and which of the two checks it
-failed. Returned as data alongside the assembled items, never logged — there
-is no logging seam yet, and the query path may not have side effects.
+**Rejection** — one item assembly declined, and why: it failed one of the two
+manifest checks, or it was a pinned item the **pin budget** could not afford.
+Returned as data alongside the assembled items, never logged — there is no
+logging seam yet, and the query path may not have side effects. Only the first
+two mean a provider lied; a rejection names which, so the reasons are not
+confused for one another.
 
 **Ranked body** — the scored, ordered items.
 
-**Pinned tail** — items flagged `append_to_end`, which always follow the ranked
-body regardless of score. Web-search actions are the motivating case. They are
-split off before ranking and never scored.
+**Pinned tail** — the items flagged `append_to_end` that a query honors, which
+always follow the ranked body regardless of score. Web-search actions are the
+motivating case. They are split off before ranking and never scored. Flagging
+an item asks for the tail rather than joining it: how many of the requests a
+query honors is the **pin budget**, and the rest become rejections.
+
+**Pin budget** — how many pinned items assembly honors for one query:
+`MAX_PINNED_ITEMS_PER_PROVIDER` from any one producing provider and
+`MAX_PINNED_ITEMS_PER_QUERY` in all, both in `hop-core`'s `pipeline`. Spent in
+provider-supplied order, so a provider that sets the flag on everything it
+returns gets its one row rather than the list — and, because the share is per
+producer, cannot take the whole tail away from another provider by answering
+first, though answering first does spend one of the shared slots.
+It counts pins, never deciding which providers may pin; that is a capability
+check nothing has built yet. Not a **bound** in this glossary's sense: it
+restricts neither the length nor the content of a wire value and no parse can
+apply it, which is why it lives with the assembly that spends it rather than in
+`hop-protocol`'s `limits`.
 
 **Cap** — the maximum result count, applied to the concatenated body and tail
 together. A body that alone fills the cap squeezes the tail out; the old
@@ -155,6 +173,13 @@ sinks the whole frame. Distinct from a **rejection**, which is an *item* that
 assembly declined: a rejection is data returned alongside the items that
 survived, so a query with one still answers. Neither is ever a truncation, a
 normalization, or a silent fix.
+
+A truncation in that sense is keeping a shortened version of a value and saying
+nothing — the shortened id `limits` refuses to produce. Refusing a whole item
+and reporting it is not one, however short the surviving list gets, which is
+why the **pin budget** rejects rather than truncates. Within assembly the
+**cap** is the truncation: it shortens the assembled list to `max_results`
+silently, naming nothing it dropped.
 
 ## Redaction
 

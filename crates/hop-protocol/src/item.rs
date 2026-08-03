@@ -199,7 +199,43 @@ pub struct Item {
     /// Bounded at [`MAX_COPY_TEXT`](crate::limits::MAX_COPY_TEXT) bytes on the way in.
     #[serde(default, deserialize_with = "limits::de_item_copy_text")]
     pub copy_text: Option<String>,
-    /// Pinned after ranked results (web search actions), rather than ranked among them.
+    /// Asks for this item to be pinned after the ranked results, rather than
+    /// ranked among them. The pinned web-search row is the motivating case.
+    ///
+    /// It is a request, and what it requests is an exception to every ordering
+    /// rule the assembler has. `hop-core`'s pipeline splits pinned items out
+    /// before it filters an exclusive query (`w firefox`) down to that mode's
+    /// kinds and before it scores anything, so a pinned item is placed without
+    /// having matched what was typed, without clearing the minimum-score
+    /// floor, and whatever its own kind. That is deliberate: the web-search
+    /// row has to show for a query nothing about it matches. Nothing after the
+    /// split can drop such an item on relevance.
+    ///
+    /// So the exception is limited by *count* instead, and the limit is not
+    /// here. What limits a frame in this crate is
+    /// [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME),
+    /// which caps items in one frame without regard to this flag, and no
+    /// per-query limit is parseable at all: a query's items arrive across
+    /// several frames from several providers, and no single parse sees enough
+    /// of one query to count its pinned items. The limit therefore lives where
+    /// a whole query is in hand — as the **pin budget** in `hop-core`'s
+    /// `pipeline` module, `MAX_PINNED_ITEMS_PER_PROVIDER` pinned items from
+    /// any one producer and `MAX_PINNED_ITEMS_PER_QUERY` in all, honored in
+    /// **provider-supplied order** — the order the outputs reached assembly,
+    /// each provider's items in the order it returned them — with the rest
+    /// returned as rejections. A provider that flags everything it returns
+    /// gets its one row, not the flood: being verbose wins it nothing, and
+    /// cannot cost another provider the row it asked for. Being *early* still
+    /// can, though, and the difference is worth keeping straight — the
+    /// per-producer share stops a provider taking a second row, while the
+    /// per-query total is shared and spent in provider-supplied order, so a
+    /// provider early in that order spends a slot a later one might have had.
+    ///
+    /// What the pin budget does not do is decide *who* may pin: the flag is a
+    /// field on this type, so anything that can answer a query can set it, and
+    /// the budget counts a first-party provider's rows and a hostile one's
+    /// alike. A capability check would be the answer to that, and
+    /// `MAX_PINNED_ITEMS_PER_QUERY`'s docs are where it is stated to belong.
     pub append_to_end: bool,
     /// Bounded at [`MAX_PROVIDER_ID`](crate::limits::MAX_PROVIDER_ID) bytes on the way in.
     #[serde(deserialize_with = "limits::de_provider")]
