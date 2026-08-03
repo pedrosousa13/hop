@@ -593,11 +593,13 @@ impl Pipeline {
         // `global_frequency` map) and `query_boost` (from the per-query
         // `selections` map, kept in memory only, never written to disk), and
         // both are keyed on the bare id string. Giving `global_frequency` a
-        // provider dimension is a persisted-format migration (version bump,
-        // load-path migration) on the same load path issues #37/#38 already
-        // target, not an in-memory rekey like `Boosts::by_provider_item`
-        // above; `selections` is deferred alongside it rather than resolved
-        // on its own. Filed as issue #72.
+        // provider dimension is a persisted-format change, not an in-memory
+        // rekey like `Boosts::by_provider_item` above: it means bumping
+        // `hop-core`'s `learning::STORE_VERSION`, which that module answers
+        // by refusing the older store rather than migrating it (see the
+        // constant for why), so the cost is every user's learning, not a
+        // migration to write. `selections` is deferred alongside it rather
+        // than resolved on its own. Filed as issue #72.
         for item in &provider_items {
             let learned = self.learning.boost_for(&routed.term, &item.id);
             if learned != 0.0 {

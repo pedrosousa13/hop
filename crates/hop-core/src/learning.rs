@@ -41,8 +41,75 @@
 //!   the `MAX_ITEM_ID` key bound to what it parsed. Its contract is
 //!   unchanged: it still returns `Learning` rather than a `Result`, still
 //!   falls back to an empty state on any error, and still never panics.
+//! - What a store claims about itself is no longer taken at face value
+//!   (issue #38), by two different means: the version is *checked*, the
+//!   timestamps are *corrected*. The salvage parsed `version` and copied it
+//!   through without ever comparing it to anything, and read every `last_ms`
+//!   as written — including one in the future, which disables decay
+//!   outright. [`Learning::load`] now refuses a store whose version is not
+//!   `STORE_VERSION`, and clamps back to the load instant those `last_ms`
+//!   values that sit ahead of it, leaving every other stamp exactly as it
+//!   was. `save` writes `STORE_VERSION` rather than whatever version the
+//!   value in memory carries. The same three parts of `load`'s contract are
+//!   again unchanged.
 //!
 //! Nothing outside `load` and `save` touches the filesystem.
+//!
+//! # The store is trust-sensitive input to a launch decision
+//!
+//! This is not merely state that would be a nuisance to lose.
+//! [`Learning::boost_for`] is what `Pipeline::assemble` adds to an item's
+//! ranking score, which the ranker computes as `fuzzy + weight + boost`, and
+//! a boost is meant to be strong enough to override match quality —
+//! `CONTEXT.md` says so in as many words. A single entry in the persisted
+//! table is worth up to `FREQ_BOOST_CAP` (60) on its own, more than the
+//! entire kind-weight spread (30 for a window down to 6 for a utility
+//! kind), so it outweighs every distinction the ranker draws between kinds
+//! and is added on top of whatever the query itself matched.
+//!
+//! The boost only reaches an item some provider actually produced, so the
+//! file alone puts no item into the list. What it decides is which of the
+//! items the user *does* see comes first — including an item whose id was
+//! planted by whoever wrote the file, since a `.desktop` in
+//! `~/.local/share/applications` costs the same one write. Position one in
+//! a launcher is what the user presses Enter on, which is why whether this
+//! file is trusted has to be settled in [`Learning::load`].
+//!
+//! What the guards here achieve is narrow, and worth stating exactly:
+//!
+//! - A store on a version this code does not write is refused, in either
+//!   direction: an older format and a newer one are equally never read
+//!   under this one's semantics. `STORE_VERSION` prices what refusing each
+//!   direction costs a user.
+//! - A `last_ms` ahead of the load instant is clamped back to it, so decay
+//!   runs from that instant rather than never. An unclamped future stamp
+//!   switched decay off outright — `apply_decay` returns the raw,
+//!   undecayed value while `now <= last_ms` — and no `save` could age it
+//!   out of the file either.
+//!
+//! What they do not achieve is the larger half, and the clamp's half is
+//! narrower than it looks. A clamped entry is stamped *now*, so
+//! `apply_decay` sees an age of zero and returns the full undecayed boost at
+//! that instant; what the clamp removes is the *permanence*, and only once
+//! the store is written back, since a store nothing re-saves is re-clamped
+//! to a fresh load instant every session. Nor was a future stamp ever an
+//! attacker's best move: writing `last_ms` at the current time buys the same
+//! boost and trips nothing at all. A store written with a plausible recent
+//! `last_ms` and a high `count` is indistinguishable from learning this
+//! module recorded itself and gets exactly the boost it asks for; neither
+//! guard so much as looks at an entry's id, and nothing here checks the
+//! file's owner or mode.
+//!
+//! That is also why the clamp is not stricter. Penalizing a future stamp —
+//! zeroing it, or decaying it hardest — would cost the attacker one edit
+//! and cost an honest user with a skewed clock their real learning.
+//!
+//! Refusing a written store outright means being able to tell that this
+//! module wrote it, which is a checksum or a message authentication code —
+//! a design decision of its own, deliberately out of scope for issue #38
+//! and implemented nowhere below. The store is better validated than it
+//! was. It is not trustworthy, and nothing here should be read as saying
+//! so.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -61,7 +128,38 @@ use hop_protocol::{ItemId, MAX_ITEM_ID, MAX_QUERY_TEXT};
 /// aliases module in M1.6) — aliases are an explicit user instruction and
 /// must always beat learned behavior. Exported so the aliases module and
 /// its tests can assert that relationship directly.
+///
+/// This is the ceiling on the *sum* `boost_for` returns, and no single
+/// persisted entry reaches it alone: an entry off disk contributes only
+/// `frequency_boost`, capped at `FREQ_BOOST_CAP` (60), and the remaining 25
+/// can come only from `query_boost`, whose `selections` table is in-memory
+/// and never written (see `PersistedLearningStore`). Both figures matter for
+/// a different comparison — 85 against the alias boost above, and 60 against
+/// the kind weights, which it already exceeds across their whole range. The
+/// module docs work through what one entry being worth that much means for a
+/// store that was written rather than learned.
 pub const LEARNING_BOOST_CAP: f32 = 85.0;
+
+/// The store format this code understands: the `version` [`Learning::save`]
+/// writes, and the only one [`Learning::load`] will read. Named once here
+/// rather than left as a bare `1` at each site that means it.
+///
+/// A store on any other version is refused whole — never read entry by
+/// entry under this version's semantics — and `load` falls back to an empty
+/// state, exactly as it does for a file it cannot parse.
+///
+/// The refusal is not symmetric in what it costs. An *older* store is
+/// learning already lost to whichever change bumped the version. A *newer*
+/// one is a live store, written by a later hop, that an older binary now
+/// discards: a user who downgrades, or who runs two versions against one
+/// state directory, loses their learning outright rather than half of it.
+/// That is still the right trade, because the alternative is not "keep the
+/// learning" — it is parsing a v2 file under v1 rules for as long as the
+/// field names happen to still fit, which misreads the table that decides
+/// what the user launches and announces nothing while it does. Lost
+/// learning is rebuilt by using hop; a table silently meaning something
+/// else is never noticed at all.
+const STORE_VERSION: u32 = 1;
 
 // --- Constants (unchanged from the salvage) ---
 
@@ -209,6 +307,13 @@ struct LearningEntry {
 /// learning insights to the user is explicitly out of scope here).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Learning {
+    /// Only ever read during a [`Learning::load`], where the second parse
+    /// branch needs somewhere to put a file's `version` before checking it
+    /// against `STORE_VERSION`. Its value means nothing once `load` has
+    /// returned, and the two constructors disagree about it harmlessly:
+    /// `Default` zeroes it, `Learning::empty` sets `STORE_VERSION`.
+    /// [`Learning::save`] consults neither — it writes `STORE_VERSION`, for
+    /// the reason given there.
     version: u32,
     #[serde(default, skip_serializing)]
     selections: HashMap<String, HashMap<String, LearningEntry>>,
@@ -234,6 +339,40 @@ fn now_ms() -> u64 {
 
 /// Apply recency decay to a raw boost value.
 /// Returns full value if within half-life, halved if within quarter-life, quartered beyond.
+///
+/// # Why `now <= last_ms` still returns the raw value
+///
+/// A stamp off disk can no longer arrive here ahead of the clock:
+/// `Learning::purge_and_bound` clamps a `last_ms` that sits ahead of the
+/// load instant back to it — and leaves every other stamp alone — which is
+/// what stops a future-dated entry from holding an undecayed boost for
+/// ever. The branch is kept regardless, deliberately,
+/// for the two reasons below — and the paragraph after them says why it is
+/// not replaced by something harsher instead.
+///
+/// It is this function's guard against `now - last_ms` underflowing, and
+/// that case is reachable without anything forged: `record` stamps entries
+/// with `now_ms()`, and a wall clock that then moves backwards — an NTP
+/// correction, a laptop waking with a stale RTC — leaves an in-memory entry
+/// stamped after the next reading. Without the branch that subtraction
+/// panics in debug and wraps to an enormous age in release.
+///
+/// It also costs nothing against the alternative that keeps the function
+/// total: `now.saturating_sub(last_ms)` yields an age of 0, 0 is inside the
+/// half-life, and the half-life arm returns `raw` — the same value by a
+/// longer route. The branch only says so where it can be read.
+///
+/// And the remaining alternative — penalizing the entry, returning 0 or
+/// decaying it hardest — is rejected because the reachable case is the
+/// honest one. It would spend a user's real learning on a clock correction
+/// they did not make, and it would not make a written store any less
+/// believed, which is the thing that actually wants fixing and which
+/// nothing in this module can do (see the module docs).
+///
+/// What the branch costs is unchanged, but no longer unbounded: an entry
+/// stamped ahead of the clock is boosted as though it had just been
+/// launched, until the clock passes it. Off disk that is now at most the
+/// instant of the load; in memory it is however far the clock jumped back.
 fn apply_decay(raw: i32, last_ms: u64, now: u64) -> i32 {
     if now <= last_ms {
         return raw;
@@ -392,10 +531,11 @@ fn purge_retention(
 // --- Learning implementation ---
 
 impl Learning {
-    /// An empty state: version 1, no selections, no global frequency.
+    /// An empty state: the current `STORE_VERSION`, no selections, no global
+    /// frequency.
     fn empty() -> Self {
         Self {
-            version: 1,
+            version: STORE_VERSION,
             selections: HashMap::new(),
             global_frequency: HashMap::new(),
         }
@@ -403,11 +543,36 @@ impl Learning {
 
     /// Load from disk, falling back to an empty state on any error — a
     /// missing file, a path that is not a regular file, more bytes than
-    /// `MAX_STORE_BYTES`, unparseable bytes, or valid JSON of the wrong
-    /// shape all land here. Never panics, and never reports which of those
-    /// happened: a load failure is indistinguishable from a first run, which
-    /// is a known gap owed a reporting channel of its own rather than
-    /// something this function decides per call.
+    /// `MAX_STORE_BYTES`, unparseable bytes, valid JSON of the wrong shape,
+    /// or a `version` that is not `STORE_VERSION` all land here. Never
+    /// panics, and never reports which of those happened: a load failure is
+    /// indistinguishable from a first run, which is a known gap owed a
+    /// reporting channel of its own rather than something this function
+    /// decides per call.
+    ///
+    /// # The two things a store says about itself
+    ///
+    /// A file asserts what no parse can check: which format its bytes are in
+    /// (`version`), and when each entry was last launched (`last_ms`). Both
+    /// used to be taken at face value, and they are dealt with differently
+    /// because they are different claims.
+    ///
+    /// The version is checked here, in *both* parse branches below, and a
+    /// mismatch refuses the whole store — see `STORE_VERSION` for why
+    /// refusing beats reinterpreting, and what refusing costs a user who
+    /// downgrades. The second branch is unreachable while the two shapes
+    /// agree: `PersistedLearningStore` and [`Learning`] require the same two
+    /// fields, so any document the second could accept the first accepted
+    /// already. It carries the check regardless, because a check that holds
+    /// only while two separately-maintained shapes coincide is not a check:
+    /// the day one of them grows a field the other lacks, the second branch
+    /// becomes reachable, and a guard on the first alone would be a hole
+    /// opened by an edit made somewhere else entirely.
+    ///
+    /// The timestamps are not checked but corrected: `purge_and_bound`
+    /// clamps a `last_ms` ahead of the load instant back to it, touching no
+    /// stamp that is not, and says there why a clamp rather than a refusal
+    /// and what the clamp does and does not buy.
     ///
     /// # Limits that do not subsume one another
     ///
@@ -434,8 +599,8 @@ impl Learning {
     /// [`Learning::save`] applies none of its own (see `MAX_STORE_BYTES` for
     /// what that makes this the load-path half of). `purge_expired` is no
     /// substitute either — it drops entries by age, so it keeps every entry
-    /// whose timestamp is recent or in the future, however many of those
-    /// there are.
+    /// whose timestamp is recent, including one the clamp has just moved
+    /// from the future to the load instant, however many of those there are.
     ///
     /// Of this module's own three size caps, `MAX_GLOBAL_ENTRIES` is the only
     /// one with anything to do here. `MAX_QUERIES` and `MAX_ITEMS_PER_QUERY`
@@ -447,29 +612,44 @@ impl Learning {
     /// # What the entry cap bounds, and what it does not
     ///
     /// It bounds *how many* entries survive a load. It does not decide
-    /// *which*, and specifically it does not favour the honest ones:
-    /// `evict_lru_map` evicts by oldest `last_ms`, so an entry stamped in
-    /// the future is preferentially *kept* and a genuine entry is what gets
-    /// dropped in its place. Future-dating therefore does not let an entry
-    /// evade the cap — the count comes down regardless — but it does let one
-    /// win eviction against real learning.
+    /// *which*: `evict_lru_map` evicts by oldest `last_ms`, so the newest
+    /// stamp in the map is the last entry dropped. Future-dating never let
+    /// an entry evade the cap — the count came down regardless — but it did
+    /// let one win eviction against real learning, by an unbounded margin
+    /// and for ever.
     ///
-    /// That selection hazard is a timestamp being trusted, and it is fixed
-    /// by checking the store's integrity rather than by clamping a timestamp
-    /// here, where a clamp could only guess at which stamps were honest.
-    /// Issue #38 owns it. This function deliberately validates no timestamp.
+    /// The clamp bounds that margin without settling the question. No entry
+    /// now reaches eviction stamped later than the load instant, where one
+    /// could previously carry a date no clock will reach. What the clamp
+    /// does not do is make the honest entries win: every entry already on
+    /// disk was stamped before the load, so a clamped entry is still the
+    /// newest in the map and still the last evicted. What that costs is one
+    /// slot out of `MAX_GLOBAL_ENTRIES`; what it no longer costs is that
+    /// slot against every launch to come, since a launch recorded in this
+    /// session is stamped after the load instant, which puts the clamped
+    /// entry ahead of it in the eviction order rather than behind.
+    ///
+    /// Settling it means refusing the entry, and refusing needs a reason to
+    /// believe the rest of the store — an integrity check, which is issue
+    /// #38's out-of-scope half and is implemented nowhere here. The module
+    /// docs say what that leaves standing.
     pub fn load(path: &Path) -> Learning {
         let Some(data) = read_bounded_store(path) else {
             return Self::empty();
         };
         if let Ok(persisted) = serde_json::from_str::<PersistedLearningStore>(&data) {
+            if persisted.version != STORE_VERSION {
+                return Self::empty();
+            }
             let mut store = Self::empty();
-            store.version = persisted.version;
             store.global_frequency = persisted.global_frequency;
             store.purge_and_bound();
             return store;
         }
         if let Ok(mut store) = serde_json::from_str::<Learning>(&data) {
+            if store.version != STORE_VERSION {
+                return Self::empty();
+            }
             store.selections.clear();
             store.purge_and_bound();
             return store;
@@ -478,9 +658,16 @@ impl Learning {
     }
 
     /// Everything a freshly parsed store owes before [`Learning::load`] hands
-    /// it out: drop entries whose key is over [`MAX_ITEM_ID`] bytes, drop
-    /// entries that have expired, then evict whatever is still over
-    /// `MAX_GLOBAL_ENTRIES`.
+    /// it out: drop entries whose key is over [`MAX_ITEM_ID`] bytes, clamp
+    /// every `last_ms` in the future back to now, drop entries that have
+    /// expired, then evict whatever is still over `MAX_GLOBAL_ENTRIES`.
+    ///
+    /// The key bound and the clamp apply to `global_frequency` alone,
+    /// because it is the only half of a [`Learning`] a load populates:
+    /// `save` never writes `selections`, and of `load`'s two branches one
+    /// never assigns them and the other clears them. `purge_expired` does
+    /// sweep both, being shared with `record`; at load its pass over
+    /// `selections` has nothing to do.
     ///
     /// # Why the key bound is applied here at all
     ///
@@ -504,21 +691,103 @@ impl Learning {
     /// issue, and is deliberately not applied here; the two are easy to
     /// mistake for one another because both look like "checking the id".
     ///
+    /// # Why the future stamps are clamped rather than trusted or dropped
+    ///
+    /// `last_ms` is a claim the file makes about when an entry was last
+    /// launched, and nothing else in the store corroborates it. A stamp
+    /// ahead of the clock is one no honest `record` wrote — `record` stamps
+    /// `now_ms()` — so it is either a clock that has since moved backwards
+    /// or a number somebody chose, and from here the two look identical.
+    ///
+    /// Trusting it is what this replaces, and the cost of trusting it was
+    /// not a slightly generous boost: `apply_decay` returns the raw,
+    /// undecayed value for as long as `now <= last_ms`, and
+    /// `purge_retention` keeps anything at or past the cutoff, so an entry
+    /// dated far enough ahead held full boost for ever and could never age
+    /// out of the file either.
+    ///
+    /// Clamping reads the stamp as the most recent honest value it could
+    /// have been. Dropping the entry instead is the alternative rejected: a
+    /// modest forward skew is ordinary — a store synced from a machine whose
+    /// clock runs fast, a VM resumed with a bad RTC — and dropping would
+    /// silently delete real learning to punish a clock, against this
+    /// module's standing policy of degrading bad data rather than discarding
+    /// it (`saturating_count_i32`'s doc comment).
+    ///
+    /// What the clamp buys is narrower than "the entry is now decayed", and
+    /// the difference matters. The clamped stamp is `now`, so the very next
+    /// `apply_decay` sees an age of zero, which is inside the half-life, and
+    /// returns the raw undecayed value: at the load instant the entry is
+    /// boosted exactly as an entry launched a moment ago would be. What
+    /// changes is that the boost now *starts ageing* from somewhere, where
+    /// before it aged from a date no clock would reach. And even that is
+    /// contingent, because the clamp is a load-path guard with no
+    /// counterpart in `save`, which writes what memory holds and validates
+    /// nothing: a corrected stamp becomes durable only when the store is
+    /// next written, and until then every load clamps the file's own value
+    /// again, from that session's instant.
+    ///
+    /// Being stricter would buy nothing. An attacker who can write the file
+    /// can write `last_ms` at the current time instead of the far future,
+    /// collect the same boost and trip no check here at all — a future stamp
+    /// was never their best move. Zeroing or hard-decaying a future entry
+    /// would therefore cost them one edit, and cost an honest user with a
+    /// skewed clock the learning they really did earn. What the clamp gives
+    /// up is stated where it lands: [`Learning::load`] on eviction,
+    /// `apply_decay` on the boost itself, and the module docs on the store no
+    /// clamp can help with.
+    ///
     /// # Why this order
     ///
-    /// Each step hands the next a smaller map, and each is about something
-    /// different: what is not learning at all, what is too old to count, and
-    /// what is simply too much. The key bound goes first so eviction never
-    /// spends a slot deciding between a genuine entry and one that was never
-    /// admissible — an over-long key stamped in the future would otherwise
-    /// win that comparison outright. Purging before evicting is the same
-    /// argument once more: it leaves eviction only entries that were going
-    /// to be kept anyway, where the reverse order would spend evictions on
-    /// entries the purge was about to drop and leave a needlessly smaller
-    /// store behind.
+    /// Each step hands the next a smaller or saner map, and each is about
+    /// something different: what is not learning at all, what cannot be
+    /// true, what is too old to count, and what is simply too much. The key
+    /// bound goes first so eviction never spends a slot deciding between a
+    /// genuine entry and one that was never admissible — an over-long key
+    /// stamped in the future would otherwise win that comparison against
+    /// every entry that was really learned, clamped or not.
+    ///
+    /// The clamp's position, by contrast, is free against *both* of the
+    /// steps that follow it, and saying so is better than implying an order
+    /// that does work it does not do.
+    ///
+    /// Against `evict_lru_map`: eviction drops the smallest `last_ms`, and
+    /// the clamp is `min(last_ms, now)`, which is monotonic — `a <= b`
+    /// implies `min(a, now) <= min(b, now)`. A monotonic rewrite can never
+    /// invert a comparison, only flatten a strict one into a tie, and the
+    /// only stamps it moves are those above `now`. So every entry stamped
+    /// behind the load instant survives, or does not, identically on either
+    /// side of the eviction.
+    ///
+    /// Two comparisons the order can change, neither of them a matter of
+    /// honesty. Which of two *future-dated* entries is dropped: clamped they
+    /// tie at `now` and `HashMap` iteration order picks, unclamped the
+    /// nearer-future one goes first. And an entry stamped on the load
+    /// instant exactly, which ties with a clamped entry rather than losing
+    /// to it by the millisecond it was written earlier.
+    ///
+    /// Against `purge_expired`: the purge keeps entries at or after the
+    /// retention cutoff, and a future stamp and the `now` that replaces it
+    /// are both past that cutoff, so no entry changes side either way.
+    ///
+    /// It is written where it is because a correction reads better before
+    /// the two steps that select — not because either of them would decide
+    /// differently. What the clamp does *not* do is fix eviction's
+    /// preference for a future-dated entry; [`Learning::load`] works through
+    /// why, and it is why that preference is not listed among this issue's
+    /// achievements.
+    ///
+    /// Purging before evicting is the key bound's argument once more: it
+    /// leaves eviction only entries that were going to be kept anyway, where
+    /// the reverse order would spend evictions on entries the purge was
+    /// about to drop and leave a needlessly smaller store behind.
     fn purge_and_bound(&mut self) {
         self.global_frequency
             .retain(|id, _| id.len() <= MAX_ITEM_ID);
+        let now = now_ms();
+        for entry in self.global_frequency.values_mut() {
+            entry.last_ms = entry.last_ms.min(now);
+        }
         self.purge_expired();
         evict_lru_map(&mut self.global_frequency, MAX_GLOBAL_ENTRIES);
     }
@@ -533,6 +802,18 @@ impl Learning {
     /// Per-query selections are never written — only the canonicalized,
     /// retention-purged global frequency table is.
     ///
+    /// The version written is `STORE_VERSION`, never `self.version`: these
+    /// bytes are in the format this function serializes, whatever version
+    /// the value in memory happens to carry. That distinction is not
+    /// academic — [`Learning`] derives `Default`, which zeroes `version`, so
+    /// copying the field through would have any caller that started from
+    /// `Learning::default()` rather than from a file (`Pipeline`'s own field
+    /// among them) write a store the very next [`Learning::load`] refuses.
+    ///
+    /// Nothing about `last_ms` is corrected on the way out. `save` writes
+    /// what memory holds; the clamp belongs to `purge_and_bound`, where
+    /// untrusted bytes arrive.
+    ///
     /// A store that cannot be serialized returns `Err` having created
     /// nothing at all — no file, no directory — so whatever is already on
     /// disk survives intact. `serialize_and_persist` is where that ordering
@@ -545,7 +826,7 @@ impl Learning {
         serialize_and_persist(
             path,
             &PersistedLearningStore {
-                version: self.version,
+                version: STORE_VERSION,
                 global_frequency: canonicalized_global_frequency(&purged_global),
             },
         )
@@ -1472,7 +1753,9 @@ mod tests {
         let path = dir.path().join("learning.json");
         std::fs::write(
             &path,
-            r#"{"version":1,"global_frequency":{"app:firefox":{"count":4000000000,"last_ms":18446744073709551615}}}"#,
+            format!(
+                r#"{{"version":{STORE_VERSION},"global_frequency":{{"app:firefox":{{"count":4000000000,"last_ms":18446744073709551615}}}}}}"#
+            ),
         )
         .unwrap();
 
@@ -2043,7 +2326,7 @@ mod tests {
     /// its bytes were admitted.
     fn whitespace_padded_store(total_bytes: usize) -> String {
         let store = format!(
-            r#"{{"version":1,"global_frequency":{{"app:a":{{"count":3,"last_ms":{}}}}}}}"#,
+            r#"{{"version":{STORE_VERSION},"global_frequency":{{"app:a":{{"count":3,"last_ms":{}}}}}}}"#,
             now_ms()
         );
         let mut padded = String::with_capacity(total_bytes);
@@ -2058,7 +2341,7 @@ mod tests {
             .map(|i| format!(r#""app:{i}":{{"count":1,"last_ms":{last_ms}}}"#))
             .collect();
         format!(
-            r#"{{"version":1,"global_frequency":{{{}}}}}"#,
+            r#"{{"version":{STORE_VERSION},"global_frequency":{{{}}}}}"#,
             body.join(",")
         )
     }
@@ -2112,7 +2395,7 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"version":1,"global_frequency":{{"{over_long}":{{"count":9,"last_ms":{now}}},"app:a":{{"count":1,"last_ms":{now}}}}}}}"#
+                r#"{{"version":{STORE_VERSION},"global_frequency":{{"{over_long}":{{"count":9,"last_ms":{now}}},"app:a":{{"count":1,"last_ms":{now}}}}}}}"#
             ),
         )
         .unwrap();
@@ -2141,7 +2424,7 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"version":1,"global_frequency":{{"{key}":{{"count":9,"last_ms":{now}}}}}}}"#
+                r#"{{"version":{STORE_VERSION},"global_frequency":{{"{key}":{{"count":9,"last_ms":{now}}}}}}}"#
             ),
         )
         .unwrap();
@@ -2224,15 +2507,19 @@ mod tests {
         );
     }
 
-    // Every entry here is stamped past any conceivable clock reading, so
-    // `purge_expired` — which drops entries by age — keeps all of them. The
-    // entry cap is the only thing left that can bring the count down, which
-    // is what makes this the case the age filter alone never covered.
+    // Every entry in the *file* here is stamped past any conceivable clock
+    // reading; the load clamps each one to the load instant, which is just
+    // as recent, so `purge_expired` — which drops entries by age — keeps all
+    // of them either way. The entry cap is the only thing left that can
+    // bring the count down, which is what makes this the case the age filter
+    // alone never covered.
     //
     // What this does *not* claim is that the surviving entries are the
-    // honest ones: eviction is by `last_ms`, so future-dating wins eviction
-    // even though it does not evade the cap. See `Learning::load`'s doc
-    // comment for that distinction and where it is dealt with.
+    // honest ones. Eviction is by `last_ms`, and the clamp bounds a forged
+    // stamp at the load instant rather than beating it: every entry that was
+    // already on disk was stamped earlier than that, so future-dating still
+    // survives eviction against them. See `Learning::load`'s doc comment for
+    // what the clamp does and does not change here.
     #[test]
     fn future_dated_entries_do_not_evade_the_entry_cap() {
         let dir = tempfile::tempdir().unwrap();
@@ -2244,7 +2531,8 @@ mod tests {
         assert_eq!(
             loaded.global_frequency.len(),
             MAX_GLOBAL_ENTRIES,
-            "a future-dated entry survives the age filter, and must still meet the cap"
+            "an entry future-dated in the file is clamped to the load instant, which \
+             survives the age filter just as well, and must still meet the cap"
         );
     }
 
@@ -2356,5 +2644,139 @@ mod tests {
 
         let err = result.expect_err("a directory that cannot be opened must fail the save");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    // --- The version and the timestamps a store carries (issue #38). ---
+    //
+    // Two different things a store asserts about itself, neither of which was
+    // checked: which format its bytes are in, and when each entry was last
+    // launched. See the module docs for what checking them does and does not
+    // achieve.
+
+    /// A store on `version`, carrying one entry stamped `last_ms`.
+    fn store_at_version(version: u32, last_ms: u64) -> String {
+        format!(
+            r#"{{"version":{version},"global_frequency":{{"app:a":{{"count":3,"last_ms":{last_ms}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_store_on_an_unrecognized_version_is_refused_rather_than_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, store_at_version(STORE_VERSION + 1, now_ms())).unwrap();
+
+        let loaded = Learning::load(&path);
+
+        assert!(
+            loaded.is_empty(),
+            "a store this code has never written must not be read under this code's semantics"
+        );
+    }
+
+    // The other side of the check: a store on the version this code writes
+    // loads as it always did. Without this, refusing every store would
+    // satisfy the test above.
+    #[test]
+    fn a_store_on_the_version_this_code_understands_is_still_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, store_at_version(STORE_VERSION, now_ms())).unwrap();
+
+        assert!(
+            Learning::load(&path).frequency_boost("app:a") > 0,
+            "a store on the current version is ordinary learning and must load"
+        );
+    }
+
+    // `Learning` derives `Default`, which zeroes `version` — so a store built
+    // in memory rather than by `load` carries a version no `load` would
+    // accept. `save` writing `STORE_VERSION` rather than `self.version` is
+    // what keeps the version check from silently discarding the learning of
+    // any caller that started from `Learning::default()` (`Pipeline`'s own
+    // field, among them) instead of from a file.
+    #[test]
+    fn a_store_saved_from_a_default_learning_reloads_rather_than_being_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+
+        let mut store = Learning::default();
+        store.record_launch("q", &ItemId::new("app:a").unwrap());
+        store.save(&path).unwrap();
+
+        assert!(
+            Learning::load(&path).frequency_boost("app:a") > 0,
+            "save writes the format it actually produces, so its own output must reload"
+        );
+    }
+
+    #[test]
+    fn a_far_future_timestamp_is_clamped_to_the_load_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, store_at_version(STORE_VERSION, u64::MAX)).unwrap();
+
+        let before = now_ms();
+        let loaded = Learning::load(&path);
+        let after = now_ms();
+
+        let stamped = loaded.global_frequency.get("app:a").unwrap().last_ms;
+        assert!(
+            stamped >= before && stamped <= after,
+            "a stamp no clock will reach must come back as the load instant, got {stamped}"
+        );
+    }
+
+    // What the clamp above buys, stated as the thing the criterion asks for:
+    // the entry decays. The second assertion is the behavior before this
+    // change — the same clock reading, against the stamp as the file wrote
+    // it, returns the raw value — so the two lines together are the
+    // before-and-after, not just an assertion that division works.
+    //
+    // `frequency_boost` reads the clock itself, so it cannot be asked what it
+    // will return in 91 days; `apply_decay` takes `now` as an argument and is
+    // the same function `frequency_boost` calls.
+    #[test]
+    fn a_clamped_timestamp_decays_where_the_future_one_it_replaced_never_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, store_at_version(STORE_VERSION, u64::MAX)).unwrap();
+
+        let loaded = Learning::load(&path);
+        let clamped = loaded.global_frequency.get("app:a").unwrap().last_ms;
+
+        let raw = 40;
+        let long_after = clamped + DECAY_QUARTER_MS + 1;
+        assert_eq!(
+            apply_decay(raw, clamped, long_after),
+            raw / 4,
+            "a clamped stamp ages like any other and its boost decays"
+        );
+        assert_eq!(
+            apply_decay(raw, u64::MAX, long_after),
+            raw,
+            "the same clock reading against the file's own stamp is undecayed, which is \
+             what the clamp exists to prevent"
+        );
+    }
+
+    // The other side of the clamp, and the reason it is a clamp rather than
+    // a rewrite: a stamp in the past is what every honest entry carries, and
+    // must survive a load byte for byte. A load that stamped every entry
+    // `now` would pass the two tests above and destroy all decay.
+    #[test]
+    fn a_timestamp_in_the_past_is_left_exactly_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let a_minute_ago = now_ms() - 60_000;
+        std::fs::write(&path, store_at_version(STORE_VERSION, a_minute_ago)).unwrap();
+
+        let loaded = Learning::load(&path);
+
+        assert_eq!(
+            loaded.global_frequency.get("app:a").unwrap().last_ms,
+            a_minute_ago,
+            "an honest stamp is not in the future and must not be touched"
+        );
     }
 }
