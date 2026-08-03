@@ -199,7 +199,34 @@ pub struct Item {
     /// Bounded at [`MAX_COPY_TEXT`](crate::limits::MAX_COPY_TEXT) bytes on the way in.
     #[serde(default, deserialize_with = "limits::de_item_copy_text")]
     pub copy_text: Option<String>,
-    /// Pinned after ranked results (web search actions), rather than ranked among them.
+    /// Asks for this item to be pinned after the ranked results, rather than
+    /// ranked among them. The pinned web-search row is the motivating case.
+    ///
+    /// It is a request, and what it requests is an exception to every ordering
+    /// rule the assembler has. `hop-core`'s pipeline splits pinned items out
+    /// before it filters an exclusive query (`w firefox`) down to that mode's
+    /// kinds and before it scores anything, so a pinned item is placed without
+    /// having matched what was typed, without clearing the minimum-score
+    /// floor, and whatever its own kind. That is deliberate: the web-search
+    /// row has to show for a query nothing about it matches. Nothing after the
+    /// split can drop such an item on relevance.
+    ///
+    /// So the exception is bounded by *count* instead, and the bound is not
+    /// here. This crate deliberately puts no maximum on how many items in a
+    /// frame set the flag, because no parse can enforce the one that matters:
+    /// the exception is spent per **query**, and a query's items arrive across
+    /// several frames from several providers, none of which can see the
+    /// others. The bound therefore lives where a whole query is in hand — as
+    /// `MAX_PINNED_ITEMS_PER_QUERY` in `hop-core`'s `pipeline` module, which
+    /// honors that many pinned items per query, in the order the providers
+    /// returned them, and returns the rest as rejections. A provider that
+    /// flags everything it returns gets the bound, not the flood.
+    ///
+    /// What the bound does not do is decide *who* may pin: the flag is a field
+    /// on this type, so anything that can answer a query can set it, and the
+    /// bound treats a first-party provider and a hostile one alike. A
+    /// capability check would be the answer to that, and
+    /// `MAX_PINNED_ITEMS_PER_QUERY`'s docs are where it is stated to belong.
     pub append_to_end: bool,
     /// Bounded at [`MAX_PROVIDER_ID`](crate::limits::MAX_PROVIDER_ID) bytes on the way in.
     #[serde(deserialize_with = "limits::de_provider")]

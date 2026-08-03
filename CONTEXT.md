@@ -110,15 +110,25 @@ its producer declared, and every item's provider string is its producer's
 manifest id. Assembly accepts nothing else, so an item's self-description is
 never taken on trust.
 
-**Rejection** — one item assembly declined, and which of the two checks it
-failed. Returned as data alongside the assembled items, never logged — there
-is no logging seam yet, and the query path may not have side effects.
+**Rejection** — one item assembly declined, and why: it failed one of the two
+manifest checks, or it was a pinned item past the **pin budget**. Returned as
+data alongside the assembled items, never logged — there is no logging seam
+yet, and the query path may not have side effects.
 
 **Ranked body** — the scored, ordered items.
 
 **Pinned tail** — items flagged `append_to_end`, which always follow the ranked
 body regardless of score. Web-search actions are the motivating case. They are
 split off before ranking and never scored.
+
+**Pin budget** — the most pinned items assembly honors for one query,
+`MAX_PINNED_ITEMS_PER_QUERY` in `hop-core`'s `pipeline`. The first that many in
+provider-supplied order are honored and the rest become rejections, so the flag
+cannot be spent by a provider that sets it on everything it returns. A bound on
+a per-query assembly, not on a wire value, which is why it does not live in
+`hop-protocol`'s `limits` with the bounds a parse can enforce. It bounds how
+many items may pin, never which providers may — that is a capability check
+nothing has built yet.
 
 **Cap** — the maximum result count, applied to the concatenated body and tail
 together. A body that alone fills the cap squeezes the tail out; the old
