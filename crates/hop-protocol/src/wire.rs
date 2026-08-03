@@ -135,6 +135,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::content::IconName;
     use crate::item::*;
 
     fn sample_item() -> Item {
@@ -143,10 +144,7 @@ mod tests {
             kind: Kind::App,
             title: "Firefox".into(),
             subtitle: Some("Web Browser".into()),
-            icon: Some(IconSpec {
-                name: Some("firefox".into()),
-                path: None,
-            }),
+            icon: Some(IconSpec::Name(IconName::new("firefox").unwrap())),
             actions: vec![Action {
                 id: ActionId::new("open").unwrap(),
                 kind: ActionKind::Open,
@@ -232,7 +230,7 @@ mod tests {
             concat!(
                 r#"{"type":"results","query_id":7,"partial":true,"items":["#,
                 r#"{"id":"app:firefox","kind":"app","title":"Firefox","#,
-                r#""subtitle":"Web Browser","icon":{"name":"firefox","path":null},"#,
+                r#""subtitle":"Web Browser","icon":{"name":"firefox"},"#,
                 r#""actions":[{"id":"open","kind":"open","label":"Open"}],"#,
                 r#""default_action":"open","copy_text":null,"append_to_end":false,"provider":"apps"}"#,
                 r#"]}"#

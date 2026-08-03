@@ -48,14 +48,14 @@
 //!   id                4 096   (MAX_ITEM_ID)
 //!   title             1 024   (MAX_TITLE)
 //!   subtitle          1 024   (MAX_SUBTITLE)
-//!   icon name           256   (MAX_ICON_NAME)
-//!   icon path         4 096   (MAX_ICON_PATH)
+//!   icon              4 096   (the larger of MAX_ICON_NAME and MAX_ICON_PATH:
+//!                              an icon is a name or a path, never both)
 //!   copy_text        65 536   (MAX_COPY_TEXT)
 //!   provider             64   (MAX_PROVIDER_ID)
 //!   default_action      128   (MAX_ACTION_ID)
 //!   32 actions        8 192   (MAX_ACTIONS_PER_ITEM × (MAX_ACTION_ID + MAX_ACTION_LABEL))
 //!                   -------
-//!                    84 416 bytes
+//!                    84 160 bytes
 //! ```
 //!
 //! At [`MAX_ITEMS_PER_RESULTS_FRAME`] that is roughly **84 MB in a single
@@ -131,17 +131,25 @@ pub const MAX_ACTION_LABEL: usize = 128;
 /// `windows`, `files`), not free text. 64 bytes is already generous for one.
 pub const MAX_PROVIDER_ID: usize = 64;
 
-/// Maximum bytes of an [`IconSpec`](crate::item::IconSpec)'s icon-theme name.
+/// Maximum bytes of an [`IconName`](crate::content::IconName), the name arm of
+/// an [`IconSpec`](crate::item::IconSpec).
 ///
 /// A name looked up in an icon theme, such as `firefox` or
 /// `application-x-executable`. 256 bytes covers the longest names any theme
 /// ships.
+///
+/// This is the bound; what a name may *contain* is a content rule, and it lives
+/// on the type in [`content`](crate::content) along with the bound's application.
 pub const MAX_ICON_NAME: usize = 256;
 
-/// Maximum bytes of an [`IconSpec`](crate::item::IconSpec)'s icon path.
+/// Maximum bytes of an [`IconPath`](crate::content::IconPath), the path arm of
+/// an [`IconSpec`](crate::item::IconSpec).
 ///
 /// An absolute path to an icon file, so `PATH_MAX` = 4096, as for
 /// [`MAX_ITEM_ID`].
+///
+/// The two bounds never both apply to one item: an icon is a name or a path, so
+/// this module's budget table counts the larger of them once rather than the sum.
 pub const MAX_ICON_PATH: usize = 4_096;
 
 /// Maximum bytes of copy text — an [`Item`](crate::item::Item)'s `copy_text` and
@@ -467,10 +475,10 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
 // carries its bound in that type's own `Deserialize`, through `validated`
 // above, so that the bound and whatever else the type promises are one gate
 // rather than two: `MAX_ITEM_ID` and `MAX_ACTION_ID` are applied by
-// `crate::item`, `MAX_OPEN_URL` and the outcome half of `MAX_COPY_TEXT` by
-// `crate::content`, and `MAX_QUERY_TEXT` by `crate::redaction`. Grepping a
-// constant still finds every field it governs; it just finds some of them in
-// the module that owns the type.
+// `crate::item`, `MAX_OPEN_URL`, `MAX_ICON_NAME`, `MAX_ICON_PATH` and the
+// outcome half of `MAX_COPY_TEXT` by `crate::content`, and `MAX_QUERY_TEXT` by
+// `crate::redaction`. Grepping a constant still finds every field it governs; it
+// just finds some of them in the module that owns the type.
 
 pub(crate) fn de_title<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string(d, "Item.title", MAX_TITLE)
@@ -486,14 +494,6 @@ pub(crate) fn de_provider<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::
 
 pub(crate) fn de_action_label<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string(d, "Action.label", MAX_ACTION_LABEL)
-}
-
-pub(crate) fn de_icon_name<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    opt_string(d, "IconSpec.name", MAX_ICON_NAME)
-}
-
-pub(crate) fn de_icon_path<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    opt_string(d, "IconSpec.path", MAX_ICON_PATH)
 }
 
 pub(crate) fn de_item_copy_text<'de, D: Deserializer<'de>>(
@@ -726,16 +726,19 @@ mod tests {
     fn icon_name_bound_holds_on_both_sides() {
         assert_string_boundary::<Item>(MAX_ICON_NAME, |v| {
             let mut item = item_json();
-            item["icon"] = json!({ "name": v, "path": null });
+            item["icon"] = json!({ "name": v });
             item
         });
     }
 
     #[test]
     fn icon_path_bound_holds_on_both_sides() {
-        assert_string_boundary::<Item>(MAX_ICON_PATH, |v| {
+        // A path has to be absolute to get as far as its length being the
+        // reason it is refused, so the leading `/` is the prefix — and it counts
+        // against the bound like any other byte.
+        assert_string_boundary_with_prefix::<Item>(MAX_ICON_PATH, "/", |v| {
             let mut item = item_json();
-            item["icon"] = json!({ "name": null, "path": v });
+            item["icon"] = json!({ "path": v });
             item
         });
     }
@@ -866,9 +869,9 @@ mod tests {
         let mut over_copy_text = item_json();
         over_copy_text["copy_text"] = over_by_one(MAX_COPY_TEXT);
         let mut over_icon_name = item_json();
-        over_icon_name["icon"] = json!({ "name": over_by_one(MAX_ICON_NAME), "path": null });
+        over_icon_name["icon"] = json!({ "name": over_by_one(MAX_ICON_NAME) });
         let mut over_icon_path = item_json();
-        over_icon_path["icon"] = json!({ "name": null, "path": over_by_one(MAX_ICON_PATH) });
+        over_icon_path["icon"] = json!({ "path": format!("/{}", "a".repeat(MAX_ICON_PATH)) });
         let mut over_label = item_json();
         let mut long_label = action_json();
         long_label["label"] = over_by_one(MAX_ACTION_LABEL);
@@ -888,8 +891,8 @@ mod tests {
             ("Item.subtitle", over_subtitle),
             ("Item.provider", over_provider),
             ("Item.copy_text", over_copy_text),
-            ("IconSpec.name", over_icon_name),
-            ("IconSpec.path", over_icon_path),
+            ("IconSpec::Name", over_icon_name),
+            ("IconSpec::Path", over_icon_path),
             ("Action.label", over_label),
             ("Item.actions", over_action_count),
         ];
@@ -1011,23 +1014,24 @@ mod tests {
     // test that recomputed them on both sides would assert nothing.
     #[test]
     fn the_documented_worst_case_is_what_the_constants_compose_to() {
+        // An icon contributes one of its two bounds and not the sum of them:
+        // `IconSpec` is an enum, so a name and a path cannot both be present.
         let per_item = MAX_ITEM_ID
             + MAX_TITLE
             + MAX_SUBTITLE
-            + MAX_ICON_NAME
-            + MAX_ICON_PATH
+            + MAX_ICON_NAME.max(MAX_ICON_PATH)
             + MAX_COPY_TEXT
             + MAX_PROVIDER_ID
             + MAX_ACTION_ID
             + MAX_ACTIONS_PER_ITEM * (MAX_ACTION_ID + MAX_ACTION_LABEL);
         assert_eq!(
-            per_item, 84_416,
+            per_item, 84_160,
             "the per-item total in this module's budget table no longer matches the constants"
         );
 
         let per_frame = per_item * MAX_ITEMS_PER_RESULTS_FRAME;
         assert_eq!(
-            per_frame, 84_416_000,
+            per_frame, 84_160_000,
             "the ~84 MB per-frame figure in this module's budget table no longer holds"
         );
     }
