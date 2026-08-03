@@ -1657,6 +1657,20 @@ mod tests {
         let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: `c_path` is a live NUL-terminated string for the duration of
         // the call, which is all `mkfifo(3)` requires of it.
+        //
+        // The workspace denies `unsafe_code` (see `[workspace.lints.rust]` in
+        // the root `Cargo.toml`), and this statement is the only exception in
+        // the tree. It is scoped to the statement rather than the function or
+        // the module so that a second `unsafe` added anywhere near it still
+        // fails the build. `expect` rather than `allow`: if this call ever goes
+        // away — a safe wrapper, a different way of making the FIFO — the
+        // unfulfilled expectation becomes a warning, and CI's `-D warnings`
+        // turns it into an error, so the exception deletes itself instead of
+        // outliving its reason.
+        #[expect(
+            unsafe_code,
+            reason = "mkfifo(3) has no safe wrapper in libc; test-only, and production code has none"
+        )]
         let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
         assert_eq!(
             made,

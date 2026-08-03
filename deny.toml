@@ -1,0 +1,172 @@
+# Supply-chain policy for the workspace, enforced by `cargo deny check` in CI.
+#
+# The point of this file is that the policy is reviewed rather than remembered.
+# Every dependency this workspace pulls in — including the ones a plugin author
+# never sees — is checked against it on every pull request, and any exception to
+# it has to be written down here, with a reason, in a diff somebody reads.
+#
+# Nothing here is grandfathered. `libc` and `tempfile` arrived before this gate
+# existed (see the note in `crates/hop-protocol/Cargo.toml`) and are checked by
+# it like everything else.
+#
+# Schema: cargo-deny's v2 config. The old severity keys `vulnerability` and
+# `copyleft`, and the `[licenses] deny` list, no longer exist — vulnerabilities
+# are always an error, and a license is refused by not being on the allow list.
+# (`[advisories] unmaintained` does still exist, and is set below; it is the one
+# severity key that survived the v2 migration in a new form.) Both a removed key
+# and a key cargo-deny has never heard of are hard failures rather than warnings
+# — `error[deprecated]` and `error[unexpected-keys]` respectively, each aborting
+# before a single check runs — so a stale or misspelled config cannot sit here
+# quietly doing nothing. That is the behaviour this file depends on: it is why
+# every setting below can be read as load-bearing rather than aspirational.
+
+[graph]
+# Empty means every target triple, not just the host. A crate that only builds
+# on Windows still has a license and can still carry an advisory, and we would
+# rather find that out here than the first time somebody cross-compiles. It
+# costs nothing today, and the durable form of that claim is a property rather
+# than a roster: every crate in the lock file that no Linux build ever compiles
+# offers MIT as one arm of its license expression, so MIT already satisfies all
+# of them and none is the reason for a line in the allow list below. A roster is
+# the wrong thing to write here because the next `cargo update` falsifies it
+# silently, while the property survives and can be re-checked. The set
+# regenerates with:
+#
+#   comm -23 <(grep '^name = ' Cargo.lock | cut -d'"' -f2 | sort) \
+#            <(cargo tree --target x86_64-unknown-linux-gnu --prefix none \
+#                | awk '{print $1}' | sort -u)
+#
+# which is four crates as this is written — `errno`, `r-efi`, `windows-link`,
+# `windows-sys` — named to make the property spot-checkable, not to be
+# maintained. If that command ever prints a name whose license is not already on
+# the allow list, this paragraph is what has to be re-argued.
+#
+# None is depended on directly; all of them arrive under `tempfile`, itself only
+# a dev-dependency. `tempfile` reaches `windows-sys` by three paths at once —
+# directly, through `errno`, and through `rustix`, which is `tempfile`'s *Unix*
+# syscall backend and carries the Windows bindings for the other side of its own
+# `cfg` (`cargo tree -i windows-sys --target all` shows all three parents) — and
+# reaches `r-efi` through `getrandom`, whose UEFI arm is compiled for no target
+# this project ships. `windows-link` hangs off `windows-sys` alone.
+targets = []
+all-features = false
+no-default-features = false
+
+[advisories]
+# The RustSec advisory database, fetched at check time. Vulnerabilities are
+# always an error in this schema and cannot be downgraded, which is the
+# behaviour we want.
+#
+# Yanked crates are an error too. A yank is the registry's own signal that a
+# version should not be used, and treating it as a warning means the signal
+# scrolls past in a green build. The cost is that an upstream yank can turn CI
+# red without anybody here changing a line — that is the gate working, and the
+# fix is to move off the yanked version, not to soften this.
+yanked = "deny"
+# Unmaintained crates are an error across the whole graph, not just for the
+# dependencies this workspace names directly. An abandoned crate five levels
+# down still ships in the binary, and this tree is small enough that the
+# stricter setting is affordable.
+unmaintained = "all"
+# Advisories this workspace has knowingly accepted, each with a reason and a way
+# out. Empty, and it should stay that way: an entry here is a decision to ship a
+# known problem, so it belongs in a pull request with an argument attached, not
+# in a config bump.
+ignore = []
+
+[licenses]
+# The workspace is GPL-3.0-only (see `[workspace.package]` in the root
+# `Cargo.toml`), so every dependency's license has to be one GPL-3.0 can absorb.
+# This is not a generic permissive list copied from elsewhere: it is the minimum
+# that resolves the tree, so every entry below is load-bearing and deleting any
+# one of them turns `cargo deny check licenses` red. That is a property, not a
+# hope — it is checkable one line at a time by removing an entry and re-running,
+# and it is what makes the absences further down mean something.
+#
+#   MIT           Permissive and GPL-compatible, and what most of this tree
+#                 resolves to: one half of the usual Rust dual license offered
+#                 by serde, regex, thiserror, syn and libc, and the only option
+#                 tokio, tokio-macros and zmij offer at all.
+#   MPL-2.0       nucleo-matcher, and it is the *only* license that crate
+#                 offers, so this entry exists for exactly one dependency.
+#                 MPL-2.0 is weak, file-level copyleft and is explicitly
+#                 GPL-compatible: § 3.3 permits the Larger Work to be
+#                 distributed under a Secondary License, and the GPL is named as
+#                 one. Its obligation attaches to modified MPL files themselves;
+#                 we vendor nothing and modify nothing, so it does not reach
+#                 hop's own sources.
+#   Unicode-3.0   unicode-ident, whose expression is
+#                 `(MIT OR Apache-2.0) AND Unicode-3.0` — the AND means this is
+#                 required whichever side of the OR is taken. Permissive: a
+#                 BSD-style grant over the Unicode character data tables.
+#   GPL-3.0-only  hop's own crates, hop-protocol and hop-core. They are checked
+#                 by this gate like anything else — the workspace is not
+#                 exempted from its own policy — so the license it is actually
+#                 published under has to appear here. This entry is not an
+#                 invitation to take on a GPL-3.0 dependency: doing that is a
+#                 licensing decision about hop's own distribution and needs an
+#                 argument, not a line that happens to already be present.
+#
+# Deliberately absent: Apache-2.0 and Unlicense. Every crate here that offers
+# either offers it as one arm of an `OR` whose other arm is MIT — `MIT OR
+# Apache-2.0` across most of the tree, `Unlicense OR MIT` for aho-corasick and
+# memchr, `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` for rustix — and
+# MIT already satisfies all of them. Allowing a second arm resolves nothing new
+# and costs the minimality above.
+#
+# Neither is absent because it is unacceptable. Apache-2.0 is compatible with
+# GPL-3.0 specifically — it is *not* compatible with GPL-2.0, and its
+# patent-termination clause is part of why GPLv3 exists in the form it does — so
+# an Apache-2.0-only dependency would very likely be fine. What leaving it off
+# buys is that saying so becomes a diff somebody reads, on the day a crate
+# actually needs it, rather than a permission granted years earlier to nothing in
+# particular.
+allow = [
+    "GPL-3.0-only",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+]
+# How sure the scanner must be when it has to read a LICENSE file instead of a
+# manifest field. cargo-deny's default; raising it turns text-detection noise
+# into build failures for no gain here, since every crate in this tree declares
+# its license in metadata.
+confidence-threshold = 0.8
+# Per-crate escapes from the allow list above. Empty. If a crate ever needs one
+# it needs a sentence here saying which crate, which license, and why the
+# incompatibility is acceptable.
+exceptions = []
+
+[licenses.private]
+# hop's own crates are GPL-3.0-only and are not marked `publish = false`, so
+# there is nothing to skip.
+ignore = false
+
+[bans]
+# Two copies of a crate at different major versions is normal in a Rust tree and
+# usually not ours to fix — it is one transitive dependency disagreeing with
+# another. A warning keeps it visible without failing a build over something no
+# change in this repo can resolve.
+multiple-versions = "warn"
+# A `*` version requirement accepts whatever the registry serves next, which is
+# the opposite of a supply-chain gate. None exist today; this keeps it that way.
+wildcards = "deny"
+highlight = "all"
+# Crates refused outright, whatever their license or advisory status. Empty —
+# no crate has been banned. This is the hook for a "never depend on X again"
+# decision if one is ever made.
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Where dependencies are allowed to come from. This is the check that matters
+# most for a project whose roadmap is hosting third-party code: an advisory
+# database only knows about crates it has heard of, and a dependency pulled from
+# an arbitrary git URL is one nobody is scanning. crates.io only, and a git
+# dependency is an error rather than a warning — the schema defaults here are
+# "warn", which would let one land in a green build.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

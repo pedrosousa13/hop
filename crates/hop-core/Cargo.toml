@@ -6,7 +6,20 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-hop-protocol = { path = "../hop-protocol" }
+# `version` alongside `path` so this is not a wildcard requirement. A bare path
+# dependency accepts any version of the crate it points at, which is what
+# `cargo deny check bans` flags. The path is what a workspace build uses; the
+# version is what anything else would.
+#
+# Quieting the gate instead was considered and rejected. `deny.toml` has an
+# `allow-wildcard-paths` knob, but cargo-deny honours it only for crates marked
+# `publish = false`, and hop's are not (see `[licenses.private]` in `deny.toml`)
+# — so that route means declaring these crates unpublishable to silence a lint,
+# and relaxing the rule for every path dependency the workspace ever gains, to
+# avoid one field. The lint is also right on the merits: a path-only dependency
+# cannot be published to a registry at all, since the path means nothing off this
+# machine. Fixing the manifest is the smaller and truer change.
+hop-protocol = { path = "../hop-protocol", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

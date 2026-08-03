@@ -30,3 +30,38 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # A separate job, not a step in `ci`: it never compiles the workspace, so it
+  # wants neither the rustfmt/clippy components nor the build cache — and, the
+  # reason that matters, it reports as its own red check. "Supply chain failed"
+  # and "a test failed" are different problems for a reviewer, and one job would
+  # collapse them into a single status.
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # SHA-pinned, not `@v2` and not the `v2.1.1` tag it names: a gate whose job
+      # is to stop dependency drift should not itself float. Bumping it is then a
+      # deliberate edit with a diff.
+      #
+      # `command: check` with no arguments runs all four checks — advisories,
+      # bans, licenses, sources — under the policy in `deny.toml` at the repo
+      # root, so the gate is configured in a reviewed file rather than in flags
+      # buried here. `arguments: ""` overrides the action's `--all-features`
+      # default so `deny.toml`'s `[graph]` decides the feature set; the workspace
+      # declares no optional features today, and the override is here for when
+      # that stops being true.
+      #
+      # The advisory database is cloned over the network at run time, so an
+      # outage or a rate limit turns this job red rather than green. That is the
+      # right direction to fail — a gate that passes because it could not reach
+      # the advisory list is worse than no gate — but it means a red `Supply
+      # chain` check should be read before it is believed. If it proves flaky,
+      # cache the database rather than making the check advisory.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: ""

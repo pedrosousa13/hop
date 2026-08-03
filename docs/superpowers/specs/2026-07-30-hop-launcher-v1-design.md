@@ -1,7 +1,7 @@
 # Hop Launcher v1 — Design Spec
 
 Date: 2026-07-30
-Status: Approved; amended 2026-07-31
+Status: Approved; amended 2026-07-31, 2026-08-03
 Decisions by: Pedro Sousa
 
 **Amendment, 2026-07-31.** Amended after a grilling session over the milestone
@@ -12,6 +12,10 @@ milestone), §6 (what "locked" means and when), §8 (the keymap is
 configurable), §8a (theming becomes an ecosystem), §11 (the latency test
 gains an adversarial arm), §13 (milestones split from five to six). Each
 change is marked **[Amended 2026-07-31]** in place.
+
+**Amendment, 2026-08-03.** Amended when issue #35 landed the supply-chain gate
+CI never had. One section changed: §11 (the CI list now names `cargo deny`).
+The change is marked **[Amended 2026-08-03]** in place.
 
 ## 1. What this is
 
@@ -217,7 +221,7 @@ The product must be fully exercisable by an automated agent with no human at the
 - hop-gtk: headless smoke test (broadway/offscreen) + `scripts/dev-run.sh` manual loop (salvaged style).
 - Latency regression test: scripted 10k-item index, assert p95 query < 10 ms in CI.
 - **[Amended 2026-07-31] The latency gate needs a second, adversarial arm.** A p95 over a normal workload never sees the pathological case: sweep finding #46 measured `Ranker::rank` at 4.09 s for a 100 KB query over 5 000 items — `Pattern::parse` splits on spaces into one atom per word, so cost is `O(atoms × items)` with no ceiling on either factor, and `truncate(max_results)` runs *last*, bounding the output rather than the work. So CI asserts both: p95 < 10 ms over the scripted index, **and** a bounded worst case over pathological input (long query, oversized candidate set, huge per-item strings). This forces #46's input cap to be decided in M2 rather than discovered in production.
-- CI (GitHub Actions): fmt, clippy (deny warnings), test, cross-compile check. **No release automation until v1 works on the author's machine** (branch red-flag #1).
+- CI (GitHub Actions): fmt, clippy (deny warnings), test, cross-compile check. **[Amended 2026-08-03]** Plus a supply-chain gate (issue #35): `cargo deny check` runs all four checks — advisories, bans, licenses, sources — against `deny.toml` at the repo root, as its own job rather than a step, so "supply chain failed" and "a test failed" report as separate red checks. **No release automation until v1 works on the author's machine** (branch red-flag #1).
 
 ## 12. Release & site plan
 
