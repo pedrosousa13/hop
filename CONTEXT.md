@@ -275,3 +275,19 @@ not match it.
 application, ranking, learning lookup, assembly. Nothing on it may touch disk,
 spawn a subprocess, or make a network call. Learning state moves to and from
 disk only on explicit `load` and `save`.
+
+**No `unsafe` in production code** — enforced rather than documented:
+`unsafe_code = "deny"` in the root `Cargo.toml`'s `[workspace.lints.rust]`,
+which each member inherits with `[lints] workspace = true`, so a new member that
+omits that line sits outside the gate. So do doc tests, which rustdoc compiles
+as crates of their own that the lint does not reach — the comment beside
+`unsafe_code` in the root `Cargo.toml` carries the detail, and it is the reason
+this rule is stated about compiled code rather than about the whole tree. In
+compiled code one exception exists: the `libc::mkfifo` call in `hop-protocol`'s
+`content.rs`, inside `#[cfg(test)] mod tests`. It carries
+`#[expect(unsafe_code)]` on the statement rather than
+`#[allow]` on the module, so a second `unsafe` beside it still fails, and the
+exception warns itself out of existence once its call goes — which CI's
+`-D warnings` turns into an error. `deny` and not `forbid`, so a genuine FFI
+need can annotate one call with a `SAFETY:` comment instead of weakening the
+line for the whole workspace.

@@ -17,5 +17,37 @@ tokio = { version = "1", default-features = false, features = ["sync", "time", "
 tempfile = "3"
 regex = "1"
 
+# Both member crates opt in with `[lints] workspace = true`. A workspace lint no
+# crate inherits is a gate that does nothing, so any new member must do the same.
+[workspace.lints.rust]
+# Production code in this workspace contains no `unsafe`, and this is what keeps
+# it that way rather than a claim in a document that drifts. What the lint covers
+# is normal compilation of both members — `src/` and `#[cfg(test)]` code alike,
+# which is why the workspace's one `unsafe` block, a `libc::mkfifo` call inside
+# `#[cfg(test)] mod tests` in `hop-protocol`, needs a narrow
+# `#[expect(unsafe_code)]` at the statement to build at all. That `expect` is
+# itself the proof the lint reaches test code: were it not firing there, the
+# unfulfilled expectation would warn, and CI's `-D warnings` would fail.
+#
+# What it does not cover is doc tests. Cargo hands `--deny=unsafe_code` to
+# rustdoc — visible in `cargo test -p hop-protocol --doc -v` — but rustdoc
+# compiles each ``` block as a separate crate and does not forward the flag to
+# it, so an `unsafe` block in a doc comment compiles and passes
+# `cargo test --workspace` with no attribute written anywhere and nothing for a
+# grep to find. The exposure is narrow and worth stating plainly: a doc test is
+# an example that runs in CI and ships in no binary, so what gets through is
+# unsound documentation, not unsound hop. It is written down because the claim
+# has to stop where the lint does. `grep -rn unsafe_code crates/` reads the
+# exceptions the lint forced somebody to declare — useful, and not an audit,
+# since it neither reaches doc tests nor distinguishes an attribute from prose
+# about the rule.
+#
+# `deny` rather than `forbid` so that an exception is *possible* — a crate that
+# has to talk to a C API should be able to, with a `SAFETY:` comment and a
+# reviewer. `forbid` cannot be overridden anywhere, which would mean the next
+# genuine need for FFI turns into a pull request that weakens this line for the
+# whole workspace instead of one that annotates a single call.
+unsafe_code = "deny"
+
 [workspace.lints.clippy]
 unwrap_used = "warn"

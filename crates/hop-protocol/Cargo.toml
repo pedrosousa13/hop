@@ -16,9 +16,10 @@ thiserror.workspace = true
 # a second implementation of it.
 #
 # These two are the first dependencies the contract crate has taken beyond serde
-# and thiserror, and they arrive with no supply-chain gate on this workspace —
-# see issue #35, which is open for exactly that. Whoever picks it up should treat
-# these as in scope rather than grandfathered.
+# and thiserror, and they arrived before this workspace had a supply-chain gate.
+# It has one now — `deny.toml` at the repo root, run by the `Supply chain` job in
+# CI — and they are checked by it like every other dependency, which is what the
+# note that used to stand here asked for.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
