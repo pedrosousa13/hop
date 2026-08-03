@@ -141,7 +141,8 @@ applied at the deserialization boundary, and the bound is applied first.
 **Validating newtype** — a type wrapping a private `String` whose only
 constructor applies every rule, and whose `Deserialize` hands the parsed string
 to that same constructor. One gate, not two: a value that exists has passed the
-rules however it was made. `ItemId`, `ActionId`, `CopyText` and `OpenUrl`.
+rules however it was made. `ItemId`, `ActionId`, `CopyText`, `OpenUrl` and
+`QueryText`.
 
 **Allowed scheme** — a URL scheme an `OpenUrl` may carry, from the allow-list
 `ALLOWED_URL_SCHEMES`. An allow-list, never a deny-list: a scheme that is not on
@@ -155,6 +156,23 @@ assembly declined: a rejection is data returned alongside the items that
 survived, so a query with one still answers. Neither is ever a truncation, a
 normalization, or a silent fix.
 
+## Redaction
+
+**Redaction** — printing a marker in place of the value, optionally with a
+bounded fact about it such as its byte length. Redaction applies to
+*formatting*, not to transport: a redacted value is still serialized and sent
+whole. A bound restricts how long a value may be, a content rule what it may
+contain, and a redaction what formatting it discloses; the three live in
+`hop-protocol`'s `limits`, `content` and `redaction` modules. What the disclosed
+fact costs is priced on the type that discloses it, under the `# What ... costs`
+heading in Conventions, never assumed to be free.
+
+**Redacting newtype** — a validating newtype that also carries its own `Debug`,
+so the redaction travels with the value: a field formatted on its own prints the
+same marker it prints inside its frame, and a field added to a frame later is
+redacted by having the type. `QueryText`, the type of `ClientMsg::Query.text`,
+which holds keystrokes typed into the launcher overlay.
+
 ## Conventions
 
 **`// DIVERGENCE:`** — the literal marker on any test where behavior
@@ -162,6 +180,26 @@ deliberately differs from the old extension's, with the reason inline. Grep for
 it to audit every place this codebase knowingly departs from what it ported.
 Comments must be self-contained: never defer the justification to a document
 outside the repo.
+
+**`# What ... costs`** — the doc-heading form under which a type prices a
+decision: what is given up, and the alternative that was rejected instead.
+Only `# What` and `costs` are fixed, so the audit is
+`grep -rnE '^\s*/// # What .* costs'` rather than a grep for one literal string
+— and it is the heading that is greppable, not the wording between. The anchor
+is what keeps the output to the headings themselves: without it the pattern also
+returns this file's own mentions of the form. A redaction that
+discloses a fact about the value **must** carry one, so that every priced
+disclosure is one grep away; anything else that gives something up **may**.
+`QueryText`'s `# What reporting the length costs` is the worked example, and
+`content`'s `# What refusing a carriage return costs` is the permission taken
+up — the same heading spent on a rule's cost rather than a disclosure's.
+
+The form prices what a gate on a wire value gives up, so it is scoped to
+`hop-protocol`'s `limits`, `content` and `redaction`. Prose that prices
+something else is outside the form rather than missing it: `hop-core`'s
+`pipeline` heading `## When the manifest is read, and what that costs` prices
+when a check runs, not what a gate discloses or refuses, and the grep above does
+not match it.
 
 **Query path** — the code that runs on every keystroke: routing, alias
 application, ranking, learning lookup, assembly. Nothing on it may touch disk,

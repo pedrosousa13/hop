@@ -81,11 +81,11 @@ use thiserror::Error;
 ///
 /// A launcher query is a few words typed against a keystroke-latency budget.
 /// 1 KiB still admits a generous accidental paste while keeping the string that
-/// flows into the search path — and that `hop-core`'s learning store then holds
+/// flows into the query path — and that `hop-core`'s learning store then holds
 /// resident as an in-memory key — small enough that a hostile client cannot
 /// grow either.
 ///
-/// This is a search-path and resident-memory bound, not a disk one. Query text
+/// This is a query-path and resident-memory bound, not a disk one. Query text
 /// never reaches disk: `hop-core`'s learning store persists only its global
 /// launch-frequency table, which is keyed by item id (see [`MAX_ITEM_ID`]), and
 /// deliberately leaves the query-keyed half of its state unserialized.
@@ -465,15 +465,12 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
 //
 // Not every bounded field is here. A field whose type is a validating newtype
 // carries its bound in that type's own `Deserialize`, through `validated`
-// above, so that the bound and the type's other rules are one gate rather than
-// two: `MAX_ITEM_ID` and `MAX_ACTION_ID` are applied by `crate::item`,
-// `MAX_OPEN_URL` and the outcome half of `MAX_COPY_TEXT` by `crate::content`.
-// Grepping a constant still finds every field it governs; it just finds some of
-// them in the module that owns the type.
-
-pub(crate) fn de_query_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    string(d, "ClientMsg::Query.text", MAX_QUERY_TEXT)
-}
+// above, so that the bound and whatever else the type promises are one gate
+// rather than two: `MAX_ITEM_ID` and `MAX_ACTION_ID` are applied by
+// `crate::item`, `MAX_OPEN_URL` and the outcome half of `MAX_COPY_TEXT` by
+// `crate::content`, and `MAX_QUERY_TEXT` by `crate::redaction`. Grepping a
+// constant still finds every field it governs; it just finds some of them in
+// the module that owns the type.
 
 pub(crate) fn de_title<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string(d, "Item.title", MAX_TITLE)
@@ -531,6 +528,7 @@ mod tests {
     use super::*;
     use crate::content::{ALLOWED_URL_SCHEMES, CopyText, OpenUrl};
     use crate::item::Item;
+    use crate::redaction::QueryText;
     use crate::wire::{ClientMsg, DaemonMsg, ExecOutcome, ProtoError};
 
     /// An otherwise-valid item, as JSON, for a test to overwrite one field of.
@@ -832,7 +830,7 @@ mod tests {
         let msg = json!({ "type": "query", "id": 1, "text": "a".repeat(MAX_QUERY_TEXT + 1) });
         let err = serde_json::from_str::<ClientMsg>(&msg.to_string()).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("ClientMsg::Query.text"), "got: {text}");
+        assert!(text.contains(QueryText::FIELD), "got: {text}");
         assert!(text.contains(&MAX_QUERY_TEXT.to_string()), "got: {text}");
     }
 
