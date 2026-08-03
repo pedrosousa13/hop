@@ -163,16 +163,9 @@ bounded fact about it such as its byte length. Redaction applies to
 *formatting*, not to transport: a redacted value is still serialized and sent
 whole. A bound restricts how long a value may be, a content rule what it may
 contain, and a redaction what formatting it discloses; the three live in
-`hop-protocol`'s `limits`, `content` and `redaction` modules.
-
-**`# What ... costs`** — the literal doc-heading form under which a type prices
-something it gives up: what an adversary gets, and what was rejected instead. A
-redaction that discloses a fact about the value carries one, so that "a
-disclosure nobody priced" is a grep rather than a reviewer's memory. Grep for
-the heading, not for the wording between. `QueryText`'s `# What reporting the
-length costs` is the worked example; `content`'s `# What refusing a carriage
-return costs` is the same heading spent on a rule's cost rather than a
-disclosure's.
+`hop-protocol`'s `limits`, `content` and `redaction` modules. What the disclosed
+fact costs is priced on the type that discloses it, under the `# What ... costs`
+heading in Conventions, never assumed to be free.
 
 **Redacting newtype** — a validating newtype that also carries its own `Debug`,
 so the redaction travels with the value: a field formatted on its own prints the
@@ -187,6 +180,24 @@ deliberately differs from the old extension's, with the reason inline. Grep for
 it to audit every place this codebase knowingly departs from what it ported.
 Comments must be self-contained: never defer the justification to a document
 outside the repo.
+
+**`# What ... costs`** — the doc-heading form under which a type prices a
+decision: what is given up, and the alternative that was rejected instead.
+Only `# What` and `costs` are fixed, so the audit is
+`grep -rnE '# What .* costs'` rather than a grep for one literal string — and it
+is the heading that is greppable, not the wording between. A redaction that
+discloses a fact about the value **must** carry one, so that every priced
+disclosure is one grep away; anything else that gives something up **may**.
+`QueryText`'s `# What reporting the length costs` is the worked example, and
+`content`'s `# What refusing a carriage return costs` is the permission taken
+up — the same heading spent on a rule's cost rather than a disclosure's.
+
+The form prices what a gate on a wire value gives up, so it is scoped to
+`hop-protocol`'s `limits`, `content` and `redaction`. Prose that prices
+something else is outside the form rather than missing it: `hop-core`'s
+`pipeline` heading `## When the manifest is read, and what that costs` prices
+when a check runs, not what a gate discloses or refuses, and the grep above does
+not match it.
 
 **Query path** — the code that runs on every keystroke: routing, alias
 application, ranking, learning lookup, assembly. Nothing on it may touch disk,

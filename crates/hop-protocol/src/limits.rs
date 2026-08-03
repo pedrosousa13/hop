@@ -81,11 +81,11 @@ use thiserror::Error;
 ///
 /// A launcher query is a few words typed against a keystroke-latency budget.
 /// 1 KiB still admits a generous accidental paste while keeping the string that
-/// flows into the search path — and that `hop-core`'s learning store then holds
+/// flows into the query path — and that `hop-core`'s learning store then holds
 /// resident as an in-memory key — small enough that a hostile client cannot
 /// grow either.
 ///
-/// This is a search-path and resident-memory bound, not a disk one. Query text
+/// This is a query-path and resident-memory bound, not a disk one. Query text
 /// never reaches disk: `hop-core`'s learning store persists only its global
 /// launch-frequency table, which is keyed by item id (see [`MAX_ITEM_ID`]), and
 /// deliberately leaves the query-keyed half of its state unserialized.

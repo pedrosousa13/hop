@@ -98,10 +98,16 @@ use crate::limits::{self, BoundError, MAX_QUERY_TEXT, check_len};
 ///   bucketed redaction would report one differently from the refusal beside
 ///   it.
 /// - Bucketing does not buy back the paste-versus-typing distinction. That
-///   shape is in the *number* of frames, not in their lengths: N keystrokes are
-///   N frames and a paste is one, whatever each frame reports. What bucketing
-///   would hide is narrower than it first looks — a *pasted* value's exact
-///   length.
+///   shape is in the *number* of frames, not in their lengths: against a
+///   launcher that sends a frame per keystroke, N keystrokes are N frames and a
+///   paste is one, however each frame reports its size. What that frame count
+///   recovers is the keystroke count, though, and the keystroke count need not
+///   be the byte length: the figure `Debug` reports is bytes rather than
+///   characters — pinned by
+///   `tests::the_reported_byte_count_is_bytes_and_not_characters` — and a
+///   backspace is a keystroke that shortens the text. So bucketing would hide
+///   a *pasted* value's exact length, and a *typed* one's wherever those two
+///   part company. What it leaves standing is which of the two happened.
 /// - What this type exists to close is the text.
 ///
 /// The second and third reasons are about this field. The first is not: it

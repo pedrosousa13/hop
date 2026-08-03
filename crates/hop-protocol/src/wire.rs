@@ -41,7 +41,7 @@ pub enum ClientMsg {
         /// [`MAX_QUERY_TEXT`](crate::limits::MAX_QUERY_TEXT) bound applied on
         /// the way in.
         ///
-        /// This is the string that flows into the search path and that the
+        /// This is the string that flows into the query path and that the
         /// learning store keeps resident as an in-memory key. It never reaches
         /// disk — only the item-id-keyed frequency table is persisted.
         text: QueryText,
