@@ -121,28 +121,44 @@ impl ProviderOutput {
 /// ## What the pinned tail bypasses, and why it needs a budget at all
 ///
 /// The pinned tail is the one path into the result list that nothing filters.
-/// Step 4 of [`Pipeline::assemble`] splits it off, so neither the
-/// exclusive-mode filter (step 5) nor [`Ranker::rank`] — with its fuzzy match
-/// and its `min_score` floor — ever sees a pinned item. That bypass is
-/// deliberate, and it is what makes the pinned web-search row work: the row
-/// must show for `w firefox` even though nothing about it matches "firefox",
-/// and it must show under an exclusive route whose kinds it does not share.
+/// Step 4 of [`Pipeline::assemble`] splits every `append_to_end` item off
+/// before the exclusive-mode filter (step 5) and before [`Ranker::rank`] —
+/// with its fuzzy match and its `min_score` floor — so neither ever sees one,
+/// and an item the budget then honors arrives in the list having faced
+/// nothing. That bypass is deliberate, and it is what makes the pinned
+/// web-search row work: the row must show for `w firefox` even though nothing
+/// about it matches "firefox", and it must show under an exclusive route whose
+/// kinds it does not share.
 ///
 /// `append_to_end` is a plain `bool` on [`Item`] though, and any provider can
-/// set it on every item it returns. Unbudgeted, that is guaranteed placement
-/// on every query for as many items as a provider cares to send, filling
-/// whatever the ranked body leaves under `max_results`. The budget keeps the
-/// exception the size of its intended use rather than the size of whatever a
-/// provider asks for.
+/// set it on every item it returns. Setting it is therefore a *request* for
+/// the tail, not entry to it. Unbudgeted, every request would be granted: that
+/// is guaranteed placement on every query for as many items as a provider
+/// cares to send, filling whatever the ranked body leaves under `max_results`.
+/// The budget keeps the exception the size of its intended use rather than the
+/// size of whatever a provider asks for.
 ///
 /// ## Why one, and why this is the half that carries the weight
 ///
-/// One first-party pinned row per source is the whole intended use: a provider
-/// of pinned rows has *a* row — the web-search action — not a collection of
-/// them. So this half is not a compromise between the use and the abuse; it is
-/// the use, stated exactly, and every honest provider today sits inside it.
+/// The argument is about what the path is *for*, not about how many providers
+/// exist to use it — none ship in this repo yet, and a number chosen to fit
+/// today's implementations would be a number chosen from nothing. What the
+/// path is for is placing a row that ranking cannot reach: the web-search
+/// action stands for "do this with what you typed", so it must appear on a
+/// query it does not match. One row per source is exactly that need. A second
+/// unmatched row from the same source is no longer a standing offer but a
+/// list, and a list of things the user might want is what ranking is for — so
+/// the second row belongs in the ranked body, where it can be scored against
+/// what was typed like everything else. One is the number that keeps the
+/// exception available to every source while making a *collection* of
+/// unrankable rows impossible to assemble.
 ///
-/// It is also what keeps a flooding provider from taking the pinned path away
+/// It is also the only value that needs no tie-break within a source. At two
+/// or more, something must decide which of a source's own pins survive, and
+/// the only order available is the one the source itself supplied — which
+/// hands the choice back to the provider the share exists to limit.
+///
+/// And it is what keeps a flooding provider from taking the pinned path away
 /// from anyone else. Because the share is per producer, a provider that flags
 /// a hundred items is refused its second pin for having had its first, not for
 /// being who it is: the refusal is arithmetic over producer ids, needing no
@@ -494,13 +510,14 @@ impl Pipeline {
     ///    (what ranking uses) and any alias boosts.
     /// 3. Collect boosts: the alias boosts plus a learning boost for every
     ///    candidate item, summed into one [`Boosts`] map.
-    /// 4. Split off `append_to_end` items — the pinned tail, never ranked
-    ///    (`Ranker::rank` drops them itself, so this split is what keeps
-    ///    them alive at all) — and spend the **pin budget** over them in
-    ///    provider-supplied order: at most [`MAX_PINNED_ITEMS_PER_PROVIDER`]
-    ///    from any one producer and at most [`MAX_PINNED_ITEMS_PER_QUERY`] in
-    ///    all, with everything it cannot afford rejected as
-    ///    [`FailedCheck::PinBudget`].
+    /// 4. Split off the `append_to_end` items — the ones *requesting* the
+    ///    pinned tail, never ranked (`Ranker::rank` drops them itself, so
+    ///    this split is what keeps them alive at all) — and spend the **pin
+    ///    budget** over the requests in provider-supplied order, the ones it
+    ///    affords becoming the pinned tail: at most
+    ///    [`MAX_PINNED_ITEMS_PER_PROVIDER`] from any one producer and at most
+    ///    [`MAX_PINNED_ITEMS_PER_QUERY`] in all, with every request it cannot
+    ///    afford rejected as [`FailedCheck::PinBudget`].
     /// 5. If the route is exclusive, filter the remaining items to that
     ///    mode's kinds.
     /// 6. Rank what remains, using `effective_term`.
@@ -577,8 +594,8 @@ impl Pipeline {
         // stop different things: MAX_PINNED_ITEMS_PER_PROVIDER stops one
         // producer taking the pinned path for itself, MAX_PINNED_ITEMS_PER_QUERY
         // stops enough providers doing it one pin at a time. See both
-        // constants for what each is worth and where a capability check
-        // deciding *who* may pin belongs.
+        // constants for what each half is worth, and MAX_PINNED_ITEMS_PER_QUERY
+        // for where a capability check deciding *who* may pin belongs.
         //
         // A pin refused here is refused outright rather than left to step 9's
         // cap, because the two refuse different things: the cap drops what a
@@ -1210,6 +1227,21 @@ mod tests {
         )
     }
 
+    /// One provider's single pinned row, paired with that provider's own
+    /// manifest — for the tests that need two outputs to name the same
+    /// producer, which [`flood_output`]'s generated ids cannot do without
+    /// colliding.
+    fn pin_output(provider_id: &'static str, id: &str) -> ProviderOutput {
+        output(
+            provider_id,
+            vec![Kind::WebSearch],
+            vec![Item {
+                provider: provider_id.into(),
+                ..pinned(Kind::WebSearch, id, "Search the web")
+            }],
+        )
+    }
+
     /// The ids of a rejection list, for asserting *which* items were declined.
     fn ids_of_rejections(rejections: &[Rejection]) -> Vec<String> {
         rejections
@@ -1286,6 +1318,74 @@ mod tests {
         assert!(
             out.rejections.is_empty(),
             "nothing here exceeds either half of the pin budget"
+        );
+    }
+
+    /// The share is counted over producer *ids* against the tail being built,
+    /// not over [`ProviderOutput`] values, and one provider may answer a
+    /// single query with more than one output — a scheduler streaming partial
+    /// results is the obvious way to get there. So the share has to survive
+    /// being split across them. Nothing else in this module would notice a
+    /// refactor that counted one pin per output instead: every other test here
+    /// gives each producer exactly one output, so all of them would still pass
+    /// while this provider quietly took two rows.
+    #[test]
+    fn a_producer_answering_in_two_outputs_still_gets_one_pin() {
+        let mut pipeline = Pipeline::default();
+        let out = pipeline.assemble(
+            "firefox",
+            CheckedItems::check(vec![
+                pin_output("web", "web:first"),
+                pin_output("web", "web:second"),
+            ]),
+            50,
+        );
+        assert_eq!(
+            ids(&out.items),
+            vec!["web:first"],
+            "one producer, two outputs, one pin: the share belongs to the \
+             provider that produced the items, not to the output it arrived in"
+        );
+        assert_eq!(
+            ids_of_rejections(&out.rejections),
+            vec!["web:second"],
+            "and the second output's pin is refused for being the producer's \
+             second, exactly as it would have been inside one output"
+        );
+    }
+
+    /// Several providers flooding at once, which the tests above do not cover:
+    /// each is held to its own row rather than the first flooder taking the
+    /// query total, and the total is reached by three *different* producers
+    /// having spent it — not by any one of them.
+    #[test]
+    fn several_flooding_providers_are_each_held_to_one_pin() {
+        let mut pipeline = Pipeline::default();
+        let out = pipeline.assemble(
+            "firefox",
+            CheckedItems::check(vec![
+                flood_output("first", 4),
+                flood_output("second", 4),
+                flood_output("third", 4),
+            ]),
+            50,
+        );
+        assert_eq!(
+            ids(&out.items),
+            vec!["first:0", "second:0", "third:0"],
+            "twelve pins requested by three providers yields one row each, in \
+             the order their outputs were checked"
+        );
+        assert_eq!(
+            out.rejections.len(),
+            9,
+            "and the other nine are refused: three per provider, none of them \
+             for anything the provider claimed about itself"
+        );
+        assert!(
+            out.rejections
+                .iter()
+                .all(|r| r.check == FailedCheck::PinBudget),
         );
     }
 

@@ -223,8 +223,12 @@ pub struct Item {
     /// any one producer and `MAX_PINNED_ITEMS_PER_QUERY` in all, honored in
     /// the order the providers returned them, with the rest returned as
     /// rejections. A provider that flags everything it returns gets its one
-    /// row, not the flood, and cannot take the pinned path away from another
-    /// provider by being quick or by being verbose.
+    /// row, not the flood: being verbose wins it nothing, and cannot cost
+    /// another provider the row it asked for. Being *early* still can, though,
+    /// and the difference is worth keeping straight — the per-producer share
+    /// stops a provider taking a second row, while the per-query total is
+    /// shared and spent in the order the providers answered, so a provider
+    /// that answers early spends a slot a later provider might have had.
     ///
     /// What the pin budget does not do is decide *who* may pin: the flag is a
     /// field on this type, so anything that can answer a query can set it, and

@@ -130,7 +130,8 @@ query honors is the **pin budget**, and the rest become rejections.
 `MAX_PINNED_ITEMS_PER_QUERY` in all, both in `hop-core`'s `pipeline`. Spent in
 provider-supplied order, so a provider that sets the flag on everything it
 returns gets its one row rather than the list — and, because the share is per
-producer, cannot take the tail away from another provider by answering first.
+producer, cannot take the whole tail away from another provider by answering
+first, though answering first does spend one of the shared slots.
 It counts pins, never deciding which providers may pin; that is a capability
 check nothing has built yet. Not a **bound** in this glossary's sense: it
 restricts neither the length nor the content of a wire value and no parse can
