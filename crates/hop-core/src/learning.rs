@@ -33,12 +33,20 @@
 //!   bytes is now refused. [`Learning::record_launch`] says which caller that
 //!   bound is the *only* protection for, and what it deliberately does not
 //!   bound.
+//! - The load path is bounded (issue #37). The salvage read the whole file
+//!   with `read_to_string` — whatever the path pointed at, however large —
+//!   and enforced `MAX_GLOBAL_ENTRIES` only in `record`, never on the way in.
+//!   [`Learning::load`] now refuses a path that is not a regular file, reads
+//!   at most `MAX_STORE_BYTES` + 1 bytes, and applies both the entry cap and
+//!   the `MAX_ITEM_ID` key bound to what it parsed. Its contract is
+//!   unchanged: it still returns `Learning` rather than a `Result`, still
+//!   falls back to an empty state on any error, and still never panics.
 //!
 //! Nothing outside `load` and `save` touches the filesystem.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -46,7 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use hop_protocol::{ItemId, MAX_QUERY_TEXT};
+use hop_protocol::{ItemId, MAX_ITEM_ID, MAX_QUERY_TEXT};
 
 /// The maximum boost [`Learning::boost_for`] can ever return. Must sit
 /// strictly below the alias boost constant (180.0, arriving with the
@@ -66,6 +74,112 @@ const QUERY_BOOST_CAP: i32 = 150;
 
 const FREQ_BOOST_PER_COUNT: i32 = 3;
 const FREQ_BOOST_CAP: i32 = 60;
+
+/// The most bytes [`Learning::load`] will read from a store file. A file
+/// over this is refused whole rather than truncated to fit: a prefix of a
+/// store is not a smaller store.
+///
+/// Derived from the two constants that bound a persisted store's shape,
+/// rather than picked as a round number:
+///
+/// ```text
+///   MAX_GLOBAL_ENTRIES               1 000  entries that can reach `save`
+///                                           (neither row is a bound `save`
+///                                           itself applies — see below for
+///                                           what enforces each)
+///   x  MAX_ITEM_ID x 6              24 576  one entry's key: an item id at
+///                                           its bound, every byte a C0
+///                                           control — which `serde_json`
+///                                           writes as `\u001f`, six
+///                                           characters for one byte, the
+///                                           worst expansion JSON string
+///                                           escaping has
+///   +  per-entry overhead              128  82 counted, rounded up: the
+///                                           quotes, colon, space, braces and
+///                                           comma around one entry (7), the
+///                                           indentation and newlines
+///                                           `to_string_pretty` adds (24),
+///                                           and the two numeric fields with
+///                                           their names, at full width —
+///                                           `count` a 10-digit u32,
+///                                           `last_ms` a 20-digit u64 (51)
+///                              ------------
+///                                24 704 000  bytes, ~23.6 MiB
+/// ```
+///
+/// The 46 bytes per entry that rounding leaves spare — ~46 KB across a full
+/// store — also absorb the document's own envelope (`version`, the
+/// `global_frequency` key, the enclosing braces), which is under a hundred
+/// bytes and does not warrant a term of its own.
+///
+/// # What actually enforces the two rows
+///
+/// Neither of them is a bound [`Learning::save`] applies. `save` purges by
+/// retention and canonicalizes — both of which can only shrink the map — and
+/// then writes whatever `global_frequency` holds, however many entries that
+/// is and however long their keys are. Both rows hold transitively, and it
+/// is worth writing down through what.
+///
+/// `MAX_ITEM_ID` takes two enforcements, not one. `ItemId::new` bounds every
+/// key [`Learning::record_launch`] adds, and bounds nothing that arrives off
+/// disk: `global_frequency` is a `HashMap<String, _>`, so a parse imposes no
+/// length on its keys and builds no [`ItemId`] to impose one. `purge_and_bound`
+/// is what covers that second half, as of issue #37 — before it, a
+/// hand-written megabyte key loaded and was written straight back out.
+///
+/// `MAX_GLOBAL_ENTRIES` is enforced by `record`, which has always evicted
+/// down to it, and by `purge_and_bound`, also as of issue #37.
+///
+/// What none of that amounts to is a bound on every `Learning` in existence.
+/// `Learning` is public and derives `Deserialize`, and the generated impl is
+/// written inside this module, so a private field is no barrier: an outside
+/// caller can parse a `Learning` straight from JSON — the very route
+/// [`Learning::load`]'s second branch takes, which is why that branch calls
+/// `purge_and_bound` rather than inheriting a guarantee from somewhere — and
+/// building one in-module, as this module's own tests do, is another way in.
+/// A `Learning` obtained either way is bounded by nothing, and `save` would
+/// write it out exactly as it found it.
+///
+/// So this ceiling's guarantee is about the round trip this module owns: a
+/// store whose state came from [`Learning::load`] or from `record`, saved,
+/// fits under it. That is the case that has to hold, because it is the one
+/// hop runs.
+///
+/// # That the round trip closes
+///
+/// With both rows enforced on the way in, it does. The largest store a load
+/// can hand back is `MAX_GLOBAL_ENTRIES` entries keyed at `MAX_ITEM_ID`
+/// bytes: every other dimension of an entry is bounded by its own type, and
+/// what `save` does before writing — retention purging, canonicalization —
+/// can only drop an entry, merge two, or shorten a key. That is exactly the
+/// store the maximal test builds, and `save` writes it at 24 658 047 bytes
+/// (measured) against this 24 704 000-byte ceiling. A store that survives a
+/// load therefore saves to a file the next load accepts.
+///
+/// Without the key bound it did not close, and the entry cap could not have
+/// closed it: a hand-written store in *compact* JSON can sit under this
+/// ceiling with keys far past `MAX_ITEM_ID`, and `save` re-serializes it
+/// with `to_string_pretty`'s ~26 bytes per entry of indentation and spacing
+/// on top — over the ceiling, and unreadable by the very next load. The
+/// entry count in that story is legal throughout; only the key length is
+/// not.
+///
+/// The ceiling **must** comfortably admit any store this module writes from
+/// state it produced, or a legitimate full store would fail to reload and
+/// the guard meant to protect a user's learning would be what discarded it.
+/// That requirement is held as a test rather than as a claim here:
+/// `the_largest_store_save_can_write_still_reloads_intact` builds a store
+/// sitting on every one of those maxima at once, saves it, measures the file
+/// against this ceiling and reloads it. What makes those the real maxima is
+/// the transitive enforcement above, whose load-path half is pinned
+/// separately by `a_store_over_the_entry_cap_is_evicted_down_to_it_on_load`
+/// and `a_persisted_key_over_the_item_id_bound_is_dropped_on_load`.
+///
+/// This bounds bytes and nothing else. It is no bound on how many entries a
+/// store holds — a file a tenth of this size can still carry tens of
+/// thousands of tiny entries — which is `MAX_GLOBAL_ENTRIES`'s job,
+/// applied separately after the parse.
+const MAX_STORE_BYTES: u64 = (MAX_GLOBAL_ENTRIES * (MAX_ITEM_ID * 6 + 128)) as u64;
 
 /// 30 days in milliseconds — half-life for decay.
 const DECAY_HALF_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -288,24 +402,125 @@ impl Learning {
     }
 
     /// Load from disk, falling back to an empty state on any error — a
-    /// missing file, unparseable bytes, or valid JSON of the wrong shape all
-    /// land here. Never panics.
+    /// missing file, a path that is not a regular file, more bytes than
+    /// `MAX_STORE_BYTES`, unparseable bytes, or valid JSON of the wrong
+    /// shape all land here. Never panics, and never reports which of those
+    /// happened: a load failure is indistinguishable from a first run, which
+    /// is a known gap owed a reporting channel of its own rather than
+    /// something this function decides per call.
+    ///
+    /// # Limits that do not subsume one another
+    ///
+    /// Three apply to a load, and no one of them implies another:
+    /// `MAX_STORE_BYTES` bounds how many *bytes* are read,
+    /// `MAX_GLOBAL_ENTRIES` how many *entries* survive, and [`MAX_ITEM_ID`]
+    /// how long a surviving entry's *key* may be. A store can sit far under
+    /// the byte ceiling and still hold a hundred thousand entries; a store
+    /// can hold a single entry and be gigabytes of whitespace; and a store
+    /// can be legal on both of those counts with a megabyte key in it.
+    /// `read_bounded_store` applies the byte ceiling, alongside its own
+    /// separate guard on what *kind* of thing the path is — which is not a
+    /// size limit at all — and `purge_and_bound` applies the other two after
+    /// the parse, in the order its own doc comment justifies.
+    ///
+    /// The cap is applied to what was actually parsed, and how many entries
+    /// a file holds is never taken on trust: `MAX_GLOBAL_ENTRIES` used to be
+    /// enforced only by `record`, so a store that *arrived* over the cap
+    /// stayed over it until the next launch was recorded — `record` has
+    /// always ended by evicting down to the cap, so a session that records
+    /// one is repaired by it. A session that records none never is, and that
+    /// is an ordinary session: reading boosts and saving touches neither
+    /// `record` nor, before this change, any cap at all, and
+    /// [`Learning::save`] applies none of its own (see `MAX_STORE_BYTES` for
+    /// what that makes this the load-path half of). `purge_expired` is no
+    /// substitute either — it drops entries by age, so it keeps every entry
+    /// whose timestamp is recent or in the future, however many of those
+    /// there are.
+    ///
+    /// Of this module's own three size caps, `MAX_GLOBAL_ENTRIES` is the only
+    /// one with anything to do here. `MAX_QUERIES` and `MAX_ITEMS_PER_QUERY`
+    /// bound the per-query selections, which no load keeps: `save` never
+    /// writes them, and both branches below discard whatever a file offered
+    /// in their place. The other limit applied below, [`MAX_ITEM_ID`], is
+    /// `hop-protocol`'s and bounds a key's length rather than any count.
+    ///
+    /// # What the entry cap bounds, and what it does not
+    ///
+    /// It bounds *how many* entries survive a load. It does not decide
+    /// *which*, and specifically it does not favour the honest ones:
+    /// `evict_lru_map` evicts by oldest `last_ms`, so an entry stamped in
+    /// the future is preferentially *kept* and a genuine entry is what gets
+    /// dropped in its place. Future-dating therefore does not let an entry
+    /// evade the cap — the count comes down regardless — but it does let one
+    /// win eviction against real learning.
+    ///
+    /// That selection hazard is a timestamp being trusted, and it is fixed
+    /// by checking the store's integrity rather than by clamping a timestamp
+    /// here, where a clamp could only guess at which stamps were honest.
+    /// Issue #38 owns it. This function deliberately validates no timestamp.
     pub fn load(path: &Path) -> Learning {
-        if let Ok(data) = std::fs::read_to_string(path) {
-            if let Ok(persisted) = serde_json::from_str::<PersistedLearningStore>(&data) {
-                let mut store = Self::empty();
-                store.version = persisted.version;
-                store.global_frequency = persisted.global_frequency;
-                store.purge_expired();
-                return store;
-            }
-            if let Ok(mut store) = serde_json::from_str::<Learning>(&data) {
-                store.selections.clear();
-                store.purge_expired();
-                return store;
-            }
+        let Some(data) = read_bounded_store(path) else {
+            return Self::empty();
+        };
+        if let Ok(persisted) = serde_json::from_str::<PersistedLearningStore>(&data) {
+            let mut store = Self::empty();
+            store.version = persisted.version;
+            store.global_frequency = persisted.global_frequency;
+            store.purge_and_bound();
+            return store;
+        }
+        if let Ok(mut store) = serde_json::from_str::<Learning>(&data) {
+            store.selections.clear();
+            store.purge_and_bound();
+            return store;
         }
         Self::empty()
+    }
+
+    /// Everything a freshly parsed store owes before [`Learning::load`] hands
+    /// it out: drop entries whose key is over [`MAX_ITEM_ID`] bytes, drop
+    /// entries that have expired, then evict whatever is still over
+    /// `MAX_GLOBAL_ENTRIES`.
+    ///
+    /// # Why the key bound is applied here at all
+    ///
+    /// `global_frequency` is a `HashMap<String, _>`, so parsing one imposes
+    /// no length on its keys. `ItemId::new` bounds an id at the point an
+    /// [`ItemId`] is built, which covers every key `record_launch` can add —
+    /// and covers nothing at all about a key that arrived off disk, since
+    /// none was built on the way in. A key over the bound therefore cannot
+    /// be learning this module recorded, and is dropped rather than kept:
+    /// keeping it would break the byte ceiling's own derivation, which
+    /// assumes every persisted key is at most `MAX_ITEM_ID` bytes — see
+    /// `MAX_STORE_BYTES`, where that assumption is stated and this is the
+    /// enforcement it names.
+    ///
+    /// The entry is dropped, not the store around it. That follows the
+    /// policy `saturating_count_i32`'s doc comment sets out for this module:
+    /// degrade bad data rather than discard the good alongside it.
+    ///
+    /// This is a bound — how long a key may be — and not a rule about what a
+    /// key may *contain*. The id-scrubbing rule is the latter, is a separate
+    /// issue, and is deliberately not applied here; the two are easy to
+    /// mistake for one another because both look like "checking the id".
+    ///
+    /// # Why this order
+    ///
+    /// Each step hands the next a smaller map, and each is about something
+    /// different: what is not learning at all, what is too old to count, and
+    /// what is simply too much. The key bound goes first so eviction never
+    /// spends a slot deciding between a genuine entry and one that was never
+    /// admissible — an over-long key stamped in the future would otherwise
+    /// win that comparison outright. Purging before evicting is the same
+    /// argument once more: it leaves eviction only entries that were going
+    /// to be kept anyway, where the reverse order would spend evictions on
+    /// entries the purge was about to drop and leave a needlessly smaller
+    /// store behind.
+    fn purge_and_bound(&mut self) {
+        self.global_frequency
+            .retain(|id, _| id.len() <= MAX_ITEM_ID);
+        self.purge_expired();
+        evict_lru_map(&mut self.global_frequency, MAX_GLOBAL_ENTRIES);
     }
 
     /// Persist to disk via a temp file + atomic rename + directory fsync,
@@ -532,6 +747,80 @@ impl Learning {
         self.global_frequency
             .retain(|_, entry| entry.last_ms >= cutoff);
     }
+}
+
+/// The bytes at `path`, or `None` if the path is not a regular file, if it
+/// holds more than `MAX_STORE_BYTES`, or if anything about reading it
+/// fails. [`Learning::load`]'s only way to reach the filesystem.
+///
+/// `CONTEXT.md` scopes **bound** to a length rule on a wire value, living in
+/// `hop-protocol`'s `limits`; the word is used here in that same sense —
+/// a length, checked at a deserialization boundary — one boundary over, on a
+/// file rather than a frame, and not as some second meaning.
+///
+/// # Two guards, in this order
+///
+/// **The stat comes first, and must.** Opening a FIFO for reading blocks
+/// until a writer appears — forever, for a store nobody is writing to — so
+/// the refusal has to happen before the open, not after it. A size check
+/// could not stand in for this either: a FIFO and a character device both
+/// report a length of zero, so by length alone `/dev/zero` is an empty
+/// store.
+///
+/// [`fs::metadata`] follows symlinks, which is what is wanted here. The
+/// check is on what the path *resolves to*: a symlink to `/dev/zero`
+/// resolves to a character device and is refused, while a symlink to a
+/// regular file resolves to a regular file and loads — pointing
+/// `~/.local/state/hop` at another volume is an ordinary thing to do and
+/// must keep working.
+///
+/// **The read is bounded, not merely pre-checked.** `metadata.len()` is a
+/// hint and not a guarantee: a character device reports zero whatever it
+/// would yield, and an ordinary file can grow between the stat and the read.
+/// So the length from the stat is never consulted; [`std::io::Read::take`]
+/// bounds the read itself, and at most `MAX_STORE_BYTES + 1` bytes are ever
+/// read, whatever the stat said or did not say. The claim is about bytes
+/// read rather than bytes allocated: the `String` they land in is grown by
+/// `read_to_string` and may hold spare capacity past its length, which is a
+/// constant factor on a bounded number, not an unbounded one.
+///
+/// The `+ 1` is what distinguishes a store sitting exactly on the
+/// ceiling — legitimate, and loaded — from one over it: at the ceiling the
+/// read returns `MAX_STORE_BYTES` bytes and stops of its own accord, and
+/// over it the extra byte comes back and the store is refused.
+///
+/// # The window between them
+///
+/// The two calls name a path, not an object, so between the stat and the
+/// open the path can be replaced — the classic TOCTOU window. What that can
+/// cost is a load that blocks (a FIFO swapped in after the stat is opened
+/// without complaint) or that reads a device's bytes instead of a file's.
+/// What it cannot cost is unbounded memory: `take` bounds whatever the open
+/// landed on, so the byte ceiling holds even when the stat check is
+/// defeated. That is the division of labour between the two guards — the
+/// stat decides *what kind of thing* is read, the ceiling decides *how much*
+/// — and it is why neither one substitutes for the other.
+///
+/// Closing the window itself means opening first and re-checking the
+/// descriptor (`O_NONBLOCK` so a FIFO cannot block the open, then `fstat` on
+/// the file that was actually opened). That is a unix-specific open path for
+/// a race an attacker who can write the store's directory has better uses
+/// for: writing a large regular file, which the ceiling refuses without any
+/// racing at all. It is left out deliberately rather than overlooked.
+fn read_bounded_store(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let mut data = String::new();
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_STORE_BYTES + 1)
+        .read_to_string(&mut data)
+        .ok()?;
+
+    (data.len() as u64 <= MAX_STORE_BYTES).then_some(data)
 }
 
 /// Serialize `value`, then persist it — and only in that order. A value
@@ -1734,6 +2023,293 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(sync_parent_directory(&missing).is_err());
+    }
+
+    // --- The bounded load path (issue #37). ---
+    //
+    // Two different limits, with two different failure modes, neither of
+    // which subsumes the other: `MAX_STORE_BYTES` bounds how many *bytes*
+    // `load` will read off disk, and `MAX_GLOBAL_ENTRIES` bounds how many
+    // *entries* survive the parse. A store can be far under the byte ceiling
+    // and still hold a hundred thousand tiny entries; a store can hold one
+    // entry and be gigabytes of whitespace.
+
+    /// A parseable one-entry store, padded to exactly `total_bytes` with
+    /// whitespace, which JSON ignores between tokens.
+    ///
+    /// Padding rather than more entries is what keeps the two tests below
+    /// about the byte ceiling *alone*: the store inside is a single entry,
+    /// nowhere near the entry cap, so whether it loads turns only on whether
+    /// its bytes were admitted.
+    fn whitespace_padded_store(total_bytes: usize) -> String {
+        let store = format!(
+            r#"{{"version":1,"global_frequency":{{"app:a":{{"count":3,"last_ms":{}}}}}}}"#,
+            now_ms()
+        );
+        let mut padded = String::with_capacity(total_bytes);
+        padded.push_str(&store);
+        padded.push_str(&" ".repeat(total_bytes - store.len()));
+        padded
+    }
+
+    /// A parseable store of `entries` entries, all stamped `last_ms`.
+    fn store_of_entries(entries: usize, last_ms: u64) -> String {
+        let body: Vec<String> = (0..entries)
+            .map(|i| format!(r#""app:{i}":{{"count":1,"last_ms":{last_ms}}}"#))
+            .collect();
+        format!(
+            r#"{{"version":1,"global_frequency":{{{}}}}}"#,
+            body.join(",")
+        )
+    }
+
+    #[test]
+    fn a_store_one_byte_over_the_byte_ceiling_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let padded = whitespace_padded_store(MAX_STORE_BYTES as usize + 1);
+        std::fs::write(&path, &padded).unwrap();
+
+        let loaded = Learning::load(&path);
+
+        assert!(
+            loaded.is_empty(),
+            "a store over the byte ceiling must be refused, not parsed"
+        );
+    }
+
+    // The other side of the ceiling. Without this, refusing every store
+    // would satisfy the test above — and a store that is exactly as large as
+    // the ceiling allows is a store `save` is entitled to have written.
+    #[test]
+    fn a_store_exactly_on_the_byte_ceiling_is_still_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let padded = whitespace_padded_store(MAX_STORE_BYTES as usize);
+        std::fs::write(&path, &padded).unwrap();
+
+        let loaded = Learning::load(&path);
+
+        assert!(
+            loaded.frequency_boost("app:a") > 0,
+            "a store exactly on the byte ceiling is legitimate and must still load"
+        );
+    }
+
+    // Neither the byte ceiling nor the entry cap can reach this case: one
+    // over-long key breaks no count and, on its own, no ceiling either. A
+    // store hand-written in compact JSON can sit under the ceiling with a
+    // key far past `MAX_ITEM_ID` in it, load, and then be re-serialized by
+    // `save` with `to_string_pretty`'s indentation on top — over the
+    // ceiling, unreadable by the very next load. `record_launch` takes an
+    // `ItemId`, so no key this long can be real learning.
+    #[test]
+    fn a_persisted_key_over_the_item_id_bound_is_dropped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let over_long = "a".repeat(MAX_ITEM_ID + 1);
+        let now = now_ms();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"global_frequency":{{"{over_long}":{{"count":9,"last_ms":{now}}},"app:a":{{"count":1,"last_ms":{now}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = Learning::load(&path);
+
+        assert!(
+            !loaded.global_frequency.contains_key(&over_long),
+            "a key over MAX_ITEM_ID must not survive a load"
+        );
+        assert!(
+            loaded.global_frequency.contains_key("app:a"),
+            "only the over-long entry is dropped, not the store around it"
+        );
+    }
+
+    // The other side of that bound: a key of exactly `MAX_ITEM_ID` bytes is
+    // one `ItemId::new` accepts, so it is real learning and must survive.
+    #[test]
+    fn a_persisted_key_exactly_on_the_item_id_bound_survives_a_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let key = "a".repeat(MAX_ITEM_ID);
+        assert!(ItemId::new(key.clone()).is_ok(), "an id this long is legal");
+        let now = now_ms();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"global_frequency":{{"{key}":{{"count":9,"last_ms":{now}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            Learning::load(&path).global_frequency.contains_key(&key),
+            "a key exactly on the bound is legitimate and must still load"
+        );
+    }
+
+    // The byte ceiling cannot reach this case: a FIFO has no length to
+    // compare against, and reading one blocks until a writer appears —
+    // forever, on a store nobody is writing to. Only refusing it before the
+    // open avoids that, which is why the stat check is a separate guard
+    // rather than a consequence of the ceiling.
+    //
+    // This test can only hang if that check is missing or is ordered after
+    // the open, which is the regression it exists to catch. `mkfifo(1)` is
+    // coreutils, so it needs no dependency; the test is unix-gated because a
+    // FIFO is a unix concept, not because the guard is.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_rather_than_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo should have created the FIFO");
+
+        let loaded = Learning::load(&path);
+
+        assert!(
+            loaded.is_empty(),
+            "a path that is not a regular file must be refused"
+        );
+    }
+
+    // The stat check refuses what a path *resolves* to, never the fact that
+    // it was reached through a symlink: `~/.local/state/hop` being a symlink
+    // into a different volume is an ordinary setup, and a store there must
+    // still load. A symlink to `/dev/zero` resolves to a character device
+    // and is refused by the same check that refuses the FIFO above.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_regular_store_is_still_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-store.json");
+        let link = dir.path().join("learning.json");
+
+        let mut store = Learning::empty();
+        store.record_launch("q", &ItemId::new("app:a").unwrap());
+        store.save(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            Learning::load(&link).frequency_boost("app:a") > 0,
+            "a symlink to a regular file resolves to one, and must load"
+        );
+    }
+
+    // `MAX_GLOBAL_ENTRIES` was enforced only in `record`, so a store that
+    // arrived with more entries than that kept every one of them until the
+    // next launch was recorded — and for good, in a session that records
+    // none, which is any session that only reads boosts and saves. The
+    // file's own count is not evidence of anything.
+    #[test]
+    fn a_store_over_the_entry_cap_is_evicted_down_to_it_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, store_of_entries(MAX_GLOBAL_ENTRIES + 500, now_ms())).unwrap();
+
+        let loaded = Learning::load(&path);
+
+        assert_eq!(
+            loaded.global_frequency.len(),
+            MAX_GLOBAL_ENTRIES,
+            "a store over the entry cap must be evicted down to it"
+        );
+    }
+
+    // Every entry here is stamped past any conceivable clock reading, so
+    // `purge_expired` — which drops entries by age — keeps all of them. The
+    // entry cap is the only thing left that can bring the count down, which
+    // is what makes this the case the age filter alone never covered.
+    //
+    // What this does *not* claim is that the surviving entries are the
+    // honest ones: eviction is by `last_ms`, so future-dating wins eviction
+    // even though it does not evade the cap. See `Learning::load`'s doc
+    // comment for that distinction and where it is dealt with.
+    #[test]
+    fn future_dated_entries_do_not_evade_the_entry_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(&path, store_of_entries(MAX_GLOBAL_ENTRIES + 500, u64::MAX)).unwrap();
+
+        let loaded = Learning::load(&path);
+
+        assert_eq!(
+            loaded.global_frequency.len(),
+            MAX_GLOBAL_ENTRIES,
+            "a future-dated entry survives the age filter, and must still meet the cap"
+        );
+    }
+
+    // The requirement stated in `MAX_STORE_BYTES`'s doc comment, exercised
+    // rather than asserted in prose: the largest store `save` can ever write
+    // must reload intact, or the ceiling would refuse this module's own
+    // output. Largest means every dimension at once — `MAX_GLOBAL_ENTRIES`
+    // entries, each keyed by a `MAX_ITEM_ID`-byte id made entirely of the C0
+    // control characters `serde_json` spends a six-character `\u00XX` escape
+    // on (the worst expansion JSON escaping has), each carrying both numeric
+    // fields at their full width.
+    //
+    // An id may hold control characters: `ItemId::new` bounds its length and
+    // applies no content rule, and `hop-protocol`'s content rules cover the
+    // two command-shaped outcomes, not ids.
+    #[test]
+    fn the_largest_store_save_can_write_still_reloads_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+
+        // The C0 controls `serde_json` spends the full six characters on.
+        // The five it has a two-character escape for (`\b`, `\t`, `\n`,
+        // `\f`, `\r`) are left out, so every byte of every key below really
+        // does cost six and the store really is the largest one `save` can
+        // write, rather than one a few thousand bytes short of it.
+        const SIX_CHARACTER_ESCAPES: [char; 16] = [
+            '\u{1}', '\u{2}', '\u{3}', '\u{4}', '\u{5}', '\u{6}', '\u{7}', '\u{b}', '\u{e}',
+            '\u{f}', '\u{10}', '\u{11}', '\u{12}', '\u{13}', '\u{14}', '\u{15}',
+        ];
+
+        let mut store = Learning::empty();
+        for i in 0..MAX_GLOBAL_ENTRIES {
+            let mut id = SIX_CHARACTER_ESCAPES[0].to_string().repeat(MAX_ITEM_ID - 3);
+            // Three base-16 digits over that alphabet, so every key is
+            // distinct and none of them is cheaper to escape than the rest.
+            for digit in [i / 256, (i / 16) % 16, i % 16] {
+                id.push(SIX_CHARACTER_ESCAPES[digit]);
+            }
+            assert_eq!(id.len(), MAX_ITEM_ID);
+            store.global_frequency.insert(
+                id,
+                LearningEntry {
+                    count: u32::MAX,
+                    // The widest a `last_ms` can be written, and a value
+                    // `save` will really persist: retention keeps anything
+                    // at or past the cutoff, and a future stamp is past it.
+                    last_ms: u64::MAX,
+                },
+            );
+        }
+        assert_eq!(store.global_frequency.len(), MAX_GLOBAL_ENTRIES);
+
+        store.save(&path).unwrap();
+        let written = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            written <= MAX_STORE_BYTES,
+            "save wrote {written} bytes, over the {MAX_STORE_BYTES}-byte ceiling its own \
+             loads enforce"
+        );
+
+        assert_eq!(
+            Learning::load(&path).global_frequency.len(),
+            MAX_GLOBAL_ENTRIES,
+            "a full store must survive a round trip through save and load"
+        );
     }
 
     // A directory with no read permission cannot be opened for the fsync,
