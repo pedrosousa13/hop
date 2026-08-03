@@ -222,6 +222,32 @@ pub trait Provider: Send + Sync {
     /// Making the obligation unmissable — a newtype forcing a conversion at
     /// each sink — is a design change deliberately left out of the issue that
     /// wrote this comment (#47), which documents the floor beneath it.
+    ///
+    /// # The implementation also validates its own term
+    ///
+    /// A second obligation, and not the one above restated: escaping is about
+    /// what the term does to a sink, this is about whether the term is usable
+    /// at all. `q.mode` answers neither. A mode is how the query was
+    /// *interpreted*, not a finding about the text, and on every explicit
+    /// route — a prefix, a sigil, or a trailing phrase — the marker that named
+    /// the mode decided it alone, with nothing having read the term that
+    /// marker left: `route("$١٠٠ usd to eur")` yields [`Mode::Currency`] with
+    /// a numeric portion no `parse::<f64>` accepts, `route("=٢+٢")`
+    /// [`Mode::Calculator`] likewise, and `route("zurich weather")` yields
+    /// [`Mode::Weather`] having read only the suffix its term came before.
+    /// Only the currency *inference* predicate checks for a parseable number,
+    /// and `q.mode` is the same value whichever route produced it.
+    ///
+    /// So parse a routed term defensively or not at all: handle the failure
+    /// and answer with no items. A failed parse here is an ordinary outcome
+    /// rather than an impossible state, and this method runs on every
+    /// keystroke, so an `unwrap` on one is a panic any keyboard that types `٢`
+    /// can reach. Shape is the smaller half of the job regardless —
+    /// `100 xyz to abc` satisfies the currency shape check and still names no
+    /// real currency pair, so a term that parses is not yet a term this
+    /// provider can answer. [`RoutedQuery`] carries the reasoning and the
+    /// decision behind it (issue #67), under "An exclusive mode filters
+    /// results; it never checks the term's shape".
     fn query(
         &self,
         q: &RoutedQuery,

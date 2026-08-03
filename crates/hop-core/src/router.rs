@@ -13,6 +13,17 @@
 //! launcher into a single mode. That distinction is the fix for an audited
 //! defect in the previous GNOME extension, where a bare city name or sum
 //! would hide the apps and files the user was actually reaching for.
+//!
+//! Exclusivity is a statement about which results are *shown*, never about
+//! what was typed. Whatever named the mode — a prefix, a sigil, or the
+//! trailing ` weather` — matches before any inference predicate runs and
+//! returns on the spot, so an exclusive route hands its provider a term
+//! nothing in this module has shape-checked: `$١٠٠ usd to eur` reaches
+//! [`Mode::Currency`] with a numeric portion that is not an `f64`, and
+//! `zurich weather` reaches [`Mode::Weather`] on a marker that trails the
+//! term it forwards. See [`RoutedQuery`], under "An exclusive mode filters
+//! results; it never checks the term's shape", for what that leaves the
+//! provider owing and why checking the sigil path was rejected.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -45,6 +56,36 @@ use regex::Regex;
 /// one, and [`Mode::WebSearch`] is not yet produced by [`route`] (see the
 /// variant). That makes the sink easier to *guess* on those routes. It does
 /// not make it absent on the others.
+///
+/// # A mode is not a shape check either
+///
+/// A separate claim from the one above, and both hold at once: a mode says
+/// nothing about how the term must be escaped, *and* nothing about whether it
+/// parses. [`Mode::Currency`] says the query asked for a currency conversion,
+/// not that its term carries a number, and [`Mode::Calculator`] does not
+/// promise an expression anything can evaluate.
+///
+/// Three variants are reachable both ways, and the value does not say which
+/// way it was: [`Mode::Currency`], [`Mode::Calculator`] and
+/// [`Mode::Timezone`] each have at least one route that checks the term —
+/// against a pattern, or against the alias set — and at least one that
+/// matches a marker and stops. `route("100 usd to eur")` matched digits an
+/// `f64` accepts; `route("$١٠٠ usd to eur")` matched the `$` and never read
+/// what followed. Both are [`Mode::Currency`], the same value with nothing on
+/// it recording which route produced it, so the checked route's guarantee
+/// cannot be recovered from the mode.
+///
+/// The remaining eight carry less still, not more. [`Mode::Windows`],
+/// [`Mode::Apps`], [`Mode::Files`], [`Mode::Emoji`], [`Mode::Weather`] and
+/// [`Mode::Actions`] are reachable only by an explicit route, which inspects
+/// the prefix, sigil or trailing phrase that named the mode and nothing else;
+/// [`Mode::All`] is what [`route`] falls back to once every predicate has
+/// declined; and [`Mode::WebSearch`] is not produced at all, as above. So no
+/// variant of this enum is evidence about the term — on three the evidence
+/// exists on one route and is not carried, on the other eight there was never
+/// any to carry. Which routes do carry a shape guarantee, and why the sigil
+/// path deliberately carries none, is on [`RoutedQuery`] under "An exclusive
+/// mode filters results; it never checks the term's shape".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     All,
@@ -133,6 +174,78 @@ pub enum Mode {
 /// hazard and enforces nothing about it — both fields are plain `String`s
 /// that will interpolate into anything, silently.
 ///
+/// # An exclusive mode filters results; it never checks the term's shape
+///
+/// This is a different claim from the section above, and running the two
+/// together is the mistake worth naming: that one is about **escaping** —
+/// text that is hostile when interpolated into a sink — and this one is about
+/// **shape**, whether the term parses at all. Neither implies the other.
+/// `100 usd to eur` parses cleanly and still needs escaping before it reaches
+/// a URL; `١٠٠ usd to eur` holds no path, shell or URL metacharacter at all
+/// and still parses as nothing. Nothing in this section makes a term safe to
+/// interpolate.
+///
+/// [`route`] tries every explicit marker first — the prefixes, the sigils and
+/// the trailing ` weather` — and returns on the first match, so no inference
+/// predicate ever sees a term that arrived through one. It makes no difference
+/// which end of the query the marker sat at: `zurich weather` is routed by its
+/// suffix and forwards the `zurich` that preceded it, as unread as the `١٠٠`
+/// that follows a `$`. `exclusive` therefore means exactly that the user named
+/// the mode and results are filtered to its kinds — no more:
+///
+/// ```text
+/// "$١٠٠ usd to eur"  ->  Currency    term = "١٠٠ usd to eur"   exclusive
+/// "=٢+٢"             ->  Calculator  term = "٢+٢"              exclusive
+/// ```
+///
+/// Both are correct, and both are what the user asked for: typing the sigil
+/// declares the mode whatever follows it. Neither term's numeric portion
+/// parses as an `f64`. The same digits *without* a sigil reach [`Mode::All`]
+/// instead, because `looks_like_currency` and `looks_like_math` both count
+/// only ASCII digits — so the parseable-numeric-portion guarantee belongs to
+/// the inferred currency route, never to [`Mode::Currency`] as such. Reading
+/// the mode as the guarantee is how `q.term.parse::<f64>().unwrap()` gets
+/// written, and that panic is two keystrokes away from any keyboard that
+/// types `٢`.
+///
+/// Nor does inference imply a *usable* term. Each of the three inference
+/// predicates checks something, but no two of them check the same kind of
+/// thing. `looks_like_currency` checks the most, and the regex is the whole
+/// of it: `[0-9]+(\.[0-9]+)?`, a three-letter code, `to`, a second code — so
+/// the numeric portion is what `str::parse::<f64>` accepts. `looks_like_math`
+/// checks an alphabet rather than an expression — it demands at least one
+/// ASCII digit and rejects every character outside `0-9`, `+ - * / ( ) . %`
+/// and whitespace, asking nothing about balanced parens or evaluable
+/// structure. So `route("2+2x")` falls through to [`Mode::All`] on the `x`,
+/// while `route("2+")` and `route("(1+")` are inferred [`Mode::Calculator`]
+/// carrying terms no evaluator will accept: a digit is present, nothing
+/// outside the class is, and that is the whole of the check. `infer_timezone`
+/// constrains the term to the alias set on its two alias branches — the bare
+/// token and the ` time` suffix — and forwards whatever was typed on the three
+/// phrase-prefix ones. And the [`Mode::All`] fallback is `exclusive: false`
+/// having been deduced from nothing at all, every predicate above it having
+/// declined. Three predicates, three different guarantees, and not one of them
+/// enough for a provider to skip parsing the term itself.
+///
+/// So the obligation sits with the provider, which
+/// [`crate::provider::Provider::query`] records at the seam where it lands: a
+/// provider parses a routed term defensively or not at all, and treats a
+/// failed parse as an ordinary "no items" answer rather than an impossible
+/// state. That is not a new obligation. `100 xyz to abc` satisfies the
+/// currency shape check and still names no real currency pair, so even an
+/// inferred route never promised the term was *semantically* usable — shape
+/// was always the smaller half of what a provider has to establish.
+///
+/// The alternative — shape-check the sigil path, and fall through to
+/// [`Mode::All`] on a malformed term — was considered and rejected (issue
+/// #67). [`route`] runs on every keystroke while the currency check only
+/// matches a *complete* conversion, so a checked sigil would leave `$`, `$1`,
+/// `$100` and `$100 usd` all falling back to general results and snap into
+/// [`Mode::Currency`] only on the final character. Avoiding that flicker would
+/// mean checking the sigil path more weakly than the inferred one, at which
+/// point [`Mode::Currency`] means two different things and the change has lost
+/// the single-meaning advantage that motivated it.
+///
 /// # Debug-formatting this type prints what the user typed
 ///
 /// `RoutedQuery` derives `Debug` and holds `term` and `raw` as plain
@@ -156,9 +269,21 @@ pub struct RoutedQuery {
     /// before interpolating this into a path, an argv element, a URL or a
     /// query string.
     pub term: String,
-    /// `true` only when the user typed an explicit prefix or sigil. An
-    /// exclusive route should replace the general search; a non-exclusive
-    /// (inferred) route should augment it.
+    /// `true` only when the user named the mode outright — an explicit
+    /// prefix, a sigil, or a trailing phrase. An exclusive route should
+    /// replace the general search; a non-exclusive (inferred) route should
+    /// augment it.
+    ///
+    /// It records how the mode was chosen and which results are shown, and
+    /// nothing about `term`: whichever marker named the mode decided the
+    /// route on its own, and no predicate ever ran on the text it left behind
+    /// — which sits before the marker on the ` weather` suffix and after it
+    /// on every other explicit route. `false` is not the converse and does
+    /// not mean checked: the [`Mode::All`] fallback carries it having been
+    /// deduced from nothing, and `infer_timezone`'s phrase-prefix branches
+    /// carry it having checked only the phrase. See the type's docs, "An
+    /// exclusive mode filters results; it never checks the term's shape",
+    /// before reading `mode` as a promise about what `term` holds.
     pub exclusive: bool,
     /// The untouched original input, exactly as passed to [`route`] — and
     /// untrusted exactly as `term` is, having had not even the trim applied:
@@ -232,10 +357,17 @@ static TIMEZONE_ALIASES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// The digits are `[0-9]` rather than `\d` because the regex crate's `\d` is
 /// Unicode-aware: it also accepts Arabic-Indic, Devanagari and fullwidth
 /// digits, which `str::parse::<f64>` then rejects. That handed the currency
-/// provider a term whose numeric portion routing had implied was already
-/// shape-checked. `[0-9]` is also what [`looks_like_math`] means by a digit,
-/// so [`looks_like_currency`] and [`looks_like_math`] now agree on what a
-/// number is.
+/// provider a term this predicate had just called a well-formed conversion,
+/// with a numeric portion that was not an `f64` — a match here is the whole of
+/// what makes that portion parseable, so accepting a digit `parse` rejects
+/// broke the one guarantee inferring the mode carries. `[0-9]` is also what
+/// [`looks_like_math`] means by a digit, so [`looks_like_currency`] and
+/// [`looks_like_math`] now agree on what a number is.
+///
+/// That guarantee is this predicate's, not [`Mode::Currency`]'s. A `$` sigil
+/// reaches the same mode without this pattern ever running, and carries no
+/// such promise; [`RoutedQuery`]'s "An exclusive mode filters results; it
+/// never checks the term's shape" is where that split is argued.
 ///
 /// Those are two of this file's three inference predicates; the agreement
 /// stops there. [`infer_timezone`] still normalizes with full `to_lowercase`,
@@ -759,6 +891,65 @@ mod tests {
             (command.mode, command.term.as_str(), command.exclusive),
             (Mode::Actions, "rm -rf /", true)
         );
+    }
+
+    #[test]
+    fn explicit_sigils_forward_an_unparseable_term_unchanged() {
+        // Pins issue #67's decision — option 1, providers validate their own
+        // term — against a later change that quietly implements option 2. An
+        // exclusive route is a *filtering* contract: the sigil matched before
+        // any inference predicate ran, so nothing shape-checked what follows
+        // it, and both terms below reach a mode whose provider cannot parse
+        // them. That is the designed behavior, not a defect.
+        //
+        // Option 2 (shape-check the sigil path, fall through to `Mode::All`
+        // when the term is malformed) was rejected because `route` runs on
+        // every keystroke while the currency predicate only matches a
+        // *complete* conversion: `$`, `$1`, `$100` and `$100 usd` would each
+        // drop the user back to general results, snapping into currency mode
+        // only on the final character. A weaker check on the sigil path would
+        // avoid the flicker only by making `Mode::Currency` mean two different
+        // things, which is the one thing option 2 was for. `=` is pinned here
+        // beside `$` because the answer is one rule for every sigil: exclusive
+        // has to mean the same thing whichever prefix set it, and `$` is the
+        // case that forced the rule.
+        //
+        // The inferred half of the pair is pinned separately: the same digits
+        // without a sigil reach `Mode::All`, by
+        // `arabic_indic_digits_do_not_route_to_currency` in the ASCII-only
+        // section below.
+        let currency = route("$١٠٠ usd to eur");
+        assert_eq!(
+            (currency.mode, currency.term.as_str(), currency.exclusive),
+            (Mode::Currency, "١٠٠ usd to eur", true)
+        );
+
+        let calculator = route("=٢+٢");
+        assert_eq!(
+            (
+                calculator.mode,
+                calculator.term.as_str(),
+                calculator.exclusive
+            ),
+            (Mode::Calculator, "٢+٢", true)
+        );
+
+        // Asserting the routes alone would restate the routing table. What
+        // this test is for is that both terms fail the parse a provider
+        // reading `Mode::Currency` or `Mode::Calculator` as a shape guarantee
+        // would reach for — the panic that guarantee would have licensed.
+        for term in [currency.term.as_str(), calculator.term.as_str()] {
+            let numeric: String = term
+                .chars()
+                .take_while(|c| !c.is_ascii_alphabetic() && !c.is_whitespace())
+                .collect();
+            assert!(
+                numeric.parse::<f64>().is_err(),
+                "{term:?} reached its mode through a sigil, so its numeric portion \
+                 {numeric:?} must not be assumed parseable — if it now parses, the \
+                 sigil path has started shape-checking and this contract changed"
+            );
+        }
     }
 
     #[test]
