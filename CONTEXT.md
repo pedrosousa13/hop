@@ -65,9 +65,42 @@ kind today, which is a fact about the current mapping and not a guarantee.
 `=`, a trailing ` weather`…). Results are filtered to that mode's kinds and
 nothing else shows.
 
+Filtering is the whole of the contract: an exclusive route carries **no**
+guarantee about the shape of the **term**. Whatever named the mode — a prefix,
+a sigil, or the trailing ` weather` — matches before any inference predicate
+runs and **routing** returns immediately, so no predicate ever sees the term it
+leaves behind, whichever end of the query that term sat at: `zurich weather` is
+as unchecked as `w zurich`. `$١٠٠ usd to eur` is an exclusive `Currency` route
+whose numeric portion is not an `f64`, and `=٢+٢` the same for `Calculator` —
+both correct, because typing the sigil is the user asking for that mode
+whatever comes after it. Validating a term is the receiving **provider**'s job:
+a provider parses a routed term defensively or not at all, and never on the
+strength of the mode it arrived under. That obligation is not new — `100 xyz to
+abc` passes the currency shape check and still names no real currency pair, so
+inference never promised semantic validity either.
+
+Shape-checking the sigil path was considered and rejected (issue #67).
+**Routing** runs on every keystroke while the currency shape check only matches
+a *complete* conversion, so a checked sigil would drop the user back to general
+results for `$`, `$1`, `$100` and `$100 usd`, snapping into `Currency` only on
+the final character. Avoiding that flicker would need a weaker check on the
+sigil path than on the inferred one, at which point `Currency` means two
+different things and the change has lost its only advantage.
+
 **Inferred** — the mode was deduced from the shape of the query rather than
 declared: a bare sum, a bare currency conversion, a bare city name. Exclusivity
 stays **off**.
+
+Inferred is where shape-checking happens, but it does not follow that an
+inferred **term** is checked. What each predicate guarantees is its own, and
+only one of them is about parseability: an inferred `Currency` route matched
+`^[0-9]+(\.[0-9]+)?…` on ASCII digits, so its numeric portion parses as an
+`f64`. An inferred `Timezone` route constrains the term to the alias set on
+only two of its five branches — the `time in `, `time ` and `now in ` phrase
+prefixes forward whatever was typed after them, unchecked. And the `Mode::All`
+fallback is `exclusive: false` while being deduced from nothing at all: it is
+what routing returns when every predicate declined, so it is the fallback
+rather than an inference, and it carries the least of any route.
 
 **Augment, not hijack** — the rule that inferred modes add to results instead
 of replacing them. Typing `2+2` puts the calculator answer first and still
