@@ -20,6 +20,31 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 /// Which search mode a routed query should be interpreted as.
+///
+/// # A mode is not a sink, and no mode is the safe one
+///
+/// A mode is an interpretation of a query, and it says nothing about how the
+/// term routed under it must be escaped. The sink is a property of the
+/// *provider*: whichever provider answers is what decides whether the term
+/// becomes a path, an argv element or a URL, so a mode says only which
+/// providers were asked. [`crate::provider::Provider::query`] carries the
+/// escaping contract, and [`RoutedQuery`] documents why its fields need one.
+///
+/// [`Mode::All`] is where this matters most, and it is the opposite of a safe
+/// default. A provider that wants to answer ordinary, unprefixed search
+/// **must** list `All` among its modes or it is never asked at all — see
+/// [`ProviderManifest::modes`](crate::provider::ProviderManifest::modes) — so
+/// `All` is the mode under which the most sinks are reachable at once, a
+/// files provider's path sink and an actions provider's command sink
+/// included, and it is the mode most providers will actually serve.
+///
+/// Four variants do let a sink be named without knowing which provider
+/// answers: [`Mode::Files`] implies a path sink, [`Mode::Actions`] a command
+/// sink, and [`Mode::Weather`] and [`Mode::WebSearch`] HTTP/URL sinks —
+/// `hop-protocol`'s `ExecOutcome::OpenUrl` is already the outcome that opens
+/// one, and [`Mode::WebSearch`] is not yet produced by [`route`] (see the
+/// variant). That makes the sink easier to *guess* on those routes. It does
+/// not make it absent on the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     All,
@@ -38,6 +63,84 @@ pub enum Mode {
 }
 
 /// The result of routing a raw query string.
+///
+/// # Both string fields are unvalidated, untrusted input
+///
+/// [`route`] chooses a mode, and removes the text that named it where any
+/// did. It applies no
+/// **content rule**, no escaping and no **refusal**. Exactly one gate has run
+/// upstream of this struct, and only for text that arrived off the wire:
+/// `hop-protocol`'s `MAX_QUERY_TEXT` **bound**, which `QueryText` applies at
+/// the deserialization boundary to refuse an over-long
+/// `ClientMsg::Query.text`. A bound restricts how long a value may be and
+/// says nothing whatever about what it may contain — and [`route`] takes a
+/// `&str`, so even that much is a fact about one caller rather than a
+/// guarantee this struct carries.
+///
+/// Treat `term` and `raw` alike as hostile text: the input box takes pastes,
+/// so what lands in it was not necessarily composed by the person sitting in
+/// front of it.
+///
+/// The two fields are untrusted in *different shapes*, and confusing them is
+/// the mistake this warning exists to prevent:
+///
+/// - `term` has been trimmed. Beyond the trim it has had a prefix or suffix
+///   removed where one named the mode, and on `infer_timezone`'s two alias
+///   branches it has been replaced outright by the alias key it matched.
+/// - `raw` has had none of that: not trimmed, not stripped, not
+///   canonicalized. It is the whole input, including everything `term` had
+///   removed, and it is no cleaner for being unmodified.
+///
+/// Stripping and **exclusive** are independent, which is the easy thing to
+/// get backwards. An **exclusive** route always strips what named the mode.
+/// An **inferred** route strips on `infer_timezone`'s phrase branches
+/// (`time in `, `time `, `now in `, and the ` time` suffix — every one of
+/// them `exclusive: false`) and strips nothing on the shape-inferred ones, a
+/// bare sum or a bare currency amount, which reach `term` as typed but for
+/// the trim. Either way none of it is sanitizing:
+/// `f ../../../../etc/passwd` loses `f ` and keeps the traversal, so the
+/// routed side is not a cleaned side, whatever the name suggests.
+///
+/// The one place a term is constrained to a *known set* is those two alias
+/// branches, which forward a key from the fixed `TIMEZONE_ALIASES` set
+/// instead of the spelling that was typed. Stripping narrows a term too, on
+/// the routes that strip, but only by removing what named the mode — it
+/// constrains nothing about the rest. And even the alias constraint is a
+/// property of those two branches rather than of [`Mode::Timezone`] or of
+/// this type: `tz `, `timezone `, `time in `, `time ` and `now in ` all reach
+/// the same mode carrying whatever followed them, and nothing on a
+/// `RoutedQuery` says which branch produced it. Do not read a timezone route
+/// as a checked one.
+///
+/// Worked examples, all of them faithfully forwarded and all **exclusive**,
+/// so results are filtered to that mode's kinds and nothing else shows:
+///
+/// ```text
+/// "f ../../../../etc/passwd"  ->  Files    term = "../../../../etc/passwd"
+/// "wx Berlin&key=leak"        ->  Weather  term = "Berlin&key=leak"
+/// "> rm -rf /"                ->  Actions  term = "rm -rf /"
+/// ```
+///
+/// The second is the concrete parameter-injection shape: a weather provider
+/// building `format!("https://api/...?q={}", q.term)` hands the author of the
+/// query a free extra URL parameter. **Exclusive** is the user having named
+/// the mode explicitly, not a finding that the text is fit for whatever
+/// answers it.
+///
+/// Escaping the value for a sink is the provider's job, because only the
+/// provider knows which sink it has; [`crate::provider::Provider::query`]
+/// carries that contract and the reasoning for it. This type documents the
+/// hazard and enforces nothing about it — both fields are plain `String`s
+/// that will interpolate into anything, silently.
+///
+/// # Debug-formatting this type prints what the user typed
+///
+/// `RoutedQuery` derives `Debug` and holds `term` and `raw` as plain
+/// `String`s, so `format!("{q:?}")` — or a `tracing` call capturing `?q` —
+/// discloses the query verbatim. `hop-protocol`'s `QueryText` redacts the
+/// same text one crate upstream, but that redaction stops at [`route`], which
+/// takes a `&str`. Issue #83 is open on the gap; this type does **not** close
+/// it, so do not treat a `RoutedQuery` as safe to format into a log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutedQuery {
     pub mode: Mode,
@@ -48,12 +151,45 @@ pub struct RoutedQuery {
     /// `_`) rather than the spelling that was typed. See `infer_timezone` in
     /// this module for why that route forwards the key and the phrase-prefix
     /// routes do not.
+    ///
+    /// Trimmed, sometimes stripped, never sanitized: see the type's docs
+    /// before interpolating this into a path, an argv element, a URL or a
+    /// query string.
     pub term: String,
     /// `true` only when the user typed an explicit prefix or sigil. An
     /// exclusive route should replace the general search; a non-exclusive
     /// (inferred) route should augment it.
     pub exclusive: bool,
-    /// The untouched original input, exactly as passed to `route`.
+    /// The untouched original input, exactly as passed to [`route`] — and
+    /// untrusted exactly as `term` is, having had not even the trim applied:
+    /// see the type's docs.
+    ///
+    /// **No code consults this field's value, and no prospective consumer is
+    /// known.** Checked when this comment was written: the only read in the
+    /// workspace is this module's own
+    /// `raw_is_untouched_original_with_leading_whitespace` test —
+    /// `Pipeline::assemble` carries the field through a struct-update
+    /// expression without ever looking at it — and none of the M2 slices that
+    /// build against this seam (#54 through #60) names a use for the raw
+    /// query as against the term: M2's providers are apps (#57) and
+    /// calculator (#58), and neither brief mentions the raw query at all. So
+    /// this documents an *absence* rather than an intended consumer; do not
+    /// read it as naming one.
+    ///
+    /// It is kept rather than deleted for two reasons. First, `CONTEXT.md`
+    /// defines **raw query** as a domain term and names this field as its
+    /// carrier, exactly as it names `term` for **term**; deleting the field
+    /// would strand a defined concept, which is a vocabulary change belonging
+    /// to the domain model. Second, [`crate::provider::Provider::query`]
+    /// receives a `&RoutedQuery` and nothing else, so a provider that needs
+    /// the text as typed — whatever prefix or sigil named the mode, where one
+    /// did, or the whitespace, or the spelling an alias branch canonicalized
+    /// away — has no other way to reach it once this field is gone.
+    ///
+    /// If M2 ends with this still unread, that is the point to settle the
+    /// question rather than carry it further: either a provider names the
+    /// field, or it and `CONTEXT.md`'s **raw query** entry are retired
+    /// together, as one change.
     pub raw: String,
 }
 
@@ -594,6 +730,35 @@ mod tests {
         let r = route("  w fire");
         assert_eq!(r.term, "fire");
         assert_eq!(r.raw, "  w fire");
+    }
+
+    // --- The worked examples on `RoutedQuery`, pinned.
+
+    #[test]
+    fn sink_shaped_payloads_are_forwarded_verbatim_and_exclusively() {
+        // Not a behavior change and not a defect report: routing is supposed
+        // to forward these, and the provider is supposed to escape them for
+        // its own sink. This exists because `RoutedQuery`'s docs quote these
+        // three routes to a provider author as the reason to distrust the
+        // term, so a later edit that changed any of them would leave that
+        // warning describing a router the tree no longer has.
+        let traversal = route("f ../../../../etc/passwd");
+        assert_eq!(
+            (traversal.mode, traversal.term.as_str(), traversal.exclusive),
+            (Mode::Files, "../../../../etc/passwd", true)
+        );
+
+        let url_param = route("wx Berlin&key=leak");
+        assert_eq!(
+            (url_param.mode, url_param.term.as_str(), url_param.exclusive),
+            (Mode::Weather, "Berlin&key=leak", true)
+        );
+
+        let command = route("> rm -rf /");
+        assert_eq!(
+            (command.mode, command.term.as_str(), command.exclusive),
+            (Mode::Actions, "rm -rf /", true)
+        );
     }
 
     #[test]

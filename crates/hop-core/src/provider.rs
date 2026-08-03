@@ -168,6 +168,60 @@ pub trait Provider: Send + Sync {
     fn manifest(&self) -> ProviderManifest;
 
     /// Answers a routed query with the items this provider can find.
+    ///
+    /// # The implementation is the escaping party for its own sink
+    ///
+    /// Both of `q`'s string fields are unvalidated, untrusted text.
+    /// [`crate::router::route`] applies no **content rule**, no escaping and
+    /// no **refusal**: `q.term` has been trimmed, and stripped of whatever
+    /// prefix or suffix named the mode where one did (and on the timezone
+    /// alias branches replaced by the key it matched), while `q.raw` has not
+    /// even had the trim. Neither field has been checked against anything.
+    /// Do not read stripping as a signal of exclusivity or of cleanliness:
+    /// an **inferred** route strips too, on the timezone phrase branches, and
+    /// stripping only removes what named the mode. See [`RoutedQuery`] for
+    /// the worked examples.
+    ///
+    /// `q.exclusive` is the user having named the mode explicitly — a prefix,
+    /// a sigil, or a trailing phrase — so results are filtered to that mode's
+    /// kinds and nothing else shows. It is not a finding that the text is fit
+    /// for whatever answers it.
+    ///
+    /// Escaping therefore has to happen here, in the implementation, and
+    /// cannot be lifted into `hop-core`: only the provider knows what its
+    /// sink is, and the correct treatment differs for each. A path sink needs
+    /// traversal segments refused and the result resolved under a root; a
+    /// command sink needs the value passed as one argv element rather than
+    /// through a shell; a URL sink needs percent-encoding *of the component
+    /// being built*, which is not the same set of characters for a path
+    /// segment as for a query-string value; an SQL sink needs a parameterized
+    /// statement and no string building at all. Each of those is wrong for
+    /// the others — percent-encoding a shell word neither makes it safe nor
+    /// leaves it usable — so any single escape applied before dispatch would
+    /// be the wrong one for most callers, which is why the router applies
+    /// none.
+    ///
+    /// [`Mode`] does not answer the question for you. The sink is a property
+    /// of *this* provider, not of the mode it was asked under: a provider
+    /// that lists [`Mode::All`] — which every provider answering ordinary,
+    /// unprefixed search must, see [`ProviderManifest::modes`] — receives
+    /// terms under the one mode that names no sink at all, and owes them the
+    /// same escaping it owes a term routed [`Mode::Files`].
+    ///
+    /// This is a documented obligation and nothing more. Nothing in this
+    /// crate enforces it: `q` hands over plain `String`s, and an
+    /// implementation that interpolates one straight into a URL compiles and
+    /// passes every check [`crate::pipeline::CheckedItems::check`] makes —
+    /// those are about an item's kind and its producer, never about what its
+    /// fields contain. The gates that do sit downstream are `hop-protocol`'s
+    /// **content rules** and the `ALLOWED_URL_SCHEMES` allow-list on an
+    /// `ExecOutcome::OpenUrl`, and they constrain the outcome *value* rather
+    /// than the interpolation that built it: they refuse a scheme the
+    /// contract never heard of, and have nothing to say about an
+    /// attacker-chosen extra query parameter on an ordinary `https` URL.
+    /// Making the obligation unmissable — a newtype forcing a conversion at
+    /// each sink — is a design change deliberately left out of the issue that
+    /// wrote this comment (#47), which documents the floor beneath it.
     fn query(
         &self,
         q: &RoutedQuery,
