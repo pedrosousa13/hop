@@ -211,21 +211,25 @@ pub struct Item {
     /// row has to show for a query nothing about it matches. Nothing after the
     /// split can drop such an item on relevance.
     ///
-    /// So the exception is bounded by *count* instead, and the bound is not
-    /// here. This crate deliberately puts no maximum on how many items in a
-    /// frame set the flag, because no parse can enforce the one that matters:
-    /// the exception is spent per **query**, and a query's items arrive across
-    /// several frames from several providers, none of which can see the
-    /// others. The bound therefore lives where a whole query is in hand — as
-    /// `MAX_PINNED_ITEMS_PER_QUERY` in `hop-core`'s `pipeline` module, which
-    /// honors that many pinned items per query, in the order the providers
-    /// returned them, and returns the rest as rejections. A provider that
-    /// flags everything it returns gets the bound, not the flood.
+    /// So the exception is limited by *count* instead, and the limit is not
+    /// here. What limits a frame in this crate is
+    /// [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME),
+    /// which caps items in one frame without regard to this flag, and no
+    /// per-query limit is parseable at all: a query's items arrive across
+    /// several frames from several providers, and no single parse sees enough
+    /// of one query to count its pinned items. The limit therefore lives where
+    /// a whole query is in hand — as the **pin budget** in `hop-core`'s
+    /// `pipeline` module, `MAX_PINNED_ITEMS_PER_PROVIDER` pinned items from
+    /// any one producer and `MAX_PINNED_ITEMS_PER_QUERY` in all, honored in
+    /// the order the providers returned them, with the rest returned as
+    /// rejections. A provider that flags everything it returns gets its one
+    /// row, not the flood, and cannot take the pinned path away from another
+    /// provider by being quick or by being verbose.
     ///
-    /// What the bound does not do is decide *who* may pin: the flag is a field
-    /// on this type, so anything that can answer a query can set it, and the
-    /// bound treats a first-party provider and a hostile one alike. A
-    /// capability check would be the answer to that, and
+    /// What the pin budget does not do is decide *who* may pin: the flag is a
+    /// field on this type, so anything that can answer a query can set it, and
+    /// the budget counts a first-party provider's rows and a hostile one's
+    /// alike. A capability check would be the answer to that, and
     /// `MAX_PINNED_ITEMS_PER_QUERY`'s docs are where it is stated to belong.
     pub append_to_end: bool,
     /// Bounded at [`MAX_PROVIDER_ID`](crate::limits::MAX_PROVIDER_ID) bytes on the way in.
