@@ -290,11 +290,10 @@ impl ResultSource for HostSource {
                 // `MAX_ITEMS_PER_QUERY` bounds what this task accumulates,
                 // not what any one frame carries — `MAX_RESULTS` already
                 // bounds that far lower. Filling the room exactly is still a
-                // cap, the same rule `connection.rs`'s `take_within_cap`
-                // documents for the same reason: an accumulator with no room
-                // left has nothing to give a later batch, so ending the query
-                // now is the same answer arrived at one batch later, and it
-                // costs the client one fewer round trip to learn it.
+                // cap: an accumulator with no room left has nothing to give a
+                // later batch, so ending the query now is the same answer
+                // arrived at one batch later, and it costs the client one
+                // fewer round trip to learn it.
                 let room = MAX_ITEMS_PER_QUERY.saturating_sub(accumulated.items().len());
                 let capped = checked.items().len() >= room;
                 if capped {
