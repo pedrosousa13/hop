@@ -325,6 +325,22 @@ pub(crate) fn flatpak_application_roots(home: Option<&str>) -> Vec<PathBuf> {
     roots
 }
 
+/// The largest `.desktop` file [`scan_apps`] will read.
+///
+/// `scan_apps` runs synchronously in `build_host()`, before `serve_with`
+/// binds the listening socket (see `server.rs`), and again on the watcher
+/// thread on every filesystem event thereafter — so an unbounded
+/// `read_to_string` here is a startup (and later, a permanent index-update)
+/// denial of service: one oversized file dropped under any watched root,
+/// including the ordinary `~/.local/share/applications` a downloaded
+/// `.desktop` file lands in, either exhausts memory reading it or blocks the
+/// daemon from ever accepting a connection. 256 KiB is a couple orders of
+/// magnitude past the largest real `.desktop` file this crate's author has
+/// ever seen (a few KB at most, since the format is a flat key-value list) —
+/// generous enough that no legitimate file is ever rejected, small enough
+/// that even reading it is not itself the DoS.
+const MAX_DESKTOP_FILE_BYTES: u64 = 256 * 1024;
+
 /// Scans every directory in `roots`, in order, parsing each `.desktop` file
 /// found into an [`AppEntry`]. A root that does not exist or cannot be read
 /// is skipped, not an error — an unconfigured `~/.icons`-style directory on
@@ -334,6 +350,16 @@ pub(crate) fn flatpak_application_roots(home: Option<&str>) -> Vec<PathBuf> {
 /// same filename is discarded. This is what makes `roots`' ordering
 /// (user-then-system, from [`xdg_application_roots`]) a real precedence
 /// rule rather than a coincidence of iteration order.
+///
+/// Every candidate is `stat`-ed before it is read: anything that is not a
+/// regular file (a symlink resolving to a FIFO or a character device such as
+/// `/dev/zero`, which has no EOF and would hang a `read_to_string` forever)
+/// or that exceeds [`MAX_DESKTOP_FILE_BYTES`] is skipped exactly like a
+/// missing or unreadable file, never read. This check runs after an app id
+/// is marked "seen" in `seen_ids`, matching this function's existing
+/// seen-before-validated ordering (tracked separately; not this change's
+/// concern) — an oversized or special file under a later root still blocks a
+/// same-named entry from a later root the way any other invalid file does.
 ///
 /// The only place in this module that performs disk I/O other than the
 /// inotify watcher itself (`open_watch`/`spawn_index_watcher`, Task 6) —
@@ -359,6 +385,12 @@ pub fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
                 continue;
             };
             if !seen_ids.insert(app_id.clone()) {
+                continue;
+            }
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() > MAX_DESKTOP_FILE_BYTES {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(&path) else {
@@ -462,6 +494,77 @@ mod scan_tests {
             entries.len(),
             1,
             "a missing root must not abort the whole scan"
+        );
+    }
+
+    #[test]
+    fn scan_apps_skips_a_file_over_the_size_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately one byte over `MAX_DESKTOP_FILE_BYTES`, not just
+        // "big" — this and the boundary test below straddle the `>`
+        // comparison so a regression to `>=` (which would wrongly reject a
+        // file landing exactly on the bound) is caught by the other test,
+        // not silently passed by this one alone.
+        let header = "[Desktop Entry]\nName=Huge\nExec=huge\n";
+        let padding = "#".repeat(MAX_DESKTOP_FILE_BYTES as usize + 1 - header.len());
+        let content = format!("{header}{padding}");
+        assert_eq!(content.len() as u64, MAX_DESKTOP_FILE_BYTES + 1);
+        fs::write(dir.path().join("huge.desktop"), content).unwrap();
+        write_entry(dir.path(), "normal.desktop", "Normal");
+
+        let entries = scan_apps(&[dir.path().to_path_buf()]);
+        let ids: Vec<&str> = entries.iter().map(|e| e.app_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["normal"],
+            "a file over the size bound must be skipped while a normal file beside it is still indexed"
+        );
+    }
+
+    #[test]
+    fn a_file_landing_exactly_on_the_size_bound_is_still_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = "[Desktop Entry]\nName=Boundary\nExec=boundary\n";
+        let padding = "#".repeat(MAX_DESKTOP_FILE_BYTES as usize - header.len());
+        let content = format!("{header}{padding}");
+        assert_eq!(content.len() as u64, MAX_DESKTOP_FILE_BYTES);
+        fs::write(dir.path().join("boundary.desktop"), content).unwrap();
+
+        let entries = scan_apps(&[dir.path().to_path_buf()]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "a file landing exactly on the bound must still be read, not skipped"
+        );
+    }
+
+    #[test]
+    fn scan_apps_skips_a_symlink_to_a_special_file_without_reading_it() {
+        // `/dev/zero` is an infinite stream of zero bytes reporting
+        // `st_size == 0`, so the size check alone would never catch it —
+        // what actually skips it is `metadata.is_file()`, which is false for
+        // a character device even when reached through a symlink. If
+        // `scan_apps` ever read it instead of skipping it,
+        // `std::fs::read_to_string` would never return: `/dev/zero` has no
+        // EOF. This pins Linux special-file behavior the crate already
+        // assumes elsewhere (it depends on `inotify`), so it is skipped
+        // rather than failed on a system without `/dev/zero`.
+        let special = Path::new("/dev/zero");
+        if !special.exists() {
+            eprintln!("skipping: /dev/zero not present on this system");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(special, dir.path().join("evil.desktop")).unwrap();
+        write_entry(dir.path(), "normal.desktop", "Normal");
+
+        let entries = scan_apps(&[dir.path().to_path_buf()]);
+        let ids: Vec<&str> = entries.iter().map(|e| e.app_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["normal"],
+            "a symlink to a special file must be skipped without being read"
         );
     }
 
