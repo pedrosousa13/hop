@@ -61,9 +61,30 @@ impl Drop for DaemonProcess {
 /// and polls for its socket to appear before handing the process back. Same
 /// 100ms/50-attempt (5s total) shape as `hopd/tests/socket.rs`'s helper, for
 /// the same reason: fast on the common case, bounded on a stuck one.
+///
+/// `HOME`, `XDG_DATA_HOME` and `XDG_DATA_DIRS` are pinned to paths under
+/// `runtime_dir` that this test never populates, mirroring
+/// `hopd/tests/socket.rs`'s `spawn_daemon` and for the identical reason: the
+/// daemon this spawns registers a real, environment-backed apps provider
+/// (`hopd::apps::build_apps_provider`) alongside the skeleton one, and that
+/// provider answers from whatever `.desktop` files actually exist under
+/// those roots. Left unset, `the_cli_query_round_trips_and_exits_zero`'s
+/// query would run against the *host machine's* real applications rather
+/// than an empty index, and its `lines.len() == 1` assertion would fail on
+/// any machine with an installed application whose title, generic name,
+/// comment, keywords or exec command happens to contain that query's term.
+/// This closes the two roots `build_apps_provider` reads from `std::env`; it
+/// cannot close the hardcoded, unparameterized Flatpak system export
+/// directory `flatpak_application_roots` always includes
+/// (`/var/lib/flatpak/exports/share/applications`), which remains a
+/// residual, unclosable risk — see `hopd/tests/socket.rs`'s `spawn_daemon`
+/// doc comment for the fuller account of why that root can't be closed here.
 fn spawn_daemon(hopd_path: &Path, runtime_dir: &Path) -> DaemonProcess {
     let child = Command::new(hopd_path)
         .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("HOME", runtime_dir.join("isolated-home"))
+        .env("XDG_DATA_HOME", runtime_dir.join("isolated-xdg-data-home"))
+        .env("XDG_DATA_DIRS", "")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -91,9 +112,17 @@ fn the_cli_query_round_trips_and_exits_zero() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let _daemon = spawn_daemon(&hopd_path, runtime_dir.path());
 
+    // `SkeletonProvider::query` ignores its query text and always answers
+    // with the same hardcoded item, so any term proves the round trip — this
+    // one is deliberately a nonsense token rather than an ordinary word like
+    // "hello", so it cannot collide with a real application's title, generic
+    // name, comment, keywords or exec command and spuriously pull in a
+    // second item from the apps provider `spawn_daemon` does not otherwise
+    // fully isolate (its own doc comment names the one root it cannot close:
+    // the hardcoded, unparameterized Flatpak system export directory).
     let output = Command::new(env!("CARGO_BIN_EXE_hop"))
         .arg("query")
-        .arg("hello")
+        .arg("hop-cli-e2e-canary-5c2f91")
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
         .output()
         .expect("failed to run hop query");

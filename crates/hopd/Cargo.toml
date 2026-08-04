@@ -17,6 +17,7 @@ hop-protocol = { path = "../hop-protocol", version = "0.1.0" }
 # `macros`, `rt` set; `io-util` adds `AsyncReadExt`/`AsyncWriteExt` for the
 # per-connection read/write loop.
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-util"] }
+inotify.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

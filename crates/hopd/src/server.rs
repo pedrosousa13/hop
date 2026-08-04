@@ -84,6 +84,9 @@ fn build_host() -> ProviderHost {
     if let Err(err) = host.register(SkeletonProvider) {
         eprintln!("hopd: could not register the skeleton provider: {err}");
     }
+    if let Err(err) = host.register(crate::apps::build_apps_provider()) {
+        eprintln!("hopd: could not register the apps provider: {err}");
+    }
     host
 }
 
@@ -160,5 +163,23 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod build_host_tests {
+    use super::*;
+
+    #[test]
+    fn build_host_registers_both_the_skeleton_and_apps_providers() {
+        // Not a behavior test of AppsProvider itself (Task 5 already covers
+        // that) — this pins that `build_host` actually calls the wiring
+        // function this task adds, so a future edit that adds the function
+        // but forgets to call it fails here rather than silently shipping a
+        // daemon with no apps provider registered.
+        let host = build_host();
+        let ids: Vec<_> = host.manifests().iter().map(|m| m.id).collect();
+        assert!(ids.contains(&"skeleton"));
+        assert!(ids.contains(&hop_core::provider::APPS_PROVIDER_ID));
     }
 }
