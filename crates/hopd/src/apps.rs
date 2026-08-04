@@ -758,15 +758,19 @@ pub(crate) const QUERY_RESULT_CAP: usize = 50;
 /// [`AppIndex::query`]'s signature takes and returns nothing capable of
 /// naming a filesystem path, and its body is a lock acquisition over an
 /// already-resident `Vec` followed by `filter`/`take`/`clone` — nothing in
-/// its call graph reaches `std::fs`. `index_tests::query_still_answers_after_
-/// the_backing_directory_is_deleted` below is the stronger, runtime version
-/// of that claim: it proves the answer does not change when the disk it was
-/// built from is no longer there to be read.
+/// its call graph reaches `std::fs`. That guarantee is already complete at
+/// the type level: `query` has no field or parameter through which a path
+/// could arrive. `index_tests::query_still_answers_after_the_backing_
+/// directory_is_deleted` below does not strengthen that proof — nothing in
+/// the current body can make its pre- and post-deletion assertions diverge
+/// — but it stands as a regression trap: if some future change gave
+/// `AppIndex` a stored path or root list and wired `query` to consult it,
+/// this is the test that would start failing.
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
+        reason = "no consumer until Task 7 (issue #57) wires AppIndex into startup"
     )
 )]
 pub(crate) struct AppIndex {
@@ -778,7 +782,7 @@ impl AppIndex {
         not(test),
         expect(
             dead_code,
-            reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
+            reason = "no consumer until Task 7 (issue #57) wires AppIndex into startup"
         )
     )]
     pub(crate) fn new(entries: Vec<AppEntry>) -> Self {
@@ -841,7 +845,9 @@ impl AppIndex {
         not(test),
         expect(
             dead_code,
-            reason = "no consumer until Task 6 (issue #57) wires AppIndex into the filesystem watcher"
+            reason = "Task 6's spawn_index_watcher calls this (index.replace(scan_apps(&roots))), \
+                      but that closure has no non-test caller until Task 7 (issue #57) wires \
+                      spawn_index_watcher into startup"
         )
     )]
     pub(crate) fn replace(&self, entries: Vec<AppEntry>) {
