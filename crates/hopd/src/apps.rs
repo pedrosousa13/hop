@@ -1818,7 +1818,10 @@ pub(crate) fn spawn_index_watcher(index: Arc<AppIndex>, roots: Vec<PathBuf>) {
         loop {
             match inotify.read_events_blocking(&mut buffer) {
                 Ok(_events) => index.replace(scan_apps(&roots)),
-                Err(_err) => return,
+                Err(err) => {
+                    eprintln!("hopd: apps provider: desktop-entry watcher stopped: {err}");
+                    return;
+                }
             }
         }
     });
