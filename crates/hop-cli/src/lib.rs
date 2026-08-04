@@ -1,4 +1,4 @@
-//! `hop` — the walking-skeleton CLI for the hop launcher daemon.
+//! `hop` — the command-line client for the hop launcher daemon.
 //!
 //! Two subcommands exist today: `hop version`, which needs no daemon, and
 //! `hop query <text>...`, which speaks the same length-prefixed JSON framing
@@ -236,9 +236,8 @@ fn try_run_query(text: &str) -> Result<(), QueryError> {
             DaemonMsg::Error { error, .. } => return Err(QueryError::Daemon(error)),
             // Any other id is a stale frame — a `results` or `query_done`
             // for a query this process is no longer (or was never) waiting
-            // on. This CLI never sends `Cancel`, so it should never see one
-            // in practice; a real multi-query client's frame-demultiplexing
-            // is issue #55's slice, not this walking skeleton's. Dropped
+            // on. This CLI only ever has one query in flight and never sends
+            // `Cancel`, so it should never see one in practice. Dropped
             // unrendered here, that is the client half of the lifecycle
             // contract (#55), not a permissive default.
             _ => continue,

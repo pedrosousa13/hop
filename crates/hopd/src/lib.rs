@@ -50,8 +50,8 @@ use std::process::ExitCode;
 /// no exit beyond an unrecoverable startup error, so under normal operation
 /// this function does not return at all. Signal handling and any orderly
 /// shutdown belong to issue #62 (socket activation and lifecycle) — this
-/// walking skeleton's only contribution to "restart works" is the
-/// stale-socket removal [`server::serve`] documents in place.
+/// daemon's only contribution to "restart works" is the stale-socket
+/// removal [`server::serve`] documents in place.
 pub fn run() -> ExitCode {
     let runtime_dir = match runtime_dir::resolve() {
         Ok(dir) => dir,

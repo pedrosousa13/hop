@@ -34,7 +34,7 @@ const SOCKET_FILE_NAME: &str = "hopd.sock";
 /// against a leftover socket file, live or not — but it is not a
 /// single-instance guard: nothing here checks whether another `hopd` is still
 /// listening on that path before unlinking it out from under it. That check
-/// is a later M2 slice's job, not this walking skeleton's.
+/// is a later M2 slice's job, not this daemon's.
 ///
 /// The removal is unconditional rather than `if socket_path.exists() {
 /// remove_file }` for two reasons. First, that shape is a TOCTOU: whatever
@@ -130,7 +130,7 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
                 // logging the same line as fast as it can. It is not a
                 // backoff strategy and not a connection-rate limit — the
                 // real accept-rate and connection-cap policy is issue #98's,
-                // not this walking skeleton's.
+                // not this daemon's.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
