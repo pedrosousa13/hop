@@ -7,3 +7,4 @@ pub mod pipeline;
 pub mod provider;
 pub mod rank;
 pub mod router;
+pub mod sanitize;
