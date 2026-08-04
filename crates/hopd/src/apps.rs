@@ -286,13 +286,6 @@ use std::path::{Path, PathBuf};
 ///
 /// Pure — see this task's note on why the caller supplies these values
 /// rather than this function reading `std::env` itself.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 7 (issue #57) wires this into startup"
-    )
-)]
 pub(crate) fn xdg_application_roots(
     home: Option<&str>,
     data_home: Option<&str>,
@@ -323,13 +316,6 @@ pub(crate) fn xdg_application_roots(
 /// directories in `XDG_DATA_DIRS`, which is why these are enumerated
 /// separately rather than folding into [`xdg_application_roots`] — ported
 /// from the salvaged parser's `desktop_entry_files`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 7 (issue #57) wires this into startup"
-    )
-)]
 pub(crate) fn flatpak_application_roots(home: Option<&str>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(home) = home {
@@ -353,13 +339,6 @@ pub(crate) fn flatpak_application_roots(home: Option<&str>) -> Vec<PathBuf> {
 /// inotify watcher itself (`open_watch`/`spawn_index_watcher`, Task 6) —
 /// called once at startup and once per filesystem-change notification
 /// thereafter, **never** from [`AppIndex::query`] (Task 3).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 7 (issue #57) wires this into startup"
-    )
-)]
 pub(crate) fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
     let mut seen_ids = HashSet::new();
     let mut entries = Vec::new();
@@ -756,13 +735,6 @@ pub(crate) struct AppIndex {
 }
 
 impl AppIndex {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no consumer until Task 7 (issue #57) wires AppIndex into startup"
-        )
-    )]
     pub(crate) fn new(entries: Vec<AppEntry>) -> Self {
         AppIndex {
             entries: RwLock::new(entries),
@@ -805,15 +777,6 @@ impl AppIndex {
     /// called once at startup (via [`AppIndex::new`]) and once per
     /// filesystem-change notification thereafter (Task 6) — never from the
     /// query path.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Task 6's spawn_index_watcher calls this (index.replace(scan_apps(&roots))), \
-                      but that closure has no non-test caller until Task 7 (issue #57) wires \
-                      spawn_index_watcher into startup"
-        )
-    )]
     pub(crate) fn replace(&self, entries: Vec<AppEntry>) {
         *self
             .entries
@@ -974,16 +937,6 @@ pub(crate) trait WindowSource: Send + Sync + 'static {
 /// what makes [`focus_or_launch`] correctly and unconditionally launch
 /// until the M5 GNOME shim replaces this with a real implementation — see
 /// Design decision 4.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "AppsProvider::new (Task 5) takes an Arc<dyn WindowSource> but never \
-                  constructs a concrete WindowSource itself, so this concrete type stays dead \
-                  in the non-test build until Task 7 (issue #57) wires build_apps_provider, \
-                  which is what actually instantiates one, into build_host"
-    )
-)]
 pub(crate) struct EmptyWindowSource;
 
 impl WindowSource for EmptyWindowSource {
@@ -1007,16 +960,6 @@ pub(crate) trait Launcher: Send + Sync + 'static {
 /// stripped by [`sanitize_exec`] at parse time. Standard streams are
 /// discarded and detached from the daemon's own terminal, if it has one; a
 /// launched app is not expected to write anything hopd should see.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "AppsProvider::new (Task 5) takes an Arc<dyn Launcher> but never constructs a \
-                  concrete Launcher itself, so this concrete type stays dead in the non-test \
-                  build until Task 7 (issue #57) wires build_apps_provider, which is what \
-                  actually instantiates one, into build_host"
-    )
-)]
 pub(crate) struct SystemLauncher;
 
 impl Launcher for SystemLauncher {
@@ -1440,14 +1383,6 @@ pub struct AppsProvider {
 }
 
 impl AppsProvider {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no non-test caller until Task 7 (issue #57) wires build_apps_provider, \
-                      which constructs an AppsProvider through this constructor, into build_host"
-        )
-    )]
     pub(crate) fn new(
         index: Arc<AppIndex>,
         windows: Arc<dyn WindowSource>,
@@ -1719,15 +1654,6 @@ use inotify::{Inotify, WatchMask};
 /// once per buffered write syscall, so a package manager writing a
 /// `.desktop` file in several chunks produces one event instead of several
 /// and is never seen half-written.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only called from open_watch, which is itself only called from \
-                  spawn_index_watcher — no non-test caller until Task 7 (issue #57) wires \
-                  spawn_index_watcher into startup"
-    )
-)]
 fn watch_mask() -> WatchMask {
     WatchMask::CREATE
         | WatchMask::DELETE
@@ -1741,14 +1667,6 @@ fn watch_mask() -> WatchMask {
 /// `~/.icons`, say) is skipped rather than failing the whole watcher,
 /// mirroring [`scan_apps`]'s own tolerance for missing roots. Fails only if
 /// *no* root could be watched at all.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only called from spawn_index_watcher, which has no non-test caller until \
-                  Task 7 (issue #57) wires it into startup"
-    )
-)]
 fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
     let inotify = Inotify::init()?;
     let mask = watch_mask();
@@ -1797,14 +1715,6 @@ fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
 /// per-provider-isolation posture (`build_host`'s own doc comment: "a
 /// daemon that refuses to start over one misconfigured provider is worse
 /// than one that serves the rest").
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no non-test caller until Task 7 (issue #57) wires this into build_host's \
-                  startup path"
-    )
-)]
 pub(crate) fn spawn_index_watcher(index: Arc<AppIndex>, roots: Vec<PathBuf>) {
     let mut inotify = match open_watch(&roots) {
         Ok(i) => i,
@@ -1935,4 +1845,29 @@ mod watcher_tests {
             "the removed entry must disappear without the daemon restarting"
         );
     }
+}
+
+/// Builds a real, environment-backed [`AppsProvider`]: scans the real
+/// XDG/flatpak roots once, starts the inotify watcher over them, and wires
+/// [`EmptyWindowSource`]/[`SystemLauncher`] as the M2 backends.
+///
+/// The **only** place in this module that reads `std::env` — everything
+/// upstream of this function ([`xdg_application_roots`],
+/// [`flatpak_application_roots`], [`scan_apps`], [`AppIndex`]) takes its
+/// inputs as plain values precisely so that only this one call site, run
+/// once at daemon startup rather than under test, ever touches process
+/// environment state.
+pub fn build_apps_provider() -> AppsProvider {
+    let home = std::env::var("HOME").ok();
+    let data_home = std::env::var("XDG_DATA_HOME").ok();
+    let data_dirs = std::env::var("XDG_DATA_DIRS").ok();
+
+    let mut roots =
+        xdg_application_roots(home.as_deref(), data_home.as_deref(), data_dirs.as_deref());
+    roots.extend(flatpak_application_roots(home.as_deref()));
+
+    let index = Arc::new(AppIndex::new(scan_apps(&roots)));
+    spawn_index_watcher(index.clone(), roots);
+
+    AppsProvider::new(index, Arc::new(EmptyWindowSource), Arc::new(SystemLauncher))
 }

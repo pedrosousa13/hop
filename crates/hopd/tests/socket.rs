@@ -54,9 +54,32 @@ impl Drop for DaemonProcess {
 /// own stderr would make a passing suite's output look like a failing one.
 /// The one test that needs the daemon's stderr —
 /// `an_unset_runtime_dir_is_a_startup_error` — does not use this helper.
+///
+/// `HOME`, `XDG_DATA_HOME` and `XDG_DATA_DIRS` are pinned to paths under
+/// `runtime_dir` that this test never populates, rather than left to
+/// whatever the developer or CI box running this suite happens to have set.
+/// Since issue #57, this spawned `hopd` registers a real, environment-backed
+/// apps provider (`hopd::apps::build_apps_provider`) alongside the skeleton
+/// one, and that provider answers from whatever `.desktop` files actually
+/// exist under those roots — `the_round_trip_returns_one_item_end_to_end`
+/// queries for "hello" and asserts exactly one item comes back, which would
+/// silently start failing on any machine that happens to have an installed
+/// application whose name, keywords or command contain that substring. This
+/// closes the two roots `build_apps_provider` reads from `std::env`, so the
+/// scan it does at startup always sees no applications, regardless of the
+/// host machine's real `$HOME`. It cannot close the one root
+/// `flatpak_application_roots` does not parameterize —
+/// `/var/lib/flatpak/exports/share/applications`, a fixed system path — so a
+/// machine with a Flatpak-installed app matching "hello" remains a residual,
+/// unclosable risk, accepted rather than solved by inventing a seam
+/// `build_apps_provider`'s deliberately parameterless signature does not
+/// offer.
 fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
     let child = Command::new(env!("CARGO_BIN_EXE_hopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("HOME", runtime_dir.join("isolated-home"))
+        .env("XDG_DATA_HOME", runtime_dir.join("isolated-xdg-data-home"))
+        .env("XDG_DATA_DIRS", "")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

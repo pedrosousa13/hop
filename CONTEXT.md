@@ -274,6 +274,14 @@ It does not make `Assembly::rejections` unignorable for every caller, only for
 the host's own path — see **Rejection** for the half that still is not
 reached.
 
+**Desktop entry** — a `.desktop` file under an XDG application directory
+(freedesktop.org's Desktop Entry Specification), the source the apps
+provider indexes. **App id** — the desktop entry's file name with its
+trailing `.desktop` removed (`firefox.desktop` → `firefox`); the apps
+provider's items carry it as `app:<app id>`, which is what `hop-core`'s
+alias table also synthesizes for an `app` alias boost — see
+`APPS_PROVIDER_ID`'s own docs for why the two must agree.
+
 ## Frames
 
 **Frame** — one message on the socket: a four-byte big-endian payload length
