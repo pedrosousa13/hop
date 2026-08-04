@@ -32,11 +32,10 @@ use tokio::sync::mpsc;
 ///
 /// # What an implementation owes the daemon
 ///
-/// Three obligations, none of which this seam checks. The in-tree source is
-/// too small to break any of them, so nothing today notices — they are
-/// written here because issue #56's provider host is the first implementation
-/// that can break them, and its author reads this doc rather than the review
-/// that found them.
+/// Three obligations, none of which this seam checks. [`HostSource`] is the
+/// first implementation with enough surface to break any of them, and here is
+/// where it actually stands against each — read this rather than assume
+/// landing issue #56 settled all three, because it did not.
 ///
 /// **Items must respect `hop_protocol::limits`' per-item field bounds.**
 /// [`Item`]'s fields are public, and those bounds are applied where an item is
@@ -50,6 +49,11 @@ use tokio::sync::mpsc;
 /// [`MAX_FRAME_BYTES`](hop_protocol::limits::MAX_FRAME_BYTES) at encode time,
 /// which surfaces as an `io::Error` that kills the connection with no error
 /// frame — a worse outcome than refusing the item would have been.
+/// [`HostSource`] does not close this gap: [`ProviderHost`]'s per-provider
+/// turn checks an item's `kind` and `provider` against its producer's
+/// manifest and nothing about its field lengths, so a provider that returns
+/// an oversized title reaches this trait exactly as unchecked as this
+/// paragraph warns.
 ///
 /// **What a source buffers is daemon memory the cap does not see.** The
 /// receiver returned here lives inside the connection's exchange for the life
@@ -58,6 +62,12 @@ use tokio::sync::mpsc;
 /// the daemon has *forwarded*; a `mpsc::channel(1_000)` carrying 1 000-item
 /// batches parks a million items the cap never counts. Every source in this
 /// crate uses capacity 1, and a source with more should have a reason.
+/// [`HostSource`] honours the capacity half — its `start` opens exactly
+/// `mpsc::channel(1)` — but a *single* batch is still whatever one provider
+/// returns: neither [`ProviderHost`] nor this source caps how many items one
+/// provider may answer with, so nothing here stops one `send` from parking
+/// however many a provider sent. Closing that is issue #30's, and it is worth
+/// naming rather than leaving implied that capacity 1 already bounds it.
 ///
 /// **`send` points must be frequent enough for cancellation to be prompt.**
 /// The channel is the cancellation mechanism (see the module docs), and a
@@ -67,7 +77,11 @@ use tokio::sync::mpsc;
 /// end that nobody wanted the answer. Issue #55's criterion is that a
 /// superseded query's work *stops* rather than completing and being discarded,
 /// and this seam delivers that only for sources that reach a `send` often
-/// relative to how long a query stays on screen.
+/// relative to how long a query stays on screen. [`HostSource`] honours this
+/// one squarely: [`ProviderHost::spawn_query`] runs each selected provider as
+/// its own task and sends the moment that provider's `run_one` resolves, so a
+/// cancellation is only ever as stale as the slowest *individual* provider,
+/// never the whole query.
 pub trait ResultSource: Clone + Send + Sync + 'static {
     /// Starts answering one query. Batches arrive on the returned receiver;
     /// the channel closing means the source is done; dropping the receiver
@@ -185,6 +199,9 @@ pub struct StderrLog;
 impl ProviderLog for StderrLog {
     fn record(&self, event: ProviderEvent<'_>) {
         match event {
+            // Answered is the common *successful* case — most selected
+            // providers answer most queries — so, like Skipped below,
+            // logging it per keystroke would bury the events worth reading.
             ProviderEvent::Answered { .. } => {}
             ProviderEvent::Failed(failure) => eprintln!(
                 "hopd: provider {} failed ({:?}) after {:?}: {}",

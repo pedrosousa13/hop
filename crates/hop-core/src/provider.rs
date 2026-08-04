@@ -34,14 +34,15 @@ use crate::router::{Mode, RoutedQuery};
 /// checks each item against its own producer's manifest, but never checks
 /// that two answering providers declare *distinct* `id`s — nothing in this
 /// crate enforces manifest-id uniqueness across a query's `ProviderOutput`s.
-/// If a future provider registry ever lets two providers both declare
-/// `id: APPS_PROVIDER_ID`, both pass `CheckedItems::check` and both collect
-/// every alias boost this constant tags — the exact boost-theft failure
-/// issue #31 exists to close, just moved one level up, from "which item" to
-/// "which provider". **Rejecting a second registration under an id already
-/// in use is load-bearing for boost correctness**, not just registry
-/// hygiene, and whatever builds the M2 provider registry needs to enforce
-/// it.
+/// If two providers both declared `id: APPS_PROVIDER_ID`, both would pass
+/// `CheckedItems::check` and both would collect every alias boost this
+/// constant tags — the exact boost-theft failure issue #31 exists to close,
+/// just moved one level up, from "which item" to "which provider".
+/// **Rejecting a second registration under an id already in use is
+/// load-bearing for boost correctness**, not just registry hygiene, and
+/// [`ProviderHost::register`](crate::host::ProviderHost::register) is what
+/// enforces it now — see
+/// [`RegistrationError::DuplicateId`](crate::host::RegistrationError::DuplicateId).
 pub const APPS_PROVIDER_ID: &str = "apps";
 
 /// Static description of what a provider serves and how the (future)

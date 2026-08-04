@@ -159,10 +159,18 @@ never taken on trust.
 
 **Rejection** — one item assembly declined, and why: it failed one of the two
 manifest checks, or it was a pinned item the **pin budget** could not afford.
-Returned as data alongside the assembled items, never logged — there is no
-logging seam yet, and the query path may not have side effects. Only the first
-two mean a provider lied; a rejection names which, so the reasons are not
-confused for one another.
+Returned as data alongside the assembled items rather than logged directly,
+because `Pipeline::assemble` runs on every keystroke and may not have side
+effects. That used to mean rejections went unlogged everywhere, full stop; it
+no longer does. The **provider host** now reads the manifest-check half of
+them — the two reasons that mean a provider lied — through its **log seam**
+every time it runs `CheckedItems::check` on `ProviderHost::run_one`'s path.
+What still goes unlogged is the pin-budget half, minted only inside
+`Pipeline::assemble` itself, which the daemon does not call today (see
+**Provider host**) — and, more generally, `Assembly::rejections` stays
+ignorable by any caller that is not the host. Only the first two reasons mean
+a provider lied; a rejection names which, so the reasons are not confused for
+one another.
 
 **Ranked body** — the scored, ordered items.
 
@@ -190,6 +198,76 @@ why it lives with the assembly that spends it rather than in `hop-protocol`'s
 together. A body that alone fills the cap squeezes the tail out; the old
 extension reserved room for the tail instead, and that difference is a recorded
 divergence.
+
+## Provider host
+
+**Provider host** — what owns registered **providers** and runs their
+queries: `hop-core`'s `ProviderHost`. Not a scheduler in the ranking sense —
+it decides *whether* a provider runs for a query and *for how long*, never in
+what order its items appear. Ordering that is `Pipeline::assemble`'s job, and
+the host does not call it.
+
+**Registration** — the one moment a provider's manifest is read:
+`Provider::manifest`, called once, at `ProviderHost::register`. What is
+captured then is what every later scheduling decision consults; nothing after
+registration re-reads the provider to make one.
+
+**Captured manifest** — the manifest exactly as registration read it, kept as
+the baseline a later call is checked against, so a provider whose live
+`Provider::manifest()` answer has since shifted is caught rather than trusted.
+**Effective manifest** — the captured manifest with host policy applied: its
+budget **clamped** to the host's ceiling, its minimum term length raised to
+the host's floor where that is higher. Both are kept because they answer
+different questions: scheduling and the enforced budget read the effective
+manifest, while the captured one is what a later call is compared against —
+clamping deliberately makes the two differ, which is exactly why the effective
+manifest cannot serve as that baseline itself.
+
+**Clamp** — the host lowering a provider's budget to its ceiling, or raising
+its minimum term length to its floor. One direction each: a clamp can only
+shorten a budget or raise a floor, never move a value the other way, and
+neither is negotiable by the provider it clamps.
+
+**Budget** — the host's deadline for one provider on one query: how long it
+may run before the host stops waiting and reports an outcome, cut off or not.
+Distinguish a **budget miss** — the host's own act of cutting a provider off
+once its budget expires, enforcement — from a provider's own **timeout**
+(`ProviderError::Timeout`) — the provider noticing its own deadline and giving
+up first, cooperation. A client sees the same failure kind either way; only
+the **log seam** tells the two apart. Not a **bound**: a bound constrains how
+large a value may be, a budget constrains how long a provider may run — one is
+about size, the other about time, and a manifest's `budget` field is measured
+in neither bytes nor elements. Also distinct from the **pin budget** above,
+which counts items rather than measuring time; the two share a name and
+nothing else.
+
+**Panic isolation** — a provider's panic surfacing as a failure that names the
+provider, rather than unwinding into the daemon. Each provider's query runs as
+its own spawned task, so a panic there becomes a `JoinError` the host reads,
+not a crash the connection driver inherits.
+
+**Sanitize** — rewriting provider-supplied text so it is safe to render:
+stripped of control and direction-override characters, then truncated to a
+documented maximum. That truncation is the same act this glossary already
+names under **Refusal**, above — a shortened value with nothing said about
+what was cut — applied here to a provider's error text rather than to an
+assembled list or a delivered batch; the two are consistent, not competing
+senses of the word. Contrast with a **content rule**, which *refuses* a value
+that breaks a rule outright: sanitizing never refuses, because the value here
+is a diagnostic about a failure that has already happened, and refusing it
+would replace the reason a provider failed with the reason its explanation was
+unacceptable. That is also why sanitizing is lossy where a **bound** is not —
+a bound is enforced at the parse, before a value exists at all, while
+sanitizing rewrites a value that already does.
+
+**Log seam** — where the **provider host** reports what providers did:
+`ProviderLog` and the `ProviderEvent`s it records. This is the seam
+**Rejection**, above, promised would make ignoring a rejection a real mistake
+— and now does, for the host: `ProviderHost::run_one` reads every rejection
+`CheckedItems::check` produces and records it as `ProviderEvent::Rejected`.
+It does not make `Assembly::rejections` unignorable for every caller, only for
+the host's own path — see **Rejection** for the half that still is not
+reached.
 
 ## Frames
 

@@ -94,18 +94,24 @@ impl ProviderOutput {
     /// a contract this constructor rests on and does not enforce. Read that
     /// method's docs for the abuse a provider that ignores it recovers.
     ///
-    /// It cannot be enforced from here: `hop-core` has no registry and no
-    /// scheduler, so there is no earlier, trusted manifest in this crate to
-    /// compare against. A host that keeps one is in a strictly stronger
-    /// position — a manifest captured once at registration cannot be
-    /// re-minted in response to what a provider decided to return — and such
-    /// a host should compare its captured manifest against
-    /// [`Provider::manifest`] and refuse the provider on any mismatch. What
-    /// it must not do is hand the captured manifest to this crate to be
-    /// checked against: a constructor taking a caller-supplied manifest is
-    /// the hole the section above exists to keep closed, and it does not stop
-    /// being that hole because this particular caller would have passed a
-    /// trustworthy value.
+    /// It cannot be enforced from here, by design: this constructor never
+    /// sees a manifest captured any earlier than the call it makes, so it has
+    /// nothing of its own to compare against. `hop-core` now has both a
+    /// registry and a scheduler —
+    /// [`ProviderHost`](crate::host::ProviderHost) — and its private
+    /// `run_one` is in the strictly stronger position this paragraph used to
+    /// ask a future host for: it keeps a manifest captured once at
+    /// registration, which cannot be re-minted in response to what a provider
+    /// decided to return, and it compares that captured manifest against the
+    /// one this constructor reads back through `ProviderOutput::manifest`,
+    /// refusing the provider's whole answer on any mismatch. What it does
+    /// not do, and must not, is hand its captured manifest to *this*
+    /// constructor to be checked against: a constructor taking a
+    /// caller-supplied manifest is the hole the section above exists to keep
+    /// closed, and it does not stop being that hole because this particular
+    /// caller would have passed a trustworthy value. The host's comparison
+    /// runs beside this constructor, on the value it returns — never inside
+    /// it.
     pub fn from_provider<P: Provider>(provider: &P, items: Vec<Item>) -> Self {
         ProviderOutput {
             manifest: provider.manifest(),
@@ -320,13 +326,19 @@ pub enum FailedCheck {
 /// producer's *real* manifest id rather than a claim the item made — the same
 /// fact `producer_id` asserts everywhere, arrived at earlier.
 ///
-/// Rejections are *returned as data* rather than logged, because this
-/// codebase has no logging seam yet and [`Pipeline::assemble`] is pure — it
-/// runs on every keystroke and may not perform side effects. Everything here
-/// is owned, so a rejection outlives both the item it describes and the
-/// borrow of the manifest that refused it: a future logging seam can move a
-/// `Vec<Rejection>` off the query path and format it whenever it likes,
-/// without this type having to change shape.
+/// Rejections are *returned as data* rather than logged from here, because
+/// [`Pipeline::assemble`] is pure — it runs on every keystroke and may not
+/// perform side effects. Everything here is owned, so a rejection outlives
+/// both the item it describes and the borrow of the manifest that refused it:
+/// a logging seam can move a `Vec<Rejection>` off the query path and format
+/// it whenever it likes, without this type having to change shape. That seam
+/// now exists — [`ProviderLog`](crate::host::ProviderLog) — and
+/// [`ProviderHost::run_one`](crate::host::ProviderHost) is exactly that
+/// caller: it reads the rejections [`CheckedItems::check`] produced for one
+/// provider and records them as
+/// [`ProviderEvent::Rejected`](crate::host::ProviderEvent::Rejected) before
+/// this value's owned shape ever needs to matter to a query path with side
+/// effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejection {
     /// The rejected item's id.
@@ -371,12 +383,18 @@ pub struct Rejection {
 /// [`Assembly`], rather than being handed back from `check` separately: what
 /// assembly refused belongs to the query it refused them for, so one call
 /// yields one outcome. It is worth being precise about what that does *not*
-/// buy, since it would be easy to read as more: nothing obliges a caller to
-/// look at them. [`Assembly`]'s fields are public and `.items` discards the
-/// rejections in one character, which is exactly what the tests below do.
-/// Until there is a logging seam (issue #34) that makes ignoring them a real
-/// mistake, this shape keeps rejections available and attached to their
-/// query — it does not make them unignorable.
+/// buy, since it would be easy to read as more: nothing obliges *this* caller
+/// to look at them. [`Assembly`]'s fields are public and `.items` discards
+/// the rejections in one character, which is exactly what the tests below do.
+///
+/// A logging seam that makes ignoring a rejection a real mistake now exists —
+/// [`ProviderLog`](crate::host::ProviderLog), issue #34 — but it is reached
+/// through [`ProviderHost::run_one`](crate::host::ProviderHost), which calls
+/// [`CheckedItems::check`] directly and records what it returns; nothing
+/// forces that same discipline on a caller of *this* type that isn't the
+/// host. So the shape here keeps rejections available and attached to their
+/// query, and the host is the caller that has made ignoring them a mistake —
+/// it does not make them unignorable for every caller this type has.
 #[derive(Debug)]
 pub struct CheckedItems {
     items: Vec<Item>,

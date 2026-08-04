@@ -486,7 +486,7 @@ impl ProviderHost {
     /// # Why one task per provider
     ///
     /// "One task" names the unit of isolation, not a literal count:
-    /// [`ProviderHost::run_one`] itself spawns a second, inner task to run
+    /// `ProviderHost::run_one` itself spawns a second, inner task to run
     /// the provider's query future under, so each selected provider actually
     /// gets two — an outer supervisor task (the one this function spawns,
     /// running `run_one`) and the inner, abortable query task `run_one`
