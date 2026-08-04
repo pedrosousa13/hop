@@ -45,13 +45,6 @@ use hop_protocol::{
 // silently wrong" failure mode this attribute exists to avoid, just moved to
 // the other build. Restricting the expectation to the non-test build is what
 // it is actually describing: "no consumer *outside tests* yet."
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
-    )
-)]
 pub(crate) struct ParsedEntry {
     pub(crate) title: String,
     /// The `Exec=` value, field codes (`%f`, `%U`, ...) stripped — ready to
@@ -181,13 +174,6 @@ pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
 /// arguments the launcher doesn't have (a file to open, an icon path); with
 /// none supplied, dropping the token is the specification's own answer for
 /// an application invoked with no arguments.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
-    )
-)]
 fn sanitize_exec(raw: &str) -> String {
     raw.split_whitespace()
         .filter(|token| !token.starts_with('%'))
@@ -198,13 +184,6 @@ fn sanitize_exec(raw: &str) -> String {
 /// Truncates `s` to at most `max` bytes, never splitting a multi-byte
 /// character. Short-circuits when already within bound, so this allocates
 /// only when it actually has work to do.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
-    )
-)]
 fn truncate_to_byte_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
