@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -100,10 +101,22 @@ fn recv_event_within<T>(rx: &mut mpsc::UnboundedReceiver<T>, deadline: Duration)
 
 /// A source that streams each scripted batch when the test releases it, and
 /// reports on `events` when it observes cancellation (its send failing).
+///
+/// `delay` is paced between batches, not just decorative: with a capacity-1
+/// channel and no delay, a `send` that lands *just* before the receiver is
+/// dropped still returns `Ok` — the item was accepted into the (now-about-
+/// to-be-discarded) buffer slot before the drop, which the sender has no way
+/// to observe. A source racing the driver like that can report "finished"
+/// even though its last batch was silently dropped with the receiver, which
+/// makes cancellation-observability assertions against it flaky rather than
+/// load-bearing. A short delay before each send gives the driver's (fast,
+/// no-sleep) reaction to the previous batch — including dropping the
+/// receiver, if that batch hit a cap — time to land first.
 #[derive(Clone)]
 struct ScriptedSource {
     batches: Vec<Vec<Item>>,
     events: mpsc::UnboundedSender<&'static str>,
+    delay: Duration,
 }
 
 impl ResultSource for ScriptedSource {
@@ -111,8 +124,12 @@ impl ResultSource for ScriptedSource {
         let (tx, rx) = mpsc::channel(1);
         let batches = self.batches.clone();
         let events = self.events.clone();
+        let delay = self.delay;
         tokio::spawn(async move {
             for batch in batches {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 if tx.send(batch).await.is_err() {
                     let _ = events.send("cancelled");
                     return;
@@ -130,6 +147,7 @@ fn a_query_streams_several_results_frames_before_its_done_frame() {
     let daemon = start_daemon(ScriptedSource {
         batches: vec![vec![item(1)], vec![item(2)], vec![item(3)]],
         events,
+        delay: Duration::ZERO,
     });
     let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
     hello(&mut stream);
@@ -294,13 +312,19 @@ fn a_cancel_frame_stops_the_active_query_and_answers_query_done() {
 #[test]
 fn a_query_streaming_past_the_cap_is_truncated_and_terminated() {
     // Six batches of one full frame each: 6 000 items offered, the cap is
-    // 5 000. The daemon must deliver exactly the cap and then QueryDone —
-    // refusal of the remainder, never eviction of what was delivered.
+    // 5 000. The daemon must deliver exactly the cap, drop the source, and
+    // send exactly one QueryDone — refusal of the remainder, never eviction
+    // of what was delivered, and never a lingering source left to answer a
+    // 6th batch nobody asked for.
     let batch: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME).map(item).collect();
-    let (events, _events_rx) = mpsc::unbounded_channel();
+    let (events, mut events_rx) = mpsc::unbounded_channel();
     let daemon = start_daemon(ScriptedSource {
         batches: vec![batch; 6],
         events,
+        // See ScriptedSource's doc: paced so the cancellation-observability
+        // assertion below is a property of the daemon, not a coin flip on
+        // which side of the receiver drop the last `send` lands.
+        delay: Duration::from_millis(5),
     });
     let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
     hello(&mut stream);
@@ -326,6 +350,34 @@ fn a_query_streaming_past_the_cap_is_truncated_and_terminated() {
     assert_eq!(
         total, MAX_ITEMS_PER_QUERY,
         "the exchange must deliver exactly the cap and stop"
+    );
+
+    // The source must actually be dropped at the cap, not just have its
+    // output truncated on the wire: the still-pending 6th batch must be
+    // refused, which ScriptedSource can only report by observing its `send`
+    // fail. A daemon that hit the cap but forgot to drop the receiver would
+    // instead accept and finish that 6th batch, and this would see
+    // "finished" here instead of "cancelled" — or nothing at all, since the
+    // source would then be blocked forever offering a batch nobody drains.
+    assert_eq!(
+        recv_event_within(&mut events_rx, Duration::from_secs(5)),
+        Some("cancelled"),
+        "the source must observe its work stopping once the cap is hit, \
+         not run on past it"
+    );
+
+    // And exactly one QueryDone for this id: the regression this catches
+    // from the other direction is a daemon that still holds the source live
+    // past the cap, drains its pending (empty, capped) batch, and sends a
+    // second QueryDone for the same id nobody is expecting.
+    let mut buf = [0u8; 1];
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let read = stream.read(&mut buf);
+    assert!(
+        matches!(read, Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock),
+        "no further frame may follow the cap's QueryDone, got: {read:?}"
     );
 }
 
