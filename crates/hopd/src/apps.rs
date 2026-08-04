@@ -14,20 +14,6 @@
 //! (`docs/superpowers/plans/2026-08-04-issue-57-apps-provider.md`) for the
 //! full reasoning behind each divergence from those sources.
 
-// This task (issue #57, Task 1) lands parsing with no consumer yet: nothing
-// outside `#[cfg(test)]` calls `parse_desktop_entry`, `app_id_from_file_name`
-// or `build_entry` until Task 2's directory scan and Task 3's index exist, so
-// a normal (non-test) build sees every item below as unreachable. `expect`
-// rather than `allow`, matching this workspace's one other use of the pattern
-// (`hop-protocol`'s `mkfifo` call): once Task 2 adds a real caller in this
-// same file, the lint stops firing, the expectation goes unfulfilled, and
-// `-D warnings` turns that into a build error — the exception is required to
-// delete itself rather than survive by inertia.
-#![expect(
-    dead_code,
-    reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
-)]
-
 use hop_protocol::{
     Action, ActionId, ActionKind, IconName, IconPath, IconSpec, Item, ItemId, Kind,
     limits::MAX_TITLE,
@@ -40,6 +26,32 @@ use hop_protocol::{
 /// per-file, while assembling an [`AppEntry`] (`build_entry`) also needs the
 /// app id, which comes from the file's *name*, not its contents.
 #[derive(Debug, PartialEq, Eq)]
+// Scoped per-item, not module-wide: a module-wide `#![expect(dead_code)]` is
+// satisfied as long as *any* item in the file is still dead, so it would stay
+// silently fulfilled if Task 2 wired up some of these seven items but not all
+// (`AppEntry`'s `haystack` field, say, staying unread until Task 3's index).
+// One `#[expect]` per symbol means each stops being optional independently:
+// the moment *that* item gets a real caller, *that* attribute's expectation
+// goes unfulfilled and `-D warnings` fails the build, so no partially-wired
+// state can hide behind a sibling that's still unused. Matches the scoping
+// (not just the `expect`-over-`allow` choice) of this workspace's other use
+// of the pattern, `hop-protocol`'s single-statement `#[expect(unsafe_code)]`
+// on its `mkfifo` call.
+//
+// `cfg_attr(not(test), ...)` rather than a bare `#[expect]`: this crate's
+// tests (below) call every one of these seven items directly, so under
+// `--cfg test` they are not dead at all and an unconditional `#[expect]`
+// would itself go unfulfilled on `cargo test` — the exact same "expectation
+// silently wrong" failure mode this attribute exists to avoid, just moved to
+// the other build. Restricting the expectation to the non-test build is what
+// it is actually describing: "no consumer *outside tests* yet."
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
+    )
+)]
 pub(crate) struct ParsedEntry {
     pub(crate) title: String,
     /// The `Exec=` value, field codes (`%f`, `%U`, ...) stripped — ready to
@@ -65,6 +77,13 @@ pub(crate) struct ParsedEntry {
 /// this one stops at a [`ParsedEntry`] so [`build_entry`] can apply
 /// `hop-protocol`'s content rules ([`IconName`], [`IconPath`]) before
 /// anything becomes an [`Item`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
+    )
+)]
 pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
     let mut name = String::new();
     let mut localized_name = String::new();
@@ -169,6 +188,13 @@ pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
 /// arguments the launcher doesn't have (a file to open, an icon path); with
 /// none supplied, dropping the token is the specification's own answer for
 /// an application invoked with no arguments.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
+    )
+)]
 fn sanitize_exec(raw: &str) -> String {
     raw.split_whitespace()
         .filter(|token| !token.starts_with('%'))
@@ -179,6 +205,13 @@ fn sanitize_exec(raw: &str) -> String {
 /// Truncates `s` to at most `max` bytes, never splitting a multi-byte
 /// character. Short-circuits when already within bound, so this allocates
 /// only when it actually has work to do.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
+    )
+)]
 fn truncate_to_byte_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -200,6 +233,13 @@ fn truncate_to_byte_boundary(s: &str, max: usize) -> String {
 /// definition joins subdirectory names with `-` for a nested file, which
 /// this function does not do; see this plan's Scope section for why that is
 /// out of scope.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
+    )
+)]
 pub(crate) fn app_id_from_file_name(file_name: &str) -> Option<String> {
     file_name.strip_suffix(".desktop").map(str::to_string)
 }
@@ -218,6 +258,13 @@ pub(crate) fn app_id_from_file_name(file_name: &str) -> Option<String> {
 /// which no real filename reaches (see the reasoning at the call site in
 /// Task 2) — the whole entry is dropped, since there is no id left to build
 /// one under.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
+    )
+)]
 pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntry> {
     let id = ItemId::new(format!("app:{app_id}")).ok()?;
 
@@ -259,6 +306,13 @@ pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntr
 /// never serialized, since [`Item`] has no field for either. See this plan's
 /// Design decision 7.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
+    )
+)]
 pub(crate) struct AppEntry {
     pub(crate) app_id: String,
     pub(crate) item: Item,
@@ -341,19 +395,46 @@ mod tests {
 
     #[test]
     fn an_overlong_name_is_truncated_at_a_char_boundary() {
-        // "é" is two bytes; a naive byte-index truncation at MAX_TITLE would
-        // risk landing mid-character if MAX_TITLE were ever odd relative to
-        // the run. `é` repeated MAX_TITLE times is comfortably past the
-        // bound either way, so this also pins that oversized input is
-        // shortened rather than rejected.
-        let long_name = "é".repeat(MAX_TITLE);
+        // "字" is three bytes, and MAX_TITLE (1024) is not a multiple of 3
+        // (1024 = 3*341 + 1), so a raw `s[..MAX_TITLE]` slice would land one
+        // byte inside the 342nd character (bytes 1023..1026) rather than on
+        // a boundary — which panics outright, since `str` indexing refuses a
+        // non-boundary cut. A two-byte character like the previous "é" was
+        // wrong for this: MAX_TITLE is even, so byte 1024 is a boundary for
+        // *any* run of 2-byte characters regardless of whether the walk-back
+        // loop runs at all, which is exactly the "boundary the test can't
+        // reach" bug this project has shipped before. `assert_eq!` on the
+        // exact walked-back length, not just `<= MAX_TITLE`, so a walk-back
+        // that stops one character early or late is also caught, not only
+        // one that panics or splits a character.
+        let long_name = "字".repeat(MAX_TITLE);
         let parsed =
             parse_desktop_entry(&format!("[Desktop Entry]\nName={long_name}\nExec=x\n")).unwrap();
-        assert!(parsed.title.len() <= MAX_TITLE);
+        assert_eq!(
+            parsed.title.len(),
+            1023,
+            "must walk back to the boundary just below MAX_TITLE, not truncate mid-character"
+        );
         assert!(
             std::str::from_utf8(parsed.title.as_bytes()).is_ok(),
             "truncation must not split a multi-byte character"
         );
+    }
+
+    #[test]
+    fn truncate_to_byte_boundary_walks_back_from_a_mid_character_cut() {
+        // Exercises the walk-back loop directly, with a `max` chosen
+        // independently of MAX_TITLE's parity so this doesn't depend on that
+        // constant ever staying not-a-multiple-of-3. "€" is three bytes, so
+        // boundaries fall only at multiples of 3 (0, 3, 6, 9, 12, 15); a
+        // `max` of 7 lands inside the third character (bytes 6..9). A
+        // mutation that deleted the walk-back (`s[..max]` directly) would
+        // panic here rather than compile-time fail, since byte 7 is not a
+        // valid `str` slice point; a mutation that walked back too far (or
+        // not far enough) would still slice cleanly but return the wrong
+        // number of characters, which the exact-match `assert_eq!` catches.
+        let s = "€".repeat(5);
+        assert_eq!(truncate_to_byte_boundary(&s, 7), "€€");
     }
 
     #[test]
@@ -378,6 +459,23 @@ mod tests {
         assert_eq!(entry.item.id.as_str(), "app:firefox");
         assert_eq!(entry.item.provider, hop_core::provider::APPS_PROVIDER_ID);
         assert_eq!(entry.item.kind, Kind::App);
+    }
+
+    #[test]
+    fn build_entry_carries_app_id_exec_and_haystack_onto_the_app_entry() {
+        // `AppEntry`'s own fields exist for the index and launch path Task 2
+        // and Task 4 add, not for anything already on `Item` — a mutation
+        // that dropped `app_id`, `parsed.exec` or `parsed.haystack` from
+        // `build_entry`'s `Some(AppEntry { ... })` (or filled one from the
+        // wrong local) would leave `Item` looking correct while these three
+        // carried nothing, or the wrong value.
+        let parsed =
+            parse_desktop_entry("[Desktop Entry]\nName=Firefox\nExec=firefox --new-window\n")
+                .unwrap();
+        let entry = build_entry("firefox".to_string(), parsed).unwrap();
+        assert_eq!(entry.app_id, "firefox");
+        assert_eq!(entry.exec, "firefox --new-window");
+        assert!(entry.haystack.contains("firefox"));
     }
 
     #[test]
