@@ -19,10 +19,50 @@ use tokio::sync::mpsc;
 ///
 /// `Clone` because every connection gets its own handle; implementations are
 /// expected to be cheap handles over shared state, not the state itself.
+///
+/// # What an implementation owes the daemon
+///
+/// Three obligations, none of which this seam checks. The in-tree source is
+/// too small to break any of them, so nothing today notices — they are
+/// written here because issue #56's provider host is the first implementation
+/// that can break them, and its author reads this doc rather than the review
+/// that found them.
+///
+/// **Items must respect `hop_protocol::limits`' per-item field bounds.**
+/// [`Item`]'s fields are public, and those bounds are applied where an item is
+/// *parsed*, so an item handed back through this trait has passed nothing. The
+/// daemon bounds its retained set by item *count*
+/// ([`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY)), and
+/// the byte figure that count is justified against is the count multiplied by
+/// those per-item bounds — so a source producing a 100 MB title makes that
+/// arithmetic, and the bound it justifies, meaningless. The only thing below
+/// it is
+/// [`MAX_FRAME_BYTES`](hop_protocol::limits::MAX_FRAME_BYTES) at encode time,
+/// which surfaces as an `io::Error` that kills the connection with no error
+/// frame — a worse outcome than refusing the item would have been.
+///
+/// **What a source buffers is daemon memory the cap does not see.** The
+/// receiver returned here lives inside the connection's exchange for the life
+/// of the query, so the channel's capacity and the size of each batch are
+/// daemon memory chosen by the source. `MAX_ITEMS_PER_QUERY` counts only what
+/// the daemon has *forwarded*; a `mpsc::channel(1_000)` carrying 1 000-item
+/// batches parks a million items the cap never counts. Every source in this
+/// crate uses capacity 1, and a source with more should have a reason.
+///
+/// **`send` points must be frequent enough for cancellation to be prompt.**
+/// The channel is the cancellation mechanism (see the module docs), and a
+/// source learns it was cancelled only when a `send` fails — never between
+/// sends. A source that computes for ten seconds and then sends once is
+/// therefore not cancelled at all: it runs to completion and discovers at the
+/// end that nobody wanted the answer. Issue #55's criterion is that a
+/// superseded query's work *stops* rather than completing and being discarded,
+/// and this seam delivers that only for sources that reach a `send` often
+/// relative to how long a query stays on screen.
 pub trait ResultSource: Clone + Send + Sync + 'static {
     /// Starts answering one query. Batches arrive on the returned receiver;
     /// the channel closing means the source is done; dropping the receiver
-    /// cancels the work.
+    /// cancels the work — subject to the obligations on this trait, which say
+    /// what "cancels" costs an implementation that never sends.
     fn start(&self, text: QueryText) -> mpsc::Receiver<Vec<Item>>;
 }
 

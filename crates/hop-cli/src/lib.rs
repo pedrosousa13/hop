@@ -233,13 +233,32 @@ fn try_run_query(text: &str) -> Result<(), QueryError> {
                 }
                 return Ok(());
             }
-            DaemonMsg::Error { error, .. } => return Err(QueryError::Daemon(error)),
-            // Any other id is a stale frame — a `results` or `query_done`
-            // for a query this process is no longer (or was never) waiting
-            // on. This CLI only ever has one query in flight and never sends
-            // `Cancel`, so it should never see one in practice. Dropped
-            // unrendered here, that is the client half of the lifecycle
-            // contract (#55), not a permissive default.
+            // An `Error`'s `query_id` says what the error is about, and that
+            // is what decides whether it ends this query — see
+            // `DaemonMsg::Error`'s contract. `None` scopes it to the
+            // connection or to a frame that named no query, and this process
+            // has nothing to fall back on either way, so it is fatal here.
+            DaemonMsg::Error {
+                query_id: None,
+                error,
+            } => return Err(QueryError::Daemon(error)),
+            // `Some(id)` is terminal for that exchange alone. Naming this
+            // one ends it; naming any other is a stale frame and falls
+            // through below. Nothing in tree sends this form yet — hopd
+            // passes `None` on every error path today — but #59's
+            // `UnknownItem` / `UnknownAction` refusals are query-scoped by
+            // construction, and a reference client that killed the process
+            // on the first one would be the wrong example to copy.
+            DaemonMsg::Error {
+                query_id: Some(id),
+                error,
+            } if id == QUERY_ID => return Err(QueryError::Daemon(error)),
+            // Any other id is a stale frame — a `results`, `query_done` or
+            // `error` for a query this process is no longer (or was never)
+            // waiting on. This CLI only ever has one query in flight and
+            // never sends `Cancel`, so it should never see one in practice.
+            // Dropped unrendered here, that is the client half of the
+            // lifecycle contract (#55), not a permissive default.
             _ => continue,
         }
     }

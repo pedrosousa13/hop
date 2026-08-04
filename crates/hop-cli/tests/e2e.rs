@@ -300,6 +300,107 @@ fn the_cli_drops_frames_whose_query_id_is_not_current() {
 }
 
 #[test]
+fn the_cli_drops_an_error_frame_scoped_to_another_query() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        // An error naming a query this process is not waiting on. Per
+        // `DaemonMsg::Error`'s contract a `Some(id)` error is terminal for
+        // that exchange alone, so this must be dropped exactly like a stale
+        // `results` frame — not treated as fatal. The frames after it prove
+        // the exchange survived.
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Error {
+                query_id: Some(id + 1),
+                error: hop_protocol::ProtoError {
+                    code: hop_protocol::ErrorCode::UnknownItem,
+                    message: "stale query's problem, not this one's".to_string(),
+                },
+            },
+        );
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(1, "survived the stale error")],
+            },
+        );
+        write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("query")
+        .arg("q")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "an error scoped to another query must not kill this one, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("survived the stale error"),
+        "the current query's item must still print, got: {stdout}"
+    );
+}
+
+#[test]
+fn the_cli_fails_on_an_error_frame_scoped_to_its_own_query() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        // The other half of the contract: an error naming *this* exchange is
+        // terminal for it, and no `QueryDone` follows. Sent after a results
+        // frame, so this also pins that nothing already assembled is printed
+        // for an exchange that ended badly.
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(1, "assembled but never shown")],
+            },
+        );
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Error {
+                query_id: Some(id),
+                error: hop_protocol::ProtoError {
+                    code: hop_protocol::ErrorCode::ProviderFailed,
+                    message: "this exchange is over".to_string(),
+                },
+            },
+        );
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("query")
+        .arg("q")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an error naming this query must end it as a failure"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("this exchange is over"),
+        "the daemon's message must reach stderr, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "nothing may be printed for an exchange that ended in an error"
+    );
+}
+
+#[test]
 fn the_cli_refuses_a_daemon_that_streams_past_the_per_query_cap() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let daemon = fake_daemon(runtime_dir.path(), |stream, id| {

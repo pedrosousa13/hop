@@ -193,8 +193,9 @@ pub const MAX_ACTIONS_PER_ITEM: usize = 32;
 ///
 /// It bounds one frame, not a query: a daemon may legitimately stream several
 /// partial `results` frames for the same query, so this is not a bound on the
-/// total a client accumulates. See this module's docs for what it multiplies out
-/// to against the per-item bounds.
+/// total a client accumulates. See also [`MAX_ITEMS_PER_QUERY`], which is that
+/// total, and this module's docs for what this one multiplies out to against
+/// the per-item bounds.
 pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 
 /// Maximum total items one query id may deliver, summed across every
@@ -219,7 +220,28 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// smaller — a launcher renders tens of items — so this is a memory guard,
 /// not a display guard: at the composed per-item worst case (84 160 bytes,
 /// see the module docs) it holds retained state per connection under
-/// ~421 MB hostile-shaped, ~1 MB honest-shaped.
+/// ~421 MB hostile-shaped, ~1 MB honest-shaped — assuming the items being
+/// counted respect the per-item bounds, which is a narrower assumption than
+/// it sounds.
+///
+/// # Why those byte figures are conditional
+///
+/// This constant bounds a **count**. The byte figures above are that count
+/// multiplied by bounds this module applies *at the parse*
+/// (`#[serde(deserialize_with = …)]`), so they hold for every item that
+/// arrived over a socket and for no item that did not. [`Item`](crate::item::Item)'s
+/// fields are public `String`s and `Vec`s, and an item a daemon builds
+/// in-process — or takes from a result source in-process — has passed no
+/// check at all: 5 000 items with a 100 MB title each are 5 000 items, and
+/// this cap admits them. The only backstop below that is [`MAX_FRAME_BYTES`]
+/// at encode time, which refuses the frame as an error rather than reporting
+/// an over-sized item.
+///
+/// The obligation is therefore on whatever produces items in-process, and it
+/// is documented where such a thing is written — `hopd`'s `ResultSource`
+/// seam. Enforcing it rather than documenting it belongs to the provider host
+/// (issue #56), which is the first code that will accept items from outside
+/// this process without parsing them.
 pub const MAX_ITEMS_PER_QUERY: usize = 5_000;
 
 /// Maximum bytes of one frame's JSON payload, exclusive of the 4-byte length

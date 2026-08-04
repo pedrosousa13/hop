@@ -381,6 +381,93 @@ fn a_query_streaming_past_the_cap_is_truncated_and_terminated() {
     );
 }
 
+#[test]
+fn a_batch_aligned_with_neither_the_frame_bound_nor_the_cap_still_splits_and_truncates() {
+    // Every other cap test on this file hands the daemon batches of exactly
+    // `MAX_ITEMS_PER_RESULTS_FRAME`, which lets two of `forward_batch`'s
+    // paths go unexercised over a socket: `chunks()` always yields one chunk,
+    // and the batch that fills the cap fills it exactly, so `truncate` is a
+    // no-op. 1 500-item batches are aligned with neither bound and reach
+    // both.
+    //
+    // 1 500 against a 1 000-item frame bound splits every batch into 1 000 +
+    // 500. Against a 5 000-item cap, `room` steps 5 000 → 3 500 → 2 000 →
+    // 500, so the fourth batch crosses the line with `0 < room <
+    // batch.len()` — the truncating branch — and the fifth is refused
+    // outright.
+    let batch: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME + MAX_ITEMS_PER_RESULTS_FRAME / 2)
+        .map(item)
+        .collect();
+    assert!(
+        !batch.len().is_multiple_of(MAX_ITEMS_PER_RESULTS_FRAME)
+            && !MAX_ITEMS_PER_QUERY.is_multiple_of(batch.len()),
+        "this test is worth nothing unless the batch size divides neither bound"
+    );
+    let (events, _events_rx) = mpsc::unbounded_channel();
+    let daemon = start_daemon(ScriptedSource {
+        batches: vec![batch; 5],
+        events,
+        delay: Duration::ZERO,
+    });
+    let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
+    hello(&mut stream);
+
+    send(
+        &mut stream,
+        &ClientMsg::Query {
+            id: 4,
+            text: QueryText::new("q").unwrap(),
+        },
+    );
+
+    let mut total = 0;
+    let mut frames = 0;
+    loop {
+        match recv(&mut stream) {
+            DaemonMsg::Results {
+                query_id: 4, items, ..
+            } => {
+                // `recv` decodes through `hop_protocol`, whose parse refuses a
+                // frame over the per-frame bound outright — so a daemon that
+                // stopped splitting batches would fail this test inside the
+                // helper. Asserted here as well so the failure names the rule
+                // rather than the codec.
+                assert!(
+                    items.len() <= MAX_ITEMS_PER_RESULTS_FRAME,
+                    "a source batch over the per-frame bound must be split, got {} items",
+                    items.len()
+                );
+                total += items.len();
+                frames += 1;
+            }
+            DaemonMsg::QueryDone { query_id: 4 } => break,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        total, MAX_ITEMS_PER_QUERY,
+        "the crossing batch must be truncated to exactly the room left, not delivered whole"
+    );
+    assert!(
+        frames > MAX_ITEMS_PER_QUERY.div_ceil(MAX_ITEMS_PER_RESULTS_FRAME),
+        "a 1 500-item batch takes two frames, so the cap's worth of items takes \
+         more frames than the cap divided by the frame bound, got {frames}"
+    );
+
+    // Exactly one QueryDone: the fifth batch was refused rather than queued
+    // behind the cap, so nothing follows the terminal frame.
+    let mut buf = [0u8; 1];
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let read = stream.read(&mut buf);
+    assert!(
+        matches!(read, Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock),
+        "no further frame may follow the cap's QueryDone, got: {read:?}"
+    );
+}
+
 /// A source built for the "superseded query stays silent" test. Its first
 /// `start` call streams forever, exactly like [`EndlessSource`] — the test
 /// needs to control precisely when that query's work stops, by superseding

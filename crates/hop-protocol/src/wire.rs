@@ -38,6 +38,32 @@ pub enum ClientMsg {
     /// A `Query` on a connection with a query already active cancels that query
     /// server-side; the daemon sends no further frames for the superseded id,
     /// not even `QueryDone`.
+    ///
+    /// # `id` must be unique for the life of the connection
+    ///
+    /// The client chooses `id`, and it must not reuse one it has already sent
+    /// on the same connection. A counter incremented per query is the natural
+    /// implementation, and monotonic ids also make "later" readable off the
+    /// number, which nothing else on this connection supplies.
+    ///
+    /// Reuse is not *refused*, because by the time the second frame arrives
+    /// the daemon no longer holds the state that would let it recognise one:
+    /// the retained set is keyed by the id and there is no history beside it.
+    /// What the daemon does instead is treat `Query { id }` as an ordinary new
+    /// exchange — a second one that happens to carry the same id — which
+    /// supersedes the first and replaces its retained items whole. The
+    /// consequences land on the client:
+    ///
+    /// - Items delivered in the first round are still on the client's screen
+    ///   and still labelled with this `query_id`, but the daemon no longer
+    ///   holds them, so an [`Execute`](ClientMsg::Execute) frame naming one is
+    ///   refused as unknown (issue #59) even though this daemon is what sent
+    ///   it. That is
+    ///   the exact failure the retained set's refuse-never-evict rule exists
+    ///   to prevent, reintroduced by the client rather than by the daemon.
+    /// - Frames of the two rounds are indistinguishable on the wire, so the
+    ///   client cannot tell a late frame of the first from a frame of the
+    ///   second, and the stale-frame drop it relies on has nothing to key on.
     Query {
         id: u64,
         /// What the user typed, held as a [`QueryText`] rather than a `String`
@@ -84,17 +110,37 @@ pub enum DaemonMsg {
         partial: bool,
         /// Bounded at
         /// [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME)
-        /// items per frame and
-        /// [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY) items
-        /// summed across the exchange. This bounds one frame, not one query: a daemon
-        /// may send several partial `results` frames for the same `query_id`.
+        /// items and refused at the parse if it holds more. That is the bound
+        /// on *this field*, and a daemon may send several partial `results`
+        /// frames for the same `query_id`, so it is not what the exchange sums
+        /// to.
+        ///
+        /// The exchange total is bounded separately, by
+        /// [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY). No
+        /// single frame can break that one, so nothing here can enforce it:
+        /// a transport applies it as it accumulates, which is what the daemon
+        /// does to what it retains and delivers, and what a client does to
+        /// what it assembles.
         #[serde(deserialize_with = "limits::de_results_items")]
         items: Vec<Item>,
     },
     /// The one terminal frame of a query exchange; sent when the source finishes,
     /// when the exchange hits [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY),
-    /// or in answer to a matching `Cancel` — but not for a query superseded by a
-    /// new `Query`.
+    /// or in answer to a matching `Cancel`.
+    ///
+    /// # When an exchange ends without one
+    ///
+    /// A client waiting on this frame must be prepared for each of these
+    /// instead, because none of them produces it:
+    ///
+    /// - A query **superseded** by a new `Query` on the same connection. The
+    ///   client that superseded it has moved on, and a `QueryDone` for the old
+    ///   id would be dropped as stale anyway.
+    /// - A [`DaemonMsg::Error`] naming the query id, which is terminal for
+    ///   that exchange in this frame's place — see that variant's contract.
+    /// - The connection ending, whether at EOF or behind a connection-scoped
+    ///   `DaemonMsg::Error` the daemon closes after. Every exchange on it ends
+    ///   with it, in flight or not.
     QueryDone {
         query_id: u64,
     },
@@ -102,6 +148,30 @@ pub enum DaemonMsg {
         query_id: u64,
         outcome: ExecOutcome,
     },
+    /// A protocol-level error.
+    ///
+    /// # What `query_id` scopes, and what it does not
+    ///
+    /// `query_id` says what the error is *about*. It does not say whether the
+    /// connection survives it, and a client that reads it as "fatal" or
+    /// "recoverable" is reading something this field does not carry.
+    ///
+    /// - **`Some(id)`** scopes the error to that exchange, and it is terminal
+    ///   for it: no [`DaemonMsg::QueryDone`] follows for `id`, and the two
+    ///   never both arrive for one id. The connection stays usable and every
+    ///   other query id on it is untouched, so a client drops an error naming
+    ///   an id it is not waiting on exactly as it drops a stale `results`
+    ///   frame. `ErrorCode::UnknownItem` and `ErrorCode::UnknownAction` are
+    ///   query-scoped by construction and belong in this form.
+    /// - **`None`** scopes the error to the connection, or to a frame that
+    ///   named no query: a version mismatch, a frame before the handshake, a
+    ///   frame refused at its length prefix or at its parse, or a frame the
+    ///   daemon does not implement yet. Whether the connection continues is
+    ///   *not* in the frame — `hopd` closes it behind the first four and keeps
+    ///   it open behind the last, and a peer learns which by whether EOF
+    ///   follows. A client with an exchange in flight should treat this form
+    ///   as ending that exchange: nothing promises it a `QueryDone`, and it
+    ///   cannot tell from the frame that one is still coming.
     Error {
         query_id: Option<u64>,
         error: ProtoError,
