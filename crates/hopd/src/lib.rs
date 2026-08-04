@@ -19,6 +19,7 @@
 //! those gaps is named where it applies, in [`runtime_dir`], [`server`] and
 //! [`source`].
 
+pub mod apps;
 pub(crate) mod connection;
 pub mod runtime_dir;
 pub mod server;
