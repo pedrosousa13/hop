@@ -40,7 +40,7 @@ use std::io;
 use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
 };
-use hop_protocol::limits::{MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME};
+use hop_protocol::limits::MAX_ITEMS_PER_RESULTS_FRAME;
 use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ErrorCode, Item, ProtoError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -75,31 +75,40 @@ enum ReadEvent {
 }
 
 /// One query id's exchange: the source still producing for it, if any, and
-/// every item delivered under it so far.
+/// the last assembled list it sent.
 ///
 /// The two halves are one struct because they are one invariant. `delivered`
-/// is the state issue #59's `execute` binding resolves against and the state
-/// [`MAX_ITEMS_PER_QUERY`] bounds, and it has to stay readable *while* the
-/// query streams as well as after it ends — so it cannot live inside a value
-/// that is dropped when the source stops, and holding it in a second
-/// `Option` alongside would mean two fields that must agree on a query id
-/// with nothing but a comment (and, at the point of use, an `expect`) saying
-/// they do. Here the id is stored once and the two can only disagree if this
-/// file stops compiling.
+/// is the state issue #59's `execute` binding resolves against, and it has to
+/// stay readable *while* the query streams as well as after it ends — so it
+/// cannot live inside a value that is dropped when the source stops, and
+/// holding it in a second `Option` alongside would mean two fields that must
+/// agree on a query id with nothing but a comment (and, at the point of use,
+/// an `expect`) saying they do. Here the id is stored once and the two can
+/// only disagree if this file stops compiling.
 ///
-/// `source` going to `None` is what ends an exchange — naturally, at the cap,
-/// or on a `Cancel` — and dropping the receiver is what tells the source to
-/// stop working. The exchange itself outlives that: what was delivered stays
-/// resolvable until a new `Query` replaces it whole, because an item this
-/// daemon has already shown the client must not become unresolvable just
-/// because the query that produced it finished.
+/// `source` going to `None` is what ends an exchange — naturally, at the
+/// per-frame bound, or on a `Cancel` — and dropping the receiver is what
+/// tells the source to stop working. The exchange itself outlives that: what
+/// was delivered stays resolvable until a new `Query` replaces it whole,
+/// because an item this daemon has already shown the client must not become
+/// unresolvable just because the query that produced it finished. What
+/// changes under replacement is that `delivered` is not everything this
+/// exchange has ever sent — it is only the *last* list, because each arrival
+/// replaces it rather than adding to it, so an item the daemon has since
+/// replaced away is no longer resolvable either. That is not a gap this
+/// struct leaves open; it is what criterion 6 (issue #103) asks for.
 struct Exchange {
     /// The `query_id` every frame of this exchange carries.
     id: u64,
     /// The live source, or `None` once this exchange has ended.
     source: Option<mpsc::Receiver<Vec<Item>>>,
-    /// What was delivered under [`Exchange::id`], bounded by
-    /// [`MAX_ITEMS_PER_QUERY`]. Truncated at the cap, never evicted.
+    /// The last list [`forward_batch`] sent, bounded by
+    /// [`MAX_ITEMS_PER_RESULTS_FRAME`] — this struct's own defensive bound on
+    /// one assembled list, since [`ResultSource`]'s obligations say a source
+    /// is not trusted. What a source may *accumulate* for one query is
+    /// [`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY),
+    /// enforced in `source.rs` before a batch ever reaches this connection —
+    /// this field only ever holds one arrival's worth.
     delivered: Vec<Item>,
 }
 
@@ -309,7 +318,29 @@ async fn handle_message<S: ResultSource>(
 }
 
 /// Forwards one source event — a batch, or the source finishing — to the
-/// peer, retaining what was delivered and enforcing [`MAX_ITEMS_PER_QUERY`].
+/// peer, replacing [`Exchange::delivered`] whole and enforcing
+/// [`MAX_ITEMS_PER_RESULTS_FRAME`].
+///
+/// A batch here is already the complete current list, per the replace-frame
+/// contract [`ResultSource`]'s docs describe — never an increment to append.
+/// That is what makes at most one `Results` frame per arrival correct rather
+/// than merely convenient: an increment could always be carried across
+/// several frames because the client was going to append them anyway, but a
+/// replacement cannot be, because a client receiving a second frame for the
+/// same arrival would have no way to tell "the rest of this list" from "a
+/// new list replacing it" — nothing on the wire distinguishes them (Design
+/// decision 3). So an over-long list has exactly two honest answers, truncate
+/// or refuse, and truncate-and-terminate is the one this daemon already uses
+/// at every other bound: truncate to the frame's capacity, deliver that, and
+/// end the exchange with its terminal frame — the same rule
+/// `CONTEXT.md`'s truncate-and-terminate entry states, applied here at
+/// [`MAX_ITEMS_PER_RESULTS_FRAME`] instead of at the per-query cap, because
+/// the per-query cap is no longer this connection's to enforce — see
+/// `source.rs`, where [`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY)
+/// now bounds what a source accumulates before a batch ever reaches here.
+/// This connection's [`MAX_ITEMS_PER_RESULTS_FRAME`] check stays regardless,
+/// because [`ResultSource`]'s obligations section is explicit that a source
+/// is not trusted to honour it on its own.
 async fn forward_batch(
     exchange: &mut Option<Exchange>,
     write_half: &mut OwnedWriteHalf,
@@ -323,7 +354,7 @@ async fn forward_batch(
     };
     let query_id = active.id;
 
-    let Some(batch) = batch else {
+    let Some(mut batch) = batch else {
         // The source finished. Clearing it is what takes this query out of
         // the driver's wait — a closed receiver is permanently ready, so
         // leaving it in place would spin — and `QueryDone` is the exchange's
@@ -332,60 +363,35 @@ async fn forward_batch(
         return send_msg(write_half, &DaemonMsg::QueryDone { query_id }).await;
     };
 
-    let room = MAX_ITEMS_PER_QUERY.saturating_sub(active.delivered.len());
-    let (accepted, capped) = take_within_cap(room, batch);
+    let capped = batch.len() > MAX_ITEMS_PER_RESULTS_FRAME;
+    if capped {
+        batch.truncate(MAX_ITEMS_PER_RESULTS_FRAME);
+    }
 
     // Retained before it is sent, not after: a write that fails partway
     // leaves the connection dead either way, and the state that matters is
-    // "what this daemon committed to delivering under this id". The batch is
-    // moved in rather than cloned in, and the frames below are then cut from
-    // the retained copy — one copy of each item on this path, not two.
-    let first = active.delivered.len();
-    active.delivered.extend(accepted);
+    // "what this daemon committed to delivering under this id".
+    active.delivered = batch;
+
+    send_msg(
+        write_half,
+        &DaemonMsg::Results {
+            query_id,
+            partial: true,
+            items: active.delivered.clone(),
+        },
+    )
+    .await?;
+
     if capped {
-        // Truncate-and-terminate, never eviction: everything delivered stays
-        // retained and resolvable, and what did not fit was never delivered
-        // at all. The two halves are named differently on purpose — dropping
-        // the remainder is a truncation in `CONTEXT.md`'s sense, because
-        // nothing on the wire names it and the terminal frame below is the
-        // one a completed exchange sends. Dropping the receiver stops the
-        // source; the client is told the exchange is over below.
+        // Dropping the receiver stops the source; QueryDone is what tells
+        // the client the exchange is over. The two halves of
+        // truncate-and-terminate: everything delivered stays retained and
+        // resolvable, and what did not fit was never delivered at all.
         active.source = None;
-    }
-
-    // A source batch may exceed what one frame is allowed to carry; the
-    // per-frame bound is the wire's, so the split happens here rather than
-    // in the source's contract. Every streamed frame is `partial: true`.
-    for chunk in active.delivered[first..].chunks(MAX_ITEMS_PER_RESULTS_FRAME) {
-        send_msg(
-            write_half,
-            &DaemonMsg::Results {
-                query_id,
-                partial: true,
-                items: chunk.to_vec(),
-            },
-        )
-        .await?;
-    }
-
-    if capped {
         send_msg(write_half, &DaemonMsg::QueryDone { query_id }).await?;
     }
     Ok(())
-}
-
-/// How much of `batch` fits in `room` more items, and whether the exchange is
-/// now at its cap. Truncates the crossing batch; never touches what was
-/// already accepted.
-///
-/// `room` running out exactly is still a cap: a full exchange has nothing
-/// left to give a later batch, so ending it now is the same answer arrived at
-/// one batch earlier, and it costs the client one fewer round trip to learn
-/// it.
-fn take_within_cap(room: usize, mut batch: Vec<Item>) -> (Vec<Item>, bool) {
-    let capped = batch.len() >= room;
-    batch.truncate(room);
-    (batch, capped)
 }
 
 /// What reading one frame produced.
@@ -498,39 +504,69 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::source::hardcoded_item;
 
-    fn batch_of(n: usize) -> Vec<Item> {
-        std::iter::repeat_with(hardcoded_item).take(n).collect()
+    /// An item whose id names it, so a test can tell two lists' items apart
+    /// by identity rather than by count alone.
+    fn item_named(id: &str) -> Item {
+        Item {
+            id: hop_protocol::ItemId::new(id).unwrap(),
+            kind: hop_protocol::Kind::Action,
+            title: id.to_string(),
+            subtitle: None,
+            icon: None,
+            actions: vec![],
+            default_action: hop_protocol::ActionId::new("open").unwrap(),
+            copy_text: None,
+            append_to_end: false,
+            provider: "test".to_string(),
+        }
     }
 
-    #[test]
-    fn a_batch_under_the_room_passes_whole_and_does_not_cap() {
-        let (taken, capped) = take_within_cap(10, batch_of(9));
-        assert_eq!(taken.len(), 9);
-        assert!(!capped);
+    /// A live socket pair to drive [`forward_batch`] against directly: it
+    /// needs a real `OwnedWriteHalf` to write frames into. The peer half is
+    /// kept alive (never read from) for the tests below — each writes only a
+    /// couple of small frames, well under what the kernel buffers before a
+    /// write would block.
+    fn write_half_pair() -> (tokio::net::UnixStream, OwnedWriteHalf) {
+        let (near, far) = tokio::net::UnixStream::pair().expect("unix socket pair");
+        let (_read, write_half) = near.into_split();
+        (far, write_half)
     }
 
-    #[test]
-    fn a_batch_exactly_filling_the_room_caps() {
-        // Filling the room exactly leaves nothing for a later batch, so the
-        // exchange ends now rather than on the next batch's arrival.
-        let (taken, capped) = take_within_cap(10, batch_of(10));
-        assert_eq!(taken.len(), 10);
-        assert!(capped);
-    }
+    #[tokio::test]
+    async fn the_retained_set_is_the_last_list_not_the_union() {
+        // Two forward_batch calls, each a complete replace-frame list. The
+        // first holds an item the second does not ("only-in-first"), so a
+        // retained set that was the *union* of every list sent — the bug
+        // this test exists to catch — would still contain it after the
+        // second call; the correct implementation's retained set holds
+        // exactly the second list.
+        let (_peer, mut write_half) = write_half_pair();
+        let mut exchange = Some(Exchange {
+            id: 1,
+            source: None,
+            delivered: Vec::new(),
+        });
 
-    #[test]
-    fn a_batch_over_the_room_is_truncated_never_evicted() {
-        let (taken, capped) = take_within_cap(10, batch_of(11));
-        assert_eq!(taken.len(), 10, "the crossing batch is truncated to fit");
-        assert!(capped);
-    }
+        let first = vec![item_named("only-in-first"), item_named("shared")];
+        let second = vec![item_named("shared"), item_named("only-in-second")];
 
-    #[test]
-    fn zero_room_takes_nothing() {
-        let (taken, capped) = take_within_cap(0, batch_of(3));
-        assert!(taken.is_empty());
-        assert!(capped);
+        forward_batch(&mut exchange, &mut write_half, Some(first))
+            .await
+            .unwrap();
+        forward_batch(&mut exchange, &mut write_half, Some(second.clone()))
+            .await
+            .unwrap();
+
+        let delivered = &exchange.as_ref().unwrap().delivered;
+        assert_eq!(
+            delivered, &second,
+            "the retained set must equal the last list exactly, not the \
+             union of every list this exchange has sent"
+        );
+        assert!(
+            delivered.iter().all(|i| i.id.as_str() != "only-in-first"),
+            "an item only the first list held must not survive a replacement"
+        );
     }
 }
