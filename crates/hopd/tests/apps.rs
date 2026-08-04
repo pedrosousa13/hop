@@ -58,7 +58,7 @@ fn connect(daemon: &common::TestDaemon) -> UnixStream {
 #[test]
 fn a_query_over_the_socket_returns_a_real_installed_application() {
     let dir = tempfile::tempdir().unwrap();
-    write_entry(dir.path(), "firefox.desktop", "hop-e2e-canary-27b4d0");
+    write_entry(dir.path(), "canary.desktop", "hop-e2e-canary-27b4d0");
     let daemon = daemon_over(vec![dir.path().to_path_buf()]);
     let mut stream = connect(&daemon);
 
@@ -90,7 +90,7 @@ fn a_query_over_the_socket_returns_a_real_installed_application() {
 #[test]
 fn the_a_prefix_reaches_the_apps_provider_exclusively() {
     let dir = tempfile::tempdir().unwrap();
-    write_entry(dir.path(), "firefox.desktop", "hop-e2e-canary-27b4d0");
+    write_entry(dir.path(), "canary.desktop", "hop-e2e-canary-27b4d0");
     let daemon = daemon_over(vec![dir.path().to_path_buf()]);
     let mut stream = connect(&daemon);
 
@@ -125,7 +125,7 @@ fn the_a_prefix_reaches_the_apps_provider_exclusively() {
 #[test]
 fn a_query_that_matches_nothing_still_reaches_a_clean_query_done() {
     let dir = tempfile::tempdir().unwrap();
-    write_entry(dir.path(), "firefox.desktop", "hop-e2e-canary-27b4d0");
+    write_entry(dir.path(), "canary.desktop", "hop-e2e-canary-27b4d0");
     let daemon = daemon_over(vec![dir.path().to_path_buf()]);
     let mut stream = connect(&daemon);
 
