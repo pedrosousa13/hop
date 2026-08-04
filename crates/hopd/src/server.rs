@@ -34,13 +34,26 @@ const SOCKET_FILE_NAME: &str = "hopd.sock";
 ///
 /// # Stale-socket removal is provisional
 ///
-/// If a file already sits at the socket path, it is removed before binding.
-/// This is what makes restarting hopd after a crash work at all — `bind`
-/// otherwise fails with `AddrInUse` against a leftover socket file, live or
-/// not — but it is not a single-instance guard: nothing here checks whether
-/// another `hopd` is still listening on that path before unlinking it out
-/// from under it. That check is a later M2 slice's job, not this walking
-/// skeleton's.
+/// Whatever sits at the socket path is removed before binding, unconditionally
+/// — not gated on an `exists()` check first. This is what makes restarting
+/// hopd after a crash work at all — `bind` otherwise fails with `AddrInUse`
+/// against a leftover socket file, live or not — but it is not a
+/// single-instance guard: nothing here checks whether another `hopd` is still
+/// listening on that path before unlinking it out from under it. That check
+/// is a later M2 slice's job, not this walking skeleton's.
+///
+/// The removal is unconditional rather than `if socket_path.exists() {
+/// remove_file }` for two reasons. First, that shape is a TOCTOU: whatever
+/// might be true between the `exists()` check and the `remove_file` call is
+/// exactly the kind of race this process cannot rule out just by checking
+/// first. Second, `exists()` follows symlinks and reports `false` for a
+/// dangling one — a socket path left behind as a symlink to a since-deleted
+/// target would make `exists()` say "nothing here" and then `bind` fail with
+/// `AddrInUse` anyway, since the kernel still finds a directory entry there.
+/// `remove_file` alone, tolerating only `NotFound`, handles both: the common
+/// case (nothing there) and the dangling-symlink case (something there that
+/// isn't a live socket) the same way, and still surfaces a genuine permission
+/// or I/O error instead of swallowing it.
 ///
 /// # The socket's mode is decided, not inherited
 ///
@@ -61,8 +74,10 @@ const SOCKET_FILE_NAME: &str = "hopd.sock";
 pub async fn serve(runtime_dir: &Path) -> io::Result<()> {
     let socket_path = runtime_dir.join(SOCKET_FILE_NAME);
 
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
     }
 
     let listener = UnixListener::bind(&socket_path)?;
@@ -79,7 +94,7 @@ pub async fn serve(runtime_dir: &Path) -> io::Result<()> {
                 // One task per connection, per the brief's acceptance
                 // criterion that the runtime be multi-threaded: unbounded
                 // today, since a per-connection or per-daemon cap on
-                // concurrent connections is issue #55's, not this walking
+                // concurrent connections is issue #98's, not this walking
                 // skeleton's.
                 tokio::spawn(async move {
                     if let Err(err) = handle_connection(stream).await {
@@ -91,7 +106,17 @@ pub async fn serve(runtime_dir: &Path) -> io::Result<()> {
                     }
                 });
             }
-            Err(err) => eprintln!("hopd: accept error: {err}"),
+            Err(err) => {
+                eprintln!("hopd: accept error: {err}");
+                // A floor, not a policy: this sleep exists only so a
+                // persistent accept error (EMFILE, exhausted file
+                // descriptors) cannot hot-spin the loop and pin a core
+                // logging the same line as fast as it can. It is not a
+                // backoff strategy and not a connection-rate limit — the
+                // real accept-rate and connection-cap policy is issue #98's,
+                // not this walking skeleton's.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
     }
 }
@@ -243,13 +268,26 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Option<ReadOutcome>> 
         }
     };
 
+    // `len` is already checked against MAX_FRAME_BYTES by `payload_len`
+    // above, so this allocation is capped per frame — but nothing here caps
+    // how many such allocations one connection can rack up over its
+    // lifetime, or across every connection this daemon is serving at once,
+    // and `read_exact` below has no timeout, so a peer that sends a valid
+    // prefix and then never finishes the payload holds this buffer and this
+    // task open indefinitely. Aggregate memory bounds and read timeouts are
+    // issue #98's, not this walking skeleton's.
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await?;
 
     match decode_payload::<ClientMsg>(&payload) {
         Ok(msg) => Ok(Some(ReadOutcome::Message(msg))),
         Err(err) => Ok(Some(ReadOutcome::Refused {
-            code: ErrorCode::Internal,
+            // A payload this connection read in full and still could not
+            // parse as a `ClientMsg` is bytes the peer sent, not a bug in
+            // this daemon — `ErrorCode::MalformedFrame`'s doc comment makes
+            // that split explicit. `ErrorCode::Internal` stays reserved for
+            // a failure this process caused itself.
+            code: ErrorCode::MalformedFrame,
             message: err.to_string(),
         })),
     }

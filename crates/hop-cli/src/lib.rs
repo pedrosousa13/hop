@@ -1,7 +1,7 @@
 //! `hop` — the walking-skeleton CLI for the hop launcher daemon.
 //!
 //! Two subcommands exist today: `hop version`, which needs no daemon, and
-//! `hop query <text>`, which speaks the same length-prefixed JSON framing
+//! `hop query <text>...`, which speaks the same length-prefixed JSON framing
 //! [`hopd`](../hopd/index.html) does over the same Unix socket, using
 //! `hop_protocol`'s IO-free codec on both ends of the pipe (see that crate's
 //! `framing` module docs for why the codec itself has no socket code in it).
@@ -23,8 +23,8 @@
 //!
 //! # Why no clap
 //!
-//! Two subcommands, one of which takes a single required string argument,
-//! is little enough surface that hand-rolling the match in [`parse`] is
+//! Two subcommands, one of which takes the rest of the argument list as free
+//! text, is little enough surface that hand-rolling the match in [`parse`] is
 //! fewer lines than a derive macro's attributes would be, and it keeps this
 //! crate's only dependency beyond `hop-protocol` and `serde_json` at zero.
 //! That trade tips the other way once `exec`, `toggle`, and `doctor` land —
@@ -59,7 +59,9 @@ const QUERY_ID: u64 = 1;
 pub enum Command {
     /// `hop version`.
     Version,
-    /// `hop query <text>`, carrying the text as typed.
+    /// `hop query <text>...`, carrying every argument after `query` joined
+    /// with single spaces into one query string — see [`parse`]'s doc
+    /// comment for why a single token would silently drop words.
     Query(String),
     /// Anything else: no arguments, an unrecognized subcommand, or `query`
     /// with nothing after it.
@@ -67,17 +69,27 @@ pub enum Command {
 }
 
 /// The line `main` prints to stderr for [`Command::Usage`].
-pub const USAGE: &str = "usage: hop version | hop query <text>";
+pub const USAGE: &str = "usage: hop version | hop query <text>...";
 
 /// Parses `args` — the process's arguments with `argv[0]` already stripped —
 /// into a [`Command`].
+///
+/// `hop query hello world`'s two tokens after `query` are joined with single
+/// spaces into one query string (`"hello world"`), not just the first token
+/// — `query` takes free text, and a shell hands that text over unquoted as
+/// one argument per word, so treating only `args.next()` as the query would
+/// silently drop every word after the first.
 pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Command {
     match args.next().as_deref() {
         Some("version") => Command::Version,
-        Some("query") => match args.next() {
-            Some(text) => Command::Query(text),
-            None => Command::Usage,
-        },
+        Some("query") => {
+            let tokens: Vec<String> = args.collect();
+            if tokens.is_empty() {
+                Command::Usage
+            } else {
+                Command::Query(tokens.join(" "))
+            }
+        }
         _ => Command::Usage,
     }
 }
@@ -92,7 +104,7 @@ pub fn print_version() {
     println!("protocol {API_VERSION}");
 }
 
-/// Runs `hop query <text>`: connects to `hopd`, performs the handshake,
+/// Runs `hop query <text>...`: connects to `hopd`, performs the handshake,
 /// sends the query, and prints each returned item as one line of JSON.
 ///
 /// Returns the process's exit code rather than a `Result` — every error this
@@ -224,6 +236,21 @@ mod tests {
         assert_eq!(
             parse(["query".to_string(), "hello".to_string()].into_iter()),
             Command::Query("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn query_with_multiple_tokens_joins_them() {
+        assert_eq!(
+            parse(
+                [
+                    "query".to_string(),
+                    "hello".to_string(),
+                    "world".to_string()
+                ]
+                .into_iter()
+            ),
+            Command::Query("hello world".to_string())
         );
     }
 

@@ -219,6 +219,37 @@ fn an_oversize_length_prefix_is_refused_without_the_payload_being_read() {
 }
 
 #[test]
+fn a_payload_that_is_not_valid_json_is_refused_as_malformed_not_internal() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = spawn_daemon(runtime_dir.path());
+    let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
+
+    hello(&mut stream);
+
+    // A correct length prefix in front of a payload that is not JSON at all:
+    // this is a peer-fault failure at `decode_payload`, distinct from the
+    // prefix-only refusal `an_oversize_length_prefix_is_refused...` covers,
+    // and it must not be reported as `Internal` — that code names a bug in
+    // hopd itself, not bytes a peer sent that hopd was never obligated to
+    // make sense of.
+    let payload = b"not json";
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .expect("writing the prefix must succeed");
+    stream
+        .write_all(payload)
+        .expect("writing the malformed payload must succeed");
+
+    let reply = recv(&mut stream);
+    let DaemonMsg::Error { error, .. } = reply else {
+        panic!("expected an error frame, got {reply:?}");
+    };
+    assert_eq!(error.code, ErrorCode::MalformedFrame);
+
+    assert_eof(&mut stream);
+}
+
+#[test]
 fn a_version_mismatch_is_an_explicit_error() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let daemon = spawn_daemon(runtime_dir.path());

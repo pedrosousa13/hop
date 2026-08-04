@@ -17,7 +17,7 @@ tokio = { version = "1", default-features = false, features = ["sync", "time", "
 tempfile = "3"
 regex = "1"
 
-# Both member crates opt in with `[lints] workspace = true`. A workspace lint no
+# Every member crate opts in with `[lints] workspace = true`. A workspace lint no
 # crate inherits is a gate that does nothing, so any new member must do the same.
 [workspace.lints.rust]
 # Production code in this workspace contains no `unsafe`, and this is what keeps

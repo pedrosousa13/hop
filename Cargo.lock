@@ -95,7 +95,6 @@ name = "hopd"
 version = "0.1.0"
 dependencies = [
  "hop-protocol",
- "serde_json",
  "tempfile",
  "tokio",
 ]

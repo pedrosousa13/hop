@@ -151,6 +151,20 @@ pub enum ErrorCode {
     /// sends `Query` or `Execute` first gets this instead of a response to a
     /// connection the daemon never agreed was version-compatible.
     HandshakeRequired,
+    /// The daemon refused a frame because its payload, once read in full,
+    /// did not decode as a [`ClientMsg`] — malformed JSON, an unrecognized
+    /// `type` tag, or a value that fails one of [`limits`](crate::limits)'s
+    /// bounds.
+    ///
+    /// This is [`FrameError::Decode`](crate::framing::FrameError::Decode)
+    /// surfaced to the peer: the payload came off the wire from that peer,
+    /// so a failure to parse it is peer-fault, the same attribution
+    /// `framing`'s `Encode`/`Decode` split makes for the daemon's own side of
+    /// the same failure mode. That is what keeps this code distinct from
+    /// [`ErrorCode::Internal`] — `Internal` names a bug in this daemon,
+    /// `MalformedFrame` names bytes this daemon was never obligated to make
+    /// sense of.
+    MalformedFrame,
 }
 
 #[cfg(test)]
@@ -354,6 +368,7 @@ mod tests {
             (ErrorCode::Internal, r#""internal""#),
             (ErrorCode::FrameTooLarge, r#""frame_too_large""#),
             (ErrorCode::HandshakeRequired, r#""handshake_required""#),
+            (ErrorCode::MalformedFrame, r#""malformed_frame""#),
         ];
         for (code, expected_json) in cases {
             assert_eq!(serde_json::to_string(&code).unwrap(), expected_json);
