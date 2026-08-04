@@ -317,8 +317,13 @@ queries: one query in, a stream of item batches out behind a channel. The
 channel is the whole contract — batches arrive on it, the source finishing
 closes it, and the caller dropping it *is* the cancellation, which makes
 cancellation a property of the seam rather than a protocol bolted beside it.
-This is where the **provider** host will plug in; until it does, the one
-production source answers every query with the same hardcoded item.
+This is where the **provider host** plugs in, and it now does: the one
+production source routes the query text and hands the routed query to the host,
+which answers from the providers registered with it. Only the walking
+skeleton's own provider is registered until issues #57 and #58 land the apps
+and calculator ones, so what comes back is still a single hardcoded item — but
+it arrives through the host, having passed the **manifest checks**, rather than
+bypassing it.
 
 **Retained set** — the items an exchange has delivered, kept so that a later
 `execute` resolves against what the client was actually shown. One per
