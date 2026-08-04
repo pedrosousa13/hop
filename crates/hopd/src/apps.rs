@@ -1707,3 +1707,229 @@ mod provider_tests {
         assert!(matches!(result, Err(ProviderError::Failed(_))));
     }
 }
+
+use std::io;
+
+use inotify::{Inotify, WatchMask};
+
+/// The inotify events worth rebuilding the index over: a file created,
+/// removed, finished being written, or moved in or out of a watched
+/// directory. `WatchMask::CLOSE_WRITE` rather than `WatchMask::MODIFY` is
+/// deliberate — it fires once a writer has actually finished, rather than
+/// once per buffered write syscall, so a package manager writing a
+/// `.desktop` file in several chunks produces one event instead of several
+/// and is never seen half-written.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only called from open_watch, which is itself only called from \
+                  spawn_index_watcher — no non-test caller until Task 7 (issue #57) wires \
+                  spawn_index_watcher into startup"
+    )
+)]
+fn watch_mask() -> WatchMask {
+    WatchMask::CREATE
+        | WatchMask::DELETE
+        | WatchMask::CLOSE_WRITE
+        | WatchMask::MOVED_FROM
+        | WatchMask::MOVED_TO
+}
+
+/// Opens an inotify instance and adds a watch on every path in `roots` that
+/// exists and is readable. A root that does not exist (a never-created
+/// `~/.icons`, say) is skipped rather than failing the whole watcher,
+/// mirroring [`scan_apps`]'s own tolerance for missing roots. Fails only if
+/// *no* root could be watched at all.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only called from spawn_index_watcher, which has no non-test caller until \
+                  Task 7 (issue #57) wires it into startup"
+    )
+)]
+fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
+    let inotify = Inotify::init()?;
+    let mask = watch_mask();
+
+    let mut watched_any = false;
+    for root in roots {
+        if inotify.watches().add(root, mask).is_ok() {
+            watched_any = true;
+        }
+    }
+
+    if !watched_any {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no application directory could be watched",
+        ));
+    }
+
+    Ok(inotify)
+}
+
+/// Spawns the background thread that keeps `index` current: an initial
+/// build is assumed already done by the caller (`AppIndex::new` from a
+/// [`scan_apps`] call), and this thread rebuilds it every time a watched
+/// directory changes, forever, until the process exits.
+///
+/// A dedicated OS thread, blocking on [`Inotify::read_events_blocking`],
+/// rather than the crate's tokio-integrated `EventStream` — see this plan's
+/// Design decision 5 for the two reasons: `EventStream` needs a live Tokio
+/// runtime context at construction, which this function's callers do not
+/// uniformly have (Task 8's test harness builds the provider before its
+/// runtime exists), and this thread's work — a blocking read, then
+/// [`scan_apps`]'s own blocking directory walk — has nothing to gain from
+/// running on a Tokio worker thread regardless.
+///
+/// This deliberately does not inspect which events `read_events_blocking`
+/// returned: every event `watch_mask` is configured for provokes the
+/// identical response — a full rescan — so there is nothing to gain from
+/// knowing which file changed, and the crate's own `Events` iterator is
+/// simply drained by letting it drop.
+///
+/// If no root could be watched at all (`open_watch` failing), this logs and
+/// returns without spawning anything — `index` then stays at its startup
+/// snapshot for the life of the process rather than the daemon refusing to
+/// start over a watch failure, matching this crate's existing
+/// per-provider-isolation posture (`build_host`'s own doc comment: "a
+/// daemon that refuses to start over one misconfigured provider is worse
+/// than one that serves the rest").
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no non-test caller until Task 7 (issue #57) wires this into build_host's \
+                  startup path"
+    )
+)]
+pub(crate) fn spawn_index_watcher(index: Arc<AppIndex>, roots: Vec<PathBuf>) {
+    let mut inotify = match open_watch(&roots) {
+        Ok(i) => i,
+        Err(err) => {
+            eprintln!("hopd: apps provider: could not watch for desktop-entry changes: {err}");
+            return;
+        }
+    };
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match inotify.read_events_blocking(&mut buffer) {
+                Ok(_events) => index.replace(scan_apps(&roots)),
+                Err(_err) => return,
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod watcher_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Polls `index` for up to `timeout`, checking `matches` against a fresh
+    /// query each time. A regression here hangs for the full timeout rather
+    /// than forever, which is what makes a broken watcher a failed
+    /// assertion instead of a stuck CI job.
+    fn wait_until(index: &AppIndex, timeout: Duration, matches: impl Fn(&[Item]) -> bool) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if matches(&index.query("")) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn open_watch_blocks_until_a_file_is_created_then_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inotify = open_watch(&[dir.path().to_path_buf()]).unwrap();
+
+        let writer_path = dir.path().join("new.desktop");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            std::fs::write(writer_path, "[Desktop Entry]\nName=New\nExec=new\n").unwrap();
+        });
+
+        // read_events_blocking blocks until the writer's create+close-write
+        // lands; if it never did, this call would hang and the test would
+        // time out at the harness level rather than failing an assertion —
+        // acceptable here because a hang is itself the failure signature a
+        // broken watcher produces.
+        let mut buffer = [0u8; 4096];
+        let events: Vec<_> = inotify.read_events_blocking(&mut buffer).unwrap().collect();
+        assert!(
+            !events.is_empty(),
+            "at least one event must be reported for the new file"
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn open_watch_fails_over_no_existing_root() {
+        let missing = PathBuf::from("/definitely/not/a/real/path/for/this/test");
+        assert!(open_watch(&[missing]).is_err());
+    }
+
+    #[test]
+    fn open_watch_succeeds_with_at_least_one_existing_root_among_several_missing_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = PathBuf::from("/definitely/not/a/real/path/for/this/test");
+        assert!(open_watch(&[missing, dir.path().to_path_buf()]).is_ok());
+    }
+
+    #[test]
+    fn installing_a_desktop_entry_is_reflected_in_the_index_without_rebuilding_it_by_hand() {
+        // Acceptance criterion 2, at the AppIndex level: the index reflects
+        // a filesystem change with nothing but the watcher thread acting on
+        // it — no test code calls `index.replace` or `scan_apps` directly
+        // after the watcher is spawned.
+        let dir = tempfile::tempdir().unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        let index = Arc::new(AppIndex::new(scan_apps(&roots)));
+        assert!(index.query("").is_empty(), "sanity: nothing installed yet");
+
+        spawn_index_watcher(index.clone(), roots);
+
+        std::fs::write(
+            dir.path().join("newapp.desktop"),
+            "[Desktop Entry]\nName=New App\nExec=newapp\n",
+        )
+        .unwrap();
+
+        assert!(
+            wait_until(&index, Duration::from_secs(5), |items| items
+                .iter()
+                .any(|i| i.title == "New App")),
+            "the new entry must appear without the daemon restarting"
+        );
+    }
+
+    #[test]
+    fn removing_a_desktop_entry_is_reflected_in_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_path = dir.path().join("goingaway.desktop");
+        std::fs::write(&entry_path, "[Desktop Entry]\nName=Going Away\nExec=x\n").unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        let index = Arc::new(AppIndex::new(scan_apps(&roots)));
+        assert_eq!(
+            index.query("").len(),
+            1,
+            "sanity: it was indexed at startup"
+        );
+
+        spawn_index_watcher(index.clone(), roots);
+        std::fs::remove_file(&entry_path).unwrap();
+
+        assert!(
+            wait_until(&index, Duration::from_secs(5), |items| items.is_empty()),
+            "the removed entry must disappear without the daemon restarting"
+        );
+    }
+}

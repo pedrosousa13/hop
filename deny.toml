@@ -83,6 +83,17 @@ ignore = []
 # hope — it is checkable one line at a time by removing an entry and re-running,
 # and it is what makes the absences further down mean something.
 #
+#   ISC           inotify and inotify-sys (crates/hopd's apps-provider
+#                 filesystem watcher, issue #57 — installing or removing a
+#                 desktop entry must be reflected without restarting the
+#                 daemon, which needs a real filesystem-event source).
+#                 ISC is a short, maximally permissive license — the same
+#                 grant as the two-clause BSD license, with no copyleft
+#                 obligation — and both the FSF and the OSI classify it as
+#                 GPL-compatible. Both crates offer ISC as their only
+#                 license, so, like MPL-2.0 below, this entry exists for one
+#                 dependency pair rather than one arm of a choice MIT
+#                 already covers.
 #   MIT           Permissive and GPL-compatible, and what most of this tree
 #                 resolves to: one half of the usual Rust dual license offered
 #                 by serde, regex, thiserror, syn and libc, and the only option
@@ -123,6 +134,7 @@ ignore = []
 # particular.
 allow = [
     "GPL-3.0-only",
+    "ISC",
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
