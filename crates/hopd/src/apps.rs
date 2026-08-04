@@ -758,9 +758,9 @@ pub(crate) const QUERY_RESULT_CAP: usize = 50;
 /// [`AppIndex::query`]'s signature takes and returns nothing capable of
 /// naming a filesystem path, and its body is a lock acquisition over an
 /// already-resident `Vec` followed by `filter`/`take`/`clone` — nothing in
-/// its call graph reaches `std::fs`. `tests::query_still_answers_after_the_
-/// backing_directory_is_deleted` below is the stronger, runtime version of
-/// that claim: it proves the answer does not change when the disk it was
+/// its call graph reaches `std::fs`. `index_tests::query_still_answers_after_
+/// the_backing_directory_is_deleted` below is the stronger, runtime version
+/// of that claim: it proves the answer does not change when the disk it was
 /// built from is no longer there to be read.
 #[cfg_attr(
     not(test),
