@@ -43,7 +43,8 @@ use std::process::ExitCode;
 use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
 };
-use hop_protocol::{API_VERSION, BoundError, ClientMsg, DaemonMsg, ProtoError, QueryText};
+use hop_protocol::limits::MAX_ITEMS_PER_QUERY;
+use hop_protocol::{API_VERSION, BoundError, ClientMsg, DaemonMsg, Item, ProtoError, QueryText};
 
 /// The `id` this CLI sends on its one `Query` frame per process. There is
 /// only ever one query in flight on this connection, so a fixed id (rather
@@ -105,7 +106,8 @@ pub fn print_version() {
 }
 
 /// Runs `hop query <text>...`: connects to `hopd`, performs the handshake,
-/// sends the query, and prints each returned item as one line of JSON.
+/// sends the query, and assembles the streamed results and prints them once
+/// `query_done` arrives.
 ///
 /// Returns the process's exit code rather than a `Result` — every error this
 /// flow can hit is reported to stderr and mapped to exit code 1 right here,
@@ -133,6 +135,9 @@ enum QueryError {
     Encode(serde_json::Error),
     UnexpectedHandshakeReply(DaemonMsg),
     Daemon(ProtoError),
+    /// The daemon streamed more than [`MAX_ITEMS_PER_QUERY`] items for one
+    /// query — a protocol violation, refused rather than truncated.
+    OverCap,
 }
 
 impl fmt::Display for QueryError {
@@ -148,6 +153,10 @@ impl fmt::Display for QueryError {
                 write!(f, "hopd did not acknowledge the handshake, got {msg:?}")
             }
             QueryError::Daemon(err) => write!(f, "hopd reported {:?}: {}", err.code, err.message),
+            QueryError::OverCap => write!(
+                f,
+                "hopd sent more than {MAX_ITEMS_PER_QUERY} items for one query; refusing the response"
+            ),
         }
     }
 }
@@ -198,23 +207,40 @@ fn try_run_query(text: &str) -> Result<(), QueryError> {
         },
     )?;
 
+    let mut assembled: Vec<Item> = Vec::new();
     loop {
         match recv(&mut stream)? {
             DaemonMsg::Results {
                 query_id, items, ..
             } if query_id == QUERY_ID => {
-                for item in &items {
+                // The exchange-total cap, mirrored client-side: a client
+                // trusts its daemon no more than the daemon trusts it. Over
+                // the cap is refusal, not truncation — printing a silently
+                // shortened list would misrepresent what the daemon said.
+                if assembled.len() + items.len() > MAX_ITEMS_PER_QUERY {
+                    return Err(QueryError::OverCap);
+                }
+                assembled.extend(items);
+            }
+            DaemonMsg::QueryDone { query_id } if query_id == QUERY_ID => {
+                // The terminal frame: print the assembled list, one item per
+                // line, in delivery order. Nothing is printed before this
+                // point, so a query that ends in an error — including
+                // `OverCap` above — never leaves a partial result on stdout.
+                for item in &assembled {
                     let line = serde_json::to_string(item).map_err(QueryError::Encode)?;
                     println!("{line}");
                 }
+                return Ok(());
             }
-            DaemonMsg::QueryDone { query_id } if query_id == QUERY_ID => return Ok(()),
             DaemonMsg::Error { error, .. } => return Err(QueryError::Daemon(error)),
-            // A frame naming a `query_id` other than this connection's one
-            // outstanding query is not this query's answer. This CLI never
-            // sends `Cancel`, so it should never see one in practice; a real
-            // multi-query client's frame-demultiplexing is issue #55's
-            // slice, not this walking skeleton's.
+            // Any other id is a stale frame — a `results` or `query_done`
+            // for a query this process is no longer (or was never) waiting
+            // on. This CLI never sends `Cancel`, so it should never see one
+            // in practice; a real multi-query client's frame-demultiplexing
+            // is issue #55's slice, not this walking skeleton's. Dropped
+            // unrendered here, that is the client half of the lifecycle
+            // contract (#55), not a permissive default.
             _ => continue,
         }
     }
