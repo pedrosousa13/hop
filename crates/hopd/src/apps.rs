@@ -268,7 +268,8 @@ pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntr
     not(test),
     expect(
         dead_code,
-        reason = "no consumer until Task 3 (issue #57) wires this into AppIndex"
+        reason = "AppIndex (Task 3) reads these fields, but AppIndex itself has no non-test \
+                  consumer until Task 5 (issue #57) wires it into AppsProvider"
     )
 )]
 pub(crate) struct AppEntry {
@@ -364,7 +365,7 @@ pub(crate) fn flatpak_application_roots(home: Option<&str>) -> Vec<PathBuf> {
     not(test),
     expect(
         dead_code,
-        reason = "no consumer until Task 3 (issue #57) wires this into AppIndex"
+        reason = "no consumer until Task 7 (issue #57) wires this into startup"
     )
 )]
 pub(crate) fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
@@ -730,5 +731,235 @@ mod tests {
         let entry = build_entry("x".to_string(), parsed).unwrap();
         assert_eq!(entry.item.actions.len(), 1);
         assert_eq!(entry.item.actions[0].id, entry.item.default_action);
+    }
+}
+
+use std::sync::RwLock;
+
+/// The most items [`AppIndex::query`] returns in one answer. Not a ranking
+/// cap and not `hop_protocol::limits::MAX_ITEMS_PER_RESULTS_FRAME` (1 000) —
+/// this is smaller and exists only to keep one provider's unranked batch a
+/// sane size while issue #103 (wiring `Pipeline::assemble`, and with it a
+/// real cap) remains unlanded. See this plan's Scope section.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
+    )
+)]
+pub(crate) const QUERY_RESULT_CAP: usize = 50;
+
+/// The apps provider's in-memory index: an [`AppEntry`] list a background
+/// watcher (Task 6) keeps current, queried with no disk access at all.
+///
+/// # No disk read on the query path
+///
+/// [`AppIndex::query`]'s signature takes and returns nothing capable of
+/// naming a filesystem path, and its body is a lock acquisition over an
+/// already-resident `Vec` followed by `filter`/`take`/`clone` — nothing in
+/// its call graph reaches `std::fs`. `tests::query_still_answers_after_the_
+/// backing_directory_is_deleted` below is the stronger, runtime version of
+/// that claim: it proves the answer does not change when the disk it was
+/// built from is no longer there to be read.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
+    )
+)]
+pub(crate) struct AppIndex {
+    entries: RwLock<Vec<AppEntry>>,
+}
+
+impl AppIndex {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
+        )
+    )]
+    pub(crate) fn new(entries: Vec<AppEntry>) -> Self {
+        AppIndex {
+            entries: RwLock::new(entries),
+        }
+    }
+
+    /// Filters the index to entries whose haystack contains `term`
+    /// (case-insensitive substring match), capped at [`QUERY_RESULT_CAP`].
+    /// An empty (or whitespace-only) `term` matches everything, capped the
+    /// same way — the empty-query "browse installed apps" case.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
+        )
+    )]
+    pub(crate) fn query(&self, term: &str) -> Vec<Item> {
+        let term = term.trim().to_lowercase();
+        let entries = self
+            .entries
+            .read()
+            .expect("no thread panics while holding this lock");
+        entries
+            .iter()
+            .filter(|e| term.is_empty() || e.haystack.contains(&term))
+            .take(QUERY_RESULT_CAP)
+            .map(|e| e.item.clone())
+            .collect()
+    }
+
+    /// The full [`AppEntry`] (with its `exec` command, which [`Item`] does
+    /// not carry) for the entry whose item id is `id`, or `None` if no
+    /// currently-indexed app has it — including "it did, but was
+    /// uninstalled since the query that returned it," which `AppsProvider::
+    /// execute` (Task 5) treats as an ordinary failure, not a panic.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
+        )
+    )]
+    pub(crate) fn find_by_item_id(&self, id: &ItemId) -> Option<AppEntry> {
+        self.entries
+            .read()
+            .expect("no thread panics while holding this lock")
+            .iter()
+            .find(|e| &e.item.id == id)
+            .cloned()
+    }
+
+    /// Atomically swaps in a freshly-scanned entry list. The only writer;
+    /// called once at startup (via [`AppIndex::new`]) and once per
+    /// filesystem-change notification thereafter (Task 6) — never from the
+    /// query path.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no consumer until Task 6 (issue #57) wires AppIndex into the filesystem watcher"
+        )
+    )]
+    pub(crate) fn replace(&self, entries: Vec<AppEntry>) {
+        *self
+            .entries
+            .write()
+            .expect("no thread panics while holding this lock") = entries;
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn entry(app_id: &str, title: &str) -> AppEntry {
+        let parsed = parse_desktop_entry(&format!(
+            "[Desktop Entry]\nName={title}\nExec={app_id}\nKeywords=browser;\n"
+        ))
+        .unwrap();
+        build_entry(app_id.to_string(), parsed).unwrap()
+    }
+
+    #[test]
+    fn query_matches_the_title_case_insensitively() {
+        let index = AppIndex::new(vec![entry("firefox", "Firefox"), entry("files", "Files")]);
+        let items = index.query("FIRE");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Firefox");
+    }
+
+    #[test]
+    fn query_matches_keywords_not_just_the_title() {
+        let index = AppIndex::new(vec![entry("firefox", "Firefox")]);
+        assert_eq!(
+            index.query("browser").len(),
+            1,
+            "haystack includes Keywords="
+        );
+    }
+
+    #[test]
+    fn an_empty_term_returns_everything_up_to_the_cap() {
+        let index = AppIndex::new(vec![entry("a", "A"), entry("b", "B")]);
+        assert_eq!(index.query("").len(), 2);
+        assert_eq!(index.query("   ").len(), 2, "whitespace-only is also empty");
+    }
+
+    #[test]
+    fn a_non_matching_term_returns_nothing() {
+        let index = AppIndex::new(vec![entry("firefox", "Firefox")]);
+        assert!(index.query("nonexistent-app-xyz").is_empty());
+    }
+
+    #[test]
+    fn results_are_capped_at_query_result_cap() {
+        let entries: Vec<_> = (0..QUERY_RESULT_CAP + 10)
+            .map(|n| entry(&format!("app{n}"), &format!("App {n}")))
+            .collect();
+        let index = AppIndex::new(entries);
+        assert_eq!(index.query("").len(), QUERY_RESULT_CAP);
+    }
+
+    #[test]
+    fn find_by_item_id_locates_the_matching_entry_and_carries_its_exec() {
+        let index = AppIndex::new(vec![entry("firefox", "Firefox")]);
+        let found = index
+            .find_by_item_id(&ItemId::new("app:firefox").unwrap())
+            .expect("must find the entry it was built from");
+        assert_eq!(found.exec, "firefox");
+    }
+
+    #[test]
+    fn find_by_item_id_returns_none_for_an_id_not_in_the_index() {
+        let index = AppIndex::new(vec![entry("firefox", "Firefox")]);
+        assert!(
+            index
+                .find_by_item_id(&ItemId::new("app:not-installed").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn replace_swaps_the_whole_set_and_query_sees_it_immediately() {
+        let index = AppIndex::new(vec![entry("old", "Old")]);
+        assert_eq!(index.query("").len(), 1);
+        index.replace(vec![entry("new-a", "New A"), entry("new-b", "New B")]);
+        let items = index.query("");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.title.starts_with("New")));
+    }
+
+    #[test]
+    fn query_still_answers_after_the_backing_directory_is_deleted() {
+        // The runtime half of "no disk read on the query path": build an
+        // index from a real scan, delete the directory it was scanned from
+        // entirely, then query. If `query` touched disk anywhere in its
+        // path, this would either error or return something different —
+        // asserting the answer is unchanged is what a regression that
+        // routed `query` back through a fresh `scan_apps` call would fail.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("firefox.desktop"),
+            "[Desktop Entry]\nName=Firefox\nExec=firefox\n",
+        )
+        .unwrap();
+        let index = AppIndex::new(scan_apps(&[dir.path().to_path_buf()]));
+        assert_eq!(index.query("firefox").len(), 1, "sanity: the scan found it");
+
+        std::fs::remove_dir_all(dir.path()).unwrap();
+
+        let items = index.query("firefox");
+        assert_eq!(
+            items.len(),
+            1,
+            "query must still answer from memory once the backing directory is gone"
+        );
+        assert_eq!(items[0].title, "Firefox");
     }
 }
