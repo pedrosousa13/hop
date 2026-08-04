@@ -1794,6 +1794,19 @@ fn watch_mask() -> WatchMask {
 /// `~/.icons`, say) is skipped rather than failing the whole watcher,
 /// mirroring [`scan_apps`]'s own tolerance for missing roots. Fails only if
 /// *no* root could be watched at all.
+///
+/// **Known gap, accepted rather than fixed here:** a root skipped because it
+/// does not exist yet stays unwatched even if something later creates it —
+/// inotify has no event for "a directory now exists at a path I never had a
+/// watch on," only for changes under a watch that already exists. On a
+/// fresh machine with no `~/.local/share/applications` yet, that directory's
+/// own creation (which the first user-level app install causes) is
+/// therefore invisible until the daemon restarts. Closing it means watching
+/// each root's *parent* for the child's own `CREATE` and adding a real watch
+/// once it appears — materially larger than this function's fix for
+/// issue #57's scan-then-watch race (that fix only reordered two calls; it
+/// does not synthesize watches for paths that don't exist yet). Tracked as
+/// part of issue #106 rather than fixed in this slice.
 fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
     let inotify = Inotify::init()?;
     let mask = watch_mask();
@@ -1815,10 +1828,17 @@ fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
     Ok(inotify)
 }
 
-/// Spawns the background thread that keeps `index` current: an initial
-/// build is assumed already done by the caller (`AppIndex::new` from a
-/// [`scan_apps`] call), and this thread rebuilds it every time a watched
-/// directory changes, forever, until the process exits.
+/// Spawns the background thread that keeps `index` current from an
+/// already-open `inotify`: an initial build is assumed already done by the
+/// caller (`AppIndex::new` from a [`scan_apps`] call), and this thread
+/// rebuilds it every time a watched directory changes, forever, until the
+/// process exits.
+///
+/// Takes the opened [`Inotify`] rather than opening one itself — unlike an
+/// earlier version of this function — so the caller controls exactly when
+/// watches are registered relative to the initial scan. See
+/// [`build_watched_index`], the only production caller, for why that
+/// ordering matters.
 ///
 /// A dedicated OS thread, blocking on [`Inotify::read_events_blocking`],
 /// rather than the crate's tokio-integrated `EventStream` — see this plan's
@@ -1834,22 +1854,7 @@ fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
 /// identical response — a full rescan — so there is nothing to gain from
 /// knowing which file changed, and the crate's own `Events` iterator is
 /// simply drained by letting it drop.
-///
-/// If no root could be watched at all (`open_watch` failing), this logs and
-/// returns without spawning anything — `index` then stays at its startup
-/// snapshot for the life of the process rather than the daemon refusing to
-/// start over a watch failure, matching this crate's existing
-/// per-provider-isolation posture (`build_host`'s own doc comment: "a
-/// daemon that refuses to start over one misconfigured provider is worse
-/// than one that serves the rest").
-pub fn spawn_index_watcher(index: Arc<AppIndex>, roots: Vec<PathBuf>) {
-    let mut inotify = match open_watch(&roots) {
-        Ok(i) => i,
-        Err(err) => {
-            eprintln!("hopd: apps provider: could not watch for desktop-entry changes: {err}");
-            return;
-        }
-    };
+pub fn spawn_index_watcher(mut inotify: Inotify, index: Arc<AppIndex>, roots: Vec<PathBuf>) {
     std::thread::spawn(move || {
         let mut buffer = [0u8; 4096];
         loop {
@@ -1862,6 +1867,52 @@ pub fn spawn_index_watcher(index: Arc<AppIndex>, roots: Vec<PathBuf>) {
             }
         }
     });
+}
+
+/// [`build_watched_index`]'s actual body, with `after_watch` run at the
+/// exact point that matters: after [`open_watch`] has registered every
+/// watch it can, before [`scan_apps`] runs the initial scan. Production
+/// code always passes a no-op; `watcher_tests` below passes a hook that
+/// writes a `.desktop` file right there, which is how
+/// `build_watched_index_registers_the_watch_before_the_initial_scan_runs`
+/// pins the ordering itself rather than a race that is too narrow to land
+/// deterministically from a test.
+fn build_watched_index_with_hook(roots: Vec<PathBuf>, after_watch: impl FnOnce()) -> Arc<AppIndex> {
+    let watch = open_watch(&roots);
+    after_watch();
+
+    let index = Arc::new(AppIndex::new(scan_apps(&roots)));
+
+    match watch {
+        Ok(inotify) => spawn_index_watcher(inotify, index.clone(), roots),
+        Err(err) => {
+            eprintln!("hopd: apps provider: could not watch for desktop-entry changes: {err}");
+        }
+    }
+
+    index
+}
+
+/// Builds an [`AppIndex`] over `roots` and starts the background watcher
+/// that keeps it current — the watch-then-scan order that closes issue
+/// #57's scan-then-watch race (acceptance criterion 2): [`open_watch`] runs
+/// *before* [`scan_apps`], so a `.desktop` file created or removed while the
+/// scan is in flight still generates an inotify event, queued in the
+/// kernel until the watcher thread this function spawns reads it, rather
+/// than escaping notice with no rescan until some unrelated later change
+/// happens to trigger one. The previous order — scan, then watch — left
+/// exactly that window open with no catch-up rescan on the other side of
+/// it.
+///
+/// If no root in `roots` can be watched at all ([`open_watch`] failing —
+/// most commonly every root missing on a fresh machine), this logs and
+/// returns an index that is accurate as of this call but will never update
+/// again for the life of the process, matching this crate's existing
+/// per-provider-isolation posture (`build_host`'s own doc comment: "a
+/// daemon that refuses to start over one misconfigured provider is worse
+/// than one that serves the rest").
+pub fn build_watched_index(roots: Vec<PathBuf>) -> Arc<AppIndex> {
+    build_watched_index_with_hook(roots, || {})
 }
 
 #[cfg(test)]
@@ -1932,10 +1983,11 @@ mod watcher_tests {
         // after the watcher is spawned.
         let dir = tempfile::tempdir().unwrap();
         let roots = vec![dir.path().to_path_buf()];
+        let inotify = open_watch(&roots).unwrap();
         let index = Arc::new(AppIndex::new(scan_apps(&roots)));
         assert!(index.query("").is_empty(), "sanity: nothing installed yet");
 
-        spawn_index_watcher(index.clone(), roots);
+        spawn_index_watcher(inotify, index.clone(), roots);
 
         std::fs::write(
             dir.path().join("newapp.desktop"),
@@ -1957,6 +2009,7 @@ mod watcher_tests {
         let entry_path = dir.path().join("goingaway.desktop");
         std::fs::write(&entry_path, "[Desktop Entry]\nName=Going Away\nExec=x\n").unwrap();
         let roots = vec![dir.path().to_path_buf()];
+        let inotify = open_watch(&roots).unwrap();
         let index = Arc::new(AppIndex::new(scan_apps(&roots)));
         assert_eq!(
             index.query("").len(),
@@ -1964,7 +2017,7 @@ mod watcher_tests {
             "sanity: it was indexed at startup"
         );
 
-        spawn_index_watcher(index.clone(), roots);
+        spawn_index_watcher(inotify, index.clone(), roots);
         std::fs::remove_file(&entry_path).unwrap();
 
         assert!(
@@ -1972,11 +2025,83 @@ mod watcher_tests {
             "the removed entry must disappear without the daemon restarting"
         );
     }
+
+    // --- The scan-then-watch race (issue #57 finding 1, acceptance
+    // criterion 2): closed by registering the watch before the initial scan
+    // runs, so nothing created or removed while the scan is in flight can
+    // land in a gap where no event exists to catch it. ---
+
+    #[test]
+    fn build_watched_index_registers_the_watch_before_the_initial_scan_runs() {
+        // Pins the ordering `build_watched_index` promises in its doc
+        // comment, via `build_watched_index_with_hook`'s test seam rather
+        // than the real race: the true production window (between
+        // `open_watch` returning and `scan_apps` starting) is microseconds
+        // wide and cannot be landed on deterministically from a test, so
+        // this drives the hook to fire at exactly that point instead of
+        // relying on timing.
+        //
+        // The mutation this catches: swapping `build_watched_index_with_hook`
+        // back to the old scan-then-watch order (or reordering
+        // `open_watch`/`after_watch`/`scan_apps` any other way that runs
+        // `scan_apps` before the hook). Under that reordering the file this
+        // hook writes would not exist yet when `scan_apps` runs, so the
+        // returned index's initial snapshot would not contain it —
+        // `assert_eq!` below would see 0 items instead of 1. Confirmed by
+        // temporarily reordering scan_apps ahead of the hook: this test
+        // failed with "left: 0 right: 1"; reverted after confirming.
+        let dir = tempfile::tempdir().unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        let dir_path = dir.path().to_path_buf();
+
+        let index = build_watched_index_with_hook(roots, move || {
+            std::fs::write(
+                dir_path.join("raced.desktop"),
+                "[Desktop Entry]\nName=Raced\nExec=raced\n",
+            )
+            .unwrap();
+        });
+
+        assert_eq!(
+            index.query("").len(),
+            1,
+            "a file created right after the watch is registered, before the \
+             initial scan runs, must already be in that scan's result — it \
+             can only be missing if the scan ran before the watch existed"
+        );
+    }
+
+    #[test]
+    fn build_watched_index_still_reacts_to_later_changes_through_the_watcher() {
+        // Complements the ordering test above: proves the watch handed to
+        // `spawn_index_watcher` by `build_watched_index` is the live one
+        // actually driving the background thread, not a second, unrelated
+        // instance — a change well after construction must still reach the
+        // index with nothing but the watcher acting on it.
+        let dir = tempfile::tempdir().unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        let index = build_watched_index(roots);
+        assert!(index.query("").is_empty(), "sanity: nothing installed yet");
+
+        std::fs::write(
+            dir.path().join("later.desktop"),
+            "[Desktop Entry]\nName=Later\nExec=later\n",
+        )
+        .unwrap();
+
+        assert!(
+            wait_until(&index, Duration::from_secs(5), |items| items
+                .iter()
+                .any(|i| i.title == "Later")),
+            "a change after construction must still be picked up by the watcher"
+        );
+    }
 }
 
 /// Builds a real, environment-backed [`AppsProvider`]: scans the real
-/// XDG/flatpak roots once, starts the inotify watcher over them, and wires
-/// [`EmptyWindowSource`]/[`SystemLauncher`] as the M2 backends.
+/// XDG/flatpak roots once, starts the inotify watcher over them (via
+/// [`build_watched_index`]), and wires [`EmptyWindowSource`]/
+/// [`SystemLauncher`] as the M2 backends.
 ///
 /// The **only** place in this module that reads `std::env` — everything
 /// upstream of this function ([`xdg_application_roots`],
@@ -1993,8 +2118,7 @@ pub fn build_apps_provider() -> AppsProvider {
         xdg_application_roots(home.as_deref(), data_home.as_deref(), data_dirs.as_deref());
     roots.extend(flatpak_application_roots(home.as_deref()));
 
-    let index = Arc::new(AppIndex::new(scan_apps(&roots)));
-    spawn_index_watcher(index.clone(), roots);
+    let index = build_watched_index(roots);
 
     AppsProvider::new(index, Arc::new(EmptyWindowSource), Arc::new(SystemLauncher))
 }

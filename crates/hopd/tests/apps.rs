@@ -20,7 +20,7 @@ use std::time::Duration;
 use common::{hello, recv, send, start_daemon};
 use hop_core::host::{HostPolicy, ProviderHost};
 use hop_protocol::{ClientMsg, DaemonMsg, QueryText};
-use hopd::apps::{AppIndex, AppsProvider, EmptyWindowSource, SystemLauncher, scan_apps};
+use hopd::apps::{AppsProvider, EmptyWindowSource, SystemLauncher, build_watched_index};
 use hopd::source::HostSource;
 
 /// Writes one `.desktop` file into `dir`.
@@ -37,8 +37,7 @@ fn write_entry(dir: &std::path::Path, file_name: &str, name: &str) {
 /// real one — minus the environment read, since the roots are the test's
 /// own tempdir rather than the process's real XDG state.
 fn daemon_over(roots: Vec<std::path::PathBuf>) -> common::TestDaemon {
-    let index = Arc::new(AppIndex::new(scan_apps(&roots)));
-    hopd::apps::spawn_index_watcher(index.clone(), roots);
+    let index = build_watched_index(roots);
     let provider = AppsProvider::new(index, Arc::new(EmptyWindowSource), Arc::new(SystemLauncher));
 
     let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(hop_core::host::NoopLog));
