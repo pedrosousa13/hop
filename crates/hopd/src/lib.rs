@@ -10,11 +10,13 @@
 //! lives in the crate-private `connection` module, one driver per accepted
 //! connection; the seam it pulls items through is [`source`].
 //!
-//! What it is not yet: a query router (`hop-core` exists and is unused here),
-//! a provider host — every query is still answered by the one hardcoded item
-//! [`source`] documents, until issue #56 lands real providers — or anything
-//! with a lifecycle beyond "runs until killed". Each of those gaps is named
-//! where it applies, in [`runtime_dir`], [`server`] and [`source`].
+//! What it is not yet: a daemon with real providers — the query router and the
+//! provider host are wired ([`source`]), but the only provider registered is
+//! the walking skeleton's, until issue #57 lands apps and #58 the calculator —
+//! a result *assembly* step (ranking, boosts and the pinned tail are
+//! `hop-core`'s [`pipeline`](hop_core::pipeline), still uncalled here), or
+//! anything with a lifecycle beyond "runs until killed". Each of those gaps is
+//! named where it applies, in [`runtime_dir`], [`server`] and [`source`].
 
 pub(crate) mod connection;
 pub mod runtime_dir;

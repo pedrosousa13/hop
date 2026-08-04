@@ -10,6 +10,7 @@ repository.workspace = true
 # bare path dependency is a wildcard requirement, which `cargo deny check
 # bans` flags, and quieting the gate instead would mean marking this crate
 # unpublishable to silence a lint that is right on the merits.
+hop-core = { path = "../hop-core", version = "0.1.0" }
 hop-protocol = { path = "../hop-protocol", version = "0.1.0" }
 # `net` and `rt-multi-thread` add the accept loop and the multi-threaded
 # runtime the brief requires on top of the workspace's `sync`, `time`,
