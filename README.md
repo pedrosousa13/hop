@@ -32,9 +32,11 @@ cancellation and a bounded per-query retained set, routing every query
 through `hop-core`'s provider host, which runs each registered provider
 under an enforced budget and streams back what passes its manifest checks.
 The skeleton's item is now a real registered provider rather than a
-placeholder source, and it is still the only one registered — apps,
-windows and the rest of the provider table are later M2 slices. `hop-cli`
-is the only binary that talks to `hopd` today; a UI comes later.
+placeholder source, and as of issue #57 the apps provider is registered
+alongside it, indexing installed `.desktop` files and keeping that index
+current via filesystem watching — windows and the rest of the provider
+table are later M2 slices. `hop-cli` is the only binary that talks to
+`hopd` today; a UI comes later.
 
 ## Build and test
 

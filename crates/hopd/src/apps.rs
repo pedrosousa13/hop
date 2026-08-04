@@ -264,7 +264,7 @@ pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntr
 /// never serialized, since [`Item`] has no field for either. See this plan's
 /// Design decision 7.
 #[derive(Debug, Clone)]
-pub(crate) struct AppEntry {
+pub struct AppEntry {
     pub(crate) app_id: String,
     pub(crate) item: Item,
     pub(crate) exec: String,
@@ -339,7 +339,7 @@ pub(crate) fn flatpak_application_roots(home: Option<&str>) -> Vec<PathBuf> {
 /// inotify watcher itself (`open_watch`/`spawn_index_watcher`, Task 6) —
 /// called once at startup and once per filesystem-change notification
 /// thereafter, **never** from [`AppIndex::query`] (Task 3).
-pub(crate) fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
+pub fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
     let mut seen_ids = HashSet::new();
     let mut entries = Vec::new();
 
@@ -730,12 +730,12 @@ pub(crate) const QUERY_RESULT_CAP: usize = 50;
 /// — but it stands as a regression trap: if some future change gave
 /// `AppIndex` a stored path or root list and wired `query` to consult it,
 /// this is the test that would start failing.
-pub(crate) struct AppIndex {
+pub struct AppIndex {
     entries: RwLock<Vec<AppEntry>>,
 }
 
 impl AppIndex {
-    pub(crate) fn new(entries: Vec<AppEntry>) -> Self {
+    pub fn new(entries: Vec<AppEntry>) -> Self {
         AppIndex {
             entries: RwLock::new(entries),
         }
@@ -904,7 +904,7 @@ mod index_tests {
 /// fields deliberately not here (a focus-stealing-prevention timestamp,
 /// and the method-vs-property duck-typing `skip_taskbar` had in JS).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WindowHandle {
+pub struct WindowHandle {
     pub(crate) id: String,
     /// Compared against a desktop entry's `app_id`, case-insensitively and
     /// with a trailing `.desktop` ignored on either side — ported from
@@ -920,7 +920,7 @@ pub(crate) struct WindowHandle {
 /// methods, mirroring `appLaunch.js`'s two-tier lookup — see Design
 /// decision 4 for why collapsing them to one would break half the ported
 /// test suite.
-pub(crate) trait WindowSource: Send + Sync + 'static {
+pub trait WindowSource: Send + Sync + 'static {
     /// Windows the app itself is known to own — ported from
     /// `app.get_windows()`. No id-matching is needed for anything this
     /// returns: ownership already establishes it.
@@ -937,7 +937,7 @@ pub(crate) trait WindowSource: Send + Sync + 'static {
 /// what makes [`focus_or_launch`] correctly and unconditionally launch
 /// until the M5 GNOME shim replaces this with a real implementation — see
 /// Design decision 4.
-pub(crate) struct EmptyWindowSource;
+pub struct EmptyWindowSource;
 
 impl WindowSource for EmptyWindowSource {
     fn windows_for_app(&self, _app_id: &str) -> Vec<WindowHandle> {
@@ -951,7 +951,7 @@ impl WindowSource for EmptyWindowSource {
 }
 
 /// Starts a new process for a desktop entry's `Exec=` command.
-pub(crate) trait Launcher: Send + Sync + 'static {
+pub trait Launcher: Send + Sync + 'static {
     fn launch(&self, exec: &str) -> Result<(), String>;
 }
 
@@ -960,7 +960,7 @@ pub(crate) trait Launcher: Send + Sync + 'static {
 /// stripped by [`sanitize_exec`] at parse time. Standard streams are
 /// discarded and detached from the daemon's own terminal, if it has one; a
 /// launched app is not expected to write anything hopd should see.
-pub(crate) struct SystemLauncher;
+pub struct SystemLauncher;
 
 impl Launcher for SystemLauncher {
     fn launch(&self, exec: &str) -> Result<(), String> {
@@ -1383,7 +1383,7 @@ pub struct AppsProvider {
 }
 
 impl AppsProvider {
-    pub(crate) fn new(
+    pub fn new(
         index: Arc<AppIndex>,
         windows: Arc<dyn WindowSource>,
         launcher: Arc<dyn Launcher>,
@@ -1715,7 +1715,7 @@ fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
 /// per-provider-isolation posture (`build_host`'s own doc comment: "a
 /// daemon that refuses to start over one misconfigured provider is worse
 /// than one that serves the rest").
-pub(crate) fn spawn_index_watcher(index: Arc<AppIndex>, roots: Vec<PathBuf>) {
+pub fn spawn_index_watcher(index: Arc<AppIndex>, roots: Vec<PathBuf>) {
     let mut inotify = match open_watch(&roots) {
         Ok(i) => i,
         Err(err) => {
