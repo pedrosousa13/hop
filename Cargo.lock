@@ -57,6 +57,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hop-cli"
+version = "0.1.0"
+dependencies = [
+ "hop-protocol",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "hop-core"
 version = "0.1.0"
 dependencies = [
