@@ -1617,7 +1617,28 @@ mod provider_tests {
 
     #[tokio::test]
     async fn query_returns_items_matching_the_routed_term() {
-        let provider = Arc::new(one_app_provider("Firefox"));
+        // Two entries, not one: with a single-entry index, "filtered
+        // correctly on `fire`" and "the routed term was dropped and the
+        // index was queried with an empty string" both answer with the same
+        // one item, so a mutation deleting `&q.term` in favor of `""` would
+        // pass undetected. A second entry that does not match "fire" makes
+        // the two behaviors diverge (1 item vs. 2), so this actually pins
+        // that `query` uses the routed term rather than ignoring it.
+        let firefox = build_entry(
+            "firefox".to_string(),
+            parse_desktop_entry("[Desktop Entry]\nName=Firefox\nExec=firefox\n").unwrap(),
+        )
+        .unwrap();
+        let terminal = build_entry(
+            "terminal".to_string(),
+            parse_desktop_entry("[Desktop Entry]\nName=Terminal\nExec=terminal\n").unwrap(),
+        )
+        .unwrap();
+        let provider = Arc::new(AppsProvider::new(
+            Arc::new(AppIndex::new(vec![firefox, terminal])),
+            Arc::new(EmptyWindowSource),
+            Arc::new(SystemLauncher),
+        ));
         let ctx = QueryCtx {
             cancel: hop_core::provider::CancellationFlag::default(),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
