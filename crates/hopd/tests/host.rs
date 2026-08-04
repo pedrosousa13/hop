@@ -24,13 +24,31 @@ use common::{
     start_daemon,
 };
 use hop_core::host::{HostPolicy, ProviderHost};
+use hop_core::provider::ProviderManifest;
+use hop_core::router::Mode;
 use hop_protocol::{ClientMsg, DaemonMsg, Kind, QueryText};
 use hopd::source::HostSource;
 
-/// A daemon serving a host with `providers` registered, plus the log the test
-/// reads back.
+/// A daemon serving a host with `providers` registered under the default
+/// [`HostPolicy`], plus the log the test reads back.
 fn daemon_with(providers: Vec<ScriptedProvider>, log: Arc<RecordingLog>) -> TestDaemon {
-    let mut host = ProviderHost::new(HostPolicy::default(), log);
+    daemon_with_policy(HostPolicy::default(), providers, log)
+}
+
+/// [`daemon_with`], but with the host's own policy under the test's control.
+///
+/// Needed by the no-slowest-provider-gate test below: [`HostPolicy::default`]
+/// clamps every provider's budget to
+/// [`MAX_PROVIDER_BUDGET`](hop_core::host::MAX_PROVIDER_BUDGET) (50 ms), so a
+/// provider asking for a wider budget to build a generous timing margin needs
+/// a policy that actually allows it — otherwise the clamp silently discards
+/// the margin the test asked for.
+fn daemon_with_policy(
+    policy: HostPolicy,
+    providers: Vec<ScriptedProvider>,
+    log: Arc<RecordingLog>,
+) -> TestDaemon {
+    let mut host = ProviderHost::new(policy, log);
     for provider in providers {
         host.register(provider).unwrap();
     }
@@ -199,19 +217,47 @@ fn a_fast_providers_items_arrive_before_a_slow_providers_budget_expires() {
     // no `tokio::time::timeout` available against a blocking client, so this
     // measures wall-clock elapsed around the blocking `recv` call instead.
     //
-    // The bound is 15 ms against a 20 ms provider budget: a correctly
-    // isolated host sends the fast provider's frame as soon as that
-    // provider's (essentially instant, no-await) future resolves — a matter
-    // of microseconds in practice — while an implementation that gated the
-    // frame on every provider finishing could not beat this bound, because
-    // the hanging provider never finishes on its own and is only cut off at
-    // its 20 ms budget. 15 ms therefore discriminates the two: comfortably
-    // above the fast path's real latency, comfortably below the point a gated
-    // implementation could first respond.
+    // The hanging provider is given a 500 ms budget here — well above the
+    // fixture's 20 ms default — specifically to widen the gap this
+    // assertion relies on, rather than to model anything realistic. This
+    // binary's four tests build their own multi-thread runtimes and can run
+    // concurrently with each other and with `lifecycle.rs`'s and
+    // `socket.rs`'s tests, so on a contended CI runner a bound with only a
+    // few milliseconds of margin (an earlier version used 15 ms against a
+    // 20 ms budget) is a real flake risk, not a theoretical one. A gated
+    // implementation cannot produce *any* frame before the hanging
+    // provider's budget expires — it never finishes on its own — so with a
+    // 500 ms budget a gated implementation needs 500 ms while the ungated
+    // path (the fast provider's `Script::Answer` future resolves with no
+    // await at all) still takes microseconds. The 100 ms bound below sits
+    // in that gap: a ~5x margin over the fast path's realistic latency, and
+    // still a fifth of the hanging provider's budget, so it discriminates
+    // the two shapes reliably under contention instead of passing either
+    // way. Do not tighten these numbers back down; they are chosen for
+    // margin, not to measure anything.
+    //
+    // 500 ms is above `HostPolicy::default`'s 50 ms clamp
+    // (`MAX_PROVIDER_BUDGET`), so this test builds its host with a raised
+    // `max_budget` via `daemon_with_policy` — registering the hanging
+    // provider with a 500 ms manifest budget under the *default* policy would
+    // silently clamp it back down to 50 ms and quietly narrow the margin this
+    // test exists to widen.
     let log = Arc::new(RecordingLog::default());
-    let daemon = daemon_with(
+    let daemon = daemon_with_policy(
+        HostPolicy {
+            max_budget: Duration::from_millis(500),
+            ..HostPolicy::default()
+        },
         vec![
-            ScriptedProvider::new("hanging", vec![Kind::App], Script::Hang),
+            ScriptedProvider::new("hanging", vec![Kind::App], Script::Hang).with_manifest(
+                ProviderManifest {
+                    id: "hanging",
+                    kinds: vec![Kind::App],
+                    modes: vec![Mode::All],
+                    min_term_len: 0,
+                    budget: Duration::from_millis(500),
+                },
+            ),
             ScriptedProvider::new(
                 "apps",
                 vec![Kind::App],
@@ -239,7 +285,7 @@ fn a_fast_providers_items_arrive_before_a_slow_providers_budget_expires() {
     let frame = recv(&mut stream);
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_millis(15),
+        elapsed < Duration::from_millis(100),
         "the fast provider's frame must not wait on the hanging one, took {elapsed:?}"
     );
     match frame {

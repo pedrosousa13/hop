@@ -1255,6 +1255,56 @@ mod tests {
         }
     }
 
+    /// Behaviourally identical to [`HangingProvider`] — never completes, never
+    /// polls `ctx.cancel` — but with a budget the caller chooses rather than a
+    /// fixed 10 ms.
+    ///
+    /// Used only by
+    /// `a_hanging_provider_does_not_delay_a_fast_providers_batch` below, which
+    /// needs a wide budget to give its wall-clock assertion room under CI
+    /// contention. A separate type rather than a configurable field on
+    /// `HangingProvider` itself, which other tests already depend on staying
+    /// exactly as it is.
+    pub(crate) struct SlowHangingProvider {
+        budget: Duration,
+    }
+
+    impl SlowHangingProvider {
+        pub(crate) fn new(budget: Duration) -> Self {
+            SlowHangingProvider { budget }
+        }
+    }
+
+    impl Provider for SlowHangingProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "hanging",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: self.budget,
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
     /// Records, via `Drop`, that the value holding it was dropped. Used only
     /// by [`AbandonedOnDropProvider`] — see that type's docs for why this is
     /// the one observable difference between a task that was actually
@@ -1660,8 +1710,28 @@ mod tests {
     async fn a_hanging_provider_does_not_delay_a_fast_providers_batch() {
         // "No slowest-provider gate" (spec §3): the fast provider's items must
         // arrive well before the hanging one's budget expires.
-        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
-        host.register(HangingProvider).unwrap();
+        //
+        // The hanging provider's budget (500 ms, via `SlowHangingProvider`)
+        // and the `tokio::time::timeout` bound below (100 ms) are chosen for
+        // margin under CI contention, not to measure anything: a tighter pair
+        // (an earlier version used a 10 ms budget and a 5 ms timeout) leaves
+        // only a couple of milliseconds of slack, and ordinary scheduling
+        // jitter under a loaded test binary can eat that. A host that gated
+        // the fast provider's batch on every provider finishing could not
+        // beat 500 ms — the hanging provider never finishes on its own — so
+        // 100 ms is a bound only a genuinely ungated host can meet, with
+        // ample room below the 500 ms floor a gated one would need. The
+        // `HostPolicy` here is widened past its 50 ms default
+        // (`MAX_PROVIDER_BUDGET`) so the 500 ms manifest budget is not
+        // silently clamped back down before it can do its job. Do not
+        // tighten these numbers back down; they are chosen for margin.
+        let policy = HostPolicy {
+            max_budget: Duration::from_millis(500),
+            ..HostPolicy::default()
+        };
+        let mut host = ProviderHost::new(policy, Arc::new(NoopLog));
+        host.register(SlowHangingProvider::new(Duration::from_millis(500)))
+            .unwrap();
         host.register(ScriptedProvider::new(
             "apps",
             vec![Kind::App],
@@ -1672,7 +1742,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         Arc::new(host).spawn_query(Arc::new(route("firefox")), tx);
 
-        let first = tokio::time::timeout(Duration::from_millis(5), rx.recv())
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
             .expect("the fast provider's batch must not wait on the slow one")
             .expect("a batch, not a close");
