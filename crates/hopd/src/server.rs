@@ -133,10 +133,17 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
                 let source = source.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handle_connection(stream, source).await {
-                        // The logging seam is issue #34, blocked on a later
-                        // slice; this `eprintln!` is deliberately the only
-                        // place this crate reports an error, per the
-                        // brief's behavior spec.
+                        // Issue #34's logging seam is `ProviderLog`
+                        // (`hop_core::host::ProviderLog`), landed in this
+                        // branch and implemented in this crate as
+                        // `StderrLog` (`source.rs`) — not blocked on a later
+                        // slice. Nor is this `eprintln!` the only place this
+                        // crate reports an error: `build_host` above (this
+                        // file) and `StderrLog::record`'s three logging arms
+                        // (`source.rs`) do too. What is still true, and what
+                        // the brief's behavior spec actually asks for, is
+                        // narrower: this remains the only place a
+                        // *connection-level* I/O error is reported.
                         eprintln!("hopd: connection error: {err}");
                     }
                 });
