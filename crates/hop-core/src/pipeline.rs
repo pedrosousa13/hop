@@ -94,23 +94,47 @@ impl ProviderOutput {
     /// a contract this constructor rests on and does not enforce. Read that
     /// method's docs for the abuse a provider that ignores it recovers.
     ///
-    /// It cannot be enforced from here: `hop-core` has no registry and no
-    /// scheduler, so there is no earlier, trusted manifest in this crate to
-    /// compare against. A host that keeps one is in a strictly stronger
-    /// position — a manifest captured once at registration cannot be
-    /// re-minted in response to what a provider decided to return — and such
-    /// a host should compare its captured manifest against
-    /// [`Provider::manifest`] and refuse the provider on any mismatch. What
-    /// it must not do is hand the captured manifest to this crate to be
-    /// checked against: a constructor taking a caller-supplied manifest is
-    /// the hole the section above exists to keep closed, and it does not stop
-    /// being that hole because this particular caller would have passed a
-    /// trustworthy value.
+    /// It cannot be enforced from here, by design: this constructor never
+    /// sees a manifest captured any earlier than the call it makes, so it has
+    /// nothing of its own to compare against. `hop-core` now has both a
+    /// registry and a scheduler —
+    /// [`ProviderHost`](crate::host::ProviderHost) — and its private
+    /// `run_one` is in the strictly stronger position this paragraph used to
+    /// ask a future host for: it keeps a manifest captured once at
+    /// registration, which cannot be re-minted in response to what a provider
+    /// decided to return, and it compares that captured manifest against the
+    /// one this constructor reads back through `ProviderOutput::manifest`,
+    /// refusing the provider's whole answer on any mismatch. What it does
+    /// not do, and must not, is hand its captured manifest to *this*
+    /// constructor to be checked against: a constructor taking a
+    /// caller-supplied manifest is the hole the section above exists to keep
+    /// closed, and it does not stop being that hole because this particular
+    /// caller would have passed a trustworthy value. The host's comparison
+    /// runs beside this constructor, on the value it returns — never inside
+    /// it.
     pub fn from_provider<P: Provider>(provider: &P, items: Vec<Item>) -> Self {
         ProviderOutput {
             manifest: provider.manifest(),
             items,
         }
+    }
+
+    /// The manifest this value was actually built with — the one
+    /// [`CheckedItems::check`] checks `items` against.
+    ///
+    /// This is not a second way to supply a manifest, and does not reopen the
+    /// hole the type's docs describe: it reads back the value
+    /// [`ProviderOutput::from_provider`] already minted from
+    /// [`Provider::manifest`], rather than accepting one from a caller. A
+    /// host that wants to catch a provider whose manifest shifted between its
+    /// own captured copy and the call this constructor made needs to compare
+    /// against *that* call specifically — not an earlier or later one — and
+    /// this is the only way to read it back once the value has been built.
+    /// `pub(crate)` because the need is `hop-core`-internal
+    /// ([`crate::host::ProviderHost`]); nothing downstream of this crate has
+    /// a captured manifest of its own to compare against.
+    pub(crate) fn manifest(&self) -> &ProviderManifest {
+        &self.manifest
     }
 }
 
@@ -302,13 +326,19 @@ pub enum FailedCheck {
 /// producer's *real* manifest id rather than a claim the item made — the same
 /// fact `producer_id` asserts everywhere, arrived at earlier.
 ///
-/// Rejections are *returned as data* rather than logged, because this
-/// codebase has no logging seam yet and [`Pipeline::assemble`] is pure — it
-/// runs on every keystroke and may not perform side effects. Everything here
-/// is owned, so a rejection outlives both the item it describes and the
-/// borrow of the manifest that refused it: a future logging seam can move a
-/// `Vec<Rejection>` off the query path and format it whenever it likes,
-/// without this type having to change shape.
+/// Rejections are *returned as data* rather than logged from here, because
+/// [`Pipeline::assemble`] is pure — it runs on every keystroke and may not
+/// perform side effects. Everything here is owned, so a rejection outlives
+/// both the item it describes and the borrow of the manifest that refused it:
+/// a logging seam can move a `Vec<Rejection>` off the query path and format
+/// it whenever it likes, without this type having to change shape. That seam
+/// now exists — [`ProviderLog`](crate::host::ProviderLog) — and
+/// [`ProviderHost::run_one`](crate::host::ProviderHost) is exactly that
+/// caller: it reads the rejections [`CheckedItems::check`] produced for one
+/// provider and records them as
+/// [`ProviderEvent::Rejected`](crate::host::ProviderEvent::Rejected) before
+/// this value's owned shape ever needs to matter to a query path with side
+/// effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejection {
     /// The rejected item's id.
@@ -353,12 +383,18 @@ pub struct Rejection {
 /// [`Assembly`], rather than being handed back from `check` separately: what
 /// assembly refused belongs to the query it refused them for, so one call
 /// yields one outcome. It is worth being precise about what that does *not*
-/// buy, since it would be easy to read as more: nothing obliges a caller to
-/// look at them. [`Assembly`]'s fields are public and `.items` discards the
-/// rejections in one character, which is exactly what the tests below do.
-/// Until there is a logging seam (issue #34) that makes ignoring them a real
-/// mistake, this shape keeps rejections available and attached to their
-/// query — it does not make them unignorable.
+/// buy, since it would be easy to read as more: nothing obliges *this* caller
+/// to look at them. [`Assembly`]'s fields are public and `.items` discards
+/// the rejections in one character, which is exactly what the tests below do.
+///
+/// A logging seam that makes ignoring a rejection a real mistake now exists —
+/// [`ProviderLog`](crate::host::ProviderLog), issue #34 — but it is reached
+/// through [`ProviderHost::run_one`](crate::host::ProviderHost), which calls
+/// [`CheckedItems::check`] directly and records what it returns; nothing
+/// forces that same discipline on a caller of *this* type that isn't the
+/// host. So the shape here keeps rejections available and attached to their
+/// query, and the host is the caller that has made ignoring them a mistake —
+/// it does not make them unignorable for every caller this type has.
 #[derive(Debug)]
 pub struct CheckedItems {
     items: Vec<Item>,
@@ -431,6 +467,20 @@ impl CheckedItems {
     /// received them.
     pub fn items(&self) -> &[Item] {
         &self.items
+    }
+
+    /// [`CheckedItems::items`], moved out instead of borrowed — for a caller
+    /// that owns `self`, is done with the rejections, and does not want to
+    /// clone every surviving [`Item`] just to get a `Vec` it already has.
+    /// Exists alongside `items()` rather than replacing it because most
+    /// callers only borrow.
+    /// [`ProviderHost::run_one`](crate::host::ProviderHost) is the caller
+    /// this was added for: it runs once per provider per query, on the
+    /// keystroke path spec §3 holds to 10 ms, and `items().to_vec()` there
+    /// was cloning every item — several `String`s and a `Vec<Action>` each —
+    /// for no reason but that `items()` only lends.
+    pub fn into_items(self) -> Vec<Item> {
+        self.items
     }
 
     /// The items that failed a check, in the order they were rejected.
@@ -736,6 +786,7 @@ mod tests {
     use super::*;
     use crate::provider::{APPS_PROVIDER_ID, ProviderError, QueryCtx};
     use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Every [`Kind`] there is. The `test` provider below declares all of
@@ -771,17 +822,17 @@ mod tests {
         }
 
         async fn query(
-            &self,
-            _q: &RoutedQuery,
-            _ctx: &QueryCtx,
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
         ) -> Result<Vec<Item>, ProviderError> {
             Ok(Vec::new())
         }
 
         async fn execute(
-            &self,
-            _item_id: &ItemId,
-            _action_id: &ActionId,
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
         ) -> Result<ExecOutcome, ProviderError> {
             Ok(ExecOutcome::Done)
         }

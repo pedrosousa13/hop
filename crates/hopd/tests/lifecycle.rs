@@ -8,63 +8,18 @@
 mod common;
 
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::{hello, recv, send};
+use common::{hello, recv, send, start_daemon};
 use hop_protocol::limits::{MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME};
 use hop_protocol::{
     Action, ActionId, ActionKind, ClientMsg, DaemonMsg, Item, ItemId, Kind, QueryText,
 };
-use hopd::server::serve_with;
 use hopd::source::ResultSource;
 use tokio::sync::mpsc;
-
-/// An in-process daemon on a scripted source, plus the runtime that hosts
-/// it. Dropping this drops the runtime, which tears the server task and its
-/// socket down with it.
-struct TestDaemon {
-    _runtime: tokio::runtime::Runtime,
-    socket_path: PathBuf,
-    _dir: tempfile::TempDir,
-}
-
-fn start_daemon<S: ResultSource>(source: S) -> TestDaemon {
-    let dir = tempfile::tempdir().unwrap();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let root = dir.path().to_path_buf();
-    // serve_with expects the runtime dir itself (hopd's runtime_dir::resolve
-    // is a binary-startup concern, not serve's); create the 0700 dir the
-    // way resolve() would.
-    let runtime_dir = root.join("hop");
-    std::fs::create_dir(&runtime_dir).unwrap();
-    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let serve_dir = runtime_dir.clone();
-    runtime.spawn(async move {
-        let _ = serve_with(&serve_dir, source).await;
-    });
-
-    let socket_path = runtime_dir.join("hopd.sock");
-    for _ in 0..50 {
-        if socket_path.exists() {
-            return TestDaemon {
-                _runtime: runtime,
-                socket_path,
-                _dir: dir,
-            };
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("in-process hopd socket did not appear at {socket_path:?} within 5s");
-}
 
 /// A tiny item; `n` differentiates ids so assertions can tell items apart.
 fn item(n: usize) -> Item {

@@ -3,11 +3,12 @@
 The GNOME-native, trustworthy-plugins launcher that works everywhere.
 
 Pre-alpha. This repository currently contains M2's daemon through the query
-lifecycle: a `hopd` daemon that serves streamed, cancellable queries over
-`$XDG_RUNTIME_DIR/hop/hopd.sock` (results still come from a placeholder
-source until the provider host lands), and a `hop` CLI that speaks to it
-(`hop query`, `hop version`). Real providers, a query router wired into the
-daemon, and a UI are later M2 slices.
+lifecycle and its provider host: a `hopd` daemon that serves streamed,
+cancellable queries over `$XDG_RUNTIME_DIR/hop/hopd.sock`, routed through
+`hop-core`'s query router and provider host (results still come from the
+walking skeleton's one registered provider until the real providers land),
+and a `hop` CLI that speaks to it (`hop query`, `hop version`). Real
+providers and a UI are later M2 slices.
 
 ## Design
 
@@ -25,12 +26,15 @@ The full design is at
 - `crates/hop-cli` — the `hop` command-line client that speaks to `hopd`.
 
 `hop-protocol` carries the item/action model and the client/daemon IPC
-message frames. `hop-core` carries all six pieces listed above, but `hopd`
-does not yet call into it: `hopd` streams query results with server-side
-cancellation and a bounded per-query retained set, but its one source is
-still the skeleton's placeholder item — the provider host is a later M2
-slice. `hop-cli` is the only binary that talks to `hopd` today; a UI comes
-later.
+message frames. `hop-core` carries all six pieces listed above, and `hopd`
+now depends on it: `hopd` streams query results with server-side
+cancellation and a bounded per-query retained set, routing every query
+through `hop-core`'s provider host, which runs each registered provider
+under an enforced budget and streams back what passes its manifest checks.
+The skeleton's item is now a real registered provider rather than a
+placeholder source, and it is still the only one registered — apps,
+windows and the rest of the provider table are later M2 slices. `hop-cli`
+is the only binary that talks to `hopd` today; a UI comes later.
 
 ## Build and test
 

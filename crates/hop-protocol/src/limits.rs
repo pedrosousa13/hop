@@ -245,9 +245,13 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 ///
 /// The obligation is therefore on whatever produces items in-process, and it
 /// is documented where such a thing is written — `hopd`'s `ResultSource`
-/// seam. Enforcing it rather than documenting it belongs to the provider host
-/// (issue #56), which is the first code that will accept items from outside
-/// this process without parsing them.
+/// seam, and `hop-core`'s provider host (issue #56), the first code that
+/// accepts items from a provider without parsing them. Landing the host
+/// closed the scheduling gap this comment used to describe as future work,
+/// but it did not add this enforcement: what the host checks an item against
+/// is its producer's declared `kind` and `provider` string, never the length
+/// of a field. The obligation this paragraph describes is still exactly
+/// that — documented, not enforced — wherever an item is built in-process.
 pub const MAX_ITEMS_PER_QUERY: usize = 5_000;
 
 /// Maximum bytes of one frame's JSON payload, exclusive of the 4-byte length

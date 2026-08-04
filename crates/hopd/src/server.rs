@@ -9,11 +9,13 @@
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
+use hop_core::host::ProviderHost;
 use tokio::net::UnixListener;
 
 use crate::connection::handle_connection;
-use crate::source::{ResultSource, SkeletonSource};
+use crate::source::{HostSource, ResultSource, SkeletonProvider, StderrLog};
 
 /// The socket's file name inside the runtime directory
 /// [`crate::runtime_dir::resolve`] returns.
@@ -66,7 +68,23 @@ const SOCKET_FILE_NAME: &str = "hopd.sock";
 /// traverse on every component, so the parent directory's mode is what
 /// carries the access control during that window, not the socket file's.
 pub async fn serve(runtime_dir: &Path) -> io::Result<()> {
-    serve_with(runtime_dir, SkeletonSource).await
+    serve_with(runtime_dir, HostSource::new(Arc::new(build_host()))).await
+}
+
+/// Builds the daemon's provider host: the registry every query runs through.
+///
+/// Registration failures are a programming error rather than an operating
+/// condition — the only ids registered here are literals in this function, so
+/// a duplicate means two lines in this file chose the same one. It is reported
+/// and the provider skipped rather than panicking, because a daemon that
+/// refuses to start over one misconfigured provider is worse than one that
+/// serves the rest: spec §9's per-provider isolation rule applied to startup.
+fn build_host() -> ProviderHost {
+    let mut host = ProviderHost::with_log(Arc::new(StderrLog));
+    if let Err(err) = host.register(SkeletonProvider) {
+        eprintln!("hopd: could not register the skeleton provider: {err}");
+    }
+    host
 }
 
 /// [`serve`], generic over what answers the queries.
@@ -80,8 +98,9 @@ pub async fn serve(runtime_dir: &Path) -> io::Result<()> {
 /// unchanged: the only thing a test gets to choose is where the items come
 /// from.
 ///
-/// [`serve`] passes [`SkeletonSource`] and is what the binary runs; every
-/// behaviour documented on [`serve`] is documented about this function too.
+/// [`serve`] passes a [`HostSource`] over the daemon's real provider host and
+/// is what the binary runs; every behaviour documented on [`serve`] is
+/// documented about this function too.
 pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::Result<()> {
     let socket_path = runtime_dir.join(SOCKET_FILE_NAME);
 
@@ -114,10 +133,17 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
                 let source = source.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handle_connection(stream, source).await {
-                        // The logging seam is issue #34, blocked on a later
-                        // slice; this `eprintln!` is deliberately the only
-                        // place this crate reports an error, per the
-                        // brief's behavior spec.
+                        // Issue #34's logging seam is `ProviderLog`
+                        // (`hop_core::host::ProviderLog`), landed in this
+                        // branch and implemented in this crate as
+                        // `StderrLog` (`source.rs`) — not blocked on a later
+                        // slice. Nor is this `eprintln!` the only place this
+                        // crate reports an error: `build_host` above (this
+                        // file) and `StderrLog::record`'s three logging arms
+                        // (`source.rs`) do too. What is still true, and what
+                        // the brief's behavior spec actually asks for, is
+                        // narrower: this remains the only place a
+                        // *connection-level* I/O error is reported.
                         eprintln!("hopd: connection error: {err}");
                     }
                 });
