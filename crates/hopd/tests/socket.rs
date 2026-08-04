@@ -116,7 +116,10 @@ fn the_round_trip_returns_one_item_end_to_end() {
         panic!("expected a results frame, got {results:?}");
     };
     assert_eq!(query_id, 7);
-    assert!(!partial);
+    assert!(
+        partial,
+        "streamed results frames are partial; QueryDone is the terminal signal"
+    );
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].title, "Hello from hopd");
     assert_eq!(items[0].kind, Kind::Action);
