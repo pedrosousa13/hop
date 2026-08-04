@@ -3,7 +3,7 @@
 Date: 2026-08-02
 Issue: [#53](https://github.com/pedrosousa13/hop/issues/53)
 Milestone: M2 — Daemon
-Status: Recorded; not yet amended
+Status: Recorded; amended 2026-08-04
 Decisions by: Pedro Sousa
 
 Two design forks are settled here —
@@ -23,6 +23,24 @@ a reader sees which sentence moved. The other in-repo precedent, the M1 OWASP
 sweep (`docs/security/2026-07-30-m1-owasp-sweep.md`), uses `Verdict:` and is
 left untouched after it lands — that is the right shape for a sweep of code
 that exists, and the wrong shape for this.
+
+**Amendment, 2026-08-04.** Amended when issue #56 landed the provider host.
+Four places changed: the item-count-not-bytes passage under Decision 1's
+retained-set discussion, which said the byte figure "stops being moot" once
+#56 lands and would enforce per-item bounds — #56 has landed and deliberately
+did not add that enforcement, so the passage is corrected to say what
+actually landed and that per-item field-length enforcement remains open with
+issue #30 owning it; the Follow-up table's #55 row, which made the same
+"until #56" claim and is corrected the same way; a new #56 row added to the
+Follow-up table, in the style of the existing **Landed.** rows; and the
+actors table's provider row, which still described `CheckedItems::check` as
+the whole of the in-process provider check and now also names the
+captured-manifest comparison, the enforced budget, panic containment and
+error-text bounding #56 added, plus issue #104's residual. This document's
+"What this model does not cover" section still defers the daemon↔provider
+boundary in full to the M2 OWASP sweep; none of these four changes model it
+beyond correcting what was said. Each change is marked **[Amended
+2026-08-04]** in place.
 
 ---
 
@@ -127,7 +145,7 @@ anything on the network — no HTTP client is a dependency of either crate.
 | **root**, and a process holding `CAP_DAC_OVERRIDE` | Directory mode does not apply | Nothing at this boundary. A root-equivalent adversary is outside the model. |
 | **A process that inherits an open descriptor** | Does not traverse the directory at all | Directory mode is checked at open, not per write. Whatever the daemon or a client passes on, it passes on. |
 | **The daemon, toward a client** | The reverse direction of the same socket | Bounds on `DaemonMsg`. `wire.rs`:59–64 states the reason: "A client trusts its daemon no more than the daemon trusts its clients." |
-| **A provider, in-process** | Not across the socket — but a provider supplies the values that cross it | `CheckedItems::check` (`pipeline.rs`:393) holds each item to the manifest of the provider that produced it. `content.rs`:1–9 states the residual: "the daemon is trusted" degrades to "every installed provider is trusted". |
+| **A provider, in-process** | Not across the socket — but a provider supplies the values that cross it | **[Amended 2026-08-04]** `CheckedItems::check` (`pipeline.rs`:393) holds each item to the manifest of the provider that produced it, called through `ProviderHost::run_one` (`hop-core`'s `host.rs`, issue #56), which also compares the manifest it captured at registration against a fresh call before accepting a provider's answer, runs the provider under a host-enforced budget it aborts on a miss, contains a panicking provider's failure at the `tokio::spawn` seam, and bounds and strips a provider's error text before it can leave. `content.rs`:1–9 states the residual: "the daemon is trusted" degrades to "every installed provider is trusted". A further residual #56 left open, owned by issue #104: a panic *payload* still reaches the daemon's stderr through Rust's default panic hook, unsanitized, before the host's own failure classification runs. |
 | **A remote network actor** | No route today | Neither crate depends on an HTTP client, and nothing listens on a TCP socket. This changes at M5. |
 
 The row that matters is the second one. It is the boundary's actual shape: the
@@ -586,13 +604,18 @@ to reconstruct them from `connection.rs`.
   bounding nothing the count does not already bound. That composition holds
   **only for items whose per-item bounds were actually applied**, and those
   bounds are applied at the *parse* — so they hold for every item that arrived
-  over a socket and for no item a daemon constructs in-process. Today that is
-  moot: `hopd`'s one source returns a fixed tiny item. It stops being moot at
-  the provider host ([#56](https://github.com/pedrosousa13/hop/issues/56)),
-  which is the first code to take items from outside the process without
-  parsing them. `hopd`'s `ResultSource` trait records the obligation on a
-  source; enforcing it is #56's, and until it does, the byte figure above is
-  an argument about the wire and not a bound on the daemon's memory.
+  over a socket and for no item a daemon constructs in-process. **[Amended
+  2026-08-04]** The provider host
+  ([#56](https://github.com/pedrosousa13/hop/issues/56)) has landed and is
+  the first code to take items from outside the process without parsing
+  them, and it deliberately did not add that enforcement —
+  `hop-protocol/src/limits.rs` and `hopd/src/source.rs` both say so in place,
+  and `ProviderHost`'s per-provider turn (`hop-core`'s `host.rs`) checks an
+  item's `kind` and `provider` against its producer's manifest and nothing
+  about its field lengths. `hopd`'s `ResultSource` trait still records the
+  obligation on a source; closing it is issue #30's, not #56's, and until #30
+  lands the byte figure above remains an argument about the wire and not a
+  bound on the daemon's memory.
 - **Per connection or per daemon: per connection.** The retained set lives in
   the connection driver's own state (`connection.rs`, `Exchange`), and there
   is no cross-connection registry for a query id to reach into. Client-chosen
@@ -872,7 +895,8 @@ What has to be true for this model to describe reality rather than intent:
 | Slice or issue | What it must establish |
 | --- | --- |
 | [#54](https://github.com/pedrosousa13/hop/issues/54) | Socket and directory created with a decided mode; frame cap from a `hop-protocol` constant, checked before allocation (#21); handshake-first ordering enforced (#26) |
-| [#55](https://github.com/pedrosousa13/hop/issues/55) | **Landed.** Per-query state, server-side cancellation and client-side stale-frame drop, and the retained item set Decision 1 rides on: one set per connection, holding the most recent query id's delivered items, replaced whole by the next `Query` and released when the connection closes. Capped by `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — by item **count**, not bytes — enforced by truncating the undelivered remainder, never by evicting delivered ones (T3, and [#85](https://github.com/pedrosousa13/hop/issues/85), which owns the cap). Decision 1's "rides on state the daemon needs anyway" reasoning therefore holds. Two things #55 deliberately did **not** take: bytes, which rest on per-item bounds nothing enforces on the daemon's production path until #56, and connection-level bounds, which are #98's (T13) |
+| [#55](https://github.com/pedrosousa13/hop/issues/55) | **Landed.** Per-query state, server-side cancellation and client-side stale-frame drop, and the retained item set Decision 1 rides on: one set per connection, holding the most recent query id's delivered items, replaced whole by the next `Query` and released when the connection closes. Capped by `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — by item **count**, not bytes — enforced by truncating the undelivered remainder, never by evicting delivered ones (T3, and [#85](https://github.com/pedrosousa13/hop/issues/85), which owns the cap). Decision 1's "rides on state the daemon needs anyway" reasoning therefore holds. Two things #55 deliberately did **not** take: bytes, which rest on per-item bounds — **[Amended 2026-08-04]** #56 landed the provider host without adding that enforcement, and issue #30 owns it — and connection-level bounds, which are #98's (T13) |
+| [#56](https://github.com/pedrosousa13/hop/issues/56) | **[Amended 2026-08-04] Landed.** The provider host: each provider's manifest captured once at registration and compared against a fresh call before its answer is accepted, catching a provider that answers differently after registration; a host-enforced per-provider budget that aborts a non-cooperating provider's task; panic containment via `tokio::spawn`/`JoinError`; and provider error text bounded and stripped (`hop-core`'s `sanitize` module) before it can leave. Two things #56 deliberately did **not** take: per-item field-length enforcement on items a provider returns in-process, which remains open with issue #30 owning it; and a panic hook, so a panicking provider's payload still reaches the daemon's stderr through Rust's default hook, unsanitized, before the host's own failure classification runs — issue #104 owns that decision |
 | [#59](https://github.com/pedrosousa13/hop/issues/59) | Decision 1's binding, including the action check, refusing with the existing error codes — and enforcing the retained-set cap #55 sets, with an item lost to that cap distinguishable from one the daemon never emitted (#85) |
 | [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation. #55 answered the first two — 5 000, item count only, reasoning in `hop_protocol::limits` — and left the third half-answered: the daemon truncates the undelivered remainder rather than evicting what it delivered, but says nothing on the wire that lets a client tell a capped exchange from a completed one, so its half is still a truncation and not a refusal. See Decision 1's settled answers |
 | [#60](https://github.com/pedrosousa13/hop/issues/60) | A real state directory, which is where `learning.json`'s path stops being hypothetical |
