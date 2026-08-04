@@ -41,12 +41,15 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hop_protocol::Item;
+use tokio::sync::mpsc;
 
-use crate::pipeline::{ProviderOutput, Rejection};
-use crate::provider::{Provider, ProviderError, ProviderManifest, QueryCtx, should_query};
+use crate::pipeline::{CheckedItems, ProviderOutput, Rejection};
+use crate::provider::{
+    CancellationFlag, Provider, ProviderError, ProviderManifest, QueryCtx, should_query,
+};
 use crate::router::RoutedQuery;
 use crate::sanitize::sanitize_provider_message;
 
@@ -344,15 +347,11 @@ struct Registration {
     /// any clamp. Kept so the host can compare it against a later call and
     /// catch a provider whose manifest shifts — clamping deliberately makes
     /// `effective` differ, so `effective` cannot serve as that baseline.
-    // Task 5 (query execution) is the caller; this allow goes with it.
-    #[allow(dead_code)]
     declared: ProviderManifest,
     /// `declared` with [`HostPolicy`] applied. Every scheduling decision and
     /// the enforced budget read this, and nothing re-reads
     /// [`Provider::manifest`] to make one.
     effective: ProviderManifest,
-    // Task 5 (query execution) is the caller; this allow goes with it.
-    #[allow(dead_code)]
     provider: Arc<dyn ErasedProvider>,
 }
 
@@ -449,8 +448,6 @@ impl ProviderHost {
     /// This is [`should_query`]'s caller — the thing issue #32 found it did
     /// not have outside tests, which is what left the codebase with no worked
     /// example of the intended enforcement point.
-    // Task 5 (query execution) is the caller; this allow goes with it.
-    #[allow(dead_code)]
     fn selected(&self, q: &RoutedQuery) -> Vec<&Registration> {
         self.providers
             .iter()
@@ -472,6 +469,181 @@ impl ProviderHost {
     #[cfg(test)]
     fn selected_ids(&self, q: &RoutedQuery) -> Vec<&str> {
         self.selected(q).iter().map(|r| r.effective.id).collect()
+    }
+
+    /// Runs every provider this routed query reaches, each as its own task,
+    /// each under the budget captured for it, streaming what each one answers
+    /// as its own batch.
+    ///
+    /// Returns the [`CancellationFlag`] shared by every provider's
+    /// [`QueryCtx`], so a caller that wants to cancel cooperatively can — but
+    /// the flag is not how cancellation normally arrives. Dropping `results`
+    /// is: a provider's send then fails, and that failure sets this flag for
+    /// every sibling still running. That makes cancellation a property of the
+    /// channel, matching `hopd`'s `ResultSource` contract, rather than a second
+    /// mechanism a caller has to remember.
+    ///
+    /// # Why one task per provider
+    ///
+    /// It is what makes three separate guarantees hold at once, and no shape
+    /// with fewer tasks delivers all three:
+    ///
+    /// - **Panic containment.** A panic inside a spawned task surfaces as
+    ///   [`JoinError::is_panic`](tokio::task::JoinError::is_panic) rather than
+    ///   unwinding into whatever polled it. Polling providers in one task, the
+    ///   only option before issue #29 made the future `'static`, means one
+    ///   provider's panic takes the query — and, on the connection driver's
+    ///   task, the connection.
+    /// - **A cut-off that needs no cooperation.** The task is timed out and
+    ///   then aborted, so a provider that never polls
+    ///   [`QueryCtx::cancel`] is still abandoned at its budget.
+    /// - **No slowest-provider gate** (spec §3). Each task sends as soon as its
+    ///   provider answers, so a fast provider's items are on the wire while a
+    ///   slow one is still running.
+    ///
+    /// # What abort does and does not stop
+    ///
+    /// [`JoinHandle::abort`](tokio::task::JoinHandle::abort) takes effect at
+    /// the task's next yield point. A provider awaiting anything is dropped
+    /// promptly; a provider in a loop that never yields keeps a worker thread
+    /// until it does. What the host guarantees regardless is its own
+    /// behaviour: it stops waiting at the budget, reports the miss, and the
+    /// frame is never blocked. Bounding a non-yielding provider needs
+    /// process-level isolation, which issue #29 puts explicitly out of scope
+    /// and the v3 sandbox tier (spec §6) is the answer to.
+    pub fn spawn_query(
+        self: &Arc<Self>,
+        q: Arc<RoutedQuery>,
+        results: mpsc::Sender<Vec<Item>>,
+    ) -> CancellationFlag {
+        let cancel = CancellationFlag::default();
+
+        for registration in self.selected(&q) {
+            let host = Arc::clone(self);
+            let provider = Arc::clone(&registration.provider);
+            let declared = registration.declared.clone();
+            let effective = registration.effective.clone();
+            let q = Arc::clone(&q);
+            let results = results.clone();
+            let cancel = cancel.clone();
+
+            tokio::spawn(async move {
+                host.run_one(provider, declared, effective, q, results, cancel)
+                    .await;
+            });
+        }
+
+        // Every task holds its own clone of `results`; this function's copy
+        // going out of scope is what lets the last task's drop close the
+        // channel. A host with no selected providers therefore closes it here,
+        // which is how "nothing answered" reaches the driver as a clean
+        // `QueryDone` rather than a hang.
+        cancel
+    }
+
+    /// One provider's whole turn: run it under its budget, classify what came
+    /// back, check its items against its own manifest, and send what survived.
+    async fn run_one(
+        &self,
+        provider: Arc<dyn ErasedProvider>,
+        declared: ProviderManifest,
+        effective: ProviderManifest,
+        q: Arc<RoutedQuery>,
+        results: mpsc::Sender<Vec<Item>>,
+        cancel: CancellationFlag,
+    ) {
+        let id = effective.id;
+        let budget = effective.budget;
+        let started = Instant::now();
+
+        let ctx = QueryCtx {
+            cancel: cancel.clone(),
+            deadline: started + budget,
+        };
+
+        // The handle is kept rather than moved into `timeout`, so the task can
+        // still be aborted after the budget expires. `JoinHandle` is `Unpin`,
+        // which is what makes `&mut handle` a future.
+        let mut handle = tokio::spawn(Arc::clone(&provider).query_erased(q, ctx));
+        let outcome = match tokio::time::timeout(budget, &mut handle).await {
+            Err(_elapsed) => {
+                handle.abort();
+                let elapsed = started.elapsed();
+                self.log.record(ProviderEvent::BudgetMiss {
+                    provider: id,
+                    budget,
+                    elapsed,
+                });
+                Err(ProviderFailure::budget_miss(id, elapsed))
+            }
+            Ok(Err(join_error)) if join_error.is_panic() => {
+                Err(ProviderFailure::panicked(id, started.elapsed()))
+            }
+            Ok(Err(_cancelled_task)) => Err(ProviderFailure::from_error(
+                id,
+                ProviderError::Cancelled,
+                started.elapsed(),
+            )),
+            Ok(Ok(Err(error))) => Err(ProviderFailure::from_error(id, error, started.elapsed())),
+            Ok(Ok(Ok(items))) => Ok(items),
+        };
+
+        let items = match outcome {
+            Ok(items) => items,
+            Err(failure) => {
+                self.log.record(ProviderEvent::Failed(&failure));
+                return;
+            }
+        };
+
+        // The comparison `ProviderOutput::from_provider`'s docs ask a host to
+        // make, and which only a host can: a captured manifest cannot be
+        // re-minted in response to what a provider decided to return, so a
+        // provider whose `manifest()` now answers differently is caught here
+        // and its whole answer refused. `declared` rather than `effective` is
+        // the baseline, because clamping deliberately changes fields.
+        let fresh = provider.manifest();
+        if fresh != declared {
+            let failure = ProviderFailure::from_error(
+                id,
+                ProviderError::Failed(
+                    "the provider's manifest changed after registration".to_string(),
+                ),
+                started.elapsed(),
+            );
+            self.log.record(ProviderEvent::Failed(&failure));
+            return;
+        }
+
+        // One `ProviderOutput`, from this provider alone, so each item is
+        // checked against its own producer and nothing else — the property
+        // `CheckedItems::check`'s loop comment warns against hoisting away.
+        let checked = CheckedItems::check(vec![provider.output(items)]);
+        if !checked.rejections().is_empty() {
+            self.log.record(ProviderEvent::Rejected {
+                provider: id,
+                rejections: checked.rejections(),
+            });
+        }
+
+        let items = checked.items().to_vec();
+        self.log.record(ProviderEvent::Answered {
+            provider: id,
+            items: items.len(),
+            elapsed: started.elapsed(),
+        });
+
+        if items.is_empty() {
+            return;
+        }
+
+        // A failed send means the receiver is gone, which is this seam's
+        // cancellation. Setting the flag is what carries that to the siblings
+        // still running: they learn it from the flag rather than waiting to
+        // discover their own send failing.
+        if results.send(items).await.is_err() {
+            cancel.cancel();
+        }
     }
 }
 
@@ -498,14 +670,10 @@ impl ProviderHost {
 /// dyn-compatible provider trait would be a second route to supplying a
 /// manifest, and the blanket impl means every [`Provider`] already has one.
 trait ErasedProvider: Send + Sync + 'static {
-    // Task 5 (query execution) is the caller; this allow goes with it.
-    #[allow(dead_code)]
     fn manifest(&self) -> ProviderManifest;
 
     /// [`Provider::query`] with its future boxed, which is what makes the
     /// method dyn-compatible.
-    // Task 5 (query execution) is the caller; this allow goes with it.
-    #[allow(dead_code)]
     fn query_erased(
         self: Arc<Self>,
         q: Arc<RoutedQuery>,
@@ -515,8 +683,6 @@ trait ErasedProvider: Send + Sync + 'static {
     /// Pairs `items` with this provider's manifest the only way
     /// [`ProviderOutput`](crate::pipeline::ProviderOutput) allows — see the
     /// trait docs for why this method exists here rather than at the call site.
-    // Task 5 (query execution) is the caller; this allow goes with it.
-    #[allow(dead_code)]
     fn output(&self, items: Vec<Item>) -> ProviderOutput;
 }
 
@@ -809,8 +975,6 @@ mod tests {
         }
     }
 
-    // Task 5 (query execution) is the caller; this allow goes with it.
-    #[allow(dead_code)]
     pub(crate) fn item(provider: &str, kind: Kind, id: &str, title: &str) -> Item {
         Item {
             id: ItemId::new(id).unwrap(),
@@ -957,5 +1121,349 @@ mod tests {
             .unwrap();
         host.selected_ids(&route("w terminal"));
         assert_eq!(log.lines(), vec!["skipped apps"]);
+    }
+
+    use tokio::sync::mpsc;
+
+    /// A provider that never returns — the non-cooperating case #28 is about.
+    /// It does not poll `ctx.cancel` at all, so nothing but the host can end
+    /// it.
+    pub(crate) struct HangingProvider;
+
+    impl Provider for HangingProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "hanging",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(10),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            // A yielding hang rather than a busy loop: `abort` takes effect at
+            // a yield point, and a busy loop would pin a worker thread for the
+            // whole test run. The provider still never checks cancellation,
+            // which is the property under test.
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
+    /// A provider that panics inside its future.
+    pub(crate) struct PanickingProvider;
+
+    impl Provider for PanickingProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "panicking",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(10),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            panic!("a provider indexing an empty vec");
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
+    /// A provider that fails with attacker-shaped text: over the cap, opening
+    /// with a terminal escape and a right-to-left override.
+    pub(crate) struct NastyProvider;
+
+    impl Provider for NastyProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "nasty",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(10),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            Err(ProviderError::Failed(format!(
+                "\u{1b}[31m\u{202e}{}",
+                "x".repeat(MAX_PROVIDER_MESSAGE * 10)
+            )))
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
+    /// Drains every batch a query produces, in arrival order.
+    async fn drain(mut rx: mpsc::Receiver<Vec<Item>>) -> Vec<Item> {
+        let mut all = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            all.extend(batch);
+        }
+        all
+    }
+
+    /// Runs one query against `host` and returns everything it streamed.
+    async fn run(host: Arc<ProviderHost>, raw: &str) -> Vec<Item> {
+        let (tx, rx) = mpsc::channel(1);
+        host.spawn_query(Arc::new(route(raw)), tx);
+        drain(rx).await
+    }
+
+    #[tokio::test]
+    async fn a_well_behaved_providers_items_are_streamed() {
+        let log = Arc::new(RecordingLog::default());
+        let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
+        host.register(ScriptedProvider::new(
+            "apps",
+            vec![Kind::App],
+            vec![item("apps", Kind::App, "app:firefox", "Firefox")],
+        ))
+        .unwrap();
+
+        let items = run(Arc::new(host), "firefox").await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Firefox");
+        assert_eq!(log.lines(), vec!["answered apps 1"]);
+    }
+
+    #[tokio::test]
+    async fn the_channel_closes_once_every_selected_provider_has_finished() {
+        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+        host.register(ScriptedProvider::new("a", vec![Kind::App], vec![]))
+            .unwrap();
+        host.register(ScriptedProvider::new("b", vec![Kind::App], vec![]))
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        Arc::new(host).spawn_query(Arc::new(route("x")), tx);
+        // Both answer with no items, so nothing is sent and the only event is
+        // the close — which is what `hopd`'s driver turns into `QueryDone`.
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_providers_closes_immediately() {
+        let host = Arc::new(ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog)));
+        let (tx, mut rx) = mpsc::channel(1);
+        host.spawn_query(Arc::new(route("x")), tx);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_never_completes_is_cut_off_at_its_budget_without_cooperating() {
+        let log = Arc::new(RecordingLog::default());
+        let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
+        host.register(HangingProvider).unwrap();
+
+        let started = std::time::Instant::now();
+        let items = run(Arc::new(host), "x").await;
+        let waited = started.elapsed();
+
+        assert!(items.is_empty());
+        assert!(
+            waited < Duration::from_secs(1),
+            "the host stopped waiting on its own; it waited {waited:?}"
+        );
+        let lines = log.lines();
+        assert!(
+            lines.iter().any(|l| l == "budget-miss hanging"),
+            "a budget miss must reach the seam: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "failed hanging Timeout the provider exceeded its budget"),
+            "and be reported as a timeout: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_provider_yields_a_panic_shaped_failure_naming_it() {
+        let log = Arc::new(RecordingLog::default());
+        let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
+        host.register(PanickingProvider).unwrap();
+
+        let items = run(Arc::new(host), "x").await;
+        assert!(items.is_empty());
+        assert_eq!(
+            log.lines(),
+            vec!["failed panicking Panicked the provider panicked"]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_providers_panic_does_not_cost_another_provider_its_results() {
+        // Spec §9's per-provider isolation rule, and #29's second criterion.
+        let log = Arc::new(RecordingLog::default());
+        let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
+        host.register(PanickingProvider).unwrap();
+        host.register(ScriptedProvider::new(
+            "apps",
+            vec![Kind::App],
+            vec![item("apps", Kind::App, "app:firefox", "Firefox")],
+        ))
+        .unwrap();
+
+        let items = run(Arc::new(host), "firefox").await;
+        assert_eq!(
+            items.len(),
+            1,
+            "the surviving provider's items still reach the client"
+        );
+        assert_eq!(items[0].title, "Firefox");
+        assert!(
+            log.lines()
+                .iter()
+                .any(|l| l.starts_with("failed panicking"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hanging_provider_does_not_delay_a_fast_providers_batch() {
+        // "No slowest-provider gate" (spec §3): the fast provider's items must
+        // arrive well before the hanging one's budget expires.
+        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+        host.register(HangingProvider).unwrap();
+        host.register(ScriptedProvider::new(
+            "apps",
+            vec![Kind::App],
+            vec![item("apps", Kind::App, "app:firefox", "Firefox")],
+        ))
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        Arc::new(host).spawn_query(Arc::new(route("firefox")), tx);
+
+        let first = tokio::time::timeout(Duration::from_millis(5), rx.recv())
+            .await
+            .expect("the fast provider's batch must not wait on the slow one")
+            .expect("a batch, not a close");
+        assert_eq!(first[0].title, "Firefox");
+    }
+
+    #[tokio::test]
+    async fn provider_error_text_is_bounded_and_stripped_before_it_leaves() {
+        let log = Arc::new(RecordingLog::default());
+        let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
+        host.register(NastyProvider).unwrap();
+
+        run(Arc::new(host), "x").await;
+        let lines = log.lines();
+        let line = lines.first().expect("one failure was recorded");
+        assert!(line.starts_with("failed nasty Failed "));
+        let message = line.trim_start_matches("failed nasty Failed ");
+        assert_eq!(message.len(), MAX_PROVIDER_MESSAGE);
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\u{202e}'));
+    }
+
+    #[tokio::test]
+    async fn items_that_fail_their_own_producers_manifest_are_refused_and_recorded() {
+        // The manifest checks still run, and their rejections now have
+        // somewhere to go. This provider declares `kinds: [App]` and returns a
+        // Window item.
+        let log = Arc::new(RecordingLog::default());
+        let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
+        host.register(ScriptedProvider::new(
+            "apps",
+            vec![Kind::App],
+            vec![
+                item("apps", Kind::App, "app:ok", "Fine"),
+                item("apps", Kind::Window, "window:forged", "Forged"),
+            ],
+        ))
+        .unwrap();
+
+        let items = run(Arc::new(host), "x").await;
+        assert_eq!(
+            items.len(),
+            1,
+            "the forged-kind item never reaches a client"
+        );
+        assert_eq!(items[0].id.as_str(), "app:ok");
+        assert!(log.lines().iter().any(|l| l == "rejected apps 1"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_whose_manifest_shifted_after_registration_has_its_answer_refused() {
+        // The comparison `ProviderOutput::from_provider`'s docs ask a host to
+        // make: captured versus fresh, refuse on mismatch. `ShiftyProvider`
+        // answers `min_term_len: 3` once and `0` afterwards, so its second
+        // call — the one the check makes — differs.
+        let log = Arc::new(RecordingLog::default());
+        let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
+        host.register(ShiftyProvider::new()).unwrap();
+
+        let items = run(Arc::new(host), "a firefox").await;
+        assert!(items.is_empty());
+        let lines = log.lines();
+        assert!(
+            lines.iter().any(|l| l.starts_with("failed shifty Failed")),
+            "the mismatch is reported as a failure attributed to the provider: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_receiver_cancels_the_providers_still_running() {
+        // The `ResultSource` contract `hopd` relies on: dropping the receiver
+        // is cancellation. A provider that polls the flag sees it set.
+        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+        host.register(ScriptedProvider::new(
+            "apps",
+            vec![Kind::App],
+            vec![item("apps", Kind::App, "app:firefox", "Firefox")],
+        ))
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel(1);
+        let cancel = Arc::new(host).spawn_query(Arc::new(route("firefox")), tx);
+        drop(rx);
+
+        // The provider's send fails, and that is what sets the flag for every
+        // sibling still running.
+        for _ in 0..100 {
+            if cancel.is_cancelled() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("a failed send must set the shared cancellation flag");
     }
 }
