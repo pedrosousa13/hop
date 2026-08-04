@@ -3,8 +3,10 @@
 The vocabulary this codebase uses. When naming something — a type, a test, an
 issue title, a comment — use the term as defined here rather than a synonym.
 
-Seeded at the end of M1, from the terms the core crates actually settled on.
-It describes what exists; extend it as later milestones resolve new terms.
+Seeded at the end of M1, from the terms the core crates actually settled on,
+and extended through M2 with the framing and query-lifecycle terms the daemon
+and its clients settled on. It describes what exists; extend it as later
+milestones resolve new terms.
 
 ## Items and actions
 
@@ -179,14 +181,103 @@ producer, cannot take the whole tail away from another provider by answering
 first, though answering first does spend one of the shared slots.
 It counts pins, never deciding which providers may pin; that is a capability
 check nothing has built yet. Not a **bound** in this glossary's sense: it
-restricts neither the length nor the content of a wire value and no parse can
-apply it, which is why it lives with the assembly that spends it rather than in
-`hop-protocol`'s `limits`.
+restricts neither the size nor the content of a wire value, and it is one
+process's assembly decision rather than a maximum both peers apply — which is
+why it lives with the assembly that spends it rather than in `hop-protocol`'s
+`limits`.
 
 **Cap** — the maximum result count, applied to the concatenated body and tail
 together. A body that alone fills the cap squeezes the tail out; the old
 extension reserved room for the tail instead, and that difference is a recorded
 divergence.
+
+## Frames
+
+**Frame** — one message on the socket: a four-byte big-endian payload length
+followed by that many bytes of JSON. It is the unit everything on the wire is
+counted and refused in — `MAX_FRAME_BYTES` bounds one, a **refusal** off the
+parse sinks one, and an `ErrorCode` names why one was refused. The shape is written down
+once, in `hop-protocol`'s `framing`, so the tokio daemon and the blocking CLI
+read the same bytes the same way instead of each carrying its own copy of the
+prefix arithmetic.
+
+**Payload** — the JSON half of a frame, exclusive of the length prefix. What
+`MAX_FRAME_BYTES` counts, what `payload_len` returns the length of, and what a
+`ClientMsg` or `DaemonMsg` is parsed from. Never a synonym for the frame: the
+prefix's four bytes are not payload, and a transport reads them on their own
+precisely so it can decide about the payload before it holds any of it.
+
+**Pre-allocation gate** — `framing::payload_len`: the check a transport runs on
+a frame's length prefix before it allocates a buffer sized by the number the
+peer put there. A prefix over `MAX_FRAME_BYTES` is refused on those four bytes
+alone, so the payload it describes is never read in order to be reported. It is
+a gate a caller has to *call* — a transport that allocates first and checks
+after has undone it — which is why both transports say in place that they apply
+this gate rather than re-implement it.
+
+## The query lifecycle
+
+**Handshake state** — where a connection sits in the gate every frame passes
+through: `AwaitingHello` until a `Hello` carrying this `API_VERSION` arrives,
+`Ready` after. It moves once and never back, so a second `Hello` on a `Ready`
+connection is refused rather than read as a re-handshake. Per connection, and
+held by the connection's driver: nothing about it is shared between peers.
+
+**Exchange** — one query id's life on a connection: the source still producing
+for it, and the items delivered under it. At most one is live per connection.
+An exchange *ends* when its source ends — naturally, at the per-query cap, or
+on a `Cancel` — and outlives that end, because what it delivered stays
+resolvable until the next query replaces it.
+
+**Result source** — the seam between a connection and whatever answers its
+queries: one query in, a stream of item batches out behind a channel. The
+channel is the whole contract — batches arrive on it, the source finishing
+closes it, and the caller dropping it *is* the cancellation, which makes
+cancellation a property of the seam rather than a protocol bolted beside it.
+This is where the **provider** host will plug in; until it does, the one
+production source answers every query with the same hardcoded item.
+
+**Retained set** — the items an exchange has delivered, kept so that a later
+`execute` resolves against what the client was actually shown. One per
+connection, holding the most recent query id's items: a new `Query` replaces it
+whole, and the connection closing drops it. It survives the exchange's
+**terminal frame** and a `Cancel`, on the rule that an item this daemon has
+already shown must not become unresolvable. Bounded by `MAX_ITEMS_PER_QUERY` —
+the per-query cap, which is not the assembly **cap** above: one bounds what a
+query may deliver across every frame of an exchange, the other how many results
+one assembled list may hold.
+
+**Truncate-and-terminate** — what the daemon does at the per-query cap: it
+truncates the batch that crossed the line, delivers what fit, ends the exchange
+with its terminal frame, and drops the source. The two halves of that are
+different things in this glossary's terms and are worth keeping apart. Nothing
+delivered is ever **evicted** — that is what the retained set exists for, and
+what keeps a delivered item resolvable. The undelivered remainder is dropped
+with nothing on the wire naming it, so that half is a **truncation** and not a
+**refusal**, however deliberate it is: a capped exchange and a completed one
+carry the same terminal frame. The client's half of the same constant *is* a
+refusal — it errors out rather than printing a shortened list — so the two
+sides of one cap are named differently on purpose.
+
+**Terminal frame** — the one frame that ends an exchange: `DaemonMsg::QueryDone`,
+sent when the source finishes, at the per-query cap, or in answer to a matching
+`Cancel`. Never a `partial: false` results frame — `partial` is advisory, and a
+client keys on the terminal frame instead. A query-scoped `DaemonMsg::Error` is
+terminal in its place, and the two never both arrive for one id;
+**supersession** and the connection ending produce neither.
+
+**Supersession** — a new `Query` replacing the one before it on the same
+connection. Dropping the previous exchange's source is the server-side
+cancellation, and its retained set is replaced along with it. No frame follows
+for the superseded id, not even a terminal one: the client that superseded it
+has moved on and would drop one as stale. A `Cancel` is the same mechanism
+acknowledged — the canceller is still waiting on that id, so it gets the
+terminal frame.
+
+**Stale-frame drop** — a client discarding a frame whose `query_id` names a
+query it is no longer waiting on, rather than rendering it or treating it as an
+error. The client half of the lifecycle contract, and what makes supersession's
+silence safe.
 
 ## Content rules
 
@@ -196,10 +287,23 @@ from a provider, so neither is trusted. `Done` is not one, and an item's
 `copy_text` is not one either — it reaches the same clipboard, but by way of an
 item rather than an outcome.
 
+**Bound** — a maximum on how large a wire value may be: how many bytes a string
+may hold, or how many elements a sequence may. Bounds live in `hop-protocol`'s
+`limits`, one per variable-length field, declared once for both peers. Most are
+applied at the deserialization boundary, by the field's own `deserialize_with`
+or by the **validating newtype** that carries it. Two are not, because no
+single frame can break them, and each says so where it is defined:
+`MAX_FRAME_BYTES` is applied by a transport to a frame's length prefix ahead of
+the parse — the **pre-allocation gate** — and `MAX_ITEMS_PER_QUERY` is applied
+by each transport as it accumulates an exchange's items across frames. Where a
+bound is applied is a fact about what it bounds; being applied at the parse is
+not what makes one a bound.
+
 **Content rule** — a restriction on what a wire value may *contain*, as against
-a **bound**, which restricts how long it may be. Content rules live in
-`hop-protocol`'s `content` module, bounds in its `limits` module; both are
-applied at the deserialization boundary, and the bound is applied first.
+a **bound**, which restricts how large it may be. Content rules live in
+`hop-protocol`'s `content` module, bounds in its `limits` module; a content
+rule and the bound on the same value are both applied at the deserialization
+boundary, and the bound is applied first.
 
 **Validating newtype** — a type wrapping a private `String` whose only
 constructor applies every rule, and whose `Deserialize` hands the parsed string
@@ -219,12 +323,18 @@ assembly declined: a rejection is data returned alongside the items that
 survived, so a query with one still answers. Neither is ever a truncation, a
 normalization, or a silent fix.
 
+The shape generalises past the two gates: a client refusing a stream that runs
+past `MAX_ITEMS_PER_QUERY` declines to produce the assembled list at all, names
+the cap that was broken, and prints nothing — an error where a shortened list
+would have been a truncation.
+
 A truncation in that sense is keeping a shortened version of a value and saying
 nothing — the shortened id `limits` refuses to produce. Refusing a whole item
 and reporting it is not one, however short the surviving list gets, which is
 why the **pin budget** rejects rather than truncates. Within assembly the
 **cap** is the truncation: it shortens the assembled list to `max_results`
-silently, naming nothing it dropped.
+silently, naming nothing it dropped. The daemon's half of the per-query cap is
+the other one — see **truncate-and-terminate**.
 
 ## Redaction
 

@@ -430,7 +430,7 @@ exists yet.
 | --- | --- | --- | --- | --- |
 | T1 | Allocation driven by a peer-supplied length prefix | Framing | No codec exists | Cap checked before allocation, from a `hop-protocol` constant (#21, #54) |
 | T2 | Memory amplification below the cap, via tagged-enum buffering | Any frame | Bounds apply post-buffer (`limits.rs`:27–39) | Frame cap sized against the 84 MB figure in `limits.rs`:41–72 |
-| T3 | **Unbounded retained item set.** Decision 1 has the daemon retain what it delivered per query id, accumulating across frames; `MAX_ITEMS_PER_RESULTS_FRAME` bounds one frame, and the protocol permits several partial frames per query, so absent a total the retained set would have no ceiling. Reachable by a **well-behaved** client, not only a hostile one | `results`, and Decision 1's registry | **Bounded, by item count, since #55.** The protocol supplies the total — `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — and `hopd` enforces it per connection in its connection driver (`connection.rs`, `forward_batch` / `take_within_cap`): at the cap it truncates the batch that crossed, delivers what fit, sends `QueryDone` and drops the source. Refusal of what was not yet delivered, never eviction of what was. What is **not** bounded is bytes — see "count or bytes" under Decision 1 below | A documented per-query total cap on retained items. [#85](https://github.com/pedrosousa13/hop/issues/85) is the standalone record of this gap; #55 (the state) and #59 (the binding that retains it) carry it as acceptance criteria, amended 2026-08-03. #55 has landed the cap; #59 still has to resolve `execute` against the capped set, and to make an item lost to the cap distinguishable from one the daemon never emitted — which the terminal `QueryDone` does not do today |
+| T3 | **Unbounded retained item set.** Decision 1 has the daemon retain what it delivered per query id, accumulating across frames; `MAX_ITEMS_PER_RESULTS_FRAME` bounds one frame, and the protocol permits several partial frames per query, so absent a total the retained set would have no ceiling. Reachable by a **well-behaved** client, not only a hostile one | `results`, and Decision 1's registry | **Bounded, by item count, since #55.** The protocol supplies the total — `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — and `hopd` enforces it per connection in its connection driver (`connection.rs`, `forward_batch` / `take_within_cap`): at the cap it truncates the batch that crossed, delivers what fit, sends `QueryDone` and drops the source. Truncation of the undelivered remainder, never eviction of what was delivered — the two are named differently on purpose, because only one of them is visible to the client (see Decision 1's overflow paragraph). What is **not** bounded is bytes — see "count or bytes" under Decision 1 below | A documented per-query total cap on retained items. [#85](https://github.com/pedrosousa13/hop/issues/85) is the standalone record of this gap; #55 (the state) and #59 (the binding that retains it) carry it as acceptance criteria, amended 2026-08-03. #55 has landed the cap; #59 still has to resolve `execute` against the capped set, and to make an item lost to the cap distinguishable from one the daemon never emitted — which the terminal `QueryDone` does not do today |
 | T4 | A frame acted on before the handshake | `execute`, `query` | Nothing in the types requires ordering (#26) | Connection loop refuses pre-handshake frames (#54) |
 | T5 | `execute` naming an item the daemon never delivered | `execute` | Length bounds only | Decision 1, implemented by #59 |
 | T6 | `execute` naming an action the item does not carry | `execute` | Nothing ties `action_id` to `Item.actions` | Decision 1's second half — see below |
@@ -507,8 +507,8 @@ The daemon retains the items it has delivered for a query id, and refuses any
   of that state rather than a second mechanism beside it. **That argument holds
   only while the state is bounded**, and #55 is what bounds it:
   `MAX_ITEMS_PER_QUERY` = 5 000 items per query id, per connection, enforced by
-  refusing further items rather than evicting delivered ones — see T3 and the
-  settled answers below. An unbounded registry would not be "state the daemon
+  truncating the undelivered remainder rather than evicting delivered ones —
+  see T3 and the settled answers below. An unbounded registry would not be "state the daemon
   needs anyway"; it would be new state with a new failure mode, and the
   reasoning for this decision would not survive leaving it uncapped.
 - **It puts no obligation on a future plugin ABI.** The host resolves the ids
@@ -601,19 +601,21 @@ to reconstruct them from `connection.rs`.
 
 **Overflow behaviour, and the half of #85's question that is not settled.**
 At the cap the daemon truncates the source batch that crossed the line,
-delivers what fit, sends `QueryDone`, and drops the source. Nothing already
-delivered is evicted, and nothing that was not delivered is retained — the
-delivered set and what the client holds stay in agreement, which is the
-property Decision 1 needs. The client half mirrors it as a **refusal** in
-`CONTEXT.md`'s sense: `hop-cli` errors out and prints nothing when a daemon
-streams past the cap.
+delivers what fit, sends `QueryDone`, and drops the source — **truncate-and-terminate**,
+in `CONTEXT.md`'s terms. Nothing already delivered is evicted, and nothing that
+was not delivered is retained — the delivered set and what the client holds
+stay in agreement, which is the property Decision 1 needs. The undelivered
+remainder is a **truncation** and not a refusal, because nothing on the wire
+names it; the client half of the same cap *is* a **refusal** in `CONTEXT.md`'s
+sense, because it names the cap it declined on: `hop-cli` errors out and prints
+nothing when a daemon streams past it.
 
 What the daemon does **not** do is tell the client any of that happened. A
 capped exchange and a completed one both terminate with the same
 `QueryDone { query_id }`, and no field on any frame says items were dropped.
 #85 asks for overflow to be a refusal or a rejection rather than a silent
-truncation, and as seen from the client it is still the silent one: what was
-refused is invisible to the peer it was refused on behalf of. Changing that
+truncation, and on the daemon's side it is still the silent one: what was
+dropped is invisible to the peer it was dropped on behalf of. Changing that
 needs a wire signal that does not exist today, so **this half is not settled
 by #55** — it stays with #59, which the follow-up table already charges with
 "an item lost to that cap distinguishable from one the daemon never emitted".
@@ -870,9 +872,9 @@ What has to be true for this model to describe reality rather than intent:
 | Slice or issue | What it must establish |
 | --- | --- |
 | [#54](https://github.com/pedrosousa13/hop/issues/54) | Socket and directory created with a decided mode; frame cap from a `hop-protocol` constant, checked before allocation (#21); handshake-first ordering enforced (#26) |
-| [#55](https://github.com/pedrosousa13/hop/issues/55) | **Landed.** Per-query state, server-side cancellation and client-side stale-frame drop, and the retained item set Decision 1 rides on: one set per connection, holding the most recent query id's delivered items, replaced whole by the next `Query` and released when the connection closes. Capped by `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — by item **count**, not bytes — enforced by refusing further items, never by evicting delivered ones (T3, and [#85](https://github.com/pedrosousa13/hop/issues/85), which owns the cap). Decision 1's "rides on state the daemon needs anyway" reasoning therefore holds. Two things #55 deliberately did **not** take: bytes, which rest on per-item bounds nothing enforces on the daemon's production path until #56, and connection-level bounds, which are #98's (T13) |
+| [#55](https://github.com/pedrosousa13/hop/issues/55) | **Landed.** Per-query state, server-side cancellation and client-side stale-frame drop, and the retained item set Decision 1 rides on: one set per connection, holding the most recent query id's delivered items, replaced whole by the next `Query` and released when the connection closes. Capped by `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — by item **count**, not bytes — enforced by truncating the undelivered remainder, never by evicting delivered ones (T3, and [#85](https://github.com/pedrosousa13/hop/issues/85), which owns the cap). Decision 1's "rides on state the daemon needs anyway" reasoning therefore holds. Two things #55 deliberately did **not** take: bytes, which rest on per-item bounds nothing enforces on the daemon's production path until #56, and connection-level bounds, which are #98's (T13) |
 | [#59](https://github.com/pedrosousa13/hop/issues/59) | Decision 1's binding, including the action check, refusing with the existing error codes — and enforcing the retained-set cap #55 sets, with an item lost to that cap distinguishable from one the daemon never emitted (#85) |
-| [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation. #55 answered the first two — 5 000, item count only, reasoning in `hop_protocol::limits` — and left the third half-answered: the daemon refuses rather than evicts, but says nothing on the wire that lets a client tell a capped exchange from a completed one. See Decision 1's settled answers |
+| [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation. #55 answered the first two — 5 000, item count only, reasoning in `hop_protocol::limits` — and left the third half-answered: the daemon truncates the undelivered remainder rather than evicting what it delivered, but says nothing on the wire that lets a client tell a capped exchange from a completed one, so its half is still a truncation and not a refusal. See Decision 1's settled answers |
 | [#60](https://github.com/pedrosousa13/hop/issues/60) | A real state directory, which is where `learning.json`'s path stops being hypothetical |
 | [#62](https://github.com/pedrosousa13/hop/issues/62) | Socket activation, which moves socket creation into a unit file |
 | [#39](https://github.com/pedrosousa13/hop/issues/39) | Decision 2's rule, sequenced with #72 and #88 on the load path #37, #38, #43 and #44 have already changed — plus the `ProviderManifest` opt-in field the recents consequence needs, which does not exist today (`provider.rs`:62–78) and changes the plugin seam. The field's **default is an open question**, not something this model settles |

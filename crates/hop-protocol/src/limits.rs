@@ -216,6 +216,12 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// streams past it). That is the same posture [`MAX_FRAME_BYTES`] takes:
 /// declared here, applied by the transport.
 ///
+/// The two sides carry different names in `CONTEXT.md`'s terms, and the
+/// difference is which of them says so: the daemon's half is a truncation,
+/// since a capped exchange ends with the frame a completed one ends with and
+/// nothing names the remainder, while the client's half is a refusal, since
+/// it produces no list at all and names this constant when it declines.
+///
 /// 5 000 is five maximal frames. Honest traffic is two orders of magnitude
 /// smaller — a launcher renders tens of items — so this is a memory guard,
 /// not a display guard: at the composed per-item worst case (84 160 bytes,

@@ -44,12 +44,16 @@ that streams past the cap.
    `hop_protocol::limits::MAX_ITEMS_PER_QUERY: usize = 5_000` — the total
    item count one query id may deliver across all its `results` frames,
    distinct from `MAX_ITEMS_PER_RESULTS_FRAME` (1 000), which bounds one
-   frame. At the cap the daemon **refuses further items**: it truncates the
-   batch that crossed the line, delivers what fit, sends `QueryDone`, and
+   frame. At the cap the daemon **truncates and terminates**: it truncates
+   the batch that crossed the line, delivers what fit, sends `QueryDone`, and
    drops the source. It never evicts. Rationale: the retained set exists so
    #59 can resolve an `Execute { query_id, item_id }` against what was
    actually shown; eviction would make a delivered item silently
-   unresolvable, refusal cannot.
+   unresolvable, dropping the undelivered remainder cannot. The two halves
+   carry different names in `CONTEXT.md`'s terms — the remainder is a
+   truncation, because nothing on the wire names it, while the client's half
+   of the same cap is a refusal, because it names the cap and prints
+   nothing.
 2. **`partial` is advisory; `QueryDone` is the terminal signal.** Every
    streamed `results` frame the daemon sends carries `partial: true`; the
    exchange ends with `QueryDone`, never with a `partial: false` frame.
@@ -105,7 +109,7 @@ that streams past the cap.
   over a real socket with scripted sources.
 - Modify: `crates/hop-cli/src/lib.rs` — assemble-after-done, stale-drop, cap.
 - Modify: `crates/hop-cli/tests/e2e.rs` — fake-daemon tests for stale-drop,
-  assembly, cap refusal.
+  assembly, cap refusal (the client half).
 - Modify: `README.md` — the "one hardcoded item / single reply" wording.
 
 ---
@@ -688,9 +692,9 @@ async fn forward_batch(
     }
 
     if capped {
-        // Refusal, not eviction: everything delivered stays retained and
-        // resolvable; what didn't fit was never delivered. Dropping the
-        // receiver stops the source.
+        // Truncate-and-terminate, never eviction: everything delivered
+        // stays retained and resolvable; what didn't fit was never
+        // delivered. Dropping the receiver stops the source.
         send_msg(write_half, &DaemonMsg::QueryDone { query_id }).await?;
         *active = None;
     }
@@ -1057,7 +1061,7 @@ fn a_cancel_frame_stops_the_active_query_and_answers_query_done() {
 fn a_query_streaming_past_the_cap_is_truncated_and_terminated() {
     // Six batches of one full frame each: 6 000 items offered, the cap is
     // 5 000. The daemon must deliver exactly the cap and then QueryDone —
-    // refusal of the remainder, never eviction of what was delivered.
+    // truncation of the remainder, never eviction of what was delivered.
     let batch: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME).map(item).collect();
     let (events, _events_rx) = mpsc::unbounded_channel();
     let daemon = start_daemon(ScriptedSource {
@@ -1362,7 +1366,7 @@ git commit -m "docs: the daemon streams now; retire the single-reply wording"
 | Client discards non-current query ids | Task 6 loop + stale-drop e2e test |
 | CLI waits for done, prints assembled list | Task 6 loop + both e2e tests |
 | Documented total cap distinct from per-frame bound | Task 1 (`MAX_ITEMS_PER_QUERY`) |
-| Cap behavior documented and tested (refuse vs evict) | Refuse-and-terminate: Task 1 docs, Task 4 unit tests, Task 5 cap test |
+| Cap behavior documented and tested (truncate vs evict) | Truncate-and-terminate: Task 1 docs, Task 4 unit tests, Task 5 cap test |
 | Integration test: streaming, cancellation, stale-frame over a real socket | Task 5 (streaming, cancellation), Task 6 (stale-frame, real socket, fake daemon) |
 | Integration test: past-the-cap behavior | Task 5 cap test (daemon side), Task 6 cap test (client side) |
 

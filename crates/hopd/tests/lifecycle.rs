@@ -313,9 +313,9 @@ fn a_cancel_frame_stops_the_active_query_and_answers_query_done() {
 fn a_query_streaming_past_the_cap_is_truncated_and_terminated() {
     // Six batches of one full frame each: 6 000 items offered, the cap is
     // 5 000. The daemon must deliver exactly the cap, drop the source, and
-    // send exactly one QueryDone — refusal of the remainder, never eviction
-    // of what was delivered, and never a lingering source left to answer a
-    // 6th batch nobody asked for.
+    // send exactly one QueryDone — truncation of the remainder, never
+    // eviction of what was delivered, and never a lingering source left to
+    // answer a 6th batch nobody asked for.
     let batch: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME).map(item).collect();
     let (events, mut events_rx) = mpsc::unbounded_channel();
     let daemon = start_daemon(ScriptedSource {

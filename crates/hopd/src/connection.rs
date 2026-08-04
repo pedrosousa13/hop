@@ -343,10 +343,13 @@ async fn forward_batch(
     let first = active.delivered.len();
     active.delivered.extend(accepted);
     if capped {
-        // Refusal, not eviction: everything delivered stays retained and
-        // resolvable, and what did not fit was never delivered at all.
-        // Dropping the receiver stops the source; the client is told the
-        // exchange is over below.
+        // Truncate-and-terminate, never eviction: everything delivered stays
+        // retained and resolvable, and what did not fit was never delivered
+        // at all. The two halves are named differently on purpose — dropping
+        // the remainder is a truncation in `CONTEXT.md`'s sense, because
+        // nothing on the wire names it and the terminal frame below is the
+        // one a completed exchange sends. Dropping the receiver stops the
+        // source; the client is told the exchange is over below.
         active.source = None;
     }
 

@@ -59,8 +59,8 @@ pub enum ClientMsg {
     ///   holds them, so an [`Execute`](ClientMsg::Execute) frame naming one is
     ///   refused as unknown (issue #59) even though this daemon is what sent
     ///   it. That is
-    ///   the exact failure the retained set's refuse-never-evict rule exists
-    ///   to prevent, reintroduced by the client rather than by the daemon.
+    ///   the exact failure the retained set's never-evict rule exists to
+    ///   prevent, reintroduced by the client rather than by the daemon.
     /// - Frames of the two rounds are indistinguishable on the wire, so the
     ///   client cannot tell a late frame of the first from a frame of the
     ///   second, and the stale-frame drop it relies on has nothing to key on.
