@@ -469,6 +469,20 @@ impl CheckedItems {
         &self.items
     }
 
+    /// [`CheckedItems::items`], moved out instead of borrowed — for a caller
+    /// that owns `self`, is done with the rejections, and does not want to
+    /// clone every surviving [`Item`] just to get a `Vec` it already has.
+    /// Exists alongside `items()` rather than replacing it because most
+    /// callers only borrow.
+    /// [`ProviderHost::run_one`](crate::host::ProviderHost) is the caller
+    /// this was added for: it runs once per provider per query, on the
+    /// keystroke path spec §3 holds to 10 ms, and `items().to_vec()` there
+    /// was cloning every item — several `String`s and a `Vec<Action>` each —
+    /// for no reason but that `items()` only lends.
+    pub fn into_items(self) -> Vec<Item> {
+        self.items
+    }
+
     /// The items that failed a check, in the order they were rejected.
     pub fn rejections(&self) -> &[Rejection] {
         &self.rejections

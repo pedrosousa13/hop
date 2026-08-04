@@ -713,7 +713,7 @@ impl ProviderHost {
             });
         }
 
-        let items = checked.items().to_vec();
+        let items = checked.into_items();
         self.log.record(ProviderEvent::Answered {
             provider: id,
             items: items.len(),
@@ -1234,6 +1234,36 @@ mod tests {
             host.manifests()[0].min_term_len,
             5,
             "the floor raises, it never relaxes a provider's own stricter rule"
+        );
+    }
+
+    #[test]
+    fn a_manifest_exactly_at_the_ceiling_and_floor_passes_through_unchanged() {
+        // The two clamp tests above each sit strictly on one side of the
+        // boundary — over the ceiling, and under the floor. Neither would
+        // catch `.min()`/`.max()` mutated to a strict `<`/`>` comparison,
+        // which only misbehaves exactly at equality. This test sits on the
+        // boundary itself.
+        let mut provider = ScriptedProvider::new("apps", vec![Kind::App], vec![]);
+        provider.manifest.budget = MAX_PROVIDER_BUDGET;
+        provider.manifest.min_term_len = 2;
+        let mut host = ProviderHost::new(
+            HostPolicy {
+                min_term_len_floor: 2,
+                ..HostPolicy::default()
+            },
+            Arc::new(NoopLog),
+        );
+        host.register(provider).unwrap();
+        assert_eq!(
+            host.manifests()[0].budget,
+            MAX_PROVIDER_BUDGET,
+            "a budget exactly at the ceiling is not clamped away from itself"
+        );
+        assert_eq!(
+            host.manifests()[0].min_term_len,
+            2,
+            "a minimum exactly at the floor is not raised away from itself"
         );
     }
 
