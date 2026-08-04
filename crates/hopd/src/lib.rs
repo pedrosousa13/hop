@@ -10,6 +10,7 @@
 
 pub mod runtime_dir;
 pub mod server;
+pub mod source;
 
 use std::process::ExitCode;
 

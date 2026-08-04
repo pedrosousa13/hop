@@ -14,12 +14,11 @@ use std::path::Path;
 use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
 };
-use hop_protocol::{
-    API_VERSION, Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ErrorCode, Item, ItemId, Kind,
-    ProtoError,
-};
+use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ErrorCode, ProtoError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+
+use crate::source::hardcoded_item;
 
 /// The socket's file name inside the runtime directory
 /// [`crate::runtime_dir::resolve`] returns.
@@ -320,25 +319,4 @@ async fn send_error(
         },
     )
     .await
-}
-
-/// The walking skeleton's one and only result: every `query` frame gets
-/// exactly this item back, regardless of what was typed.
-fn hardcoded_item() -> Item {
-    Item {
-        id: ItemId::new("hop:walking-skeleton").expect("within bounds by construction"),
-        kind: Kind::Action,
-        title: "Hello from hopd".to_string(),
-        subtitle: Some("M2.2 walking skeleton".to_string()),
-        icon: None,
-        actions: vec![Action {
-            id: ActionId::new("open").expect("within bounds by construction"),
-            kind: ActionKind::Open,
-            label: "Open".to_string(),
-        }],
-        default_action: ActionId::new("open").expect("within bounds by construction"),
-        copy_text: None,
-        append_to_end: false,
-        provider: "skeleton".to_string(),
-    }
 }
