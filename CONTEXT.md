@@ -256,9 +256,14 @@ senses of the word. Contrast with a **content rule**, which *refuses* a value
 that breaks a rule outright: sanitizing never refuses, because the value here
 is a diagnostic about a failure that has already happened, and refusing it
 would replace the reason a provider failed with the reason its explanation was
-unacceptable. That is also why sanitizing is lossy where a **bound** is not —
-a bound is enforced at the parse, before a value exists at all, while
-sanitizing rewrites a value that already does.
+unacceptable. The same holds against an ordinary **bound** — one enforced, as
+most are, by the **validating newtype** that carries it: a value over the
+bound is refused outright and never exists to be rendered at all. Sanitizing
+takes the opposite path everywhere: it never refuses, keeping a rewritten,
+lossy version instead of the value that broke a rule, rather than declining
+to build one. Where a bound or a content rule is applied is a separate
+question from what either does to a value that breaks it — see **Bound** —
+and it is the latter, not the former, that sanitizing departs from.
 
 **Log seam** — where the **provider host** reports what providers did:
 `ProviderLog` and the `ProviderEvent`s it records. This is the seam

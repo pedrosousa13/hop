@@ -938,8 +938,11 @@ impl IconPath {
 /// Every variant names the wire field the path came from, as [`ContentError`]'s
 /// do, and none carries the path. The path is peer-controlled, and an error is a
 /// value a caller may format wherever it formats errors — what that is has not
-/// been decided, this codebase having no logging seam yet — so the field plus
-/// the rule is what a reader gets.
+/// been decided: no seam in this codebase covers the point where a *client*
+/// formats a value like this one. `hop-core`'s `ProviderLog` seam exists now,
+/// but it is scoped to provider events on the daemon side of the wire, not to
+/// a client rendering an icon-open failure — so the field plus the rule is
+/// what a reader gets.
 #[cfg(unix)]
 #[derive(Debug, Error)]
 pub enum IconOpenError {

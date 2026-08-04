@@ -45,11 +45,11 @@ use crate::router::{Mode, RoutedQuery};
 /// [`RegistrationError::DuplicateId`](crate::host::RegistrationError::DuplicateId).
 pub const APPS_PROVIDER_ID: &str = "apps";
 
-/// Static description of what a provider serves and how the (future)
-/// scheduler should treat it. Nothing here is enforced by this module —
-/// [`should_query`] is the one piece of scheduling logic that lives at M1;
-/// budget enforcement, cancellation propagation and parallel dispatch are
-/// M2 daemon work.
+/// Static description of what a provider serves and how the scheduler
+/// should treat it. Nothing here is enforced by this module —
+/// [`should_query`] is the one piece of scheduling logic that lives at this
+/// level; budget enforcement, cancellation propagation and parallel dispatch
+/// all live in [`ProviderHost`](crate::host::ProviderHost) now, not here.
 ///
 /// `id` and `kinds` are what
 /// [`crate::pipeline::CheckedItems::check`] holds each of this provider's
