@@ -6,6 +6,9 @@
 //! works end to end rather than evidence a mock agreed with itself.
 #![allow(clippy::unwrap_used)]
 
+mod common;
+use common::{hello, recv, send};
+
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -13,9 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use hop_protocol::framing::{FRAME_PREFIX_LEN, decode_payload, encode_frame, payload_len};
 use hop_protocol::limits::MAX_FRAME_BYTES;
-use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ErrorCode, Kind, QueryText};
+use hop_protocol::{ClientMsg, DaemonMsg, ErrorCode, Kind, QueryText};
 
 /// A spawned `hopd`, and the path its socket should appear at.
 ///
@@ -78,31 +80,6 @@ fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
     );
 }
 
-/// Sends `msg` as one length-prefixed frame, through the same
-/// [`hop_protocol::framing`] functions the daemon itself uses to decode —
-/// so a test failure here means the wire contract broke, not that this
-/// helper drifted from it.
-fn send(stream: &mut UnixStream, msg: &ClientMsg) {
-    let frame = encode_frame(msg).expect("test message must encode");
-    stream
-        .write_all(&frame)
-        .expect("write to hopd must succeed");
-}
-
-/// Reads exactly one length-prefixed frame and decodes it as a [`DaemonMsg`].
-fn recv(stream: &mut UnixStream) -> DaemonMsg {
-    let mut prefix = [0u8; FRAME_PREFIX_LEN];
-    stream
-        .read_exact(&mut prefix)
-        .expect("hopd must reply with a frame");
-    let len = payload_len(prefix).expect("hopd's own prefix must be in-cap");
-    let mut payload = vec![0u8; len];
-    stream
-        .read_exact(&mut payload)
-        .expect("hopd's declared payload length must be honored");
-    decode_payload(&payload).expect("hopd's reply must decode as a DaemonMsg")
-}
-
 /// Asserts the next read on `stream` returns 0 bytes — the daemon closed its
 /// end of the connection after the error it just sent.
 fn assert_eof(stream: &mut UnixStream) {
@@ -111,22 +88,6 @@ fn assert_eof(stream: &mut UnixStream) {
         .read(&mut buf)
         .expect("read after close must not error");
     assert_eq!(n, 0, "expected EOF after hopd's error, got {n} byte(s)");
-}
-
-fn hello(stream: &mut UnixStream) {
-    send(
-        stream,
-        &ClientMsg::Hello {
-            api_version: API_VERSION,
-        },
-    );
-    let reply = recv(stream);
-    assert_eq!(
-        reply,
-        DaemonMsg::HelloAck {
-            api_version: API_VERSION
-        }
-    );
 }
 
 #[test]
