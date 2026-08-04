@@ -132,6 +132,54 @@ fn a_panicking_provider_does_not_empty_the_frame_for_the_others() {
 }
 
 #[test]
+fn an_inferred_route_still_reaches_a_registered_general_search_provider() {
+    // Critical 1's regression, at the socket: before the host's augmentation
+    // rule, `route("2+2")` yielded `(Mode::Calculator, exclusive: false)`,
+    // and a provider declaring only `Mode::All` never got asked — the
+    // literal containment `should_query` runs treats `Mode::Calculator` and
+    // `Mode::All` as unrelated. `hop query 2+2` would have returned
+    // `QueryDone` with nothing, while `hop query hello` still worked. This is
+    // the test that would have caught it.
+    let log = Arc::new(RecordingLog::default());
+    let daemon = daemon_with(
+        vec![ScriptedProvider::new(
+            "apps",
+            vec![Kind::App],
+            Script::Answer(vec![scripted_item("apps", Kind::App, "app:2048", "2048")]),
+        )],
+        log,
+    );
+    let mut stream = connect(&daemon);
+
+    send(
+        &mut stream,
+        &ClientMsg::Query {
+            id: 9,
+            text: QueryText::new("2+2").unwrap(),
+        },
+    );
+
+    let mut items = Vec::new();
+    loop {
+        match recv(&mut stream) {
+            DaemonMsg::Results {
+                query_id: 9,
+                items: batch,
+                ..
+            } => items.extend(batch),
+            DaemonMsg::QueryDone { query_id: 9 } => break,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert_eq!(
+        items.len(),
+        1,
+        "an inferred route must still reach a Mode::All provider"
+    );
+    assert_eq!(items[0].title, "2048");
+}
+
+#[test]
 fn a_hanging_provider_is_cut_off_and_the_query_still_terminates() {
     // #28's criterion at the socket: the exchange reaches `QueryDone` without
     // the provider ever cooperating, and without the client waiting on it.

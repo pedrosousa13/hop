@@ -50,7 +50,7 @@ use crate::pipeline::{CheckedItems, ProviderOutput, Rejection};
 use crate::provider::{
     CancellationFlag, Provider, ProviderError, ProviderManifest, QueryCtx, should_query,
 };
-use crate::router::RoutedQuery;
+use crate::router::{Mode, RoutedQuery};
 use crate::sanitize::sanitize_provider_message;
 
 /// Why a provider did not answer, as the host classifies it.
@@ -448,11 +448,53 @@ impl ProviderHost {
     /// This is [`should_query`]'s caller — the thing issue #32 found it did
     /// not have outside tests, which is what left the codebase with no worked
     /// example of the intended enforcement point.
+    ///
+    /// # The augmentation rule
+    ///
+    /// A registration is selected when either half holds:
+    ///
+    /// - [`should_query`] says so: its captured modes contain the routed
+    ///   mode, and the term clears its `min_term_len`. Literal containment,
+    ///   unchanged from what `should_query` has always decided.
+    /// - the route is **not exclusive**, its captured modes contain
+    ///   [`Mode::All`], and the term still clears its `min_term_len`.
+    ///
+    /// The second half lives here rather than inside `should_query` on
+    /// purpose. `should_query` is a documented pure helper — literal mode
+    /// containment, a contract other callers may already rely on — and
+    /// deciding that a non-exclusive route should *also* reach a provider it
+    /// did not literally name is a scheduling policy, which is this host's
+    /// job, not the pre-filter helper's. `should_query`'s own behavior is
+    /// unchanged by this rule.
+    ///
+    /// It exists because [`RoutedQuery::exclusive`]'s own docs say a
+    /// non-exclusive (inferred) route "should augment" the general results,
+    /// and design spec §4 lists exactly this — inferred modes augmenting
+    /// instead of hijacking — as one of the two audited router defects v1
+    /// exists to fix. Without it, `route("2+2")` (`Mode::Calculator`,
+    /// `exclusive: false`) would reach no [`Mode::All`] provider at all,
+    /// because `should_query`'s literal containment treats `Mode::Calculator`
+    /// and `Mode::All` as unrelated values: a keystroke meant to show both a
+    /// calculator answer and the app the user was typing toward would show
+    /// neither the app nor anything a general-search provider could offer.
+    /// [`Pipeline::assemble`](crate::pipeline::Pipeline::assemble)'s step 7 —
+    /// promoting an inferred mode's items to the front without removing
+    /// anything else — exists precisely to merge that utility row into the
+    /// general results, and it can only do that if the general providers were
+    /// asked to run in the first place.
+    ///
+    /// `min_term_len` still applies on the augmentation path. The rule adds a
+    /// *mode* a provider is asked under; it says nothing about the length
+    /// pre-filter, so a provider declaring `min_term_len: 5` is still skipped
+    /// for a 2-character inferred-route term, exactly as on any other route.
     fn selected(&self, q: &RoutedQuery) -> Vec<&Registration> {
         self.providers
             .iter()
             .filter(|r| {
-                let run = should_query(&r.effective, q);
+                let long_enough = q.term.chars().count() >= r.effective.min_term_len;
+                let augments =
+                    !q.exclusive && r.effective.modes.contains(&Mode::All) && long_enough;
+                let run = should_query(&r.effective, q) || augments;
                 if !run {
                     self.log.record(ProviderEvent::Skipped {
                         provider: r.effective.id,
@@ -1202,6 +1244,74 @@ mod tests {
             .unwrap();
         assert!(host.selected_ids(&route("w terminal")).is_empty());
         assert_eq!(host.selected_ids(&route("terminal")), vec!["apps"]);
+    }
+
+    #[test]
+    fn an_inferred_route_selects_a_mode_all_provider_that_does_not_declare_the_inferred_mode() {
+        // Critical 1: `route("2+2")` yields `(Mode::Calculator, exclusive:
+        // false)`. `ScriptedProvider` declares only `Mode::All`, so
+        // `should_query` alone would refuse it — but a non-exclusive route
+        // must augment the general results (spec §4), so this provider must
+        // still run.
+        let mut host = host();
+        host.register(ScriptedProvider::new("apps", vec![Kind::App], vec![]))
+            .unwrap();
+        assert_eq!(host.selected_ids(&route("2+2")), vec!["apps"]);
+    }
+
+    #[test]
+    fn an_exclusive_route_still_excludes_a_mode_all_provider() {
+        // The augmentation rule is conditioned on `!exclusive`: an explicit
+        // `w ` route must still exclude a provider that only declares
+        // `Mode::All`, the same as before this rule existed.
+        let mut host = host();
+        host.register(ScriptedProvider::new("apps", vec![Kind::App], vec![]))
+            .unwrap();
+        assert!(host.selected_ids(&route("w term")).is_empty());
+    }
+
+    #[test]
+    fn augmentation_still_respects_min_term_len() {
+        // The augmentation rule adds a *mode* a provider is asked under; it
+        // is not an exemption from the length pre-filter. A provider
+        // declaring `min_term_len: 5` must still be skipped for a
+        // 2-character inferred-route term.
+        let mut provider = ScriptedProvider::new("apps", vec![Kind::App], vec![]);
+        provider.manifest.min_term_len = 5;
+        let mut host = host();
+        host.register(provider).unwrap();
+
+        let short = route("la");
+        assert_eq!(
+            (short.mode, short.term.as_str(), short.exclusive),
+            (Mode::Timezone, "la", false),
+            "an inferred route with a short term"
+        );
+        assert!(
+            host.selected_ids(&short).is_empty(),
+            "augmenting adds a mode, not an exemption from min_term_len"
+        );
+    }
+
+    #[test]
+    fn an_inferred_route_selects_both_the_mode_all_provider_and_the_provider_declaring_that_mode() {
+        // "Augment" means both run — the general provider and whichever
+        // provider actually declared the inferred mode — not one replacing
+        // the other.
+        let mut host = host();
+        host.register(ScriptedProvider::new("apps", vec![Kind::App], vec![]))
+            .unwrap();
+        let mut calculator = ScriptedProvider::new("calculator", vec![Kind::Calculator], vec![]);
+        calculator.manifest.modes = vec![Mode::Calculator];
+        host.register(calculator).unwrap();
+
+        let mut ids = host.selected_ids(&route("2+2"));
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["apps", "calculator"],
+            "both the Mode::All provider and the Mode::Calculator provider must run"
+        );
     }
 
     #[test]
