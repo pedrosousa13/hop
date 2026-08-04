@@ -201,6 +201,15 @@ pub const MAX_ACTIONS_PER_ITEM: usize = 32;
 /// [`MAX_ITEMS_PER_QUERY`], applied where the daemon does that accumulating.
 /// See also this module's docs for what this constant multiplies out to
 /// against the per-item bounds.
+///
+/// Under replacement it is also what bounds the daemon's own retained state —
+/// not [`MAX_ITEMS_PER_QUERY`], which no longer touches it. `hopd`'s
+/// `connection.rs` keeps `Exchange::delivered`, the last list sent, truncated
+/// to this constant before being retained; `delivered` is the retained set an
+/// `execute` frame resolves against (issue #59), and the threat model's
+/// Decision 1 — settling issue #25 — depends on that retained state staying
+/// bounded for its "rides on state the daemon must keep anyway" argument to
+/// hold. This constant is now what keeps that true.
 pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 
 /// Maximum items the daemon may accumulate from providers for one query id,
