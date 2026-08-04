@@ -58,7 +58,15 @@ pub const APPS_PROVIDER_ID: &str = "apps";
 /// `Clone` because [`Provider::manifest`] hands a caller its own value —
 /// implementors that keep one prepared can return a copy of it rather than
 /// rebuilding it per query.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` because a host compares the manifest it captured at
+/// registration against what [`Provider::manifest`] answers later — see
+/// [`ProviderHost`](crate::host::ProviderHost). That comparison is how a
+/// manifest built from interior mutability is caught, so equality here is
+/// load-bearing rather than a convenience: a field added to this struct and
+/// left out of the comparison would be a field a provider could change
+/// undetected, and deriving is what keeps the two in step automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderManifest {
     pub id: &'static str,
     pub kinds: Vec<Kind>,
@@ -123,24 +131,36 @@ pub enum ProviderError {
 /// The plugin seam: anything that can answer a routed query with items, and
 /// execute an action on one of the items it produced.
 ///
-/// The two async methods are written as `-> impl Future<...> + Send`
-/// (native async-in-trait, stabilized without the `Send` bound baked in)
-/// rather than as bare `async fn`. A bare `async fn` in a public trait
-/// produces a future type with no `Send` bound at all, which would block
-/// M2's daemon from spawning it onto a Tokio runtime — `tokio::spawn`
-/// requires the spawned future to be `Send`. Writing the desugared form
-/// here, once, means every implementor gets a `Send` future automatically
-/// instead of everyone needing to route around the gap later. It also
-/// avoids the `async_fn_in_trait` lint, which flags exactly this problem and
-/// which `-D warnings` turns into a hard error — silencing that lint with
-/// `#[allow]` would be silencing a warning about the exact issue this trait
-/// exists to avoid.
+/// The two async methods are written as `-> impl Future<...> + Send + 'static`
+/// (native async-in-trait, stabilized without the bounds baked in) rather than
+/// as bare `async fn`. A bare `async fn` in a public trait produces a future
+/// type with no bounds at all, which would block the daemon from spawning it
+/// onto a Tokio runtime. Writing the desugared form here, once, means every
+/// implementor gets a spawnable future automatically instead of everyone
+/// needing to route around the gap later. It also avoids the
+/// `async_fn_in_trait` lint, which flags exactly this problem and which
+/// `-D warnings` turns into a hard error.
 ///
-/// Lifetimes were not awkward here: edition 2024's RPITIT capture rules
-/// automatically capture the lifetimes of `&self` and the by-reference
-/// arguments into the returned `impl Future`, so no explicit `+ '_` or
-/// higher-ranked bound was needed for either method to compile.
-pub trait Provider: Send + Sync {
+/// # Why the arguments are owned
+///
+/// `tokio::spawn` requires `'static` as well as `Send`, and a future capturing
+/// `&self`, `&RoutedQuery` or `&QueryCtx` is neither — so the borrowed
+/// signature this trait shipped with made the panic isolation its own docs
+/// reached for unavailable, and forced a host to poll every provider's future
+/// in one task. That is issue #29, and closing it is a breaking change to this
+/// seam that spec §6's 2026-07-31 amendment sanctions by name: the lock takes
+/// effect when the extension store ships, not now, and #29 is one of the two
+/// gaps that amendment says can only be closed by changing these types.
+///
+/// `Arc<Self>` rather than `Self` so one registered provider serves every
+/// query without being cloned; `Arc<RoutedQuery>` so the same routed query
+/// reaches every selected provider without one clone per provider on the
+/// keystroke path; `QueryCtx` by value because it is two cheap fields, one of
+/// them already `Arc`-backed.
+///
+/// `'static` on the trait itself is what `Arc<dyn ...>` erasure needs
+/// downstream, and every provider is a long-lived registered object anyway.
+pub trait Provider: Send + Sync + 'static {
     /// This provider's static description — see [`ProviderManifest`].
     ///
     /// **Stability is part of this contract: every call must return the same
@@ -150,9 +170,16 @@ pub trait Provider: Send + Sync {
     /// per call, satisfies this; deriving any field from state that changes
     /// while the provider is alive does not, whatever the intent.
     ///
-    /// Nothing in this crate enforces that, and it is
-    /// [`crate::pipeline::CheckedItems::check`] that an implementation
-    /// breaking it defeats.
+    /// Unlike when this comment was written, something does now check:
+    /// [`ProviderHost`](crate::host::ProviderHost) compares its captured
+    /// manifest against a fresh call before it accepts a provider's items, and
+    /// refuses the answer on a mismatch. What that does *not* do is make the
+    /// contract enforced everywhere —
+    /// [`ProviderOutput::from_provider`](crate::pipeline::ProviderOutput::from_provider)
+    /// still reads the manifest off the object it is handed, and a caller that
+    /// is not the host still gets whatever the provider answers with. Read on
+    /// for the abuse that recovers.
+    ///
     /// [`ProviderOutput::from_provider`](crate::pipeline::ProviderOutput::from_provider)
     /// reads the manifest *after* [`Provider::query`] has returned, so a
     /// provider answering differently on two calls gets to choose what it is
@@ -249,18 +276,18 @@ pub trait Provider: Send + Sync {
     /// decision behind it (issue #67), under "An exclusive mode filters
     /// results; it never checks the term's shape".
     fn query(
-        &self,
-        q: &RoutedQuery,
-        ctx: &QueryCtx,
-    ) -> impl Future<Output = Result<Vec<Item>, ProviderError>> + Send;
+        self: Arc<Self>,
+        q: Arc<RoutedQuery>,
+        ctx: QueryCtx,
+    ) -> impl Future<Output = Result<Vec<Item>, ProviderError>> + Send + 'static;
 
     /// Executes `action_id` on `item_id`, both of which this provider must
     /// have produced from a prior [`Provider::query`] call.
     fn execute(
-        &self,
-        item_id: &ItemId,
-        action_id: &ActionId,
-    ) -> impl Future<Output = Result<ExecOutcome, ProviderError>> + Send;
+        self: Arc<Self>,
+        item_id: ItemId,
+        action_id: ActionId,
+    ) -> impl Future<Output = Result<ExecOutcome, ProviderError>> + Send + 'static;
 }
 
 /// The pre-filter helper: should a scheduler even bother asking this
@@ -364,7 +391,11 @@ mod tests {
             }
         }
 
-        async fn query(&self, q: &RoutedQuery, ctx: &QueryCtx) -> Result<Vec<Item>, ProviderError> {
+        async fn query(
+            self: Arc<Self>,
+            q: Arc<RoutedQuery>,
+            ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
             if ctx.cancel.is_cancelled() {
                 return Err(ProviderError::Cancelled);
             }
@@ -383,9 +414,9 @@ mod tests {
         }
 
         async fn execute(
-            &self,
-            _item_id: &ItemId,
-            _action_id: &ActionId,
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
         ) -> Result<ExecOutcome, ProviderError> {
             Ok(ExecOutcome::Done)
         }
@@ -393,18 +424,18 @@ mod tests {
 
     #[tokio::test]
     async fn provider_trait_is_implementable_and_runnable_on_an_executor() {
-        let provider = FakeProvider;
+        let provider = Arc::new(FakeProvider);
         let ctx = QueryCtx {
             cancel: CancellationFlag::default(),
             deadline: Instant::now() + Duration::from_secs(1),
         };
-        let routed = route("firefox");
-        let items = provider.query(&routed, &ctx).await.unwrap();
+        let routed = Arc::new(route("firefox"));
+        let items = provider.clone().query(routed, ctx).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "firefox");
 
         let outcome = provider
-            .execute(&items[0].id, &ActionId::new("open").unwrap())
+            .execute(items[0].id.clone(), ActionId::new("open").unwrap())
             .await
             .unwrap();
         assert_eq!(outcome, ExecOutcome::Done);
@@ -423,15 +454,19 @@ mod tests {
     /// real provider is most likely to make.
     #[tokio::test]
     async fn a_providers_own_output_passes_its_own_manifests_checks() {
-        let provider = FakeProvider;
+        let provider = Arc::new(FakeProvider);
         let ctx = QueryCtx {
             cancel: CancellationFlag::default(),
             deadline: Instant::now() + Duration::from_secs(1),
         };
-        let items = provider.query(&route("firefox"), &ctx).await.unwrap();
+        let items = provider
+            .clone()
+            .query(Arc::new(route("firefox")), ctx)
+            .await
+            .unwrap();
         assert_eq!(items.len(), 1, "the fixture must actually produce an item");
 
-        let checked = CheckedItems::check(vec![ProviderOutput::from_provider(&provider, items)]);
+        let checked = CheckedItems::check(vec![ProviderOutput::from_provider(&*provider, items)]);
         assert_eq!(
             checked.rejections(),
             &[],
@@ -440,15 +475,39 @@ mod tests {
         assert_eq!(checked.items().len(), 1);
     }
 
+    /// The criterion #29 exists for: a provider's future can be handed to
+    /// `tokio::spawn`, which requires `'static` as well as `Send`. Under the
+    /// old borrowed signature this did not compile, and the trait's own doc
+    /// comment reached for the isolation it made unavailable.
+    ///
+    /// It is written as a spawn rather than an `assert_static` helper because
+    /// spawning is the thing the host actually does, and a bound assertion
+    /// would still pass if some later change made the future `'static` but
+    /// un-spawnable for another reason.
     #[tokio::test]
-    async fn provider_query_future_is_send() {
-        fn assert_send<T: Send>(_: T) {}
-        let provider = FakeProvider;
+    async fn a_provider_query_future_can_be_spawned_as_its_own_task() {
+        let provider = Arc::new(FakeProvider);
+        let routed = Arc::new(route("firefox"));
         let ctx = QueryCtx {
             cancel: CancellationFlag::default(),
             deadline: Instant::now() + Duration::from_secs(1),
         };
-        let routed = route("firefox");
-        assert_send(provider.query(&routed, &ctx));
+
+        let handle = tokio::spawn(provider.query(routed, ctx));
+        let items = handle.await.unwrap().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "firefox");
+    }
+
+    /// `ProviderManifest` has to be comparable for the host to detect a
+    /// provider whose `manifest()` answers differently after registration —
+    /// #32's interior-mutability abuse. Equality is the whole mechanism, so it
+    /// is pinned here rather than assumed at the call site.
+    #[test]
+    fn two_manifests_with_the_same_fields_are_equal_and_a_changed_field_is_not() {
+        let a = manifest(vec![Mode::Apps], 3);
+        assert_eq!(a, manifest(vec![Mode::Apps], 3));
+        assert_ne!(a, manifest(vec![Mode::Apps], 4));
+        assert_ne!(a, manifest(vec![Mode::All], 3));
     }
 }

@@ -736,6 +736,7 @@ mod tests {
     use super::*;
     use crate::provider::{APPS_PROVIDER_ID, ProviderError, QueryCtx};
     use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Every [`Kind`] there is. The `test` provider below declares all of
@@ -771,17 +772,17 @@ mod tests {
         }
 
         async fn query(
-            &self,
-            _q: &RoutedQuery,
-            _ctx: &QueryCtx,
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
         ) -> Result<Vec<Item>, ProviderError> {
             Ok(Vec::new())
         }
 
         async fn execute(
-            &self,
-            _item_id: &ItemId,
-            _action_id: &ActionId,
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
         ) -> Result<ExecOutcome, ProviderError> {
             Ok(ExecOutcome::Done)
         }
