@@ -173,16 +173,48 @@ impl HostSource {
 
 impl ResultSource for HostSource {
     fn start(&self, text: QueryText) -> mpsc::Receiver<Vec<Item>> {
-        // Capacity 1 for the reason this trait's docs give: what a source
-        // buffers is daemon memory the retained-set cap does not see, so a
-        // deeper channel would only let providers park items the cap never
-        // counts.
+        // Two channels, each capacity 1 for the reason this trait's docs
+        // give: what a source buffers is daemon memory the retained-set cap
+        // does not see, so a deeper channel would only let providers park
+        // items the cap never counts. `ProviderHost::spawn_query` speaks
+        // `CheckedItems` — issue #103's seam for reaching
+        // `Pipeline::assemble`, which nothing downstream of the host can
+        // build one of any other way — while this trait still promises a
+        // bare `Vec<Item>`, so the forwarding task below is what turns one
+        // into the other. It is a temporary seam: Task 2 replaces its body
+        // with real assembly, without touching either channel's shape.
+        let (host_tx, mut host_rx) = mpsc::channel(1);
         let (tx, rx) = mpsc::channel(1);
+
         // Routing happens here rather than inside the host because the host's
         // vocabulary is a `RoutedQuery` — the same value every provider sees,
         // shared rather than cloned per provider.
         let routed = Arc::new(route(text.as_str()));
-        self.host.spawn_query(routed, tx);
+        self.host.spawn_query(routed, host_tx);
+
+        // The task returns — dropping `host_rx`, its receiving half of the
+        // host's own channel — the moment a downstream send fails, rather
+        // than draining the rest of what the host has to say. That drop is
+        // what carries cancellation across the extra hop: each provider's
+        // clone of `host_tx` then finds its own send failing in turn, which
+        // is `ProviderHost::spawn_query`'s documented cancellation mechanism
+        // — a caller dropping `results` — applied here to `host_tx` instead
+        // of to `rx` directly, with this task standing in as the caller.
+        // Ignoring the send's error and looping instead (`let _ = tx.send(
+        // ...).await;`) would leave every provider running until it finished
+        // or was cut off at its own budget, silently breaking the
+        // `ResultSource` cancellation contract for every query that goes
+        // through this hop —
+        // `tests::dropping_the_forwarded_receiver_cancels_the_query` is
+        // written against exactly that regression.
+        tokio::spawn(async move {
+            while let Some(checked) = host_rx.recv().await {
+                if tx.send(checked.items().to_vec()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
         rx
     }
 }
@@ -291,5 +323,207 @@ mod tests {
         let item = hardcoded_item();
         assert_eq!(item.provider, manifest.id);
         assert!(manifest.kinds.contains(&item.kind));
+    }
+
+    // --- Task 1 (issue #103): the forwarding hop must not break the
+    // `ResultSource` cancellation contract. ---
+    //
+    // `HostSource::start` now has two channels and a task between them where
+    // it used to have one channel and nothing. The three providers below
+    // exist only to make that hop's cancellation observable from outside it,
+    // since `start` no longer hands out the `CancellationFlag`
+    // `ProviderHost::spawn_query` returns (nothing downstream of `HostSource`
+    // ever held it, even before this task).
+
+    use hop_core::host::HostPolicy;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Answers immediately with one well-formed item. Its purpose is to give
+    /// the forwarding task something to receive and try (and, once the test
+    /// has dropped its receiver, fail) to forward — the trigger that makes
+    /// the task discover the downstream send is dead.
+    struct InstantProvider;
+
+    impl Provider for InstantProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "instant",
+                kinds: vec![Kind::Action],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(10),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            Ok(vec![Item {
+                id: ItemId::new("instant:item").expect("within bounds by construction"),
+                kind: Kind::Action,
+                title: "Instant".to_string(),
+                subtitle: None,
+                icon: None,
+                actions: vec![],
+                default_action: ActionId::new("open").expect("within bounds by construction"),
+                copy_text: None,
+                append_to_end: false,
+                provider: "instant".to_string(),
+            }])
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
+    /// Answers after a short sleep — long enough that, in a correctly
+    /// cancelling implementation, [`InstantProvider`]'s answer has already
+    /// collapsed the forwarding task and closed the host's own channel by
+    /// the time this provider's `run_one` tries to send. *That* send is the
+    /// one whose failure sets the shared [`CancellationFlag`](hop_core::provider::CancellationFlag)
+    /// — see `ProviderHost::spawn_query`'s docs: cancellation is a property
+    /// of a provider's own send failing, not of the channel merely existing
+    /// in a closed state, so a lone fast provider whose send always succeeds
+    /// (because nothing has failed yet when it sends) could never trigger it
+    /// on its own.
+    struct DelayedProvider;
+
+    impl Provider for DelayedProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "delayed",
+                kinds: vec![Kind::Action],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(100),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(vec![Item {
+                id: ItemId::new("delayed:item").expect("within bounds by construction"),
+                kind: Kind::Action,
+                title: "Delayed".to_string(),
+                subtitle: None,
+                icon: None,
+                actions: vec![],
+                default_action: ActionId::new("open").expect("within bounds by construction"),
+                copy_text: None,
+                append_to_end: false,
+                provider: "delayed".to_string(),
+            }])
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
+    /// Never completes on its own: loops polling `ctx.cancel` and records
+    /// that it saw cancellation before giving up. The one provider here that
+    /// actually reads its `QueryCtx`, and so the only way this test can tell
+    /// "the providers were told to stop" apart from "the providers happened
+    /// to finish, or were eventually cut off at their own budget" — the
+    /// latter would still close the outer channel, so watching the channel
+    /// alone cannot distinguish a genuine cancellation from a slow one.
+    struct CooperativeProvider {
+        saw_cancellation: Arc<AtomicBool>,
+    }
+
+    impl Provider for CooperativeProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "cooperative",
+                kinds: vec![Kind::Action],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(200),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            while !ctx.cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            self.saw_cancellation.store(true, Ordering::SeqCst);
+            Err(ProviderError::Cancelled)
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
+    /// The seam this task adds — the forwarding task between `HostSource`'s
+    /// two channels — must not break the `ResultSource` contract that
+    /// dropping the receiver cancels the providers behind it. This is the
+    /// test named in the brief; see its own docs for the buggy body ("ignore
+    /// a failed send and keep looping") that was confirmed to fail it before
+    /// the forwarding task was written to return on a failed send instead.
+    #[tokio::test]
+    async fn dropping_the_forwarded_receiver_cancels_the_query() {
+        // The default `HostPolicy` ceiling (50 ms, `MAX_PROVIDER_BUDGET`) is
+        // narrower than `CooperativeProvider`'s declared budget, which would
+        // clamp it down and leave no room to tell "cancelled promptly" apart
+        // from "cut off at budget" — the same reason `hop-core`'s own
+        // `a_hanging_provider_does_not_delay_a_fast_providers_batch` widens
+        // it.
+        let policy = HostPolicy {
+            max_budget: Duration::from_millis(300),
+            ..HostPolicy::default()
+        };
+        let mut host = ProviderHost::new(policy, Arc::new(NoopLog));
+        host.register(InstantProvider).unwrap();
+        host.register(DelayedProvider).unwrap();
+        let saw_cancellation = Arc::new(AtomicBool::new(false));
+        host.register(CooperativeProvider {
+            saw_cancellation: saw_cancellation.clone(),
+        })
+        .unwrap();
+
+        let source = HostSource::new(Arc::new(host));
+        let rx = source.start(QueryText::new("anything").unwrap());
+        drop(rx);
+
+        // Poll rather than sleep a fixed amount, the same pattern
+        // `hop-core`'s own cancellation tests use: succeed the moment the
+        // flag goes true, and only fail after giving a correct
+        // implementation ample room.
+        for _ in 0..100 {
+            if saw_cancellation.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "dropping the receiver HostSource::start returns must cancel the \
+             providers behind the forwarding task, not just eventually close \
+             the outer channel once they happen to finish or are cut off at \
+             their own budget"
+        );
     }
 }

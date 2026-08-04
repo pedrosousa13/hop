@@ -395,7 +395,7 @@ pub struct Rejection {
 /// host. So the shape here keeps rejections available and attached to their
 /// query, and the host is the caller that has made ignoring them a mistake —
 /// it does not make them unignorable for every caller this type has.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CheckedItems {
     items: Vec<Item>,
     rejections: Vec<Rejection>,
@@ -465,27 +465,62 @@ impl CheckedItems {
 
     /// The items that passed both checks, in the order [`CheckedItems::check`]
     /// received them.
+    ///
+    /// A borrow, not a second route around the check: it lends what already
+    /// exists rather than building anything, so it needs no justification
+    /// against this type's "only [`check`](CheckedItems::check) may mint
+    /// one" rule beyond that — nothing reachable through `&self` can ever
+    /// have skipped it. What this exists *for* is an accumulator's per-
+    /// arrival cap arithmetic: how many more items still fit before
+    /// [`CheckedItems::truncate_items`] has anything to do, which is a
+    /// question a length alone answers and owning the items would not
+    /// answer any better.
     pub fn items(&self) -> &[Item] {
         &self.items
-    }
-
-    /// [`CheckedItems::items`], moved out instead of borrowed — for a caller
-    /// that owns `self`, is done with the rejections, and does not want to
-    /// clone every surviving [`Item`] just to get a `Vec` it already has.
-    /// Exists alongside `items()` rather than replacing it because most
-    /// callers only borrow.
-    /// [`ProviderHost::run_one`](crate::host::ProviderHost) is the caller
-    /// this was added for: it runs once per provider per query, on the
-    /// keystroke path spec §3 holds to 10 ms, and `items().to_vec()` there
-    /// was cloning every item — several `String`s and a `Vec<Action>` each —
-    /// for no reason but that `items()` only lends.
-    pub fn into_items(self) -> Vec<Item> {
-        self.items
     }
 
     /// The items that failed a check, in the order they were rejected.
     pub fn rejections(&self) -> &[Rejection] {
         &self.rejections
+    }
+
+    /// Appends `other`'s items and rejections onto the end of this value's
+    /// own, both in order — the merge an accumulator needs to build the
+    /// whole-query value [`Pipeline::assemble`] takes out of every
+    /// provider's separately-checked answer, and the only way this crate
+    /// offers to combine two [`CheckedItems`] into one.
+    ///
+    /// Safe against the "only `check` may mint one" rule because it never
+    /// manufactures anything: both `self` and `other` already went through
+    /// [`CheckedItems::check`], independently, each against its own
+    /// producer's manifest, before either could exist to be passed here at
+    /// all. Concatenating two already-checked lists cannot make an item
+    /// checked that wasn't, and cannot un-check one that was — there is no
+    /// third state for a merge to land in. What `absorb` does not do is
+    /// re-verify anything: an accumulator that wants a newly arrived batch
+    /// checked against *its* producer's manifest still has to call
+    /// [`CheckedItems::check`] on that batch itself before absorbing the
+    /// result; this method only ever receives values that already made it
+    /// through that gate.
+    pub fn absorb(&mut self, other: CheckedItems) {
+        self.items.extend(other.items);
+        self.rejections.extend(other.rejections);
+    }
+
+    /// Keeps at most `max` of `self`'s items, dropping the rest from the
+    /// end, and leaves `self`'s rejections untouched.
+    ///
+    /// Safe for the same reason [`CheckedItems::absorb`] is: shortening an
+    /// already-checked list adds nothing, so there is nothing here that
+    /// could be unchecked. An item this drops was checked and simply not
+    /// kept — never turned into a claim nothing verified, which is the only
+    /// way this type's guarantee could actually break. Rejections are left
+    /// alone on purpose: a rejection was never a candidate for this cap in
+    /// the first place, it already recorded *why* a manifest check declined
+    /// its item, and truncating it away here would misattribute that
+    /// decision to this cap instead.
+    pub fn truncate_items(&mut self, max: usize) {
+        self.items.truncate(max);
     }
 }
 
@@ -2078,5 +2113,114 @@ mod tests {
              describes itself with"
         );
         assert_eq!(someone_elses.rejections()[0].check, FailedCheck::Provenance);
+    }
+
+    // --- Task 1 (issue #103): the accumulator's merge and cap. ---
+
+    /// Two already-checked values, each carrying one surviving item and one
+    /// rejection of its own, merge with both lists preserved in order —
+    /// `self`'s first, then `other`'s. This is the shape an accumulator
+    /// actually needs: a query's providers answer one at a time, each batch
+    /// arrives already checked against its own producer, and `absorb` is
+    /// what turns a run of those into the one whole-query value
+    /// [`Pipeline::assemble`] takes.
+    #[test]
+    fn absorb_concatenates_items_and_rejections_in_order() {
+        let mut first = CheckedItems::check(vec![output(
+            "one",
+            vec![Kind::App],
+            vec![
+                Item {
+                    provider: "one".into(),
+                    ..item(Kind::App, "app:a", "Alpha")
+                },
+                // Wrong kind for its own producer's manifest — a rejection
+                // belonging to `first`.
+                Item {
+                    provider: "one".into(),
+                    ..item(Kind::Window, "window:bad", "Bad")
+                },
+            ],
+        )]);
+        let second = CheckedItems::check(vec![output(
+            "two",
+            vec![Kind::App],
+            vec![
+                Item {
+                    provider: "two".into(),
+                    ..item(Kind::App, "app:b", "Bravo")
+                },
+                // Forged provenance — a rejection belonging to `second`.
+                Item {
+                    provider: "someone-else".into(),
+                    ..item(Kind::App, "app:forged", "Forged")
+                },
+            ],
+        )]);
+
+        first.absorb(second);
+
+        assert_eq!(
+            ids(first.items()),
+            vec!["app:a", "app:b"],
+            "both sides' surviving items land in order, self's first"
+        );
+        assert_eq!(
+            ids_of_rejections(first.rejections()),
+            vec!["window:bad", "app:forged"],
+            "and so do both sides' rejections, in the same self-then-other order"
+        );
+    }
+
+    /// Keeps the first `n` items and drops the rest — leaving rejections
+    /// alone, since a rejection was never a candidate for this cap: it
+    /// already recorded why a manifest check declined its item, and that
+    /// record has nothing to do with how many *surviving* items the caller
+    /// wants kept.
+    ///
+    /// Three rejections against a cap of two, deliberately more rejections
+    /// than the `max` this call passes: an implementation that truncated
+    /// both `Vec`s to `max` — plausible if `truncate_items` were written by
+    /// analogy to a single cap applied everywhere — would leave two
+    /// rejections here, not three, and this is the number that catches it.
+    /// One rejection surviving a truncation to two would not: it sits below
+    /// `max` either way, so a bug that also caps rejections at `max` could
+    /// hide behind it.
+    #[test]
+    fn truncate_items_keeps_the_first_n_and_leaves_rejections_alone() {
+        let mut checked = CheckedItems::check(vec![output(
+            "test",
+            vec![Kind::App, Kind::Window],
+            vec![
+                item(Kind::App, "app:a", "Alpha"),
+                item(Kind::App, "app:b", "Bravo"),
+                item(Kind::App, "app:c", "Charlie"),
+                // Calculator is not among this producer's declared kinds —
+                // three rejections, present both before and after
+                // truncation.
+                item(Kind::Calculator, "calc:bad1", "Bad 1"),
+                item(Kind::Calculator, "calc:bad2", "Bad 2"),
+                item(Kind::Calculator, "calc:bad3", "Bad 3"),
+            ],
+        )]);
+        assert_eq!(
+            checked.rejections().len(),
+            3,
+            "sanity: three rejections going in"
+        );
+
+        checked.truncate_items(2);
+
+        assert_eq!(
+            ids(checked.items()),
+            vec!["app:a", "app:b"],
+            "keeps the first n, drops the rest"
+        );
+        assert_eq!(
+            checked.rejections().len(),
+            3,
+            "truncating items must not touch rejections, even when there are \
+             more of them than the item cap"
+        );
     }
 }
