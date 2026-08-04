@@ -1466,9 +1466,10 @@ impl Provider for AppsProvider {
         ProviderManifest {
             // Must be the shared constant, never a hand-written literal —
             // see this plan's Scope section and the issue's own first
-            // comment. `crate::aliases::APPS_PROVIDER_ID`'s docs spell out
-            // the silent failure a drift here would cause: every configured
-            // app alias would stop boosting anything, with no test failing.
+            // comment. `hop_core::provider::APPS_PROVIDER_ID`'s own docs
+            // spell out the silent failure a drift here would cause: every
+            // configured app alias would stop boosting anything, with no
+            // test failing.
             id: APPS_PROVIDER_ID,
             kinds: vec![Kind::App],
             // Mode::All so this provider is asked for ordinary, unprefixed
