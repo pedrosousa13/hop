@@ -87,21 +87,33 @@ pub enum FailureKind {
 /// [`sanitize_provider_message`](crate::sanitize::sanitize_provider_message),
 /// so it is within
 /// [`MAX_PROVIDER_MESSAGE`](crate::sanitize::MAX_PROVIDER_MESSAGE) bytes and
-/// carries no control or direction-override characters. Constructing a
-/// `ProviderFailure` is the only way this type is built, and each constructor
-/// sanitizes, so there is no path that produces one carrying raw provider text.
+/// carries no control or direction-override characters.
+///
+/// # Why the fields are private
+///
+/// All four fields are private, and [`ProviderFailure::provider`],
+/// [`ProviderFailure::kind`], [`ProviderFailure::message`] and
+/// [`ProviderFailure::elapsed`] are the only way to read them back. This is
+/// [`CheckedItems`](crate::pipeline::CheckedItems)'s argument applied here
+/// rather than at assembly: "the compiler enforces it instead of a reviewer
+/// noticing." A `pub` field on a `pub` struct in a `pub mod` is writable from
+/// anywhere in this crate or its dependents, which would let any caller build
+/// `ProviderFailure { provider: "apps".into(), message: raw_text, .. }`
+/// directly — skipping [`ProviderFailure::from_error`],
+/// [`ProviderFailure::panicked`] and [`ProviderFailure::budget_miss`] and,
+/// with them, every sanitization and attribution guarantee this type claims.
+/// With the fields private, the three constructors above are the *only* way
+/// to produce a value of this type at all, so every `ProviderFailure` in
+/// existence has had its text sanitized and its `provider` taken from the
+/// caller — the host, reading its own captured manifest — never from the
+/// failing provider. That is a fact about the type's shape, not a convention
+/// its constructors happen to follow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFailure {
-    /// The [`ProviderManifest::id`](crate::provider::ProviderManifest::id) of
-    /// the provider that failed, from the captured manifest.
-    pub provider: String,
-    /// How it failed.
-    pub kind: FailureKind,
-    /// Human-readable detail, sanitized. Empty for the kinds that carry no
-    /// provider-supplied text.
-    pub message: String,
-    /// How long the host waited before this outcome was known.
-    pub elapsed: Duration,
+    provider: String,
+    kind: FailureKind,
+    message: String,
+    elapsed: Duration,
 }
 
 impl ProviderFailure {
@@ -143,6 +155,28 @@ impl ProviderFailure {
             message: "the provider exceeded its budget".to_string(),
             elapsed,
         }
+    }
+
+    /// The [`ProviderManifest::id`](crate::provider::ProviderManifest::id) of
+    /// the provider that failed, from the captured manifest.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// How it failed.
+    pub fn kind(&self) -> FailureKind {
+        self.kind
+    }
+
+    /// Human-readable detail, sanitized. Empty for the kinds that carry no
+    /// provider-supplied text.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// How long the host waited before this outcome was known.
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed
     }
 }
 
@@ -256,7 +290,9 @@ mod tests {
                 } => format!("answered {provider} {items}"),
                 ProviderEvent::Failed(failure) => format!(
                     "failed {} {:?} {}",
-                    failure.provider, failure.kind, failure.message
+                    failure.provider(),
+                    failure.kind(),
+                    failure.message()
                 ),
                 ProviderEvent::BudgetMiss { provider, .. } => format!("budget-miss {provider}"),
                 ProviderEvent::Rejected {
@@ -281,9 +317,9 @@ mod tests {
             ProviderError::Failed("apps: index corrupt".into()),
             Duration::from_millis(3),
         );
-        assert_eq!(failure.provider, "calculator");
-        assert_eq!(failure.kind, FailureKind::Failed);
-        assert_eq!(failure.message, "apps: index corrupt");
+        assert_eq!(failure.provider(), "calculator");
+        assert_eq!(failure.kind(), FailureKind::Failed);
+        assert_eq!(failure.message(), "apps: index corrupt");
     }
 
     #[test]
@@ -294,31 +330,31 @@ mod tests {
             ProviderError::Failed(raw),
             Duration::from_millis(1),
         );
-        assert_eq!(failure.message.len(), MAX_PROVIDER_MESSAGE);
-        assert!(!failure.message.contains('\u{1b}'));
+        assert_eq!(failure.message().len(), MAX_PROVIDER_MESSAGE);
+        assert!(!failure.message().contains('\u{1b}'));
     }
 
     #[test]
     fn the_kinds_that_carry_no_provider_text_have_an_empty_message() {
         for error in [ProviderError::Timeout, ProviderError::Cancelled] {
             let failure = ProviderFailure::from_error("apps", error, Duration::ZERO);
-            assert_eq!(failure.message, "");
+            assert_eq!(failure.message(), "");
         }
     }
 
     #[test]
     fn a_panic_failure_names_the_provider_and_carries_the_hosts_own_words() {
         let failure = ProviderFailure::panicked("apps", Duration::from_millis(2));
-        assert_eq!(failure.provider, "apps");
-        assert_eq!(failure.kind, FailureKind::Panicked);
-        assert_eq!(failure.message, "the provider panicked");
+        assert_eq!(failure.provider(), "apps");
+        assert_eq!(failure.kind(), FailureKind::Panicked);
+        assert_eq!(failure.message(), "the provider panicked");
     }
 
     #[test]
     fn a_budget_miss_reports_as_a_timeout_to_the_client() {
         let failure = ProviderFailure::budget_miss("slow", Duration::from_millis(50));
-        assert_eq!(failure.kind, FailureKind::Timeout);
-        assert_eq!(failure.provider, "slow");
+        assert_eq!(failure.kind(), FailureKind::Timeout);
+        assert_eq!(failure.provider(), "slow");
     }
 
     #[test]
@@ -328,11 +364,28 @@ mod tests {
         let volunteered =
             ProviderFailure::from_error("slow", ProviderError::Timeout, Duration::ZERO);
         let enforced = ProviderFailure::budget_miss("slow", Duration::ZERO);
-        assert_eq!(volunteered.kind, enforced.kind);
+        assert_eq!(volunteered.kind(), enforced.kind());
         assert_ne!(
-            volunteered.message, enforced.message,
+            volunteered.message(),
+            enforced.message(),
             "and the message is what distinguishes them for a reader"
         );
+    }
+
+    #[test]
+    fn a_providers_message_is_sanitized_as_observed_through_the_accessor() {
+        // Pins the enforcement, not just the constructor: `message()` is the
+        // only way any caller outside this module can read a
+        // `ProviderFailure`'s text at all, since the field itself is
+        // private. If the field were still `pub`, this test would pass either
+        // way and prove nothing about enforcement — reading through the
+        // accessor is what makes it exercise the one path a consumer has.
+        let raw = format!("\u{1b}[31m{}", "x".repeat(MAX_PROVIDER_MESSAGE * 2));
+        let failure =
+            ProviderFailure::from_error("apps", ProviderError::Failed(raw), Duration::ZERO);
+        let observed = failure.message();
+        assert_eq!(observed.len(), MAX_PROVIDER_MESSAGE);
+        assert!(!observed.contains('\u{1b}'));
     }
 
     #[test]
