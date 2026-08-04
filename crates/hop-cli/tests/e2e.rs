@@ -6,11 +6,15 @@
 //! binaries would.
 #![allow(clippy::unwrap_used)]
 
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use hop_protocol::Item;
+use hop_protocol::framing::{FRAME_PREFIX_LEN, decode_payload, encode_frame, payload_len};
+use hop_protocol::limits::{MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME};
+use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, Item};
 
 /// `CARGO_BIN_EXE_hopd` is not set here: Cargo only defines a
 /// `CARGO_BIN_EXE_<bin>` variable for binaries the *current* package builds,
@@ -134,5 +138,374 @@ fn the_version_subcommand_prints_both_versions() {
     assert!(
         stdout.contains("protocol 1"),
         "stdout must contain the protocol version, got: {stdout:?}"
+    );
+}
+
+/// A scripted daemon: binds the socket where `hop` will look, accepts one
+/// connection, answers the handshake, hands the accepted stream to `script`,
+/// and keeps listening so the CLI's whole exchange happens against bytes
+/// this test chose. Runs on a thread; joined via the returned handle so a
+/// panic inside the script fails the test instead of vanishing.
+fn fake_daemon(
+    runtime_dir: &Path,
+    script: impl FnOnce(&mut std::os::unix::net::UnixStream, u64) + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    let hop_dir = runtime_dir.join("hop");
+    std::fs::create_dir_all(&hop_dir).unwrap();
+    let listener = UnixListener::bind(hop_dir.join("hopd.sock")).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // Handshake: expect Hello, answer HelloAck.
+        let hello = read_client_frame(&mut stream);
+        assert!(matches!(hello, ClientMsg::Hello { .. }));
+        write_daemon_frame(
+            &mut stream,
+            &DaemonMsg::HelloAck {
+                api_version: API_VERSION,
+            },
+        );
+        // Expect the query; its id is what the script frames must reference.
+        let ClientMsg::Query { id, .. } = read_client_frame(&mut stream) else {
+            panic!("expected the query frame after the handshake");
+        };
+        script(&mut stream, id);
+    })
+}
+
+fn read_client_frame(stream: &mut std::os::unix::net::UnixStream) -> ClientMsg {
+    let mut prefix = [0u8; FRAME_PREFIX_LEN];
+    stream.read_exact(&mut prefix).unwrap();
+    let len = payload_len(prefix).unwrap();
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).unwrap();
+    decode_payload(&payload).unwrap()
+}
+
+fn write_daemon_frame(stream: &mut std::os::unix::net::UnixStream, msg: &DaemonMsg) {
+    stream.write_all(&encode_frame(msg).unwrap()).unwrap();
+}
+
+fn tiny_item(n: usize, title: &str) -> Item {
+    use hop_protocol::{Action, ActionId, ActionKind, ItemId, Kind};
+    Item {
+        id: ItemId::new(format!("test:{n}")).unwrap(),
+        kind: Kind::Action,
+        title: title.to_string(),
+        subtitle: None,
+        icon: None,
+        actions: vec![Action {
+            id: ActionId::new("open").unwrap(),
+            kind: ActionKind::Open,
+            label: "Open".to_string(),
+        }],
+        default_action: ActionId::new("open").unwrap(),
+        copy_text: None,
+        append_to_end: false,
+        provider: "test".to_string(),
+    }
+}
+
+#[test]
+fn the_cli_drops_frames_whose_query_id_is_not_current() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        // A stale frame (wrong id) before, between, and after the real ones:
+        // none of the "stale" titles may reach stdout.
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id + 1,
+                partial: true,
+                items: vec![tiny_item(1, "stale before")],
+            },
+        );
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(2, "current one")],
+            },
+        );
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id + 1,
+                partial: true,
+                items: vec![tiny_item(3, "stale between")],
+            },
+        );
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(4, "current two")],
+            },
+        );
+        write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id + 1 }); // stale done: must NOT end the query
+        // Proof that the stale `QueryDone` above did not end the exchange:
+        // this frame is sent *after* it, naming the real query id. A loop
+        // that (incorrectly) ends on any `QueryDone` regardless of id would
+        // never read this frame, so "current three" would be missing from
+        // stdout — that is the failure this frame exists to catch.
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(5, "current three")],
+            },
+        );
+        write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("query")
+        .arg("q")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("current one")
+            && stdout.contains("current two")
+            && stdout.contains("current three")
+    );
+    assert!(
+        !stdout.contains("stale"),
+        "a stale frame's items must never be rendered, got: {stdout}"
+    );
+    // Assembled output: the three current items, in delivery order. This
+    // also proves "current three" (sent after the stale `QueryDone`) made
+    // it into stdout, so the exchange survived that stale done.
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3);
+    let one = stdout.find("current one").expect("current one must print");
+    let two = stdout.find("current two").expect("current two must print");
+    let three = stdout
+        .find("current three")
+        .expect("current three must print");
+    assert!(
+        one < two && two < three,
+        "items must print in delivery order, got: {stdout}"
+    );
+}
+
+#[test]
+fn the_cli_drops_an_error_frame_scoped_to_another_query() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        // An error naming a query this process is not waiting on. Per
+        // `DaemonMsg::Error`'s contract a `Some(id)` error is terminal for
+        // that exchange alone, so this must be dropped exactly like a stale
+        // `results` frame — not treated as fatal. The frames after it prove
+        // the exchange survived.
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Error {
+                query_id: Some(id + 1),
+                error: hop_protocol::ProtoError {
+                    code: hop_protocol::ErrorCode::UnknownItem,
+                    message: "stale query's problem, not this one's".to_string(),
+                },
+            },
+        );
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(1, "survived the stale error")],
+            },
+        );
+        write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("query")
+        .arg("q")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "an error scoped to another query must not kill this one, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("survived the stale error"),
+        "the current query's item must still print, got: {stdout}"
+    );
+}
+
+#[test]
+fn the_cli_fails_on_an_error_frame_scoped_to_its_own_query() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        // The other half of the contract: an error naming *this* exchange is
+        // terminal for it, and no `QueryDone` follows. Sent after a results
+        // frame, so this also pins that nothing already assembled is printed
+        // for an exchange that ended badly.
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(1, "assembled but never shown")],
+            },
+        );
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Error {
+                query_id: Some(id),
+                error: hop_protocol::ProtoError {
+                    code: hop_protocol::ErrorCode::ProviderFailed,
+                    message: "this exchange is over".to_string(),
+                },
+            },
+        );
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("query")
+        .arg("q")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an error naming this query must end it as a failure"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("this exchange is over"),
+        "the daemon's message must reach stderr, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "nothing may be printed for an exchange that ended in an error"
+    );
+}
+
+#[test]
+fn the_cli_refuses_a_daemon_that_streams_past_the_per_query_cap() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        // One item over the cap, delivered as six frames — each frame is
+        // individually in-bounds; only the exchange total is not.
+        let full: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME)
+            .map(|n| tiny_item(n, "x"))
+            .collect();
+        for _ in 0..5 {
+            write_daemon_frame(
+                stream,
+                &DaemonMsg::Results {
+                    query_id: id,
+                    partial: true,
+                    items: full.clone(),
+                },
+            );
+        }
+        // Last frame pushes the exchange total one past the cap. The CLI is
+        // expected to have already bailed by the time this write happens, so
+        // it must tolerate a broken pipe rather than unwrap — unlike every
+        // other write in this file, this one does not use the panicking
+        // helper.
+        let frame = encode_frame(&DaemonMsg::Results {
+            query_id: id,
+            partial: true,
+            items: vec![tiny_item(9, "the straw")],
+        })
+        .unwrap();
+        let _ = stream.write_all(&frame);
+        // No QueryDone: the CLI must have bailed already; writing more would
+        // hit a closed pipe.
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("query")
+        .arg("q")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    let _ = daemon.join();
+
+    assert!(
+        !output.status.success(),
+        "an over-cap stream must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&MAX_ITEMS_PER_QUERY.to_string()),
+        "the refusal must name the cap, got: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "nothing may be printed for a query that was refused mid-assembly"
+    );
+}
+
+#[test]
+fn the_cli_accepts_a_stream_that_lands_exactly_on_the_per_query_cap() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        // Five frames of MAX_ITEMS_PER_RESULTS_FRAME items land the running
+        // total at exactly MAX_ITEMS_PER_QUERY — precisely what hopd itself
+        // sends when it caps a query (see hop_protocol::limits' docs). This
+        // must be accepted and printed whole, not refused: the brief is
+        // explicit that only *exceeding* the cap is a protocol violation.
+        // This is the positive-path counterpart to the over-cap test above:
+        // together they pin the `>` boundary in `try_run_query` against a
+        // regression to an overly strict `>=`, which would wrongly refuse
+        // this legitimate, exactly-at-cap stream.
+        let full: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME)
+            .map(|n| tiny_item(n, "x"))
+            .collect();
+        for _ in 0..(MAX_ITEMS_PER_QUERY / MAX_ITEMS_PER_RESULTS_FRAME) {
+            write_daemon_frame(
+                stream,
+                &DaemonMsg::Results {
+                    query_id: id,
+                    partial: true,
+                    items: full.clone(),
+                },
+            );
+        }
+        write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("query")
+        .arg("q")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "an exactly-at-cap stream must be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        MAX_ITEMS_PER_QUERY,
+        "expected exactly {MAX_ITEMS_PER_QUERY} lines, got {}",
+        lines.len()
     );
 }

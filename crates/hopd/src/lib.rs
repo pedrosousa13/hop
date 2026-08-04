@@ -1,15 +1,25 @@
 //! hopd — the hop launcher daemon.
 //!
-//! This crate is today's walking skeleton for issue #54: a real Unix socket
-//! inside a 0700 runtime directory, a mandatory version handshake ahead of
-//! anything else, and a single hardcoded item answering every query. What it
-//! is not yet: a query router (`hop-core` exists and is unused here), a
-//! provider host, or anything with a lifecycle beyond "runs until killed".
-//! Each of those gaps is named where it applies, in [`runtime_dir`] and
-//! [`server`].
+//! A real Unix socket inside a 0700 runtime directory, a mandatory version
+//! handshake ahead of anything else, and the query lifecycle behind it: every
+//! frame of an exchange carries its query id, results stream back as partial
+//! `results` frames terminated by `query_done`, a new query cancels the one
+//! it supersedes server-side, an explicit `cancel` does the same and is
+//! acknowledged, and what one query id delivers is retained under a hard cap
+//! so a chatty client cannot grow this process without bound. All of that
+//! lives in the crate-private `connection` module, one driver per accepted
+//! connection; the seam it pulls items through is [`source`].
+//!
+//! What it is not yet: a query router (`hop-core` exists and is unused here),
+//! a provider host — every query is still answered by the one hardcoded item
+//! [`source`] documents, until issue #56 lands real providers — or anything
+//! with a lifecycle beyond "runs until killed". Each of those gaps is named
+//! where it applies, in [`runtime_dir`], [`server`] and [`source`].
 
+pub(crate) mod connection;
 pub mod runtime_dir;
 pub mod server;
+pub mod source;
 
 use std::process::ExitCode;
 
@@ -40,8 +50,8 @@ use std::process::ExitCode;
 /// no exit beyond an unrecoverable startup error, so under normal operation
 /// this function does not return at all. Signal handling and any orderly
 /// shutdown belong to issue #62 (socket activation and lifecycle) — this
-/// walking skeleton's only contribution to "restart works" is the
-/// stale-socket removal [`server::serve`] documents in place.
+/// daemon's only contribution to "restart works" is the stale-socket
+/// removal [`server::serve`] documents in place.
 pub fn run() -> ExitCode {
     let runtime_dir = match runtime_dir::resolve() {
         Ok(dir) => dir,

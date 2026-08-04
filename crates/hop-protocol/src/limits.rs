@@ -193,9 +193,62 @@ pub const MAX_ACTIONS_PER_ITEM: usize = 32;
 ///
 /// It bounds one frame, not a query: a daemon may legitimately stream several
 /// partial `results` frames for the same query, so this is not a bound on the
-/// total a client accumulates. See this module's docs for what it multiplies out
-/// to against the per-item bounds.
+/// total a client accumulates. See also [`MAX_ITEMS_PER_QUERY`], which is that
+/// total, and this module's docs for what this one multiplies out to against
+/// the per-item bounds.
 pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
+
+/// Maximum total items one query id may deliver, summed across every
+/// `results` frame of the exchange.
+///
+/// [`MAX_ITEMS_PER_RESULTS_FRAME`] bounds one frame; nothing bounds how many
+/// partial frames a daemon sends for the same `query_id`, so without this
+/// cap a merely chatty client drives unbounded retained state in the daemon
+/// — the daemon keeps what it delivered per query id so `execute` can
+/// resolve against it (issue #59, and the threat model's #25 decision,
+/// which holds only while that state is bounded).
+///
+/// Unlike its neighbours this bound is not enforced at the parse: no single
+/// frame breaks it. Transports enforce it at accumulation — the daemon caps
+/// what it retains and delivers (truncating the crossing batch and ending
+/// the query; never evicting, because a delivered item must stay
+/// resolvable), and a client caps what it assembles (refusing a daemon that
+/// streams past it). That is the same posture [`MAX_FRAME_BYTES`] takes:
+/// declared here, applied by the transport.
+///
+/// The two sides carry different names in `CONTEXT.md`'s terms, and the
+/// difference is which of them says so: the daemon's half is a truncation,
+/// since a capped exchange ends with the frame a completed one ends with and
+/// nothing names the remainder, while the client's half is a refusal, since
+/// it produces no list at all and names this constant when it declines.
+///
+/// 5 000 is five maximal frames. Honest traffic is two orders of magnitude
+/// smaller — a launcher renders tens of items — so this is a memory guard,
+/// not a display guard: at the composed per-item worst case (84 160 bytes,
+/// see the module docs) it holds retained state per connection under
+/// ~421 MB hostile-shaped, ~1 MB honest-shaped — assuming the items being
+/// counted respect the per-item bounds, which is a narrower assumption than
+/// it sounds.
+///
+/// # Why those byte figures are conditional
+///
+/// This constant bounds a **count**. The byte figures above are that count
+/// multiplied by bounds this module applies *at the parse*
+/// (`#[serde(deserialize_with = …)]`), so they hold for every item that
+/// arrived over a socket and for no item that did not. [`Item`](crate::item::Item)'s
+/// fields are public `String`s and `Vec`s, and an item a daemon builds
+/// in-process — or takes from a result source in-process — has passed no
+/// check at all: 5 000 items with a 100 MB title each are 5 000 items, and
+/// this cap admits them. The only backstop below that is [`MAX_FRAME_BYTES`]
+/// at encode time, which refuses the frame as an error rather than reporting
+/// an over-sized item.
+///
+/// The obligation is therefore on whatever produces items in-process, and it
+/// is documented where such a thing is written — `hopd`'s `ResultSource`
+/// seam. Enforcing it rather than documenting it belongs to the provider host
+/// (issue #56), which is the first code that will accept items from outside
+/// this process without parsing them.
+pub const MAX_ITEMS_PER_QUERY: usize = 5_000;
 
 /// Maximum bytes of one frame's JSON payload, exclusive of the 4-byte length
 /// prefix [`framing`](crate::framing) puts in front of it.
@@ -1092,5 +1145,15 @@ mod tests {
             "items": vec![item_json(); MAX_ITEMS_PER_RESULTS_FRAME + 1],
         });
         assert!(serde_json::from_str::<DaemonMsg>(&frame.to_string()).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_per_query_cap_admits_at_least_one_full_frame() {
+        // A cap below one frame's bound would make a single maximal `results`
+        // frame unrepresentable: the daemon could accept the frame's items and
+        // immediately have to truncate them. The relation, not either number,
+        // is the invariant.
+        assert!(MAX_ITEMS_PER_QUERY >= MAX_ITEMS_PER_RESULTS_FRAME);
     }
 }

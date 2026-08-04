@@ -430,7 +430,7 @@ exists yet.
 | --- | --- | --- | --- | --- |
 | T1 | Allocation driven by a peer-supplied length prefix | Framing | No codec exists | Cap checked before allocation, from a `hop-protocol` constant (#21, #54) |
 | T2 | Memory amplification below the cap, via tagged-enum buffering | Any frame | Bounds apply post-buffer (`limits.rs`:27–39) | Frame cap sized against the 84 MB figure in `limits.rs`:41–72 |
-| T3 | **Unbounded retained item set.** Decision 1 has the daemon retain what it delivered per query id, accumulating across frames; `MAX_ITEMS_PER_RESULTS_FRAME` bounds one frame, and `wire.rs`:74–77 permits several partial frames per query, so the retained total has no ceiling. Reachable by a **well-behaved** client, not only a hostile one | `results`, and Decision 1's registry | Nothing — the registry does not exist yet, and the protocol supplies no total | A documented per-query total cap on retained items. [#85](https://github.com/pedrosousa13/hop/issues/85) is the standalone record of this gap and is **open**; #55 (the state) and #59 (the binding that retains it) carry it as acceptance criteria, amended 2026-08-03 |
+| T3 | **Unbounded retained item set.** Decision 1 has the daemon retain what it delivered per query id, accumulating across frames; `MAX_ITEMS_PER_RESULTS_FRAME` bounds one frame, and the protocol permits several partial frames per query, so absent a total the retained set would have no ceiling. Reachable by a **well-behaved** client, not only a hostile one | `results`, and Decision 1's registry | **Bounded, by item count, since #55.** The protocol supplies the total — `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — and `hopd` enforces it per connection in its connection driver (`connection.rs`, `forward_batch` / `take_within_cap`): at the cap it truncates the batch that crossed, delivers what fit, sends `QueryDone` and drops the source. Truncation of the undelivered remainder, never eviction of what was delivered — the two are named differently on purpose, because only one of them is visible to the client (see Decision 1's overflow paragraph). What is **not** bounded is bytes — see "count or bytes" under Decision 1 below | A documented per-query total cap on retained items. [#85](https://github.com/pedrosousa13/hop/issues/85) is the standalone record of this gap; #55 (the state) and #59 (the binding that retains it) carry it as acceptance criteria, amended 2026-08-03. #55 has landed the cap; #59 still has to resolve `execute` against the capped set, and to make an item lost to the cap distinguishable from one the daemon never emitted — which the terminal `QueryDone` does not do today |
 | T4 | A frame acted on before the handshake | `execute`, `query` | Nothing in the types requires ordering (#26) | Connection loop refuses pre-handshake frames (#54) |
 | T5 | `execute` naming an item the daemon never delivered | `execute` | Length bounds only | Decision 1, implemented by #59 |
 | T6 | `execute` naming an action the item does not carry | `execute` | Nothing ties `action_id` to `Item.actions` | Decision 1's second half — see below |
@@ -440,7 +440,7 @@ exists yet.
 | T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the `version` is refused on mismatch and a future-dated timestamp clamped (#38, closed by `59fd5fe`); the version probe and the per-condition `LoadReport` are #43's (closed by `056893e`, which replaced #38's two per-branch checks); a persisted `count` is saturated at the boundary (#44, closed by `edb8258`). **Two residuals, one owner**: still no integrity check, so a plausible forged store passes all of it — and eviction still prefers a clamped future-dated entry, which `96d5713` left open and `59fd5fe` explicitly did not close (#88, open) | #88's integrity check, which is what lets a forged entry be *refused* rather than clamped, sequenced with #72 and with Decision 2 on the same load path |
 | T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:694–708) | Decision 2 |
 | T12 | Cross-provider boost theft | Provider seam | `CheckedItems::check` closes provenance forgery; the store keys on a bare id (#72) | A provider dimension in the store key |
-| T13 | Connection flood / socket occupancy | Accept loop | Unmodelled — no accept loop | Belongs to #54/#55; this document does not settle it |
+| T13 | Connection flood / socket occupancy | Accept loop | An accept loop exists (#54) and spawns one unbounded task per peer (`server.rs`, `serve_with`); nothing caps concurrent connections, aggregate memory across them, or the accept rate, and `read_frame` has no read timeout, so a peer that sends a valid length prefix and then stalls holds a task and its payload buffer open indefinitely (`connection.rs` says so in place) | Belongs to [#98](https://github.com/pedrosousa13/hop/issues/98); this document does not settle it. #54 and #55 have both landed and neither took it: #55 bounded per-*query* retained state (T3) and deliberately left every connection-level bound to #98 |
 | T14 | A provider opts in to plaintext persistence for ids that carry user content | Manifest, under Decision 2's consequence | The opt-in field does not exist yet (`provider.rs`:62–78). `CheckedItems::check` verifies an item's kind and provider id, and inspects nothing about what the id *contains* | Documentation a provider author reads before setting the field, and the extension store's PR review (spec §6) as the gate. No code check can verify the claim |
 
 ---
@@ -505,10 +505,12 @@ The daemon retains the items it has delivered for a query id, and refuses any
   already required for server-side cancellation and stale-frame drop (spec §3;
   [#55](https://github.com/pedrosousa13/hop/issues/55)). The binding is a use
   of that state rather than a second mechanism beside it. **That argument holds
-  only while the state is bounded**, and today nothing bounds it — see T3 and
-  the cap requirement below. An unbounded registry is not "state the daemon
-  needs anyway"; it is new state with a new failure mode, and the reasoning for
-  this decision would not survive leaving it uncapped.
+  only while the state is bounded**, and #55 is what bounds it:
+  `MAX_ITEMS_PER_QUERY` = 5 000 items per query id, per connection, enforced by
+  truncating the undelivered remainder rather than evicting delivered ones —
+  see T3 and the settled answers below. An unbounded registry would not be "state the daemon
+  needs anyway"; it would be new state with a new failure mode, and the
+  reasoning for this decision would not survive leaving it uncapped.
 - **It puts no obligation on a future plugin ABI.** The host resolves the ids
   before dispatch, so `Provider::execute`'s existing prose contract
   (`provider.rs`:257–258, on `Provider::execute` — "both of which this provider
@@ -550,37 +552,74 @@ whoever revisits this: a token is easier to add later than to remove later. If
 execution ever crosses a process or plugin boundary, this is the decision to
 reopen first.
 
-### What the implementing slice must still settle
+### What the implementing slice settled — and what #59 still owns
 
-Not decided here, and #59 cannot skip them:
+The three questions this section posed were left to the slice that built the
+retained set. [#55](https://github.com/pedrosousa13/hop/issues/55) has landed
+and answered all three; the answers are recorded here because they are what
+#59 inherits, and a reader auditing #59 against this document should not have
+to reconstruct them from `connection.rs`.
 
-- **When the retained set is dropped.** Enter arrives *after* `query_done`, so
-  the set cannot be released at `query_done`. Some supersede-or-expire rule is
-  required, and choosing it is choosing how long a stale id stays live.
-- **A per-query total cap on retained items — required, not optional.**
-  `MAX_ITEMS_PER_RESULTS_FRAME` = 1 000 bounds one frame, not a query:
-  `wire.rs`:74–77 states that a daemon may send several partial `results`
-  frames for the same `query_id`, and nothing in the protocol ceilings what
-  they sum to. A retained set therefore grows with the number of frames the
-  daemon sends, and **a well-behaved client driving an ordinary query can
-  reach unbounded retained state** — no hostile peer is needed, which is what
-  distinguishes this from most of the threats above.
-  [#85](https://github.com/pedrosousa13/hop/issues/85) is the issue that owns
-  this cap and it is **open**: it was recorded during this document's drafting
-  and filed so the requirement is not lost when the document lands. #55 owns
-  the per-query state and #59 owns the binding that retains it, and both were
-  amended on 2026-08-03 to carry the cap as acceptance criteria — but #85 is
-  the standalone record, and a reader checking only #55 or #59 sees a slice
-  rather than the gap. The cap should be a documented constant rather than a
-  by-product of whatever `max_results` a caller happens to pass, and #85 also
-  poses the questions the number depends on: item count or total bytes or
-  both, and whether overflow is a refusal or a **rejection** in `CONTEXT.md`'s
-  sense rather than a silent truncation. See T3.
-- **Whether retention is scoped per connection or per daemon.** Query ids are
-  chosen by the client (`ClientMsg::Query.id`), so they are not unique across
-  connections and are trivially guessable. Per-connection scoping makes that a
-  non-issue; a shared registry would need something else to keep one
-  connection's ids out of another's reach.
+- **When the retained set is dropped: replaced whole by the next `Query`, and
+  not before.** Enter arrives *after* `query_done`, so the set cannot be
+  released there — and it is not. `hopd` holds it across the exchange's
+  terminal frame and across a `Cancel`, on the rule that an item the daemon
+  has already shown must stay resolvable until the client visibly moves on.
+  The only things that release it are a new `Query` on the same connection,
+  which replaces it whole, and the connection closing, which drops it with
+  everything else. So the retained set is exactly the most recent query id's,
+  it is at most one per connection, and a stale id stays live precisely as
+  long as the client leaves it as the latest one.
+  A consequence worth stating: this makes reusing a query id on a connection
+  a client-side hazard rather than a daemon-side one — the second `Query`
+  replaces the first round's retained items while the client still holds them
+  under the same label. `ClientMsg::Query`'s doc states the uniqueness rule
+  and what the daemon does when it is broken.
+- **Item count or total bytes: count only.** The cap is
+  `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000, a documented constant
+  rather than a by-product of whatever `max_results` a caller happens to
+  pass. **Bytes were deliberately not capped**, for a reason that is also its
+  limitation: a count composes with this crate's per-item field bounds into a
+  byte figure without a second constant (84 160 bytes per item worst case ×
+  5 000 ≈ 421 MB, ~1 MB honest-shaped), and a second byte-denominated
+  constant would have to be justified against the same arithmetic while
+  bounding nothing the count does not already bound. That composition holds
+  **only for items whose per-item bounds were actually applied**, and those
+  bounds are applied at the *parse* — so they hold for every item that arrived
+  over a socket and for no item a daemon constructs in-process. Today that is
+  moot: `hopd`'s one source returns a fixed tiny item. It stops being moot at
+  the provider host ([#56](https://github.com/pedrosousa13/hop/issues/56)),
+  which is the first code to take items from outside the process without
+  parsing them. `hopd`'s `ResultSource` trait records the obligation on a
+  source; enforcing it is #56's, and until it does, the byte figure above is
+  an argument about the wire and not a bound on the daemon's memory.
+- **Per connection or per daemon: per connection.** The retained set lives in
+  the connection driver's own state (`connection.rs`, `Exchange`), and there
+  is no cross-connection registry for a query id to reach into. Client-chosen
+  ids being guessable and non-unique across connections is therefore a
+  non-issue by construction rather than by a check.
+
+**Overflow behaviour, and the half of #85's question that is not settled.**
+At the cap the daemon truncates the source batch that crossed the line,
+delivers what fit, sends `QueryDone`, and drops the source — **truncate-and-terminate**,
+in `CONTEXT.md`'s terms. Nothing already delivered is evicted, and nothing that
+was not delivered is retained — the delivered set and what the client holds
+stay in agreement, which is the property Decision 1 needs. The undelivered
+remainder is a **truncation** and not a refusal, because nothing on the wire
+names it; the client half of the same cap *is* a **refusal** in `CONTEXT.md`'s
+sense, because it names the cap it declined on: `hop-cli` errors out and prints
+nothing when a daemon streams past it.
+
+What the daemon does **not** do is tell the client any of that happened. A
+capped exchange and a completed one both terminate with the same
+`QueryDone { query_id }`, and no field on any frame says items were dropped.
+#85 asks for overflow to be a refusal or a rejection rather than a silent
+truncation, and on the daemon's side it is still the silent one: what was
+dropped is invisible to the peer it was dropped on behalf of. Changing that
+needs a wire signal that does not exist today, so **this half is not settled
+by #55** — it stays with #59, which the follow-up table already charges with
+"an item lost to that cap distinguishable from one the daemon never emitted".
+See T3.
 
 ---
 
@@ -819,7 +858,10 @@ Two facts about that worth carrying into the implementing slice:
   concerns that the M2 sweep covers.
 - **Network providers.** None exist. A10 (SSRF) was recorded not-applicable by
   the M1 sweep for that reason and re-runs at M5 against real providers.
-- **Connection-level denial of service.** No accept loop exists to model.
+- **Connection-level denial of service.** An accept loop exists now (#54), but
+  connection count, aggregate memory across connections, accept rate and read
+  timeouts are [#98](https://github.com/pedrosousa13/hop/issues/98)'s and are
+  modelled there, not here — T13 records the exposure and names the owner.
 - **A root-equivalent adversary**, and anything reachable by inheriting an open
   descriptor from the user's own processes.
 
@@ -830,9 +872,9 @@ What has to be true for this model to describe reality rather than intent:
 | Slice or issue | What it must establish |
 | --- | --- |
 | [#54](https://github.com/pedrosousa13/hop/issues/54) | Socket and directory created with a decided mode; frame cap from a `hop-protocol` constant, checked before allocation (#21); handshake-first ordering enforced (#26) |
-| [#55](https://github.com/pedrosousa13/hop/issues/55) | Per-query state, cancellation, stale-frame drop — and the retained item set Decision 1 rides on, with its lifetime and **a documented per-query total cap on retained items** (T3, and [#85](https://github.com/pedrosousa13/hop/issues/85), which owns the cap and is open). Without the cap, Decision 1's "rides on state the daemon needs anyway" reasoning does not hold |
+| [#55](https://github.com/pedrosousa13/hop/issues/55) | **Landed.** Per-query state, server-side cancellation and client-side stale-frame drop, and the retained item set Decision 1 rides on: one set per connection, holding the most recent query id's delivered items, replaced whole by the next `Query` and released when the connection closes. Capped by `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — by item **count**, not bytes — enforced by truncating the undelivered remainder, never by evicting delivered ones (T3, and [#85](https://github.com/pedrosousa13/hop/issues/85), which owns the cap). Decision 1's "rides on state the daemon needs anyway" reasoning therefore holds. Two things #55 deliberately did **not** take: bytes, which rest on per-item bounds nothing enforces on the daemon's production path until #56, and connection-level bounds, which are #98's (T13) |
 | [#59](https://github.com/pedrosousa13/hop/issues/59) | Decision 1's binding, including the action check, refusing with the existing error codes — and enforcing the retained-set cap #55 sets, with an item lost to that cap distinguishable from one the daemon never emitted (#85) |
-| [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation |
+| [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation. #55 answered the first two — 5 000, item count only, reasoning in `hop_protocol::limits` — and left the third half-answered: the daemon truncates the undelivered remainder rather than evicting what it delivered, but says nothing on the wire that lets a client tell a capped exchange from a completed one, so its half is still a truncation and not a refusal. See Decision 1's settled answers |
 | [#60](https://github.com/pedrosousa13/hop/issues/60) | A real state directory, which is where `learning.json`'s path stops being hypothetical |
 | [#62](https://github.com/pedrosousa13/hop/issues/62) | Socket activation, which moves socket creation into a unit file |
 | [#39](https://github.com/pedrosousa13/hop/issues/39) | Decision 2's rule, sequenced with #72 and #88 on the load path #37, #38, #43 and #44 have already changed — plus the `ProviderManifest` opt-in field the recents consequence needs, which does not exist today (`provider.rs`:62–78) and changes the plugin seam. The field's **default is an open question**, not something this model settles |

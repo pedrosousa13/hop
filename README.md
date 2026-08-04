@@ -2,11 +2,12 @@
 
 The GNOME-native, trustworthy-plugins launcher that works everywhere.
 
-Pre-alpha. This repository currently contains M2's walking skeleton: a `hopd`
-daemon that serves one hardcoded item over `$XDG_RUNTIME_DIR/hop/hopd.sock`,
-and a `hop` CLI that speaks to it (`hop query`, `hop version`). Real
-providers, a query router wired into the daemon, and a UI are later M2
-slices.
+Pre-alpha. This repository currently contains M2's daemon through the query
+lifecycle: a `hopd` daemon that serves streamed, cancellable queries over
+`$XDG_RUNTIME_DIR/hop/hopd.sock` (results still come from a placeholder
+source until the provider host lands), and a `hop` CLI that speaks to it
+(`hop query`, `hop version`). Real providers, a query router wired into the
+daemon, and a UI are later M2 slices.
 
 ## Design
 
@@ -25,9 +26,11 @@ The full design is at
 
 `hop-protocol` carries the item/action model and the client/daemon IPC
 message frames. `hop-core` carries all six pieces listed above, but `hopd`
-does not yet call into it — the walking skeleton answers every query with the
-same hardcoded item, regardless of what was typed. `hop-cli` is the only
-binary that talks to `hopd` today; a UI comes later.
+does not yet call into it: `hopd` streams query results with server-side
+cancellation and a bounded per-query retained set, but its one source is
+still the skeleton's placeholder item — the provider host is a later M2
+slice. `hop-cli` is the only binary that talks to `hopd` today; a UI comes
+later.
 
 ## Build and test
 
