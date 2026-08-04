@@ -1,7 +1,7 @@
 # Hop Launcher v1 — Design Spec
 
 Date: 2026-07-30
-Status: Approved; amended 2026-07-31, 2026-08-03
+Status: Approved; amended 2026-07-31, 2026-08-03, 2026-08-04
 Decisions by: Pedro Sousa
 
 **Amendment, 2026-07-31.** Amended after a grilling session over the milestone
@@ -16,6 +16,14 @@ change is marked **[Amended 2026-07-31]** in place.
 **Amendment, 2026-08-03.** Amended when issue #35 landed the supply-chain gate
 CI never had. One section changed: §11 (the CI list now names `cargo deny`).
 The change is marked **[Amended 2026-08-03]** in place.
+
+**Amendment, 2026-08-04.** Amended when issue #56 landed the provider host
+and, with it, the breaking change §6's 2026-07-31 amendment sanctioned by
+name but had not yet made. Two sections changed: §5 (the trait block now
+shows the `Send + Sync + 'static`, `Arc`-argument signature #56 actually
+landed, in place of the borrowed signature it replaced) and §6 (the
+amendment note now says #29 is closed by #56, and that #21 landed earlier,
+with #54). Each change is marked **[Amended 2026-08-04]** in place.
 
 ## 1. What this is
 
@@ -106,13 +114,21 @@ Three processes at runtime, all salvage-validated as the right shape:
 
 ## 5. Providers (v1)
 
-All implement one trait in hop-core:
+All implement one trait in hop-core. **[Amended 2026-08-04]** The signature
+below is the one issue #56 actually landed, replacing the borrowed shape this
+section showed before: `Send + Sync + 'static` on the trait itself, and
+owned/`Arc` arguments so `query` and `execute` return a `'static` future —
+which is what makes it `tokio::spawn`-able and therefore panic-isolatable, the
+gap §6's amendment note below names. See
+`crates/hop-core/src/provider.rs` for the full rationale.
 
 ```rust
-trait Provider {
+trait Provider: Send + Sync + 'static {
     fn manifest(&self) -> ProviderManifest;   // id, kinds, prefixes, regex/min-length pre-filters, budget
-    async fn query(&self, q: &RoutedQuery, ctx: &QueryCtx) -> Result<Vec<Item>>;  // ctx carries deadline + cancellation
-    async fn execute(&self, item_id: &ItemId, action_id: &ActionId) -> Result<ExecOutcome>;
+    fn query(self: Arc<Self>, q: Arc<RoutedQuery>, ctx: QueryCtx)
+        -> impl Future<Output = Result<Vec<Item>, ProviderError>> + Send + 'static;  // ctx carries deadline + cancellation
+    fn execute(self: Arc<Self>, item_id: ItemId, action_id: ActionId)
+        -> impl Future<Output = Result<ExecOutcome, ProviderError>> + Send + 'static;
     // optional: fn on_event(&self, ev: SystemEvent)  // index maintenance
 }
 ```
@@ -133,7 +149,7 @@ trait Provider {
 
 The `Provider` trait + `hop-protocol` frames **are** the plugin seam. Locked in v1's protocol so retrofit is never needed (the four rules every predecessor got wrong):
 
-> **[Amended 2026-07-31] What "locked" means, and when it starts.** The lock exists so that *third-party* plugin authors never face a retrofit. No external consumer exists until v2's Tier 1 extensions ship, so the seam stays **open to change throughout v1 development** — and M2 is precisely when the daemon discovers what the trait actually needs. The M1 sweep found two gaps that can only be closed by changing these types: the protocol has no frame-size cap (#21), and `Provider::query`'s borrowed arguments make the returned future non-`'static`, so it cannot be `tokio::spawn`ed — which is the very panic isolation the trait's own doc comment reaches for (#29). Both are ordinary M2 work. The lock takes effect when the extension store ships, not now.
+> **[Amended 2026-07-31] What "locked" means, and when it starts.** The lock exists so that *third-party* plugin authors never face a retrofit. No external consumer exists until v2's Tier 1 extensions ship, so the seam stays **open to change throughout v1 development** — and M2 is precisely when the daemon discovers what the trait actually needs. The M1 sweep found two gaps that can only be closed by changing these types: the protocol has no frame-size cap (#21), and `Provider::query`'s borrowed arguments make the returned future non-`'static`, so it cannot be `tokio::spawn`ed — which is the very panic isolation the trait's own doc comment reaches for (#29). Both are ordinary M2 work. The lock takes effect when the extension store ships, not now. **[Amended 2026-08-04]** Both gaps this paragraph named are now shut: #21 landed earlier, with #54's frame-size cap, and #29 is closed by #56's `Arc`-based signature shown in §5 above.
 
 1. Host owns fuzzy filtering by default; plugins opt into raw keystrokes via throttle.
 2. Declarative manifest pre-filters (keyword, regex, min-length) — most keystrokes never reach most plugins.
