@@ -838,6 +838,12 @@ pub struct AppIndex {
 }
 
 impl AppIndex {
+    /// Wraps an already-scanned entry list in the lock `query` and `replace`
+    /// share. Takes the `Vec` directly rather than the roots it came from —
+    /// see the module's "no disk read on the query path" contract above —
+    /// so the caller decides when [`scan_apps`] runs (at startup, and again
+    /// on every filesystem event) rather than this constructor ever doing
+    /// disk I/O itself.
     pub fn new(entries: Vec<AppEntry>) -> Self {
         AppIndex {
             entries: RwLock::new(entries),
@@ -1032,7 +1038,15 @@ pub trait WindowSource: Send + Sync + 'static {
     /// `global.display.get_tab_list()` — for the fallback heuristic used
     /// only when `windows_for_app` came back empty.
     fn all_windows(&self) -> Vec<WindowHandle>;
+    /// Restores a minimized window so it can be activated — ported from
+    /// `appLaunch.js`'s `window.unminimize()`. [`focus_or_launch`] calls
+    /// this before `activate` when `window.minimized` is set; a compositor
+    /// backend that skipped it would leave the window restored-but-hidden
+    /// behind whatever activation alone does on that desktop.
     fn unminimize(&self, window: &WindowHandle);
+    /// Raises and focuses `window` — ported from `appLaunch.js`'s
+    /// `window.activate()`, the terminal step of the "existing window
+    /// found" branch of [`focus_or_launch`].
     fn activate(&self, window: &WindowHandle);
 }
 
@@ -1055,6 +1069,11 @@ impl WindowSource for EmptyWindowSource {
 
 /// Starts a new process for a desktop entry's `Exec=` command.
 pub trait Launcher: Send + Sync + 'static {
+    /// Spawns `exec` (already split from the desktop entry's `Exec=` line,
+    /// field codes stripped) as a new, detached process. The
+    /// [`focus_or_launch`] fallback once no focusable window exists — the
+    /// seam that lets tests substitute a fake that records a call instead
+    /// of actually starting a GUI application.
     fn launch(&self, exec: &str) -> Result<(), String>;
 }
 
@@ -1486,6 +1505,11 @@ pub struct AppsProvider {
 }
 
 impl AppsProvider {
+    /// Wires an already-built index to the window and launch backends
+    /// `execute` dispatches through. Kept separate from any single
+    /// constructor that also builds the index (compare
+    /// [`build_apps_provider`]) so tests can hand it a fixture `AppIndex`
+    /// with no filesystem or watcher involved at all.
     pub fn new(
         index: Arc<AppIndex>,
         windows: Arc<dyn WindowSource>,
