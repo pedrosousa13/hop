@@ -34,9 +34,13 @@
 //! **after** buffering: a 200 MB `query` frame is rejected, but not before
 //! 200 MB has been held in memory. That is a narrower guarantee than "these
 //! bounds prevent the allocation", and it is stated here rather than glossed
-//! over. What actually prevents the allocation is a cap on the frame length
-//! applied by the transport before a byte reaches serde — issue #21. These
-//! bounds complement that cap; they do not replace it.
+//! over. What actually prevents the allocation is [`MAX_FRAME_BYTES`], the cap
+//! on frame length that [`framing::payload_len`](crate::framing::payload_len)
+//! applies before a byte reaches serde — issue #21. This crate's framing layer
+//! is IO-free and offers that check; a transport still has to call it before
+//! it allocates, which is a property of the daemon and CLI built on top of
+//! this crate, not of this module. These bounds complement that cap; they do
+//! not replace it.
 //!
 //! # What the bounds compose to
 //!
@@ -64,8 +68,8 @@
 //! daemon may send for one query. Read together with the buffering caveat
 //! above: a frame like that is accepted, and a frame of the same size that
 //! breaks one field bound is still buffered whole before it is refused. The
-//! frame-level cap in issue #21 is therefore load-bearing, not belt-and-braces,
-//! and this arithmetic is the number it has to be set against.
+//! frame-level cap, [`MAX_FRAME_BYTES`], is therefore load-bearing, not
+//! belt-and-braces, and this arithmetic is the number it is set against.
 //!
 //! Both totals are recomputed from the constants themselves by the test
 //! `the_documented_worst_case_is_what_the_constants_compose_to`, so retuning any
@@ -192,6 +196,36 @@ pub const MAX_ACTIONS_PER_ITEM: usize = 32;
 /// total a client accumulates. See this module's docs for what it multiplies out
 /// to against the per-item bounds.
 pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
+
+/// Maximum bytes of one frame's JSON payload, exclusive of the 4-byte length
+/// prefix [`framing`](crate::framing) puts in front of it.
+///
+/// This is not one more field bound alongside [`MAX_TITLE`] and its
+/// neighbours above: it is the frame-level cap that "What these bounds do not
+/// close" promises, enforced by
+/// [`framing::payload_len`](crate::framing::payload_len) **before** a payload
+/// is allocated, closing issue #21 once a transport calls it — see the
+/// buffering caveat on [`ClientMsg`](crate::wire::ClientMsg), which this
+/// composes with rather than replaces.
+///
+/// # Why 268 435 456 (256 MiB)
+///
+/// This module's "What the bounds compose to" table prices the worst-case
+/// in-bounds `results` frame — one item sitting on every bound, repeated
+/// [`MAX_ITEMS_PER_RESULTS_FRAME`] times — at 84 160 000 bytes of field
+/// content, before JSON syntax and escaping. 256 MiB admits that frame with
+/// roughly 3× headroom for syntax and realistic escaping;
+/// `the_documented_worst_case_is_what_the_constants_compose_to` asserts
+/// `MAX_FRAME_BYTES >= 3 * per_frame` so that retuning an item bound above
+/// cannot silently outgrow this cap without that test noticing.
+///
+/// What 256 MiB deliberately does *not* admit is the pathological version of
+/// that same frame: every field escaped to its most expensive form —
+/// `\uXXXX`, six JSON bytes for one byte of content — which prices out to
+/// roughly 505 MB. A frame only reachable by encoding every field that way is
+/// exactly what this cap exists to refuse: it bounds what a peer can make the
+/// process allocate, not what an honest daemon would ever send.
+pub const MAX_FRAME_BYTES: usize = 268_435_456;
 
 /// A value that broke the size budget in [`limits`](self).
 ///
@@ -1033,6 +1067,16 @@ mod tests {
         assert_eq!(
             per_frame, 84_160_000,
             "the ~84 MB per-frame figure in this module's budget table no longer holds"
+        );
+
+        // MAX_FRAME_BYTES is set against this same figure, with headroom for
+        // JSON syntax and realistic escaping — see its doc comment. Asserted
+        // here, alongside the arithmetic it is set against, so that retuning
+        // an item bound cannot silently outgrow the frame cap without this
+        // test noticing.
+        assert!(
+            MAX_FRAME_BYTES >= 3 * per_frame,
+            "MAX_FRAME_BYTES no longer has 3x headroom over the documented worst-case frame"
         );
     }
 
