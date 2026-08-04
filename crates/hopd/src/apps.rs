@@ -431,9 +431,8 @@ mod scan_tests {
 
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
-    fn write_entry(dir: &std::path::Path, file_name: &str, name: &str) {
+    fn write_entry(dir: &Path, file_name: &str, name: &str) {
         fs::write(
             dir.join(file_name),
             format!("[Desktop Entry]\nName={name}\nExec={name}\n"),
