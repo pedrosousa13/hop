@@ -5,10 +5,10 @@ The GNOME-native, trustworthy-plugins launcher that works everywhere.
 Pre-alpha. This repository currently contains M2's daemon through the query
 lifecycle and its provider host: a `hopd` daemon that serves streamed,
 cancellable queries over `$XDG_RUNTIME_DIR/hop/hopd.sock`, routed through
-`hop-core`'s query router and provider host (results still come from the
-walking skeleton's one registered provider until the real providers land),
-and a `hop` CLI that speaks to it (`hop query`, `hop version`). Real
-providers and a UI are later M2 slices.
+`hop-core`'s query router and provider host (results come from the walking
+skeleton's item and, as of issue #57, a real apps provider indexing
+installed `.desktop` files), and a `hop` CLI that speaks to it (`hop query`,
+`hop version`). A calculator provider and a UI are later M2 slices.
 
 ## Design
 

@@ -121,11 +121,20 @@ fn the_round_trip_returns_one_item_end_to_end() {
 
     hello(&mut stream);
 
+    // `SkeletonProvider::query` (`source.rs`) ignores its query text and
+    // always answers with the same hardcoded item, so any term proves the
+    // round trip — this one is deliberately a nonsense token rather than an
+    // ordinary word like "hello", so it cannot collide with a real
+    // application's title, generic name, comment, keywords or exec command
+    // and spuriously pull in a second item from the apps provider
+    // `spawn_daemon` does not otherwise isolate (its own doc comment above
+    // names the one root it cannot close: the hardcoded, unparameterized
+    // Flatpak system export directory).
     send(
         &mut stream,
         &ClientMsg::Query {
             id: 7,
-            text: QueryText::new("hello").unwrap(),
+            text: QueryText::new("hop-e2e-canary-9f3a1c").unwrap(),
         },
     );
 
