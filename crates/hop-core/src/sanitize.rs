@@ -168,13 +168,22 @@ mod tests {
 
     #[test]
     fn truncation_never_splits_a_multi_byte_character() {
-        // 'é' is two bytes, so a cap that is odd relative to the run forces a
-        // cut mid-character unless the boundary is respected.
-        let raw = "é".repeat(MAX_PROVIDER_MESSAGE);
+        // '語' is three bytes, so 256 % 3 == 1: byte 256 is provably mid-character
+        // unless the boundary is respected. This forces the while loop to actually
+        // walk backward and correct the offset. A naive slice at MAX_PROVIDER_MESSAGE
+        // would panic on 3-byte chars; the walk-back prevents that.
+        let raw = "語".repeat(MAX_PROVIDER_MESSAGE);
         let out = sanitize_provider_message(&raw);
-        assert!(out.len() <= MAX_PROVIDER_MESSAGE);
         assert!(
-            out.chars().all(|c| c == 'é'),
+            out.len() <= MAX_PROVIDER_MESSAGE,
+            "result must fit within the bound"
+        );
+        assert!(
+            out.len() < MAX_PROVIDER_MESSAGE,
+            "walk-back must have corrected a misaligned offset; result must be strictly less"
+        );
+        assert!(
+            out.chars().all(|c| c == '語'),
             "a byte cut through a code point would not round-trip as chars"
         );
         assert_eq!(std::str::from_utf8(out.as_bytes()).unwrap(), out);
