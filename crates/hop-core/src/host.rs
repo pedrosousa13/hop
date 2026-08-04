@@ -485,8 +485,17 @@ impl ProviderHost {
     ///
     /// # Why one task per provider
     ///
-    /// It is what makes three separate guarantees hold at once, and no shape
-    /// with fewer tasks delivers all three:
+    /// "One task" names the unit of isolation, not a literal count:
+    /// [`ProviderHost::run_one`] itself spawns a second, inner task to run
+    /// the provider's query future under, so each selected provider actually
+    /// gets two — an outer supervisor task (the one this function spawns,
+    /// running `run_one`) and the inner, abortable query task `run_one`
+    /// spawns within it. Both are necessary and neither is redundant: the
+    /// supervisor is what has to outlive the panic it reports, so it cannot
+    /// be the same task the panic happens in, and the inner task is what
+    /// gives `run_one` a [`JoinHandle`](tokio::task::JoinHandle) it can time
+    /// out and then abort. It is what makes three separate guarantees hold at
+    /// once, and no shape with fewer tasks delivers all three:
     ///
     /// - **Panic containment.** A panic inside a spawned task surfaces as
     ///   [`JoinError::is_panic`](tokio::task::JoinError::is_panic) rather than
@@ -602,8 +611,20 @@ impl ProviderHost {
         // provider whose `manifest()` now answers differently is caught here
         // and its whole answer refused. `declared` rather than `effective` is
         // the baseline, because clamping deliberately changes fields.
-        let fresh = provider.manifest();
-        if fresh != declared {
+        //
+        // `provider.output(items)` is the *only* remaining `Provider::manifest`
+        // call this function makes, and the comparison below reads it back
+        // through `ProviderOutput::manifest` rather than minting a second,
+        // separate call to compare against `declared`. That is deliberate:
+        // `CheckedItems::check` below checks `items` against whatever manifest
+        // `output` was actually built with, so a call made — and checked —
+        // here, then discarded in favour of a *third* call for the pairing,
+        // would leave the pairing checked against a manifest nothing verified.
+        // A provider can answer differently on adjacent calls (see
+        // `ShiftyProvider`), so "the manifest was checked" is only true of the
+        // manifest that was actually checked.
+        let output = provider.output(items);
+        if output.manifest() != &declared {
             let failure = ProviderFailure::from_error(
                 id,
                 ProviderError::Failed(
@@ -618,7 +639,7 @@ impl ProviderHost {
         // One `ProviderOutput`, from this provider alone, so each item is
         // checked against its own producer and nothing else — the property
         // `CheckedItems::check`'s loop comment warns against hoisting away.
-        let checked = CheckedItems::check(vec![provider.output(items)]);
+        let checked = CheckedItems::check(vec![output]);
         if !checked.rejections().is_empty() {
             self.log.record(ProviderEvent::Rejected {
                 provider: id,
@@ -634,6 +655,12 @@ impl ProviderHost {
         });
 
         if items.is_empty() {
+            // No send to fail here, so nothing would otherwise notice a
+            // dropped receiver on this path — check directly, so a provider
+            // that answers empty still relays cancellation to its siblings.
+            if results.is_closed() {
+                cancel.cancel();
+            }
             return;
         }
 
@@ -670,8 +697,6 @@ impl ProviderHost {
 /// dyn-compatible provider trait would be a second route to supplying a
 /// manifest, and the blanket impl means every [`Provider`] already has one.
 trait ErasedProvider: Send + Sync + 'static {
-    fn manifest(&self) -> ProviderManifest;
-
     /// [`Provider::query`] with its future boxed, which is what makes the
     /// method dyn-compatible.
     fn query_erased(
@@ -682,15 +707,15 @@ trait ErasedProvider: Send + Sync + 'static {
 
     /// Pairs `items` with this provider's manifest the only way
     /// [`ProviderOutput`](crate::pipeline::ProviderOutput) allows — see the
-    /// trait docs for why this method exists here rather than at the call site.
+    /// trait docs for why this method exists here rather than at the call
+    /// site. `run_one` reads the manifest this mints back through
+    /// [`ProviderOutput::manifest`](crate::pipeline::ProviderOutput::manifest)
+    /// rather than through a separate erased `manifest()` call, so this is
+    /// the only [`Provider::manifest`] call this trait makes.
     fn output(&self, items: Vec<Item>) -> ProviderOutput;
 }
 
 impl<P: Provider> ErasedProvider for P {
-    fn manifest(&self) -> ProviderManifest {
-        Provider::manifest(self)
-    }
-
     fn query_erased(
         self: Arc<Self>,
         q: Arc<RoutedQuery>,
@@ -975,6 +1000,72 @@ mod tests {
         }
     }
 
+    /// A provider whose declared `kinds` widen starting on its *third* call —
+    /// registration is the first, and `run_one`'s single post-registration
+    /// manifest call (made inside `provider.output(items)`) is the second.
+    ///
+    /// Built to pin that `run_one` makes exactly one manifest call after
+    /// registration, and that the call it makes is the one
+    /// [`CheckedItems::check`] actually checks items against — not an earlier
+    /// or later one. Before that was true, `run_one` re-checked a *separate*
+    /// call (`provider.manifest()`) against `declared`, then minted a *third*
+    /// call inside `provider.output(items)` to build the checked
+    /// `ProviderOutput`. A provider like this one — `declared` on its first
+    /// two calls, widened from then on — would pass that re-check on call two
+    /// while its widened call three governed the actual item check, letting a
+    /// forged `Kind::Window` item through. Under the fixed, single-call
+    /// shape, this provider's widening is never reached: call two is both the
+    /// re-check and the mint, so it still answers `declared`, and its forged
+    /// item is refused like any other kind mismatch.
+    pub(crate) struct DelayedWideningProvider {
+        calls: AtomicUsize,
+    }
+
+    impl DelayedWideningProvider {
+        pub(crate) fn new() -> Self {
+            DelayedWideningProvider {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Provider for DelayedWideningProvider {
+        fn manifest(&self) -> ProviderManifest {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            let kinds = if call <= 1 {
+                vec![Kind::App]
+            } else {
+                vec![Kind::App, Kind::Window]
+            };
+            ProviderManifest {
+                id: "drifting",
+                kinds,
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(10),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            Ok(vec![
+                item("drifting", Kind::App, "app:ok", "Fine"),
+                item("drifting", Kind::Window, "window:forged", "Forged"),
+            ])
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
     pub(crate) fn item(provider: &str, kind: Kind, id: &str, title: &str) -> Item {
         Item {
             id: ItemId::new(id).unwrap(),
@@ -1247,6 +1338,86 @@ mod tests {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
+    /// The one provider in this file that actually reads its `QueryCtx`.
+    /// Every other provider here ignores `_ctx` entirely, which is why
+    /// nothing in this file otherwise notices whether `run_one` hands each
+    /// provider the *shared* [`CancellationFlag`] and a `deadline` that
+    /// actually reflects its budget, as opposed to a freshly-defaulted flag
+    /// or an already-elapsed deadline — both compile, both leave every other
+    /// test in this file green.
+    ///
+    /// On `query`, it records how much time remained under `ctx.deadline` the
+    /// moment it started (`remaining_at_start`), then loops polling
+    /// `ctx.cancel` until it is set and records that it saw cancellation
+    /// (`saw_cancellation`) before giving up. It never completes on its own —
+    /// the only way its `query` future returns is by observing cancellation —
+    /// so a caller has to actually cancel the query for this provider's turn
+    /// to end at all.
+    pub(crate) struct CooperativeProvider {
+        saw_cancellation: Arc<AtomicBool>,
+        remaining_at_start: Arc<Mutex<Option<Duration>>>,
+    }
+
+    impl CooperativeProvider {
+        /// The budget this provider declares — named so the test that
+        /// registers it can assert `remaining_at_start` against the same
+        /// value rather than a repeated literal.
+        pub(crate) const BUDGET: Duration = Duration::from_millis(200);
+
+        /// A provider paired with the two flags its `query` future will set,
+        /// so a test can read them after registration consumes the provider.
+        pub(crate) fn new() -> (Self, Arc<AtomicBool>, Arc<Mutex<Option<Duration>>>) {
+            let saw_cancellation = Arc::new(AtomicBool::new(false));
+            let remaining_at_start = Arc::new(Mutex::new(None));
+            (
+                CooperativeProvider {
+                    saw_cancellation: saw_cancellation.clone(),
+                    remaining_at_start: remaining_at_start.clone(),
+                },
+                saw_cancellation,
+                remaining_at_start,
+            )
+        }
+    }
+
+    impl Provider for CooperativeProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "cooperative",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: CooperativeProvider::BUDGET,
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            let remaining = ctx.deadline.saturating_duration_since(Instant::now());
+            *self
+                .remaining_at_start
+                .lock()
+                .expect("no test panics holding this") = Some(remaining);
+
+            while !ctx.cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            self.saw_cancellation.store(true, Ordering::SeqCst);
+            Err(ProviderError::Cancelled)
         }
 
         async fn execute(
@@ -1570,10 +1741,46 @@ mod tests {
         );
     }
 
+    /// Pins that `run_one` checks items against the *same* manifest call it
+    /// re-checks against `declared` — not an earlier or later one. See
+    /// [`DelayedWideningProvider`]'s docs for the two-call trap this closes:
+    /// under the old shape, a provider answering `declared` through the
+    /// re-check and only widening on a *later*, separate mint call would have
+    /// its forged item accepted, because the call that passed the re-check
+    /// and the call the item check actually used were different calls. This
+    /// test's provider is built with exactly that shape, and the assertions
+    /// below are only true because the fix collapsed those into one call.
+    #[tokio::test]
+    async fn a_provider_that_only_widens_on_a_call_after_the_recheck_is_still_refused() {
+        let log = Arc::new(RecordingLog::default());
+        let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
+        host.register(DelayedWideningProvider::new()).unwrap();
+
+        let items = run(Arc::new(host), "x").await;
+        assert_eq!(
+            items.len(),
+            1,
+            "the forged Kind::Window item must never reach a client, however late \
+             the provider's manifest widens"
+        );
+        assert_eq!(items[0].id.as_str(), "app:ok");
+        assert!(
+            log.lines().iter().any(|l| l == "rejected drifting 1"),
+            "the forged item's rejection must reach the seam: {:?}",
+            log.lines()
+        );
+    }
+
     #[tokio::test]
     async fn dropping_the_receiver_cancels_the_providers_still_running() {
         // The `ResultSource` contract `hopd` relies on: dropping the receiver
-        // is cancellation. A provider that polls the flag sees it set.
+        // is cancellation. This checks the flag `spawn_query` returns — set
+        // once the lone provider's send fails — not whether a provider
+        // observes it through its own `ctx.cancel`: `ScriptedProvider`
+        // ignores `_ctx` entirely, same as every other provider in this file
+        // but for `CooperativeProvider`. See
+        // `the_ctx_a_provider_receives_is_the_shared_flag_and_a_deadline_matching_its_budget`
+        // for the test that exercises a provider actually polling its ctx.
         let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
         host.register(ScriptedProvider::new(
             "apps",
@@ -1595,5 +1802,78 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("a failed send must set the shared cancellation flag");
+    }
+
+    /// Pins the two halves of the `QueryCtx` `run_one` builds:
+    /// [`CooperativeProvider`] must observe the *shared*
+    /// [`CancellationFlag`] — the same one `spawn_query` returns and every
+    /// sibling's failed send sets — through its own `ctx.cancel`, and its
+    /// `ctx.deadline` must sit somewhere between "now" and "now plus its
+    /// budget", not already in the past.
+    ///
+    /// Two mutations to `run_one`'s `QueryCtx` construction leave every other
+    /// test in this file green because no other provider reads its ctx:
+    /// `cancel: CancellationFlag::default()` in place of `cancel.clone()`
+    /// would make cooperative cancellation dead wiring — nothing this
+    /// provider observes would ever become true — and `deadline:
+    /// Instant::now()` in place of `started + budget` would make
+    /// `remaining_at_start` zero. This test is the one that would fail under
+    /// either.
+    #[tokio::test]
+    async fn the_ctx_a_provider_receives_is_the_shared_flag_and_a_deadline_matching_its_budget() {
+        let (provider, saw_cancellation, remaining_at_start) = CooperativeProvider::new();
+        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+        host.register(provider).unwrap();
+        // A fast provider alongside it: this is the one whose failed send
+        // actually sets the shared flag, once `rx` below is dropped. Without
+        // it nothing would ever call `cancel.cancel()`, since
+        // `CooperativeProvider` itself never sends.
+        host.register(ScriptedProvider::new(
+            "apps",
+            vec![Kind::App],
+            vec![item("apps", Kind::App, "app:firefox", "Firefox")],
+        ))
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel(1);
+        Arc::new(host).spawn_query(Arc::new(route("firefox")), tx);
+        drop(rx);
+
+        // The deadline half: poll until `CooperativeProvider::query` has
+        // recorded what it saw, which happens on its very first poll — well
+        // before either provider's budget expires.
+        let remaining = 'wait_for_deadline: {
+            for _ in 0..100 {
+                if let Some(remaining) = *remaining_at_start
+                    .lock()
+                    .expect("no test panics holding this")
+                {
+                    break 'wait_for_deadline remaining;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("the provider never recorded a deadline reading");
+        };
+        assert!(
+            remaining > Duration::ZERO,
+            "an already-elapsed deadline (Instant::now() instead of started + budget) \
+             would read as zero or saturate to zero here: {remaining:?}"
+        );
+        assert!(
+            remaining <= CooperativeProvider::BUDGET,
+            "the deadline must be no further out than the provider's own budget: {remaining:?}"
+        );
+
+        // The cancellation half: the fast provider's send has failed by now
+        // (or will shortly), which is what sets the *shared* flag. Confirm
+        // this provider's own `ctx.cancel` — not a fresh default — is what it
+        // saw go true.
+        for _ in 0..100 {
+            if saw_cancellation.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the provider never observed cancellation through its own ctx.cancel");
     }
 }

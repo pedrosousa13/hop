@@ -112,6 +112,24 @@ impl ProviderOutput {
             items,
         }
     }
+
+    /// The manifest this value was actually built with — the one
+    /// [`CheckedItems::check`] checks `items` against.
+    ///
+    /// This is not a second way to supply a manifest, and does not reopen the
+    /// hole the type's docs describe: it reads back the value
+    /// [`ProviderOutput::from_provider`] already minted from
+    /// [`Provider::manifest`], rather than accepting one from a caller. A
+    /// host that wants to catch a provider whose manifest shifted between its
+    /// own captured copy and the call this constructor made needs to compare
+    /// against *that* call specifically — not an earlier or later one — and
+    /// this is the only way to read it back once the value has been built.
+    /// `pub(crate)` because the need is `hop-core`-internal
+    /// ([`crate::host::ProviderHost`]); nothing downstream of this crate has
+    /// a captured manifest of its own to compare against.
+    pub(crate) fn manifest(&self) -> &ProviderManifest {
+        &self.manifest
+    }
 }
 
 /// The **pin budget**'s per-provider half: the most `append_to_end` items one
