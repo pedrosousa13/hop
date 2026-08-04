@@ -33,6 +33,11 @@ pub enum ClientMsg {
     Hello {
         api_version: u32,
     },
+    /// A query from the client.
+    ///
+    /// A `Query` on a connection with a query already active cancels that query
+    /// server-side; the daemon sends no further frames for the superseded id,
+    /// not even `QueryDone`.
     Query {
         id: u64,
         /// What the user typed, held as a [`QueryText`] rather than a `String`
@@ -46,6 +51,9 @@ pub enum ClientMsg {
         /// disk — only the item-id-keyed frequency table is persisted.
         text: QueryText,
     },
+    /// Cancels the active query if `id` names it (the daemon answers
+    /// `QueryDone { query_id: id }`); dropped silently otherwise, because a
+    /// cancel racing a natural `QueryDone` is ordinary traffic.
     Cancel {
         id: u64,
     },
@@ -70,14 +78,23 @@ pub enum DaemonMsg {
     },
     Results {
         query_id: u64,
+        /// `partial` is advisory (`true` = more frames may follow); the terminal
+        /// signal is [`DaemonMsg::QueryDone`], never a `partial: false` frame,
+        /// and clients must key on it.
         partial: bool,
         /// Bounded at
         /// [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME)
-        /// items on the way in. This bounds one frame, not one query: a daemon
+        /// items per frame and
+        /// [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY) items
+        /// summed across the exchange. This bounds one frame, not one query: a daemon
         /// may send several partial `results` frames for the same `query_id`.
         #[serde(deserialize_with = "limits::de_results_items")]
         items: Vec<Item>,
     },
+    /// The one terminal frame of a query exchange; sent when the source finishes,
+    /// when the exchange hits [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY),
+    /// or in answer to a matching `Cancel` — but not for a query superseded by a
+    /// new `Query`.
     QueryDone {
         query_id: u64,
     },
