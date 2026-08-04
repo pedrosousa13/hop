@@ -264,14 +264,6 @@ pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntr
 /// never serialized, since [`Item`] has no field for either. See this plan's
 /// Design decision 7.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "AppIndex (Task 3) reads these fields, but AppIndex itself has no non-test \
-                  consumer until Task 5 (issue #57) wires it into AppsProvider"
-    )
-)]
 pub(crate) struct AppEntry {
     pub(crate) app_id: String,
     pub(crate) item: Item,
@@ -741,13 +733,6 @@ use std::sync::RwLock;
 /// this is smaller and exists only to keep one provider's unranked batch a
 /// sane size while issue #103 (wiring `Pipeline::assemble`, and with it a
 /// real cap) remains unlanded. See this plan's Scope section.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
-    )
-)]
 pub(crate) const QUERY_RESULT_CAP: usize = 50;
 
 /// The apps provider's in-memory index: an [`AppEntry`] list a background
@@ -766,13 +751,6 @@ pub(crate) const QUERY_RESULT_CAP: usize = 50;
 /// — but it stands as a regression trap: if some future change gave
 /// `AppIndex` a stored path or root list and wired `query` to consult it,
 /// this is the test that would start failing.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 7 (issue #57) wires AppIndex into startup"
-    )
-)]
 pub(crate) struct AppIndex {
     entries: RwLock<Vec<AppEntry>>,
 }
@@ -795,13 +773,6 @@ impl AppIndex {
     /// (case-insensitive substring match), capped at [`QUERY_RESULT_CAP`].
     /// An empty (or whitespace-only) `term` matches everything, capped the
     /// same way — the empty-query "browse installed apps" case.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
-        )
-    )]
     pub(crate) fn query(&self, term: &str) -> Vec<Item> {
         let term = term.trim().to_lowercase();
         let entries = self
@@ -821,13 +792,6 @@ impl AppIndex {
     /// currently-indexed app has it — including "it did, but was
     /// uninstalled since the query that returned it," which `AppsProvider::
     /// execute` (Task 5) treats as an ordinary failure, not a panic.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no consumer until Task 5 (issue #57) wires AppIndex into AppsProvider"
-        )
-    )]
     pub(crate) fn find_by_item_id(&self, id: &ItemId) -> Option<AppEntry> {
         self.entries
             .read()
@@ -977,16 +941,6 @@ mod index_tests {
 /// fields deliberately not here (a focus-stealing-prevention timestamp,
 /// and the method-vs-property duck-typing `skip_taskbar` had in JS).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no non-test code builds a WindowHandle literal — EmptyWindowSource, this \
-                  milestone's only WindowSource, answers Vec::new() from both list methods rather \
-                  than constructing one; only the M5 GNOME shim (design spec §7), building real \
-                  windows from compositor data, removes this"
-    )
-)]
 pub(crate) struct WindowHandle {
     pub(crate) id: String,
     /// Compared against a desktop entry's `app_id`, case-insensitively and
@@ -1003,13 +957,6 @@ pub(crate) struct WindowHandle {
 /// methods, mirroring `appLaunch.js`'s two-tier lookup — see Design
 /// decision 4 for why collapsing them to one would break half the ported
 /// test suite.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
-    )
-)]
 pub(crate) trait WindowSource: Send + Sync + 'static {
     /// Windows the app itself is known to own — ported from
     /// `app.get_windows()`. No id-matching is needed for anything this
@@ -1031,7 +978,10 @@ pub(crate) trait WindowSource: Send + Sync + 'static {
     not(test),
     expect(
         dead_code,
-        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
+        reason = "AppsProvider::new (Task 5) takes an Arc<dyn WindowSource> but never \
+                  constructs a concrete WindowSource itself, so this concrete type stays dead \
+                  in the non-test build until Task 7 (issue #57) wires build_apps_provider, \
+                  which is what actually instantiates one, into build_host"
     )
 )]
 pub(crate) struct EmptyWindowSource;
@@ -1048,13 +998,6 @@ impl WindowSource for EmptyWindowSource {
 }
 
 /// Starts a new process for a desktop entry's `Exec=` command.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
-    )
-)]
 pub(crate) trait Launcher: Send + Sync + 'static {
     fn launch(&self, exec: &str) -> Result<(), String>;
 }
@@ -1068,7 +1011,10 @@ pub(crate) trait Launcher: Send + Sync + 'static {
     not(test),
     expect(
         dead_code,
-        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
+        reason = "AppsProvider::new (Task 5) takes an Arc<dyn Launcher> but never constructs a \
+                  concrete Launcher itself, so this concrete type stays dead in the non-test \
+                  build until Task 7 (issue #57) wires build_apps_provider, which is what \
+                  actually instantiates one, into build_host"
     )
 )]
 pub(crate) struct SystemLauncher;
@@ -1094,29 +1040,12 @@ impl Launcher for SystemLauncher {
 /// `override_redirect` — ported from `appLaunch.js`'s `canUseWindow`, minus
 /// the "has an `activate` method" check, which every [`WindowHandle`]
 /// trivially satisfies by having a [`WindowSource`] behind it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called only from find_focusable_window, itself only called from focus_or_launch \
-                  — no consumer until Task 5 (issue #57) wires focus_or_launch into AppsProvider"
-    )
-)]
 fn is_focusable(window: &WindowHandle) -> bool {
     !window.skip_taskbar && !window.override_redirect
 }
 
 /// Trims, lowercases, and drops a trailing `.desktop` — ported from
 /// `appLaunch.js`'s `normalizeToken`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called only from window_matches_app, itself only called from \
-                  find_focusable_window — no consumer until Task 5 (issue #57) wires \
-                  focus_or_launch into AppsProvider"
-    )
-)]
 fn normalize_app_token(value: &str) -> String {
     let value = value.trim().to_lowercase();
     value
@@ -1130,14 +1059,6 @@ fn normalize_app_token(value: &str) -> String {
 /// alternate-name and alternate-executable comparisons, which existed there
 /// because GNOME `Shell.App` exposes several names for the same app; this
 /// side's index has exactly one id per app.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called only from find_focusable_window, itself only called from focus_or_launch \
-                  — no consumer until Task 5 (issue #57) wires focus_or_launch into AppsProvider"
-    )
-)]
 fn window_matches_app(window: &WindowHandle, app_id: &str) -> bool {
     let Some(window_app_id) = &window.app_id else {
         return false;
@@ -1148,14 +1069,6 @@ fn window_matches_app(window: &WindowHandle, app_id: &str) -> bool {
 /// The first focusable window belonging to `app_id`, checking the app's own
 /// window list before falling back to a full-session scan matched by id —
 /// ported from `appLaunch.js`'s `focusExistingAppWindow`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called only from focus_or_launch — no consumer until Task 5 (issue #57) wires \
-                  focus_or_launch into AppsProvider"
-    )
-)]
 fn find_focusable_window(windows: &dyn WindowSource, app_id: &str) -> Option<WindowHandle> {
     if let Some(window) = windows
         .windows_for_app(app_id)
@@ -1175,13 +1088,6 @@ fn find_focusable_window(windows: &dyn WindowSource, app_id: &str) -> Option<Win
 /// from `appLaunch.js`'s `launchOrFocusApp` — the behavioral spec this
 /// slice's acceptance criteria name — with the divergences recorded in this
 /// plan's Design decision 4.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
-    )
-)]
 pub(crate) fn focus_or_launch(
     windows: &dyn WindowSource,
     launcher: &dyn Launcher,
@@ -1517,5 +1423,265 @@ mod focus_or_launch_tests {
         let launcher = FakeLauncher::default();
         focus_or_launch(&source, &launcher, "firefox", "firefox").unwrap();
         assert_eq!(launcher.launched.lock().unwrap().len(), 1);
+    }
+}
+
+use std::sync::Arc;
+
+use hop_core::provider::{APPS_PROVIDER_ID, Provider, ProviderError, ProviderManifest, QueryCtx};
+use hop_core::router::{Mode, RoutedQuery};
+
+/// The apps provider: answers a query from [`AppIndex`] with no disk
+/// access, and dispatches `execute` through [`focus_or_launch`].
+pub struct AppsProvider {
+    index: Arc<AppIndex>,
+    windows: Arc<dyn WindowSource>,
+    launcher: Arc<dyn Launcher>,
+}
+
+impl AppsProvider {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no non-test caller until Task 7 (issue #57) wires build_apps_provider, \
+                      which constructs an AppsProvider through this constructor, into build_host"
+        )
+    )]
+    pub(crate) fn new(
+        index: Arc<AppIndex>,
+        windows: Arc<dyn WindowSource>,
+        launcher: Arc<dyn Launcher>,
+    ) -> Self {
+        AppsProvider {
+            index,
+            windows,
+            launcher,
+        }
+    }
+}
+
+impl Provider for AppsProvider {
+    fn manifest(&self) -> ProviderManifest {
+        ProviderManifest {
+            // Must be the shared constant, never a hand-written literal —
+            // see this plan's Scope section and the issue's own first
+            // comment. `crate::aliases::APPS_PROVIDER_ID`'s docs spell out
+            // the silent failure a drift here would cause: every configured
+            // app alias would stop boosting anything, with no test failing.
+            id: APPS_PROVIDER_ID,
+            kinds: vec![Kind::App],
+            // Mode::All so this provider is asked for ordinary, unprefixed
+            // search — a provider that omits it is never reached by a plain
+            // keystroke (see ProviderManifest::modes's own docs). Mode::Apps
+            // is the `a ` exclusive prefix.
+            modes: vec![Mode::All, Mode::Apps],
+            min_term_len: 0,
+            budget: std::time::Duration::from_millis(5),
+        }
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        q: Arc<RoutedQuery>,
+        _ctx: QueryCtx,
+    ) -> Result<Vec<Item>, ProviderError> {
+        Ok(self.index.query(&q.term))
+    }
+
+    async fn execute(
+        self: Arc<Self>,
+        item_id: ItemId,
+        _action_id: ActionId,
+    ) -> Result<hop_protocol::ExecOutcome, ProviderError> {
+        let Some(entry) = self.index.find_by_item_id(&item_id) else {
+            return Err(ProviderError::Failed(format!(
+                "{} is no longer installed",
+                item_id.as_str()
+            )));
+        };
+
+        focus_or_launch(&*self.windows, &*self.launcher, &entry.app_id, &entry.exec)
+            .map(|()| hop_protocol::ExecOutcome::Done)
+            .map_err(ProviderError::Failed)
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use hop_core::pipeline::{CheckedItems, ProviderOutput};
+    use hop_core::router::route;
+    use std::sync::Mutex;
+
+    fn one_app_provider(title: &str) -> AppsProvider {
+        let parsed =
+            parse_desktop_entry(&format!("[Desktop Entry]\nName={title}\nExec=x\n")).unwrap();
+        let entry = build_entry("x".to_string(), parsed).unwrap();
+        AppsProvider::new(
+            Arc::new(AppIndex::new(vec![entry])),
+            Arc::new(EmptyWindowSource),
+            Arc::new(SystemLauncher),
+        )
+    }
+
+    // --- Manifest correctness — the issue's load-bearing addition. ---
+
+    #[test]
+    fn the_manifest_uses_the_shared_apps_provider_id_constant() {
+        assert_eq!(one_app_provider("X").manifest().id, APPS_PROVIDER_ID);
+    }
+
+    #[test]
+    fn the_manifest_declares_mode_all_and_mode_apps() {
+        let modes = one_app_provider("X").manifest().modes;
+        assert!(
+            modes.contains(&Mode::All),
+            "omitting Mode::All means never reached by a plain keystroke"
+        );
+        assert!(
+            modes.contains(&Mode::Apps),
+            "omitting Mode::Apps means `a <term>` never reaches this provider"
+        );
+    }
+
+    #[test]
+    fn the_manifest_declares_kind_app_and_a_minimum_term_length() {
+        let manifest = one_app_provider("X").manifest();
+        assert_eq!(manifest.kinds, vec![Kind::App]);
+        assert_eq!(
+            manifest.min_term_len, 0,
+            "0 means \"always run\", including for the empty term"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_providers_own_output_passes_its_own_manifest_checks() {
+        // Pinned exactly as the issue's first comment asks: run the
+        // provider's own output through CheckedItems::check. A manifest/item
+        // mismatch here means every item this provider ever returns is
+        // silently dropped at assembly, with no test elsewhere failing.
+        let provider = Arc::new(one_app_provider("Firefox"));
+        let routed = Arc::new(route("firefox"));
+        let ctx = QueryCtx {
+            cancel: hop_core::provider::CancellationFlag::default(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        };
+        let items = provider.clone().query(routed, ctx).await.unwrap();
+        assert_eq!(items.len(), 1, "the fixture must actually produce an item");
+
+        let checked = CheckedItems::check(vec![ProviderOutput::from_provider(&*provider, items)]);
+        assert_eq!(
+            checked.rejections(),
+            &[],
+            "the apps provider's own honest output must survive its own manifest"
+        );
+        assert_eq!(checked.items().len(), 1);
+    }
+
+    #[test]
+    fn item_ids_are_app_colon_app_id_matching_what_the_alias_table_synthesizes() {
+        // hop_core::aliases synthesizes `app:<appId>` by pure string
+        // construction with no way to ask this provider what it would have
+        // produced — so the two must already agree.
+        let parsed = parse_desktop_entry("[Desktop Entry]\nName=Terminal\nExec=t\n").unwrap();
+        let entry = build_entry("org.gnome.Terminal".to_string(), parsed).unwrap();
+        assert_eq!(entry.item.id.as_str(), "app:org.gnome.Terminal");
+    }
+
+    // --- Registration and scheduling through a real ProviderHost. ---
+
+    #[test]
+    fn registered_with_a_real_host_the_provider_is_selected_for_an_ordinary_and_an_a_prefixed_query()
+     {
+        let mut host = hop_core::host::ProviderHost::with_log(Arc::new(hop_core::host::NoopLog));
+        host.register(one_app_provider("Firefox")).unwrap();
+        // No public "selected_ids" outside hop-core's own tests, so this
+        // observes selection through manifests() plus should_query directly
+        // — the same predicate ProviderHost::selected calls.
+        let manifest = &host.manifests()[0];
+        assert!(hop_core::provider::should_query(
+            manifest,
+            &route("firefox")
+        ));
+        assert!(hop_core::provider::should_query(
+            manifest,
+            &route("a firefox")
+        ));
+    }
+
+    // --- query(): the pure in-memory lookup. ---
+
+    #[tokio::test]
+    async fn query_returns_items_matching_the_routed_term() {
+        let provider = Arc::new(one_app_provider("Firefox"));
+        let ctx = QueryCtx {
+            cancel: hop_core::provider::CancellationFlag::default(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        };
+        let items = provider
+            .clone()
+            .query(Arc::new(route("fire")), ctx)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Firefox");
+    }
+
+    // --- execute(): dispatch through focus_or_launch. ---
+
+    struct RecordingLauncher {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Launcher for RecordingLauncher {
+        fn launch(&self, exec: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(exec.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_launches_the_apps_command_when_no_window_is_focusable() {
+        let parsed =
+            parse_desktop_entry("[Desktop Entry]\nName=Firefox\nExec=firefox --new\n").unwrap();
+        let entry = build_entry("firefox".to_string(), parsed).unwrap();
+        let launcher = Arc::new(RecordingLauncher {
+            calls: Mutex::new(Vec::new()),
+        });
+        let provider = Arc::new(AppsProvider::new(
+            Arc::new(AppIndex::new(vec![entry])),
+            Arc::new(EmptyWindowSource),
+            launcher.clone(),
+        ));
+
+        let outcome = provider
+            .clone()
+            .execute(
+                ItemId::new("app:firefox").unwrap(),
+                ActionId::new("open").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, hop_protocol::ExecOutcome::Done);
+        assert_eq!(
+            *launcher.calls.lock().unwrap(),
+            vec!["firefox --new".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_on_an_id_no_longer_in_the_index_fails_rather_than_panicking() {
+        let provider = Arc::new(one_app_provider("Firefox"));
+        let result = provider
+            .clone()
+            .execute(
+                ItemId::new("app:uninstalled-since-the-query").unwrap(),
+                ActionId::new("open").unwrap(),
+            )
+            .await;
+        assert!(matches!(result, Err(ProviderError::Failed(_))));
     }
 }
