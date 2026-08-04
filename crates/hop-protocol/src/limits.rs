@@ -191,44 +191,60 @@ pub const MAX_ACTIONS_PER_ITEM: usize = 32;
 /// that is a caller's choice, not a constant, and nothing in this crate can
 /// enforce it, so this bound stands on its own rather than on that habit.
 ///
-/// It bounds one frame, not a query: a daemon may legitimately stream several
-/// partial `results` frames for the same query, so this is not a bound on the
-/// total a client accumulates. See also [`MAX_ITEMS_PER_QUERY`], which is that
-/// total, and this module's docs for what this one multiplies out to against
-/// the per-item bounds.
+/// It bounds one frame — but under the replace rule
+/// ([`DaemonMsg::Results`](crate::wire::DaemonMsg::Results)'s docs), a client
+/// holds only the most recently received frame's list for a query, never a
+/// sum of frames, so this is also the effective bound on what a client holds
+/// for one query at any moment. It is still not a bound on how many `results`
+/// frames a daemon may send for one query, nor on what the daemon accumulates
+/// from providers to build each one — that growth is bounded separately, by
+/// [`MAX_ITEMS_PER_QUERY`], applied where the daemon does that accumulating.
+/// See also this module's docs for what this constant multiplies out to
+/// against the per-item bounds.
 pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 
-/// Maximum total items one query id may deliver, summed across every
-/// `results` frame of the exchange.
+/// Maximum items the daemon may accumulate from providers for one query id,
+/// across every provider arrival of the exchange.
 ///
-/// [`MAX_ITEMS_PER_RESULTS_FRAME`] bounds one frame; nothing bounds how many
-/// partial frames a daemon sends for the same `query_id`, so without this
-/// cap a merely chatty client drives unbounded retained state in the daemon
-/// — the daemon keeps what it delivered per query id so `execute` can
-/// resolve against it (issue #59, and the threat model's #25 decision,
-/// which holds only while that state is bounded).
+/// Under the replace rule
+/// ([`DaemonMsg::Results`](crate::wire::DaemonMsg::Results)'s docs), a
+/// `results` frame carries the complete current list rather than an
+/// increment, so nothing about what a client holds sums across frames — a
+/// client replaces, never accumulates, and its only guard against an
+/// oversized frame is [`MAX_ITEMS_PER_RESULTS_FRAME`], applied at the parse
+/// by [`de_results_items`]. This constant bounds something else, entirely on
+/// the daemon's side: the checked items a query has received from providers
+/// so far, which the daemon re-assembles into a fresh list on every arrival
+/// and which therefore keeps growing for as long as the query stays open.
+/// [`MAX_ITEMS_PER_RESULTS_FRAME`] does not bound that growth — it bounds one
+/// assembled list, and an honest assembly is far smaller besides — so
+/// without a separate cap a query reaching enough providers would grow the
+/// daemon's per-query accumulator without limit even while what reaches the
+/// client each time stays small. This is that cap, and it is enforced where
+/// the accumulating happens: `hopd`'s `source.rs`, inside the accumulator
+/// `HostSource::start` spawns for the query.
 ///
-/// Unlike its neighbours this bound is not enforced at the parse: no single
-/// frame breaks it. Transports enforce it at accumulation — the daemon caps
-/// what it retains and delivers (truncating the crossing batch and ending
-/// the query; never evicting, because a delivered item must stay
-/// resolvable), and a client caps what it assembles (refusing a daemon that
-/// streams past it). That is the same posture [`MAX_FRAME_BYTES`] takes:
-/// declared here, applied by the transport.
+/// Unlike its neighbours this bound is not enforced at the parse — no single
+/// `results` frame can break it, since what it bounds is built before any
+/// frame is assembled. When a provider's arrival would push the accumulator
+/// past this cap, the accumulator truncates that arrival to what fits before
+/// absorbing it, sends the frame assembled from the now-full accumulator, and
+/// stops — closing its channel, which is what causes the connection to answer
+/// with the exchange's terminal frame. **Truncate-and-terminate**: what was
+/// already assembled and delivered stays exactly that, and the remainder that
+/// did not fit is dropped with nothing on the wire naming it, the rule this
+/// daemon applies at every other bound of this shape.
 ///
-/// The two sides carry different names in `CONTEXT.md`'s terms, and the
-/// difference is which of them says so: the daemon's half is a truncation,
-/// since a capped exchange ends with the frame a completed one ends with and
-/// nothing names the remainder, while the client's half is a refusal, since
-/// it produces no list at all and names this constant when it declines.
-///
-/// 5 000 is five maximal frames. Honest traffic is two orders of magnitude
-/// smaller — a launcher renders tens of items — so this is a memory guard,
-/// not a display guard: at the composed per-item worst case (84 160 bytes,
-/// see the module docs) it holds retained state per connection under
-/// ~421 MB hostile-shaped, ~1 MB honest-shaped — assuming the items being
-/// counted respect the per-item bounds, which is a narrower assumption than
-/// it sounds.
+/// 5 000 is five times [`MAX_ITEMS_PER_RESULTS_FRAME`] — five single frames'
+/// worth of accumulated provider input. Honest traffic is two orders of
+/// magnitude smaller — a launcher renders tens of items, and what one
+/// arrival actually assembles is bounded far below even one frame's maximum
+/// — so this is a memory guard on the accumulator, not a display guard: at
+/// the composed per-item worst case (84 160 bytes, see the module docs) what
+/// one query's accumulator holds while it is live stays under ~421 MB
+/// hostile-shaped, ~1 MB honest-shaped — assuming the items being counted
+/// respect the per-item bounds, which is a narrower assumption than it
+/// sounds.
 ///
 /// # Why those byte figures are conditional
 ///
