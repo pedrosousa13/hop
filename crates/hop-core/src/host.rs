@@ -22,8 +22,24 @@
 //!   provider, because the future runs under [`tokio::spawn`] and a panicking
 //!   task surfaces as a [`JoinError`](tokio::task::JoinError) rather than
 //!   unwinding into the daemon.
-//! - **Provider-supplied text is rewritten before it can leave**, by
-//!   [`sanitize_provider_message`](crate::sanitize::sanitize_provider_message).
+//! - **Provider-supplied text is rewritten before it can leave through this
+//!   host**, by
+//!   [`sanitize_provider_message`](crate::sanitize::sanitize_provider_message),
+//!   on every path this module *returns* a value on. That has a stated
+//!   residual: a panicking provider's payload is provider-controlled text
+//!   too, and it reaches the process's stderr — and the journal — through
+//!   Rust's default panic hook, unsanitized and unbounded, before
+//!   [`ProviderHost::run_one`] ever sees the
+//!   [`JoinError`](tokio::task::JoinError) the panic surfaces as.
+//!   [`ProviderFailure::panicked`] deliberately does not carry that payload,
+//!   which closes the attribution half of the problem — a panic can no
+//!   longer make the daemon blame the wrong provider — but not this half.
+//!   Installing a panic hook would close it and is deliberately not done
+//!   here: `set_hook` is process-wide, so a hook that rewrites or suppresses
+//!   a provider's panic payload would do the same to a genuine daemon bug's,
+//!   and that trade is wider than this module should decide on its own.
+//!   Issue #104 owns that decision; until it lands, a provider that panics
+//!   with hostile text writes it to the daemon's stderr raw.
 //! - **One failing provider never empties a frame for the others**, which is
 //!   spec §9's per-provider isolation rule: providers are separate tasks
 //!   holding separate senders, so nothing about one provider's outcome is on
@@ -33,10 +49,12 @@
 //!
 //! Ranking. This module streams each provider's manifest-checked items as its
 //! own batch, in the order providers answer, and never calls
-//! [`Pipeline::assemble`](crate::pipeline::Pipeline::assemble) — see the
-//! "Scope" section of `docs/superpowers/plans/2026-08-04-issue-56-provider-host.md`
-//! for why wiring assembly needs a protocol answer about streaming that issue
-//! #56 does not give.
+//! [`Pipeline::assemble`](crate::pipeline::Pipeline::assemble). Wiring
+//! assembly in needs a protocol answer about streaming that issue #56 does
+//! not give: the wire streams append-only batches, while `assemble` is a
+//! whole-list pure function, so "rank the streamed set" means either
+//! re-sending the whole list per batch or gating on the slowest provider, and
+//! spec §3 forbids the latter outright. Tracked as issue #103.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -277,13 +295,19 @@ impl ProviderLog for NoopLog {
 /// a budget miss "logs and isolates, never blocks the frame", and the other
 /// providers' items have already streamed by then.
 ///
-/// 50 ms is also what every manifest in the tree already declares, so this
-/// ceiling clamps nothing that exists today and only bites a provider asking
-/// for materially more. A provider that genuinely needs longer than this is a
-/// provider doing I/O on the query path, which spec §3 forbids outright: the
-/// network providers return "a cached-or-pending row synchronously and push an
-/// update frame when the fetch lands", so their slow half is not a query at
-/// all.
+/// The 50 ms values that exist in the tree today are `hop-core`'s own test
+/// helpers picking a round number, not evidence about what a manifest asks
+/// for: the one production manifest, `hopd`'s `SkeletonProvider`
+/// (`crates/hopd/src/source.rs`), declares 1 ms, and the scripted test
+/// fixtures declare 10 ms, 20 ms and a deliberate 500 ms specifically to
+/// exercise this ceiling. So the true reason this ceiling clamps nothing in
+/// production *today* is narrower than "every manifest already declares
+/// this" — no manifest does — and is simply that no shipped provider asks
+/// for anywhere near 50 ms yet. A provider that genuinely needs longer than
+/// this is a provider doing I/O on the query path, which spec §3 forbids
+/// outright: the network providers return "a cached-or-pending row
+/// synchronously and push an update frame when the fetch lands", so their
+/// slow half is not a query at all.
 ///
 /// It is a constant rather than a knob because a per-provider override is
 /// exactly the provider-authored policy issue #32 exists to remove.

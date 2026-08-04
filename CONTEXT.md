@@ -166,8 +166,8 @@ no longer does. The **provider host** now reads the manifest-check half of
 them — the two reasons that mean a provider lied — through its **log seam**
 every time it runs `CheckedItems::check` on `ProviderHost::run_one`'s path.
 What still goes unlogged is the pin-budget half, minted only inside
-`Pipeline::assemble` itself, which the daemon does not call today (see
-**Provider host**) — and, more generally, `Assembly::rejections` stays
+`Pipeline::assemble` itself, which the daemon does not call today (issue
+#103; see **Provider host**) — and, more generally, `Assembly::rejections` stays
 ignorable by any caller that is not the host. Only the first two reasons mean
 a provider lied; a rejection names which, so the reasons are not confused for
 one another.
@@ -205,7 +205,7 @@ divergence.
 queries: `hop-core`'s `ProviderHost`. Not a scheduler in the ranking sense —
 it decides *whether* a provider runs for a query and *for how long*, never in
 what order its items appear. Ordering that is `Pipeline::assemble`'s job, and
-the host does not call it.
+the host does not call it (issue #103).
 
 **Registration** — the one moment a provider's manifest is read:
 `Provider::manifest`, called once, at `ProviderHost::register`. What is

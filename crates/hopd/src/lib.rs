@@ -14,9 +14,10 @@
 //! provider host are wired ([`source`]), but the only provider registered is
 //! the walking skeleton's, until issue #57 lands apps and #58 the calculator —
 //! a result *assembly* step (ranking, boosts and the pinned tail are
-//! `hop-core`'s [`pipeline`](hop_core::pipeline), still uncalled here), or
-//! anything with a lifecycle beyond "runs until killed". Each of those gaps is
-//! named where it applies, in [`runtime_dir`], [`server`] and [`source`].
+//! `hop-core`'s [`pipeline`](hop_core::pipeline), still uncalled here — issue
+//! #103), or anything with a lifecycle beyond "runs until killed". Each of
+//! those gaps is named where it applies, in [`runtime_dir`], [`server`] and
+//! [`source`].
 
 pub(crate) mod connection;
 pub mod runtime_dir;

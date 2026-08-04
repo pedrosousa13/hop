@@ -82,14 +82,26 @@ pub struct ProviderManifest {
     /// shorter than this (character count). `0` means "always run,
     /// regardless of term length".
     pub min_term_len: usize,
-    /// Per-query deadline. Not enforced here — a future scheduler reads it.
+    /// Per-query deadline. Not enforced by this module —
+    /// [`ProviderHost::run_one`](crate::host::ProviderHost) is what enforces
+    /// it, as a host-side timeout a provider need not cooperate with: the
+    /// provider's task is aborted at this budget whether or not the provider
+    /// ever reads [`QueryCtx::deadline`].
     pub budget: Duration,
 }
 
 /// What a provider's async methods receive for one in-flight query: a
 /// cooperative cancellation signal and the deadline it should respect.
-/// Neither is enforced by this module; a provider implementation is
-/// expected to poll `cancel` and compare against `deadline` itself.
+///
+/// Neither is enforced *by this module* — polling `cancel` or comparing
+/// against `deadline` is nothing this type can make a provider do. Both are
+/// enforced regardless, by [`ProviderHost`](crate::host::ProviderHost):
+/// `deadline` follows from the budget `ProviderHost::run_one` times the
+/// provider's task against and then aborts on expiry, whether or not the
+/// provider ever looks at it. `cancel` stays genuinely cooperative — a hint a
+/// provider may ignore, nothing here forces a poll — and it is the host's own
+/// abort at the budget, not `cancel`, that makes ignoring it survivable
+/// rather than a hang.
 pub struct QueryCtx {
     pub cancel: CancellationFlag,
     pub deadline: Instant,
