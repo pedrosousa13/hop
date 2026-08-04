@@ -969,3 +969,523 @@ mod index_tests {
         assert_eq!(items[0].title, "Firefox");
     }
 }
+
+/// One open window, as much as this M2 slice can describe before the M5
+/// GNOME shim (design spec §7) supplies real ones from the compositor.
+/// Ported from `appLaunch.js`'s window shape, collapsed to the fields that
+/// logic actually reads — see this plan's Design decision 4 for the two
+/// fields deliberately not here (a focus-stealing-prevention timestamp,
+/// and the method-vs-property duck-typing `skip_taskbar` had in JS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no non-test code builds a WindowHandle literal — EmptyWindowSource, this \
+                  milestone's only WindowSource, answers Vec::new() from both list methods rather \
+                  than constructing one; only the M5 GNOME shim (design spec §7), building real \
+                  windows from compositor data, removes this"
+    )
+)]
+pub(crate) struct WindowHandle {
+    pub(crate) id: String,
+    /// Compared against a desktop entry's `app_id`, case-insensitively and
+    /// with a trailing `.desktop` ignored on either side — ported from
+    /// `appLaunch.js`'s `normalizeToken`. `None` when the compositor could
+    /// not associate this window with an application at all.
+    pub(crate) app_id: Option<String>,
+    pub(crate) skip_taskbar: bool,
+    pub(crate) minimized: bool,
+    pub(crate) override_redirect: bool,
+}
+
+/// The window backend `focus_or_launch` dispatches through. Two list
+/// methods, mirroring `appLaunch.js`'s two-tier lookup — see Design
+/// decision 4 for why collapsing them to one would break half the ported
+/// test suite.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
+    )
+)]
+pub(crate) trait WindowSource: Send + Sync + 'static {
+    /// Windows the app itself is known to own — ported from
+    /// `app.get_windows()`. No id-matching is needed for anything this
+    /// returns: ownership already establishes it.
+    fn windows_for_app(&self, app_id: &str) -> Vec<WindowHandle>;
+    /// Every open window in the session — ported from
+    /// `global.display.get_tab_list()` — for the fallback heuristic used
+    /// only when `windows_for_app` came back empty.
+    fn all_windows(&self) -> Vec<WindowHandle>;
+    fn unminimize(&self, window: &WindowHandle);
+    fn activate(&self, window: &WindowHandle);
+}
+
+/// The M2 [`WindowSource`]: no windows exist yet, from either tier. This is
+/// what makes [`focus_or_launch`] correctly and unconditionally launch
+/// until the M5 GNOME shim replaces this with a real implementation — see
+/// Design decision 4.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
+    )
+)]
+pub(crate) struct EmptyWindowSource;
+
+impl WindowSource for EmptyWindowSource {
+    fn windows_for_app(&self, _app_id: &str) -> Vec<WindowHandle> {
+        Vec::new()
+    }
+    fn all_windows(&self) -> Vec<WindowHandle> {
+        Vec::new()
+    }
+    fn unminimize(&self, _window: &WindowHandle) {}
+    fn activate(&self, _window: &WindowHandle) {}
+}
+
+/// Starts a new process for a desktop entry's `Exec=` command.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
+    )
+)]
+pub(crate) trait Launcher: Send + Sync + 'static {
+    fn launch(&self, exec: &str) -> Result<(), String>;
+}
+
+/// The real [`Launcher`]: `exec`'s first whitespace-separated token is the
+/// program, the rest are its arguments — `exec` has already had field codes
+/// stripped by [`sanitize_exec`] at parse time. Standard streams are
+/// discarded and detached from the daemon's own terminal, if it has one; a
+/// launched app is not expected to write anything hopd should see.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
+    )
+)]
+pub(crate) struct SystemLauncher;
+
+impl Launcher for SystemLauncher {
+    fn launch(&self, exec: &str) -> Result<(), String> {
+        let mut parts = exec.split_whitespace();
+        let program = parts
+            .next()
+            .ok_or_else(|| "desktop entry has an empty Exec= command".to_string())?;
+        std::process::Command::new(program)
+            .args(parts)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_child| ())
+            .map_err(|err| format!("could not launch {program}: {err}"))
+    }
+}
+
+/// A window this app can be focused through: not `skip_taskbar`, not
+/// `override_redirect` — ported from `appLaunch.js`'s `canUseWindow`, minus
+/// the "has an `activate` method" check, which every [`WindowHandle`]
+/// trivially satisfies by having a [`WindowSource`] behind it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called only from find_focusable_window, itself only called from focus_or_launch \
+                  — no consumer until Task 5 (issue #57) wires focus_or_launch into AppsProvider"
+    )
+)]
+fn is_focusable(window: &WindowHandle) -> bool {
+    !window.skip_taskbar && !window.override_redirect
+}
+
+/// Trims, lowercases, and drops a trailing `.desktop` — ported from
+/// `appLaunch.js`'s `normalizeToken`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called only from window_matches_app, itself only called from \
+                  find_focusable_window — no consumer until Task 5 (issue #57) wires \
+                  focus_or_launch into AppsProvider"
+    )
+)]
+fn normalize_app_token(value: &str) -> String {
+    let value = value.trim().to_lowercase();
+    value
+        .strip_suffix(".desktop")
+        .map(str::to_string)
+        .unwrap_or(value)
+}
+
+/// Whether `window` belongs to the app named `app_id`, normalized — ported
+/// from `appLaunch.js`'s `windowMatchesApp`, minus the JS version's
+/// alternate-name and alternate-executable comparisons, which existed there
+/// because GNOME `Shell.App` exposes several names for the same app; this
+/// side's index has exactly one id per app.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called only from find_focusable_window, itself only called from focus_or_launch \
+                  — no consumer until Task 5 (issue #57) wires focus_or_launch into AppsProvider"
+    )
+)]
+fn window_matches_app(window: &WindowHandle, app_id: &str) -> bool {
+    let Some(window_app_id) = &window.app_id else {
+        return false;
+    };
+    normalize_app_token(window_app_id) == normalize_app_token(app_id)
+}
+
+/// The first focusable window belonging to `app_id`, checking the app's own
+/// window list before falling back to a full-session scan matched by id —
+/// ported from `appLaunch.js`'s `focusExistingAppWindow`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called only from focus_or_launch — no consumer until Task 5 (issue #57) wires \
+                  focus_or_launch into AppsProvider"
+    )
+)]
+fn find_focusable_window(windows: &dyn WindowSource, app_id: &str) -> Option<WindowHandle> {
+    if let Some(window) = windows
+        .windows_for_app(app_id)
+        .into_iter()
+        .find(is_focusable)
+    {
+        return Some(window);
+    }
+    windows
+        .all_windows()
+        .into_iter()
+        .find(|w| is_focusable(w) && window_matches_app(w, app_id))
+}
+
+/// Focuses an existing window for `app_id` if one is focusable, unminimizing
+/// it first if needed; otherwise launches `exec` as a new process. Ported
+/// from `appLaunch.js`'s `launchOrFocusApp` — the behavioral spec this
+/// slice's acceptance criteria name — with the divergences recorded in this
+/// plan's Design decision 4.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 5 (issue #57) wires this into AppsProvider"
+    )
+)]
+pub(crate) fn focus_or_launch(
+    windows: &dyn WindowSource,
+    launcher: &dyn Launcher,
+    app_id: &str,
+    exec: &str,
+) -> Result<(), String> {
+    if let Some(window) = find_focusable_window(windows, app_id) {
+        if window.minimized {
+            windows.unminimize(&window);
+        }
+        windows.activate(&window);
+        return Ok(());
+    }
+
+    launcher.launch(exec)
+}
+
+#[cfg(test)]
+mod focus_or_launch_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A [`WindowSource`] the tests can script and read back — what
+    /// `windows_for_app`/`all_windows` answer, and every `unminimize`/
+    /// `activate` call it received, in order.
+    #[derive(Default)]
+    struct FakeWindows {
+        for_app: Vec<WindowHandle>,
+        all: Vec<WindowHandle>,
+        calls: Mutex<Vec<(&'static str, String)>>,
+    }
+
+    impl WindowSource for FakeWindows {
+        fn windows_for_app(&self, _app_id: &str) -> Vec<WindowHandle> {
+            self.for_app.clone()
+        }
+        fn all_windows(&self) -> Vec<WindowHandle> {
+            self.all.clone()
+        }
+        fn unminimize(&self, window: &WindowHandle) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("unminimize", window.id.clone()));
+        }
+        fn activate(&self, window: &WindowHandle) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("activate", window.id.clone()));
+        }
+    }
+
+    /// A [`Launcher`] that records whether it was called, never actually
+    /// spawning a process — every test in this module must run without a
+    /// real GUI application installed.
+    #[derive(Default)]
+    struct FakeLauncher {
+        launched: Mutex<Vec<String>>,
+    }
+
+    impl Launcher for FakeLauncher {
+        fn launch(&self, exec: &str) -> Result<(), String> {
+            self.launched.lock().unwrap().push(exec.to_string());
+            Ok(())
+        }
+    }
+
+    fn window(id: &str) -> WindowHandle {
+        WindowHandle {
+            id: id.to_string(),
+            app_id: None,
+            skip_taskbar: false,
+            minimized: false,
+            override_redirect: false,
+        }
+    }
+
+    // --- Ported from appLaunch.js's own test suite. ---
+
+    #[test]
+    fn prefers_focusing_an_existing_normal_window() {
+        let windows = FakeWindows {
+            for_app: vec![window("w1")],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+
+        assert!(focus_or_launch(&windows, &launcher, "firefox", "firefox").is_ok());
+        assert_eq!(
+            *windows.calls.lock().unwrap(),
+            vec![("activate", "w1".to_string())]
+        );
+        assert!(launcher.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restores_and_focuses_a_minimized_existing_window() {
+        let mut w = window("w1");
+        w.minimized = true;
+        let windows = FakeWindows {
+            for_app: vec![w],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+
+        assert!(focus_or_launch(&windows, &launcher, "firefox", "firefox").is_ok());
+        assert_eq!(
+            *windows.calls.lock().unwrap(),
+            vec![
+                ("unminimize", "w1".to_string()),
+                ("activate", "w1".to_string())
+            ],
+            "unminimize must happen, and it must happen before activate"
+        );
+    }
+
+    #[test]
+    fn a_non_minimized_window_is_never_unminimized() {
+        // The mutation this guards: dropping the `if window.minimized`
+        // guard and always calling `unminimize` would still pass the two
+        // tests above (an extra harmless call on an already-visible
+        // window) but is wrong — this is the test that catches it.
+        let windows = FakeWindows {
+            for_app: vec![window("w1")],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        assert_eq!(
+            *windows.calls.lock().unwrap(),
+            vec![("activate", "w1".to_string())]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_launching_when_no_focusable_window_exists() {
+        // Represents the JS suite's three-rung launch fallback
+        // (activate/open_new_window/launch/appInfo.launch), collapsed to
+        // one Launcher call — see Design decision 4.
+        let windows = FakeWindows::default();
+        let launcher = FakeLauncher::default();
+
+        assert!(focus_or_launch(&windows, &launcher, "firefox", "firefox --new-window").is_ok());
+        assert_eq!(
+            *launcher.launched.lock().unwrap(),
+            vec!["firefox --new-window".to_string()]
+        );
+        assert!(windows.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn focuses_a_matching_open_window_when_the_apps_own_window_list_is_empty() {
+        let mut w = window("w1");
+        w.app_id = Some("brave-browser".to_string());
+        let windows = FakeWindows {
+            for_app: vec![],
+            all: vec![w],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+
+        assert!(focus_or_launch(&windows, &launcher, "brave-browser.desktop", "brave").is_ok());
+        assert_eq!(
+            *windows.calls.lock().unwrap(),
+            vec![("activate", "w1".to_string())]
+        );
+        assert!(
+            launcher.launched.lock().unwrap().is_empty(),
+            "a matching window must be focused, not launched past"
+        );
+    }
+
+    // --- New coverage: the branches the JS suite didn't isolate. ---
+
+    #[test]
+    fn a_skip_taskbar_window_is_not_focusable_and_falls_through_to_launch() {
+        let mut w = window("w1");
+        w.skip_taskbar = true;
+        let windows = FakeWindows {
+            for_app: vec![w],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+
+        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        assert!(
+            windows.calls.lock().unwrap().is_empty(),
+            "skip_taskbar window must not be used"
+        );
+        assert_eq!(launcher.launched.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_override_redirect_window_is_not_focusable_and_falls_through_to_launch() {
+        let mut w = window("w1");
+        w.override_redirect = true;
+        let windows = FakeWindows {
+            for_app: vec![w],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+
+        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        assert!(windows.calls.lock().unwrap().is_empty());
+        assert_eq!(launcher.launched.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tier_one_wins_over_tier_two_when_both_have_a_candidate() {
+        // Both windows carry an `app_id` that matches — not just the
+        // `for_app` one — so a mutation that checked `all_windows` before
+        // `windows_for_app` would find a *legitimate* match there too (not
+        // fall through on a missing id) and activate "scanned" instead.
+        // Giving only the `for_app` window an id (as `window()`'s default
+        // leaves it) would let a full tier-order swap hide behind the tier
+        // 2 id check legitimately failing — this fixture closes that gap.
+        let mut owned = window("owned");
+        owned.app_id = Some("firefox".to_string());
+        let mut scanned = window("scanned");
+        scanned.app_id = Some("firefox".to_string());
+        let windows = FakeWindows {
+            for_app: vec![owned],
+            all: vec![scanned],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        assert_eq!(
+            *windows.calls.lock().unwrap(),
+            vec![("activate", "owned".to_string())]
+        );
+    }
+
+    #[test]
+    fn app_id_matching_ignores_case_and_a_trailing_dot_desktop_on_either_side() {
+        let mut w = window("w1");
+        w.app_id = Some("Org.Gnome.Terminal".to_string());
+        let windows = FakeWindows {
+            for_app: vec![],
+            all: vec![w],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+
+        focus_or_launch(
+            &windows,
+            &launcher,
+            "org.gnome.terminal.desktop",
+            "gnome-terminal",
+        )
+        .unwrap();
+        assert_eq!(
+            *windows.calls.lock().unwrap(),
+            vec![("activate", "w1".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_tier_two_window_with_no_app_id_never_matches() {
+        let windows = FakeWindows {
+            for_app: vec![],
+            all: vec![window("w1")], // app_id: None
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        assert!(windows.calls.lock().unwrap().is_empty());
+        assert_eq!(launcher.launched.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn system_launcher_reports_an_empty_exec_rather_than_spawning_nothing() {
+        // Asserts on the error *message*, not just `is_err()`: on Linux,
+        // `Command::new("").spawn()` already fails at the OS level (empty
+        // program name), so `is_err()` alone would pass even with the
+        // explicit `ok_or_else` guard deleted from `SystemLauncher::launch`
+        // — it would just report a generic OS error instead of this
+        // domain-specific one. Checking the message is what actually pins
+        // the guard's existence.
+        let err = SystemLauncher.launch("").unwrap_err();
+        assert!(
+            err.contains("empty Exec="),
+            "must report the empty-Exec= guard, not a generic spawn failure: {err}"
+        );
+        let err = SystemLauncher.launch("   ").unwrap_err();
+        assert!(
+            err.contains("empty Exec="),
+            "whitespace-only must also trip the guard: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_window_source_answers_nothing_from_either_tier() {
+        // Pins the M2 production default's whole contract: until the M5
+        // GNOME shim replaces it, focus_or_launch must always launch.
+        let source = EmptyWindowSource;
+        assert!(source.windows_for_app("anything").is_empty());
+        assert!(source.all_windows().is_empty());
+
+        let launcher = FakeLauncher::default();
+        focus_or_launch(&source, &launcher, "firefox", "firefox").unwrap();
+        assert_eq!(launcher.launched.lock().unwrap().len(), 1);
+    }
+}
