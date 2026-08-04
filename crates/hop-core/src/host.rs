@@ -876,7 +876,7 @@ mod tests {
     use crate::provider::{Provider, ProviderManifest, QueryCtx};
     use crate::router::{Mode, RoutedQuery, route};
     use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, Kind};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A provider whose manifest is whatever the test says it is, and whose
     /// `query` answers with a fixed list. Task 5's tests extend this file with
@@ -1164,6 +1164,100 @@ mod tests {
         }
     }
 
+    /// Records, via `Drop`, that the value holding it was dropped. Used only
+    /// by [`AbandonedOnDropProvider`] — see that type's docs for why this is
+    /// the one observable difference between a task that was actually
+    /// aborted and a host that merely stopped waiting on it.
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Behaviourally identical to [`HangingProvider`] — never completes,
+    /// never polls `ctx.cancel` — but its future also holds a [`DropSignal`]
+    /// across its one await point, so the flag it shares with the test tells
+    /// the test whether the future was ever actually dropped.
+    ///
+    /// A separate type rather than an addition to `HangingProvider`, which
+    /// other tests already depend on staying exactly as it is.
+    ///
+    /// # Why this exists
+    ///
+    /// `a_provider_that_never_completes_is_cut_off_at_its_budget_without_cooperating`
+    /// asserts that the host stopped waiting and logged a budget miss.
+    /// Neither observation distinguishes "the host stopped *waiting* and left
+    /// the task running forever" from "the host *abandoned* the task":
+    /// removing `run_one`'s `handle.abort()` call and keeping only the
+    /// `tokio::time::timeout` around it produces the identical "stopped
+    /// waiting, logged a miss" outcome, because `timeout` alone only stops
+    /// awaiting the handle — it does not touch the task. `abort` is the whole
+    /// difference between a provider that is *cut off* (issue #28's
+    /// criterion) and one that merely stops being listened to.
+    ///
+    /// The guard closes that gap: it is constructed inside the `query`
+    /// future's body and held across the `loop`'s await point, so it lives in
+    /// the future's own suspended state. Dropping the future — which is what
+    /// `abort` does — drops the guard with it. A task that is still running,
+    /// just no longer awaited by anything, never reaches a point where this
+    /// value goes out of scope, so the guard stays alive and the flag stays
+    /// `false`. Because this provider never completes on its own, a `true`
+    /// flag can only mean the future was dropped, never that it ran to
+    /// completion.
+    pub(crate) struct AbandonedOnDropProvider {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AbandonedOnDropProvider {
+        /// A provider paired with the flag its guard will set, so a test can
+        /// hold the flag after registration consumes the provider.
+        pub(crate) fn new() -> (Self, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            (
+                AbandonedOnDropProvider {
+                    dropped: dropped.clone(),
+                },
+                dropped,
+            )
+        }
+    }
+
+    impl Provider for AbandonedOnDropProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "abandoned",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(10),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            // Constructed here, inside the future, and held across the
+            // loop's await point — see the type's docs for why that placement
+            // is what makes a drop of this future observable from outside it.
+            let _guard = DropSignal(Arc::clone(&self.dropped));
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            Ok(ExecOutcome::Done)
+        }
+    }
+
     /// A provider that panics inside its future.
     pub(crate) struct PanickingProvider;
 
@@ -1312,6 +1406,42 @@ mod tests {
                 .any(|l| l == "failed hanging Timeout the provider exceeded its budget"),
             "and be reported as a timeout: {lines:?}"
         );
+    }
+
+    /// What the test above does *not* pin, and this one does: that the
+    /// abandoned task was actually `abort`-ed, not merely stopped-waiting-on.
+    /// `a_provider_that_never_completes_is_cut_off_at_its_budget_without_cooperating`
+    /// asserts only that the host stopped waiting and logged a budget miss —
+    /// both true whether `run_one` calls `handle.abort()` or just lets
+    /// `tokio::time::timeout` expire and walks away. Deleting the `abort()`
+    /// call leaves that test green. It does not leave this one green:
+    /// [`AbandonedOnDropProvider`]'s guard is dropped if and only if its
+    /// future is dropped, which only `abort` causes, so a `false` flag here
+    /// means the task was abandoned-but-still-running rather than cut off.
+    /// See that type's docs for the full mechanism. Do not delete this test
+    /// as redundant with the one above — the two assert different halves of
+    /// issue #28's criterion.
+    #[tokio::test]
+    async fn a_hanging_providers_future_is_actually_dropped_when_the_host_aborts_it() {
+        let (provider, dropped) = AbandonedOnDropProvider::new();
+        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+        host.register(provider).unwrap();
+
+        run(Arc::new(host), "x").await;
+
+        // `abort` takes effect at the task's next yield point, not
+        // synchronously with the host giving up on it, so the flag may not be
+        // set the instant `run` returns. Poll for it, the same way
+        // `dropping_the_receiver_cancels_the_providers_still_running` polls
+        // for the cancellation flag, rather than asserting immediately or
+        // sleeping a fixed amount.
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the provider's future was never dropped — the task was never actually aborted");
     }
 
     #[tokio::test]
