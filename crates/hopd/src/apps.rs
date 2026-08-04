@@ -1393,6 +1393,36 @@ mod focus_or_launch_tests {
     }
 
     #[test]
+    fn falls_through_to_tier_two_when_tier_one_is_non_empty_but_entirely_unfocusable() {
+        // Closes a coverage gap: a plausible-but-wrong `find_focusable_window`
+        // that short-circuits on "is `windows_for_app`'s *raw* list
+        // non-empty" (rather than "did filtering it for focusability find
+        // something") would wrongly stop here and never consult tier 2 at
+        // all. Every other test with a non-empty `for_app` also has an
+        // empty `all`, so that bug is invisible to them — this fixture
+        // makes tier 1 non-empty-but-unfocusable *and* gives tier 2 a
+        // genuine focusable match, so the two implementations diverge.
+        let mut unfocusable = window("w1");
+        unfocusable.skip_taskbar = true;
+        let mut matching = window("w2");
+        matching.app_id = Some("firefox".to_string());
+        let windows = FakeWindows {
+            for_app: vec![unfocusable],
+            all: vec![matching],
+            ..Default::default()
+        };
+        let launcher = FakeLauncher::default();
+
+        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        assert_eq!(
+            *windows.calls.lock().unwrap(),
+            vec![("activate", "w2".to_string())],
+            "tier 1 being non-empty-but-unfocusable must not block the tier 2 fallback"
+        );
+        assert!(launcher.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn tier_one_wins_over_tier_two_when_both_have_a_candidate() {
         // Both windows carry an `app_id` that matches — not just the
         // `for_app` one — so a mutation that checked `all_windows` before
