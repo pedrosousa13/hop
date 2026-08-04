@@ -77,13 +77,6 @@ pub(crate) struct ParsedEntry {
 /// this one stops at a [`ParsedEntry`] so [`build_entry`] can apply
 /// `hop-protocol`'s content rules ([`IconName`], [`IconPath`]) before
 /// anything becomes an [`Item`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
-    )
-)]
 pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
     let mut name = String::new();
     let mut localized_name = String::new();
@@ -233,13 +226,6 @@ fn truncate_to_byte_boundary(s: &str, max: usize) -> String {
 /// definition joins subdirectory names with `-` for a nested file, which
 /// this function does not do; see this plan's Scope section for why that is
 /// out of scope.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
-    )
-)]
 pub(crate) fn app_id_from_file_name(file_name: &str) -> Option<String> {
     file_name.strip_suffix(".desktop").map(str::to_string)
 }
@@ -258,13 +244,6 @@ pub(crate) fn app_id_from_file_name(file_name: &str) -> Option<String> {
 /// which no real filename reaches (see the reasoning at the call site in
 /// Task 2) — the whole entry is dropped, since there is no id left to build
 /// one under.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
-    )
-)]
 pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntry> {
     let id = ItemId::new(format!("app:{app_id}")).ok()?;
 
@@ -310,7 +289,7 @@ pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntr
     not(test),
     expect(
         dead_code,
-        reason = "no consumer until Task 2 (issue #57) wires this module into a directory scan"
+        reason = "no consumer until Task 3 (issue #57) wires this into AppIndex"
     )
 )]
 pub(crate) struct AppEntry {
@@ -318,6 +297,257 @@ pub(crate) struct AppEntry {
     pub(crate) item: Item,
     pub(crate) exec: String,
     pub(crate) haystack: String,
+}
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+/// The XDG Base Directory roots a `.desktop` file may live under, in the
+/// order this crate treats as precedence-first-wins: `data_home` (falling
+/// back to `~/.local/share`), then each entry of `data_dirs` (falling back
+/// to `/usr/local/share:/usr/share`), each with `/applications` appended.
+///
+/// Order matters beyond cosmetics: [`scan_apps`] keeps the first entry it
+/// sees for a given app id and discards later ones, so a user override in
+/// `XDG_DATA_HOME` correctly shadows a system-installed entry with the same
+/// filename rather than the two colliding arbitrarily.
+///
+/// Pure — see this task's note on why the caller supplies these values
+/// rather than this function reading `std::env` itself.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 7 (issue #57) wires this into startup"
+    )
+)]
+pub(crate) fn xdg_application_roots(
+    home: Option<&str>,
+    data_home: Option<&str>,
+    data_dirs: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(data_home) = data_home {
+        roots.push(Path::new(data_home).join("applications"));
+    } else if let Some(home) = home {
+        roots.push(Path::new(home).join(".local/share/applications"));
+    }
+
+    let data_dirs = data_dirs.unwrap_or("/usr/local/share:/usr/share");
+    for dir in data_dirs
+        .split(':')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        roots.push(Path::new(dir).join("applications"));
+    }
+
+    roots
+}
+
+/// The Flatpak export directories: the per-user one under `$HOME`, then the
+/// system-wide one. Flatpak does not currently register its export
+/// directories in `XDG_DATA_DIRS`, which is why these are enumerated
+/// separately rather than folding into [`xdg_application_roots`] — ported
+/// from the salvaged parser's `desktop_entry_files`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 7 (issue #57) wires this into startup"
+    )
+)]
+pub(crate) fn flatpak_application_roots(home: Option<&str>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = home {
+        roots.push(Path::new(home).join(".local/share/flatpak/exports/share/applications"));
+    }
+    roots.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
+    roots
+}
+
+/// Scans every directory in `roots`, in order, parsing each `.desktop` file
+/// found into an [`AppEntry`]. A root that does not exist or cannot be read
+/// is skipped, not an error — an unconfigured `~/.icons`-style directory on
+/// a fresh machine is normal, not exceptional.
+///
+/// The first entry seen for a given app id wins; a later root offering the
+/// same filename is discarded. This is what makes `roots`' ordering
+/// (user-then-system, from [`xdg_application_roots`]) a real precedence
+/// rule rather than a coincidence of iteration order.
+///
+/// The only place in this module that performs disk I/O other than the
+/// inotify watcher itself (`open_watch`/`spawn_index_watcher`, Task 6) —
+/// called once at startup and once per filesystem-change notification
+/// thereafter, **never** from [`AppIndex::query`] (Task 3).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 3 (issue #57) wires this into AppIndex"
+    )
+)]
+pub(crate) fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
+    let mut seen_ids = HashSet::new();
+    let mut entries = Vec::new();
+
+    for root in roots {
+        let Ok(dir_entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for dir_entry in dir_entries.flatten() {
+            let path = dir_entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(app_id) = app_id_from_file_name(file_name) else {
+                continue;
+            };
+            if !seen_ids.insert(app_id.clone()) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(parsed) = parse_desktop_entry(&content) else {
+                continue;
+            };
+            if let Some(entry) = build_entry(app_id, parsed) {
+                entries.push(entry);
+            }
+        }
+    }
+
+    entries
+}
+
+#[cfg(test)]
+mod scan_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn write_entry(dir: &std::path::Path, file_name: &str, name: &str) {
+        fs::write(
+            dir.join(file_name),
+            format!("[Desktop Entry]\nName={name}\nExec={name}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn xdg_roots_prefer_data_home_over_the_local_share_default() {
+        let roots = xdg_application_roots(Some("/home/x"), Some("/custom/data"), None);
+        assert_eq!(roots[0], PathBuf::from("/custom/data/applications"));
+    }
+
+    #[test]
+    fn xdg_roots_fall_back_to_local_share_when_data_home_is_unset() {
+        let roots = xdg_application_roots(Some("/home/x"), None, None);
+        assert_eq!(roots[0], PathBuf::from("/home/x/.local/share/applications"));
+    }
+
+    #[test]
+    fn xdg_roots_split_data_dirs_on_colons_and_ignore_blank_segments() {
+        let roots = xdg_application_roots(None, None, Some("/a:/b::/c"));
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/a/applications"),
+                PathBuf::from("/b/applications"),
+                PathBuf::from("/c/applications"),
+            ]
+        );
+    }
+
+    #[test]
+    fn xdg_roots_default_data_dirs_when_unset() {
+        let roots = xdg_application_roots(None, None, None);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/usr/local/share/applications"),
+                PathBuf::from("/usr/share/applications"),
+            ]
+        );
+    }
+
+    #[test]
+    fn flatpak_roots_include_the_per_user_and_system_export_dirs() {
+        let roots = flatpak_application_roots(Some("/home/x"));
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/home/x/.local/share/flatpak/exports/share/applications"),
+                PathBuf::from("/var/lib/flatpak/exports/share/applications"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_apps_finds_desktop_files_and_ignores_others() {
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), "firefox.desktop", "Firefox");
+        fs::write(dir.path().join("not-an-entry.txt"), "irrelevant").unwrap();
+
+        let entries = scan_apps(&[dir.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].app_id, "firefox");
+    }
+
+    #[test]
+    fn scan_apps_skips_a_root_that_does_not_exist() {
+        let missing = PathBuf::from("/definitely/not/a/real/path/for/this/test");
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), "x.desktop", "X");
+
+        let entries = scan_apps(&[missing, dir.path().to_path_buf()]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "a missing root must not abort the whole scan"
+        );
+    }
+
+    #[test]
+    fn the_first_root_wins_when_two_roots_offer_the_same_app_id() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let system_dir = tempfile::tempdir().unwrap();
+        write_entry(user_dir.path(), "app.desktop", "User Override");
+        write_entry(system_dir.path(), "app.desktop", "System Default");
+
+        let entries = scan_apps(&[
+            user_dir.path().to_path_buf(),
+            system_dir.path().to_path_buf(),
+        ]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "the same app id from two roots must not duplicate"
+        );
+        assert_eq!(
+            entries[0].item.title, "User Override",
+            "the first root in the list must win — this is what makes root order a real precedence rule"
+        );
+    }
+
+    #[test]
+    fn a_hidden_entry_on_disk_does_not_appear_in_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("hidden.desktop"),
+            "[Desktop Entry]\nName=Hidden\nExec=hidden\nHidden=true\n",
+        )
+        .unwrap();
+
+        assert!(scan_apps(&[dir.path().to_path_buf()]).is_empty());
+    }
 }
 
 #[cfg(test)]
