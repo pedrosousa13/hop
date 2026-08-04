@@ -2,13 +2,40 @@
 //! message, reading one frame, and the handshake preamble. Kept as a `common`
 //! module rather than duplicated per test file so a wire-contract change
 //! shows up as one diff here, not a drift between suites.
+//!
+//! This module also holds the in-process daemon harness (`TestDaemon`,
+//! `start_daemon`) and the scripted-provider fixture (`Script`,
+//! `ScriptedProvider`, `RecordingLog`, `scripted_item`). Both live here
+//! rather than in the test files that use them so `lifecycle.rs` and
+//! `host.rs` share one harness instead of duplicating it.
+//!
+//! `mod common;` compiles this whole module into each of the three test
+//! binaries in this crate (`lifecycle`, `socket`, `host`), and each binary
+//! uses only a subset of what is here: `socket.rs` drives a spawned `hopd`
+//! binary and never calls `start_daemon` or touches the provider fixture;
+//! `lifecycle.rs` uses the daemon harness but not the provider fixture. Every
+//! item below is genuinely used — by a sibling binary, if not by all three —
+//! so `dead_code` warnings here are false positives from per-binary
+//! compilation, not real dead code. Allowed at the module level, once, rather
+//! than scattered per item; no other module in this workspace carries this
+//! allow.
 #![allow(clippy::unwrap_used)]
+#![allow(dead_code)]
 
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use hop_core::host::{ProviderEvent, ProviderLog};
+use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
+use hop_core::router::{Mode, RoutedQuery};
 use hop_protocol::framing::{FRAME_PREFIX_LEN, decode_payload, encode_frame, payload_len};
-use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg};
+use hop_protocol::{API_VERSION, ActionId, ClientMsg, DaemonMsg, ExecOutcome, Item, ItemId, Kind};
+use hopd::server::serve_with;
+use hopd::source::ResultSource;
 
 /// Sends `msg` as one length-prefixed frame, through the same
 /// [`hop_protocol::framing`] functions the daemon itself uses to decode —
@@ -49,4 +76,197 @@ pub fn hello(stream: &mut UnixStream) {
             api_version: API_VERSION
         }
     );
+}
+
+/// An in-process daemon on a scripted source, plus the runtime that hosts
+/// it. Dropping this drops the runtime, which tears the server task and its
+/// socket down with it.
+pub struct TestDaemon {
+    _runtime: tokio::runtime::Runtime,
+    pub socket_path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+pub fn start_daemon<S: ResultSource>(source: S) -> TestDaemon {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let root = dir.path().to_path_buf();
+    // serve_with expects the runtime dir itself (hopd's runtime_dir::resolve
+    // is a binary-startup concern, not serve's); create the 0700 dir the
+    // way resolve() would.
+    let runtime_dir = root.join("hop");
+    std::fs::create_dir(&runtime_dir).unwrap();
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let serve_dir = runtime_dir.clone();
+    runtime.spawn(async move {
+        let _ = serve_with(&serve_dir, source).await;
+    });
+
+    let socket_path = runtime_dir.join("hopd.sock");
+    for _ in 0..50 {
+        if socket_path.exists() {
+            return TestDaemon {
+                _runtime: runtime,
+                socket_path,
+                _dir: dir,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("in-process hopd socket did not appear at {socket_path:?} within 5s");
+}
+
+/// What a scripted provider does when it is asked to run — the fixture spec
+/// §11 asks for, so an integration test's outcome is a property of the script
+/// rather than of timing.
+///
+/// It lives here rather than in `hop-core` because only `hopd`'s integration
+/// tests need it: exporting it from the library crate would mean a `testing`
+/// feature or a permanently-compiled module, for a type no production caller
+/// has any use for. Issues #57, #58 and #61 reuse it from here.
+#[derive(Clone)]
+pub enum Script {
+    /// Answer with these items.
+    Answer(Vec<Item>),
+    /// Fail with this text — used for the bounding-and-stripping tests, so
+    /// pass whatever hostile string is under test.
+    Fail(String),
+    /// Panic, to prove the host contains it.
+    Panic,
+    /// Never return, to prove the host cuts it off without cooperation. Yields
+    /// while it waits, so `abort` can take effect and no worker thread is
+    /// pinned for the test run.
+    Hang,
+}
+
+/// A provider that does exactly what its [`Script`] says, and declares exactly
+/// the manifest it was built with.
+pub struct ScriptedProvider {
+    manifest: ProviderManifest,
+    script: Script,
+}
+
+impl ScriptedProvider {
+    /// A provider answering to `id`, declaring `kinds`, serving `Mode::All`
+    /// with no minimum term length, and running `script`.
+    ///
+    /// `budget` is 20 ms: comfortably above what an `Answer` or a `Fail` needs,
+    /// and comfortably below the wait an integration test would notice, so a
+    /// `Hang` resolves fast.
+    pub fn new(id: &'static str, kinds: Vec<Kind>, script: Script) -> Self {
+        ScriptedProvider {
+            manifest: ProviderManifest {
+                id,
+                kinds,
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(20),
+            },
+            script,
+        }
+    }
+
+    /// The same provider with a manifest field overridden — for the tests that
+    /// need a specific budget, mode set or minimum.
+    pub fn with_manifest(mut self, manifest: ProviderManifest) -> Self {
+        self.manifest = manifest;
+        self
+    }
+}
+
+impl Provider for ScriptedProvider {
+    fn manifest(&self) -> ProviderManifest {
+        self.manifest.clone()
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        _q: Arc<RoutedQuery>,
+        _ctx: QueryCtx,
+    ) -> Result<Vec<Item>, ProviderError> {
+        match &self.script {
+            Script::Answer(items) => Ok(items.clone()),
+            Script::Fail(text) => Err(ProviderError::Failed(text.clone())),
+            Script::Panic => panic!("scripted provider panic"),
+            Script::Hang => loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            },
+        }
+    }
+
+    async fn execute(
+        self: Arc<Self>,
+        _item_id: ItemId,
+        _action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        Ok(ExecOutcome::Done)
+    }
+}
+
+/// A [`ProviderLog`] the tests can read back, so "a record was emitted" is an
+/// assertion rather than an inspection of stderr.
+#[derive(Default)]
+pub struct RecordingLog {
+    lines: Mutex<Vec<String>>,
+}
+
+impl RecordingLog {
+    /// Every line recorded so far, in order.
+    pub fn lines(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .expect("no test panics holding this")
+            .clone()
+    }
+}
+
+impl ProviderLog for RecordingLog {
+    fn record(&self, event: ProviderEvent<'_>) {
+        let line = match event {
+            ProviderEvent::Answered {
+                provider, items, ..
+            } => {
+                format!("answered {provider} {items}")
+            }
+            ProviderEvent::Failed(failure) => format!(
+                "failed {} {:?} {}",
+                failure.provider(),
+                failure.kind(),
+                failure.message()
+            ),
+            ProviderEvent::BudgetMiss { provider, .. } => format!("budget-miss {provider}"),
+            ProviderEvent::Rejected {
+                provider,
+                rejections,
+            } => {
+                format!("rejected {provider} {}", rejections.len())
+            }
+            ProviderEvent::Skipped { provider } => format!("skipped {provider}"),
+        };
+        self.lines
+            .lock()
+            .expect("no test panics holding this")
+            .push(line);
+    }
+}
+
+/// One item, well-formed and agreeing with `provider` — the fixture's honest
+/// item, for tests that need results rather than failures.
+pub fn scripted_item(provider: &str, kind: Kind, id: &str, title: &str) -> Item {
+    Item {
+        id: ItemId::new(id).expect("within bounds by construction"),
+        kind,
+        title: title.to_string(),
+        subtitle: None,
+        icon: None,
+        actions: vec![],
+        default_action: ActionId::new("open").expect("within bounds by construction"),
+        copy_text: None,
+        append_to_end: false,
+        provider: provider.to_string(),
+    }
 }
