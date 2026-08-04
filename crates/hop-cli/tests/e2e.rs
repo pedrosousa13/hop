@@ -244,6 +244,19 @@ fn the_cli_drops_frames_whose_query_id_is_not_current() {
             },
         );
         write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id + 1 }); // stale done: must NOT end the query
+        // Proof that the stale `QueryDone` above did not end the exchange:
+        // this frame is sent *after* it, naming the real query id. A loop
+        // that (incorrectly) ends on any `QueryDone` regardless of id would
+        // never read this frame, so "current three" would be missing from
+        // stdout — that is the failure this frame exists to catch.
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(5, "current three")],
+            },
+        );
         write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
     });
 
@@ -261,14 +274,29 @@ fn the_cli_drops_frames_whose_query_id_is_not_current() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("current one") && stdout.contains("current two"));
+    assert!(
+        stdout.contains("current one")
+            && stdout.contains("current two")
+            && stdout.contains("current three")
+    );
     assert!(
         !stdout.contains("stale"),
         "a stale frame's items must never be rendered, got: {stdout}"
     );
-    // Assembled output: both current items, in delivery order.
+    // Assembled output: the three current items, in delivery order. This
+    // also proves "current three" (sent after the stale `QueryDone`) made
+    // it into stdout, so the exchange survived that stale done.
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 3);
+    let one = stdout.find("current one").expect("current one must print");
+    let two = stdout.find("current two").expect("current two must print");
+    let three = stdout
+        .find("current three")
+        .expect("current three must print");
+    assert!(
+        one < two && two < three,
+        "items must print in delivery order, got: {stdout}"
+    );
 }
 
 #[test]
@@ -326,5 +354,57 @@ fn the_cli_refuses_a_daemon_that_streams_past_the_per_query_cap() {
     assert!(
         output.stdout.is_empty(),
         "nothing may be printed for a query that was refused mid-assembly"
+    );
+}
+
+#[test]
+fn the_cli_accepts_a_stream_that_lands_exactly_on_the_per_query_cap() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        // Five frames of MAX_ITEMS_PER_RESULTS_FRAME items land the running
+        // total at exactly MAX_ITEMS_PER_QUERY — precisely what hopd itself
+        // sends when it caps a query (see hop_protocol::limits' docs). This
+        // must be accepted and printed whole, not refused: the brief is
+        // explicit that only *exceeding* the cap is a protocol violation.
+        // This is the positive-path counterpart to the over-cap test above:
+        // together they pin the `>` boundary in `try_run_query` against a
+        // regression to an overly strict `>=`, which would wrongly refuse
+        // this legitimate, exactly-at-cap stream.
+        let full: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME)
+            .map(|n| tiny_item(n, "x"))
+            .collect();
+        for _ in 0..(MAX_ITEMS_PER_QUERY / MAX_ITEMS_PER_RESULTS_FRAME) {
+            write_daemon_frame(
+                stream,
+                &DaemonMsg::Results {
+                    query_id: id,
+                    partial: true,
+                    items: full.clone(),
+                },
+            );
+        }
+        write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("query")
+        .arg("q")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "an exactly-at-cap stream must be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        MAX_ITEMS_PER_QUERY,
+        "expected exactly {MAX_ITEMS_PER_QUERY} lines, got {}",
+        lines.len()
     );
 }
