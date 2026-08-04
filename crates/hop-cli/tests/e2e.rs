@@ -113,16 +113,24 @@ fn the_cli_query_round_trips_and_exits_zero() {
     let _daemon = spawn_daemon(&hopd_path, runtime_dir.path());
 
     // `SkeletonProvider::query` ignores its query text and always answers
-    // with the same hardcoded item, so any term proves the round trip — this
-    // one is deliberately a nonsense token rather than an ordinary word like
-    // "hello", so it cannot collide with a real application's title, generic
-    // name, comment, keywords or exec command and spuriously pull in a
-    // second item from the apps provider `spawn_daemon` does not otherwise
-    // fully isolate (its own doc comment names the one root it cannot close:
-    // the hardcoded, unparameterized Flatpak system export directory).
+    // with the same hardcoded item, but the daemon now runs that item through
+    // `Pipeline::assemble` (issue #103) before it reaches a client, and
+    // `Ranker::rank` drops anything whose haystack does not fuzzy-match the
+    // term — so a nonsense token that used to prove the round trip by
+    // returning the one hardcoded item now correctly returns nothing.
+    // "walking skeleton" is chosen instead because it matches the skeleton
+    // item's haystack (`Hello from hopd` + `M2.2 walking skeleton`) on both
+    // atoms, while an installed application whose title and subtitle contain
+    // both "walking" and "skeleton" is implausible — but not impossible, so
+    // the assertion below checks the output *contains* the item rather than
+    // assuming it is the only one. That is also why this test does not assert
+    // an exact line count: doing so would depend on what happens to be
+    // installed on whatever machine runs it, which is the one root
+    // `spawn_daemon` cannot close (its own doc comment names it: the
+    // hardcoded, unparameterized Flatpak system export directory).
     let output = Command::new(env!("CARGO_BIN_EXE_hop"))
         .arg("query")
-        .arg("hop-cli-e2e-canary-5c2f91")
+        .arg("walking skeleton")
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
         .output()
         .expect("failed to run hop query");
@@ -135,15 +143,14 @@ fn the_cli_query_round_trips_and_exits_zero() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(
-        lines.len(),
-        1,
-        "expected exactly one line of stdout, got: {stdout:?}"
+    let items: Vec<Item> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line must parse as an Item"))
+        .collect();
+    assert!(
+        items.iter().any(|item| item.title == "Hello from hopd"),
+        "expected the skeleton item among the results, got {stdout:?}"
     );
-
-    let item: Item = serde_json::from_str(lines[0]).expect("line must parse as an Item");
-    assert_eq!(item.title, "Hello from hopd");
 }
 
 #[test]

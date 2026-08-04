@@ -13,11 +13,13 @@
 //! What it is not yet: a daemon with every provider — the query router and the
 //! provider host are wired ([`source`]), and the walking skeleton's and
 //! [`apps`]'s providers are both registered as of this issue (#57), but #58's
-//! calculator is still a gap — a result *assembly* step (ranking, boosts and
-//! the pinned tail are `hop-core`'s [`pipeline`](hop_core::pipeline), still
-//! uncalled here — issue #103), or anything with a lifecycle beyond "runs
-//! until killed". Each of those gaps is named where it applies, in
-//! [`runtime_dir`], [`server`] and [`source`].
+//! calculator is still a gap — or anything with a lifecycle beyond "runs
+//! until killed". Result *assembly* is no longer one of the gaps: every
+//! provider arrival re-runs `hop-core`'s [`pipeline`](hop_core::pipeline) over
+//! everything received so far for that query and replaces the client's list
+//! with the ranked, boosted, capped result (issue #103; see [`source`] for
+//! the accumulator that does it). Each remaining gap is named where it
+//! applies, in [`runtime_dir`], [`server`] and [`source`].
 
 pub mod apps;
 pub(crate) mod connection;

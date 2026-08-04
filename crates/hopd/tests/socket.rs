@@ -122,19 +122,26 @@ fn the_round_trip_returns_one_item_end_to_end() {
     hello(&mut stream);
 
     // `SkeletonProvider::query` (`source.rs`) ignores its query text and
-    // always answers with the same hardcoded item, so any term proves the
-    // round trip — this one is deliberately a nonsense token rather than an
-    // ordinary word like "hello", so it cannot collide with a real
-    // application's title, generic name, comment, keywords or exec command
-    // and spuriously pull in a second item from the apps provider
-    // `spawn_daemon` does not otherwise isolate (its own doc comment above
-    // names the one root it cannot close: the hardcoded, unparameterized
-    // Flatpak system export directory).
+    // always answers with the same hardcoded item, but the daemon now runs
+    // that item through `Pipeline::assemble` (issue #103) before it reaches a
+    // client, and `Ranker::rank` drops anything whose haystack does not
+    // fuzzy-match the term — so a nonsense token that used to prove the round
+    // trip by returning the one hardcoded item now correctly returns nothing.
+    // "walking skeleton" is chosen instead because it matches the skeleton
+    // item's haystack (`Hello from hopd` + `M2.2 walking skeleton`) on both
+    // atoms, while an installed application whose title and subtitle contain
+    // both "walking" and "skeleton" is implausible — but not impossible, so
+    // the assertion below checks the list *contains* the item rather than
+    // assuming it is the only one. That is also why this test does not assert
+    // an exact list length: doing so would depend on what happens to be
+    // installed on whatever machine runs it, which is the one root
+    // `spawn_daemon` cannot isolate (its own doc comment above names it: the
+    // hardcoded, unparameterized Flatpak system export directory).
     send(
         &mut stream,
         &ClientMsg::Query {
             id: 7,
-            text: QueryText::new("hop-e2e-canary-9f3a1c").unwrap(),
+            text: QueryText::new("walking skeleton").unwrap(),
         },
     );
 
@@ -152,9 +159,12 @@ fn the_round_trip_returns_one_item_end_to_end() {
         partial,
         "streamed results frames are partial; QueryDone is the terminal signal"
     );
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].title, "Hello from hopd");
-    assert_eq!(items[0].kind, Kind::Action);
+    assert!(
+        items
+            .iter()
+            .any(|item| item.title == "Hello from hopd" && item.kind == Kind::Action),
+        "expected the skeleton item among the results, got {items:?}"
+    );
 
     let done = recv(&mut stream);
     assert_eq!(done, DaemonMsg::QueryDone { query_id: 7 });
