@@ -49,12 +49,13 @@
 //!
 //! Ranking. This module streams each provider's manifest-checked items as its
 //! own batch, in the order providers answer, and never calls
-//! [`Pipeline::assemble`](crate::pipeline::Pipeline::assemble). Wiring
-//! assembly in needs a protocol answer about streaming that issue #56 does
-//! not give: the wire streams append-only batches, while `assemble` is a
-//! whole-list pure function, so "rank the streamed set" means either
-//! re-sending the whole list per batch or gating on the slowest provider, and
-//! spec §3 forbids the latter outright. Tracked as issue #103.
+//! [`Pipeline::assemble`](crate::pipeline::Pipeline::assemble) — still not
+//! enforced here. The protocol answer issue #103 chose is the first option that
+//! framing dismissed, and it is no longer hypothetical: the wire streams
+//! **replacement frames**, where every `results` frame re-sends the whole
+//! re-ranked list, and the daemon's result source (`hopd`'s `HostSource`
+//! accumulator) is where `assemble` now lives, called per arrival over the
+//! accumulated [`CheckedItems`](crate::pipeline::CheckedItems).
 
 use std::future::Future;
 use std::pin::Pin;
