@@ -812,9 +812,11 @@ use std::sync::RwLock;
 
 /// The most items [`AppIndex::query`] returns in one answer. Not a ranking
 /// cap and not `hop_protocol::limits::MAX_ITEMS_PER_RESULTS_FRAME` (1 000) —
-/// this is smaller and exists only to keep one provider's unranked batch a
-/// sane size while issue #103 (wiring `Pipeline::assemble`, and with it a
-/// real cap) remains unlanded. See this plan's Scope section.
+/// it is a per-provider answer-size bound, deliberately matching the daemon's
+/// own display cap `MAX_RESULTS` (50), which issue #103 now applies across
+/// the whole assembled set. Emitting at most that many per answer means the
+/// apps provider never hands assembly a batch larger than what a user can
+/// see, and never floods one query with an oversized unranked batch.
 pub(crate) const QUERY_RESULT_CAP: usize = 50;
 
 /// The apps provider's in-memory index: an [`AppEntry`] list a background

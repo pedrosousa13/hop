@@ -157,8 +157,10 @@ pub enum DaemonMsg {
         items: Vec<Item>,
     },
     /// The one terminal frame of a query exchange; sent when the source finishes,
-    /// when the exchange hits [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY),
-    /// or in answer to a matching `Cancel`.
+    /// when the exchange ends at a cap — the result source's accumulator at
+    /// [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY), or the
+    /// connection's defensive [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME)
+    /// bound truncating one over-long list — or in answer to a matching `Cancel`.
     ///
     /// # When an exchange ends without one
     ///
