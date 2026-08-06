@@ -15,6 +15,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Query(text) => hop_cli::run_query(&text),
+        Command::Exec {
+            query,
+            item_id,
+            action_id,
+        } => hop_cli::run_exec(&query, item_id, action_id),
         Command::Usage => {
             eprintln!("{}", hop_cli::USAGE);
             ExitCode::from(2)

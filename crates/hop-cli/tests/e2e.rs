@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use hop_protocol::framing::{FRAME_PREFIX_LEN, decode_payload, encode_frame, payload_len};
-use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, Item};
+use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ExecOutcome, Item};
 
 /// `CARGO_BIN_EXE_hopd` is not set here: Cargo only defines a
 /// `CARGO_BIN_EXE_<bin>` variable for binaries the *current* package builds,
@@ -149,6 +149,173 @@ fn the_cli_query_round_trips_and_exits_zero() {
     assert!(
         items.iter().any(|item| item.title == "Hello from hopd"),
         "expected the skeleton item among the results, got {stdout:?}"
+    );
+}
+
+#[test]
+fn the_cli_exec_sends_execute_against_the_live_result_and_exits_zero() {
+    // The exec flow (issue #59): `hop exec <query> <item-id> <action-id>`
+    // queries, then — only after `QueryDone` — sends an `Execute` frame
+    // naming the item from the last results frame, and maps an `Executed`
+    // reply to exit 0. The fake daemon answers the query with one item and
+    // then reads the `Execute` frame the CLI sends, proving the resolution
+    // reached the wire with the right ids.
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(1, "an app")],
+            },
+        );
+        write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
+
+        let ClientMsg::Execute {
+            query_id,
+            item_id,
+            action_id,
+        } = read_client_frame(stream)
+        else {
+            panic!("expected an Execute frame after QueryDone");
+        };
+        assert_eq!(query_id, id, "execute must name the query id");
+        assert_eq!(
+            item_id.as_str(),
+            "test:1",
+            "execute must name the delivered item"
+        );
+        assert_eq!(
+            action_id.as_str(),
+            "open",
+            "execute must name the resolved action"
+        );
+
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Executed {
+                query_id: id,
+                outcome: ExecOutcome::Done,
+            },
+        );
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("exec")
+        .arg("an app")
+        .arg("test:1")
+        .arg("open")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "hop exec must exit 0 on an Executed reply, got {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Runs `hop exec an app test:1 open` against a fresh fake daemon that
+/// answers the query with one item (`test:1`, action `open`) and, reading the
+/// `Execute` frame the CLI sends, replies with `make_reply(id)`. Returns the
+/// subprocess's output so a test can assert its real exit code.
+fn run_exec_against_reply(
+    make_reply: impl Fn(u64) -> DaemonMsg + Send + 'static,
+) -> std::process::Output {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = fake_daemon(runtime_dir.path(), move |stream, id| {
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(1, "an app")],
+            },
+        );
+        write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
+        // The exec flow resolves the item+action locally (it is in the frame
+        // above), sends Execute, then reads the daemon's reply.
+        let ClientMsg::Execute { .. } = read_client_frame(stream) else {
+            panic!("expected an Execute frame after QueryDone");
+        };
+        write_daemon_frame(stream, &make_reply(id));
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("exec")
+        .arg("an app")
+        .arg("test:1")
+        .arg("open")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .unwrap();
+    daemon.join().unwrap();
+    output
+}
+
+fn query_scoped_error(id: u64, code: hop_protocol::ErrorCode, message: &str) -> DaemonMsg {
+    DaemonMsg::Error {
+        query_id: Some(id),
+        error: hop_protocol::ProtoError {
+            code,
+            message: message.to_string(),
+        },
+    }
+}
+
+/// Criterion 6: the process's real exit code distinguishes success, unknown
+/// item, unknown action, and provider failure. Each case drives the binary and
+/// reads back its actual `ExitCode` — a regression that mapped a refusal back
+/// to generic failure (1) would fail here.
+#[test]
+fn the_cli_exec_exit_codes_distinguish_each_outcome() {
+    // Success → 0.
+    let output = run_exec_against_reply(|id| DaemonMsg::Executed {
+        query_id: id,
+        outcome: ExecOutcome::Done,
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "success must exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Unknown item → 10.
+    let output = run_exec_against_reply(|id| {
+        query_scoped_error(id, hop_protocol::ErrorCode::UnknownItem, "nope")
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(10),
+        "an unknown-item refusal must exit 10, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Unknown action → 11.
+    let output = run_exec_against_reply(|id| {
+        query_scoped_error(id, hop_protocol::ErrorCode::UnknownAction, "nope")
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(11),
+        "an unknown-action refusal must exit 11, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Provider failed → 12.
+    let output = run_exec_against_reply(|id| {
+        query_scoped_error(id, hop_protocol::ErrorCode::ProviderFailed, "boom")
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(12),
+        "a provider failure must exit 12, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

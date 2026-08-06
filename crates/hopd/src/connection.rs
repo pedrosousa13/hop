@@ -301,15 +301,112 @@ async fn handle_message<S: ResultSource>(
             }
             Ok(false)
         }
+        (
+            HandshakeState::Ready,
+            ClientMsg::Execute {
+                query_id,
+                item_id,
+                action_id,
+            },
+        ) => {
+            // Resolve against the retained set (`Exchange::delivered`), which
+            // is the live-result-set binding issue #25's threat-model shape
+            // and issue #59 choose: an execute frame acts only on an item this
+            // daemon actually delivered under `query_id` — never a stale
+            // query, never an id it never emitted. Every refusal below is
+            // query-scoped (`Some(query_id)`) and non-terminal to the
+            // connection, per `DaemonMsg::Error`'s contract.
+            //
+            // Cap-vs-never-emitted (#53/#55, design decision 4): since #103,
+            // `delivered` is the *last* assembled list, bounded at
+            // `MAX_ITEMS_PER_RESULTS_FRAME` and replaced whole per frame, while
+            // per-query accumulation is bounded upstream at
+            // `MAX_ITEMS_PER_QUERY` in `source.rs`. So an id absent from
+            // `delivered` was never what the client was shown under this
+            // `query_id` — whether the daemon never emitted it, a later frame
+            // replaced it away, or a per-query cap dropped it. Execute binds to
+            // what the client was shown, and retirement *is* removal from that
+            // live set, so all three are honestly the same `UnknownItem`,
+            // never a silent fall-through: there is no separate retained
+            // "lost to the cap" state to distinguish, and claiming one would
+            // be a fiction. This one refusal is the honest answer #53 asks for.
+            let active = match exchange {
+                Some(active) if active.id == query_id => active,
+                _ => {
+                    send_error(
+                        &mut *write_half,
+                        Some(query_id),
+                        ErrorCode::UnknownItem,
+                        format!("no such query or stale query id {query_id}"),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+            };
+
+            let Some(item) = active.delivered.iter().find(|i| i.id == item_id) else {
+                send_error(
+                    &mut *write_half,
+                    Some(query_id),
+                    ErrorCode::UnknownItem,
+                    format!("unknown item {item_id}"),
+                )
+                .await?;
+                return Ok(false);
+            };
+
+            if !item.actions.iter().any(|a| a.id == action_id) {
+                send_error(
+                    &mut *write_half,
+                    Some(query_id),
+                    ErrorCode::UnknownAction,
+                    format!("unknown action {action_id}"),
+                )
+                .await?;
+                return Ok(false);
+            }
+
+            // Resolution succeeded; dispatch to the provider that produced the
+            // item. The provider error is *not* forwarded verbatim — a
+            // `ProviderError::Failed(String)` carries provider-authored text
+            // that is not bounds-checked here, and the client only needs the
+            // classification, not the payload.
+            let provider = item.provider.clone();
+            match source.execute(&provider, item_id, action_id).await {
+                Ok(outcome) => {
+                    send_msg(write_half, &DaemonMsg::Executed { query_id, outcome }).await?
+                }
+                Err(_) => {
+                    send_error(
+                        &mut *write_half,
+                        Some(query_id),
+                        ErrorCode::ProviderFailed,
+                        format!("provider `{provider}` failed to execute the action"),
+                    )
+                    .await?
+                }
+            }
+            Ok(false)
+        }
         (HandshakeState::Ready, _other) => {
-            // A second `hello`, or `execute` (issue #59's slice): refused per
-            // frame, the connection stays open. This is a refusal of one
-            // frame, not of the peer.
+            // The only frame left to reach here on a `Ready` connection is a
+            // second `Hello` — the peer asking to re-handshake a connection
+            // that is already past that gate. Refused per frame, and the
+            // connection stays open: this is a refusal of one frame, not of
+            // the peer (mirroring how the connection's handshake docs describe
+            // a second `Hello`).
+            //
+            // `ErrorCode::Internal` is kept deliberately: no dedicated code
+            // exists for "already handshaken", and `Internal` is the code this
+            // path has always emitted for a `Ready`-state frame the daemon has
+            // no handler for. It is not the *execute* refusal path (issue
+            // #59's slice), which now has its own arm above with
+            // `UnknownItem`/`UnknownAction`/`ProviderFailed`.
             send_error(
                 write_half,
                 None,
                 ErrorCode::Internal,
-                "not implemented yet".to_string(),
+                "a connection may complete its handshake only once".to_string(),
             )
             .await?;
             Ok(false)
@@ -567,6 +664,349 @@ mod tests {
         assert!(
             delivered.iter().all(|i| i.id.as_str() != "only-in-first"),
             "an item only the first list held must not survive a replacement"
+        );
+    }
+
+    // --- Execute resolution (issue #59) ---
+
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use hop_core::provider::ProviderError;
+    use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId, Kind, QueryText};
+
+    /// An item whose `actions` carry exactly the named action ids, so a test
+    /// can exercise the unknown-action path independently of the unknown-item
+    /// one.
+    fn item_with_action(id: &str, action_ids: &[&str]) -> Item {
+        Item {
+            id: ItemId::new(id).unwrap(),
+            kind: Kind::Action,
+            title: id.to_string(),
+            subtitle: None,
+            icon: None,
+            actions: action_ids
+                .iter()
+                .map(|&a| Action {
+                    id: ActionId::new(a).unwrap(),
+                    kind: ActionKind::Open,
+                    label: a.to_string(),
+                })
+                .collect(),
+            default_action: ActionId::new("open").unwrap(),
+            copy_text: None,
+            append_to_end: false,
+            provider: "test".to_string(),
+        }
+    }
+
+    /// A source that records every `execute` call it is handed and either
+    /// succeeds with [`ExecOutcome::Done`] or fails, per its construction.
+    /// `start` never emits anything — these tests drive `handle_message`
+    /// directly against an exchange whose `delivered` the test populated.
+    #[derive(Clone)]
+    struct ScriptedSource {
+        calls: Arc<Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl ResultSource for ScriptedSource {
+        fn start(&self, _text: QueryText) -> mpsc::Receiver<Vec<Item>> {
+            let (_tx, rx) = mpsc::channel(1);
+            rx
+        }
+
+        fn execute(
+            &self,
+            provider: &str,
+            item_id: ItemId,
+            action_id: ActionId,
+        ) -> impl Future<Output = Result<ExecOutcome, ProviderError>> + Send {
+            let provider = provider.to_string();
+            let calls = self.calls.clone();
+            let fail = self.fail;
+            async move {
+                calls
+                    .lock()
+                    .expect("no test panics holding this")
+                    .push(format!("{provider}|{item_id}|{action_id}"));
+                if fail {
+                    Err(ProviderError::Failed("boom".to_string()))
+                } else {
+                    Ok(ExecOutcome::Done)
+                }
+            }
+        }
+    }
+
+    /// Reads one frame off `peer` and decodes it as a [`DaemonMsg`], so a test
+    /// can assert on exactly what `handle_message` sent.
+    async fn read_daemon_msg(peer: &mut tokio::net::UnixStream) -> DaemonMsg {
+        use tokio::io::AsyncReadExt;
+        let mut prefix = [0u8; FRAME_PREFIX_LEN];
+        peer.read_exact(&mut prefix).await.expect("read prefix");
+        let len = payload_len(prefix).expect("in-cap prefix");
+        let mut payload = vec![0u8; len];
+        peer.read_exact(&mut payload).await.expect("read payload");
+        decode_payload(&payload).expect("decode as DaemonMsg")
+    }
+
+    #[tokio::test]
+    async fn an_execute_resolves_against_delivered_and_sends_executed() {
+        let mut state = HandshakeState::Ready;
+        let source = ScriptedSource {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let mut exchange = Some(Exchange {
+            id: 7,
+            source: None,
+            delivered: vec![item_with_action("app:1", &["open"])],
+        });
+        let (mut peer, mut write_half) = write_half_pair();
+
+        let done = handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Execute {
+                query_id: 7,
+                item_id: ItemId::new("app:1").unwrap(),
+                action_id: ActionId::new("open").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!done, "a successful execute must not end the connection");
+        assert_eq!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Executed {
+                query_id: 7,
+                outcome: ExecOutcome::Done,
+            }
+        );
+        assert_eq!(
+            source.calls.lock().expect("test lock").as_slice(),
+            &["test|app:1|open".to_string()],
+            "the item's provider and both resolved ids must reach the source"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_execute_for_a_stale_query_id_is_query_scoped_unknown_item() {
+        let mut state = HandshakeState::Ready;
+        let source = ScriptedSource {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        // The live exchange is id 7; the frame names id 8.
+        let mut exchange = Some(Exchange {
+            id: 7,
+            source: None,
+            delivered: vec![item_with_action("app:1", &["open"])],
+        });
+        let (mut peer, mut write_half) = write_half_pair();
+
+        let done = handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Execute {
+                query_id: 8,
+                item_id: ItemId::new("app:1").unwrap(),
+                action_id: ActionId::new("open").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!done, "a stale-query refusal must not end the connection");
+        assert_eq!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Error {
+                query_id: Some(8),
+                error: ProtoError {
+                    code: ErrorCode::UnknownItem,
+                    message: "no such query or stale query id 8".to_string(),
+                },
+            }
+        );
+        assert!(
+            source.calls.lock().expect("test lock").is_empty(),
+            "a refused execute must never dispatch to the source"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_execute_with_no_active_exchange_is_query_scoped_unknown_item() {
+        let mut state = HandshakeState::Ready;
+        let source = ScriptedSource {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let mut exchange: Option<Exchange> = None;
+        let (mut peer, mut write_half) = write_half_pair();
+
+        let done = handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Execute {
+                query_id: 1,
+                item_id: ItemId::new("app:1").unwrap(),
+                action_id: ActionId::new("open").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!done);
+        assert_eq!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Error {
+                query_id: Some(1),
+                error: ProtoError {
+                    code: ErrorCode::UnknownItem,
+                    message: "no such query or stale query id 1".to_string(),
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_execute_for_an_undelivered_item_is_query_scoped_unknown_item() {
+        let mut state = HandshakeState::Ready;
+        let source = ScriptedSource {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        // The live query delivered "app:1" only, so "app:2" was never shown.
+        let mut exchange = Some(Exchange {
+            id: 7,
+            source: None,
+            delivered: vec![item_with_action("app:1", &["open"])],
+        });
+        let (mut peer, mut write_half) = write_half_pair();
+
+        let done = handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Execute {
+                query_id: 7,
+                item_id: ItemId::new("app:2").unwrap(),
+                action_id: ActionId::new("open").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!done);
+        assert_eq!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Error {
+                query_id: Some(7),
+                error: ProtoError {
+                    code: ErrorCode::UnknownItem,
+                    message: "unknown item app:2".to_string(),
+                },
+            }
+        );
+        assert!(source.calls.lock().expect("test lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_execute_for_an_unknown_action_is_query_scoped_unknown_action() {
+        let mut state = HandshakeState::Ready;
+        let source = ScriptedSource {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        // The item only offers "open"; the frame asks for "delete".
+        let mut exchange = Some(Exchange {
+            id: 7,
+            source: None,
+            delivered: vec![item_with_action("app:1", &["open"])],
+        });
+        let (mut peer, mut write_half) = write_half_pair();
+
+        let done = handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Execute {
+                query_id: 7,
+                item_id: ItemId::new("app:1").unwrap(),
+                action_id: ActionId::new("delete").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!done);
+        assert_eq!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Error {
+                query_id: Some(7),
+                error: ProtoError {
+                    code: ErrorCode::UnknownAction,
+                    message: "unknown action delete".to_string(),
+                },
+            }
+        );
+        assert!(source.calls.lock().expect("test lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_provider_execute_error_is_query_scoped_provider_failed() {
+        let mut state = HandshakeState::Ready;
+        let source = ScriptedSource {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: true,
+        };
+        let mut exchange = Some(Exchange {
+            id: 7,
+            source: None,
+            delivered: vec![item_with_action("app:1", &["open"])],
+        });
+        let (mut peer, mut write_half) = write_half_pair();
+
+        let done = handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Execute {
+                query_id: 7,
+                item_id: ItemId::new("app:1").unwrap(),
+                action_id: ActionId::new("open").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!done, "a provider failure is query-scoped, not terminal");
+        assert_eq!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Error {
+                query_id: Some(7),
+                error: ProtoError {
+                    code: ErrorCode::ProviderFailed,
+                    message: "provider `test` failed to execute the action".to_string(),
+                },
+            }
+        );
+        assert_eq!(
+            source.calls.lock().expect("test lock").as_slice(),
+            &["test|app:1|open".to_string()],
+            "the provider must be reached before it can fail"
         );
     }
 }

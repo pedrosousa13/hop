@@ -16,6 +16,7 @@
 //! daemon's production path runs through the host from issue #56 onward rather
 //! than waiting for #57's apps provider to make it real.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -117,6 +118,26 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
     /// obligations on this trait, which say what "cancels" costs an
     /// implementation that never sends.
     fn start(&self, text: QueryText) -> mpsc::Receiver<Vec<Item>>;
+
+    /// Executes `action_id` on `item_id`, which the connection has already
+    /// resolved against the items `provider` produced in a prior `start`.
+    ///
+    /// Resolution is the connection's job — this seam never mints an item, it
+    /// only acts on one the connection has already bound to a delivered
+    /// `Item` (see `crates/hopd/src/connection.rs`'s `Exchange::delivered`
+    /// for that retained-set rule). `provider` is that item's `provider`
+    /// string; both ids were validated against the retained set before this
+    /// is ever called. An implementation answers with the action's
+    /// [`ExecOutcome`], or a [`ProviderError`] describing why the provider
+    /// could not perform it. [`HostSource`] dispatches through its
+    /// [`ProviderHost`]; a test or scripted source answers however its
+    /// scenario wants.
+    fn execute(
+        &self,
+        provider: &str,
+        item_id: ItemId,
+        action_id: ActionId,
+    ) -> impl Future<Output = Result<ExecOutcome, ProviderError>> + Send;
 }
 
 /// The walking skeleton's item, as a real [`Provider`].
@@ -171,11 +192,13 @@ impl Provider for SkeletonProvider {
         _item_id: ItemId,
         _action_id: ActionId,
     ) -> Result<ExecOutcome, ProviderError> {
-        // Action dispatch is issue #59's slice; until then this provider
-        // produces items nothing can act on, and says so rather than
-        // pretending to have done something.
+        // Dispatch is issue #59's slice and is now wired up, but this
+        // walking-skeleton provider has no real action to perform — its
+        // hardcoded item is a placeholder. It fails honestly (surfacing as a
+        // query-scoped `ProviderFailed`) rather than pretending to have done
+        // something; the real executor is the apps provider.
         Err(ProviderError::Failed(
-            "action dispatch is not implemented yet".to_string(),
+            "the skeleton provider has no action to perform".to_string(),
         ))
     }
 }
@@ -331,6 +354,15 @@ impl ResultSource for HostSource {
         });
 
         rx
+    }
+
+    async fn execute(
+        &self,
+        provider: &str,
+        item_id: ItemId,
+        action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        self.host.execute(provider, item_id, action_id).await
     }
 }
 

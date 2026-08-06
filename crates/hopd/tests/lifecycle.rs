@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{hello, recv, send, start_daemon};
+use hop_core::provider::ProviderError;
 use hop_protocol::limits::{MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME};
 use hop_protocol::{
-    Action, ActionId, ActionKind, ClientMsg, DaemonMsg, Item, ItemId, Kind, QueryText,
+    Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ExecOutcome, Item, ItemId, Kind, QueryText,
 };
 use hopd::source::ResultSource;
 use tokio::sync::mpsc;
@@ -93,6 +94,21 @@ impl ResultSource for ScriptedSource {
             let _ = events.send("finished");
         });
         rx
+    }
+
+    async fn execute(
+        &self,
+        _provider: &str,
+        _item_id: ItemId,
+        _action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        // Lifecycle tests never drive `Execute`, so this scripted source
+        // answers with the failure a real refusal would, rather than
+        // pretending an action ran. `ResultSource::execute` is exercised
+        // where the seam is genuinely tested — hopd/tests/exec.rs.
+        Err(ProviderError::Failed(
+            "scripted lifecycle source does not execute".to_string(),
+        ))
     }
 }
 
@@ -221,6 +237,17 @@ impl ResultSource for EndlessSource {
             }
         });
         rx
+    }
+
+    async fn execute(
+        &self,
+        _provider: &str,
+        _item_id: ItemId,
+        _action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        Err(ProviderError::Failed(
+            "endless source does not execute".to_string(),
+        ))
     }
 }
 
@@ -431,6 +458,17 @@ impl ResultSource for FirstEndlessThenBoundedSource {
             }
         });
         rx
+    }
+
+    async fn execute(
+        &self,
+        _provider: &str,
+        _item_id: ItemId,
+        _action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        Err(ProviderError::Failed(
+            "bounded test source does not execute".to_string(),
+        ))
     }
 }
 
