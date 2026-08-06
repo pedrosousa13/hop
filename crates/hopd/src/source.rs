@@ -17,6 +17,7 @@
 //! than waiting for #57's apps provider to make it real.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -203,13 +204,16 @@ impl Provider for SkeletonProvider {
     }
 }
 
-/// The `max_results` the daemon passes to [`Pipeline::assemble`] on every
-/// arrival.
+/// The default `max_results` the daemon passes to [`Pipeline::assemble`]
+/// on every arrival — the value [`HostSource`] built without the config-aware
+/// constructor ([`HostSource::with_config`]) uses, and what an absent config's
+/// `Config` falls back to.
 ///
 /// A launcher renders tens of rows, not thousands, so this is sized for what
 /// a person can look at rather than for what the pipeline could produce.
-/// Issue #60's config load is where it becomes a setting a user can change;
-/// until then it is a constant because nothing yet reads one in.
+/// A config that sets its own `max_results` uses that value instead; this
+/// constant remains the default and the value the compile-time
+/// replace-frame assertion below guards.
 pub const MAX_RESULTS: usize = 50;
 
 // Design decision 3: one assembled list must fit one `results` frame — a
@@ -230,6 +234,21 @@ const _: () = assert!(MAX_RESULTS <= MAX_ITEMS_PER_RESULTS_FRAME);
 pub struct HostSource {
     host: Arc<ProviderHost>,
     pipeline: Arc<Mutex<Pipeline>>,
+    /// How many results [`Pipeline::assemble`] is asked for on every arrival.
+    /// [`HostSource::new`] and [`HostSource::with_pipeline`] default this to
+    /// [`MAX_RESULTS`]; [`HostSource::with_config`] sets it from the config.
+    max_results: usize,
+    /// Where this daemon's `Learning` store lives, when this source was built
+    /// from the real config. `None` for a test-built source that only wants
+    /// the `Learning` in-memory behavior without a store to save to.
+    ///
+    /// `start`/`execute` do not save yet: Task 4 of issue #60 adds `record_launch`
+    /// to [`ResultSource`], which is the field's first reader (it saves the
+    /// store back to this path). Until then nothing reads it, so it is
+    /// suppressed from the dead-code lint the way a genuinely-yet-unused
+    /// seam is; the moment Task 4 lands this attribute comes off.
+    #[allow(dead_code)]
+    learning_path: Option<PathBuf>,
 }
 
 impl HostSource {
@@ -241,6 +260,8 @@ impl HostSource {
         HostSource {
             host,
             pipeline: Arc::new(Mutex::new(Pipeline::default())),
+            max_results: MAX_RESULTS,
+            learning_path: None,
         }
     }
 
@@ -254,7 +275,34 @@ impl HostSource {
     /// [`HostSource`] cannot otherwise drive: seeding aliases or learning
     /// needs a `Pipeline` built by hand, and this is the only way in.
     pub fn with_pipeline(host: Arc<ProviderHost>, pipeline: Arc<Mutex<Pipeline>>) -> Self {
-        HostSource { host, pipeline }
+        HostSource {
+            host,
+            pipeline,
+            max_results: MAX_RESULTS,
+            learning_path: None,
+        }
+    }
+
+    /// A source over `host`, sharing a caller-supplied `pipeline` and the
+    /// config-derived assembly cap and learning-store path.
+    ///
+    /// This is what `run()` wires (Design decision 7 of issue #60): the
+    /// pipeline carries the `Learning` store loaded from `learning_path`, and
+    /// `max_results` is the config's value rather than the [`MAX_RESULTS`]
+    /// default. `learning_path` is `None` for a source (a test, say) that
+    /// wants in-memory `Learning` behavior without a store to persist to.
+    pub fn with_config(
+        host: Arc<ProviderHost>,
+        pipeline: Arc<Mutex<Pipeline>>,
+        max_results: usize,
+        learning_path: Option<PathBuf>,
+    ) -> Self {
+        HostSource {
+            host,
+            pipeline,
+            max_results,
+            learning_path,
+        }
     }
 }
 
@@ -282,6 +330,9 @@ impl ResultSource for HostSource {
         let routed = Arc::new(route(text.as_str()));
         self.host.spawn_query(routed, host_tx);
         let pipeline = Arc::clone(&self.pipeline);
+        // Captured alongside `pipeline` so the spawned accumulator reads the
+        // caller-configured cap without borrowing `self` across the spawn.
+        let max_results = self.max_results;
 
         // The task returns — dropping `host_rx`, its receiving half of the
         // host's own channel — the moment a downstream send fails, rather
@@ -330,7 +381,7 @@ impl ResultSource for HostSource {
                 // `Pipeline` for the length of an `.await` for no reason.
                 let assembly = {
                     let mut pipeline = pipeline.lock().await;
-                    pipeline.assemble(text.as_str(), accumulated.clone(), MAX_RESULTS)
+                    pipeline.assemble(text.as_str(), accumulated.clone(), max_results)
                 };
                 // `Assembly::rejections` is discarded here: the host already
                 // logged the manifest-check half of it through its own log
@@ -949,6 +1000,83 @@ mod tests {
              highest-ranked \"low\" items — a per-batch-then-concatenate \
              implementation would instead keep every \"low\" item and only \
              \"high\"'s first 20"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_config_assembles_to_the_configured_max_results_not_the_default() {
+        // `with_config`'s `max_results` is what the accumulator hands the
+        // pipeline on every assembly, so a value other than `MAX_RESULTS`
+        // must be honored: two providers give 30 items each (60 together,
+        // over both the configured 25 and the 50 default), and the final
+        // assembled frame must hold exactly the configured 25 — not
+        // `MAX_RESULTS`. This is the wiring issue #60's `run()` drives, so
+        // proving it here pins the seam in-process without spawning a binary.
+        let low_items: Vec<Item> = (0..30)
+            .map(|n| {
+                item(
+                    Kind::File,
+                    &format!("low:{n:02}"),
+                    &format!("low-{n:02}"),
+                    "low",
+                )
+            })
+            .collect();
+        let high_items: Vec<Item> = (0..30)
+            .map(|n| {
+                item(
+                    Kind::Window,
+                    &format!("high:{n:02}"),
+                    &format!("high-{n:02}"),
+                    "high",
+                )
+            })
+            .collect();
+
+        let low = ItemsProvider {
+            id: "low",
+            kinds: vec![Kind::File],
+            items: low_items,
+            delay: Duration::ZERO,
+            budget: Duration::from_millis(20),
+        };
+        let high = ItemsProvider {
+            id: "high",
+            kinds: vec![Kind::Window],
+            items: high_items,
+            delay: Duration::from_millis(60),
+            budget: Duration::from_millis(200),
+        };
+        let policy = HostPolicy {
+            max_budget: Duration::from_millis(200),
+            ..HostPolicy::default()
+        };
+        let mut host = ProviderHost::new(policy, Arc::new(NoopLog));
+        host.register(low).unwrap();
+        host.register(high).unwrap();
+
+        let source = HostSource::with_config(
+            Arc::new(host),
+            Arc::new(Mutex::new(Pipeline::default())),
+            25,
+            None,
+        );
+        let mut rx = source.start(QueryText::new("").unwrap());
+
+        let _first = rx
+            .recv()
+            .await
+            .expect("the low provider's arrival must send a frame");
+        let second = rx
+            .recv()
+            .await
+            .expect("the high provider's arrival must send a frame");
+
+        assert_eq!(
+            second.len(),
+            25,
+            "with_config must assemble to its configured 25 max_results, \
+             not the MAX_RESULTS default of 50"
         );
     }
 

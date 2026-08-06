@@ -79,7 +79,7 @@ pub async fn serve(runtime_dir: &Path) -> io::Result<()> {
 /// and the provider skipped rather than panicking, because a daemon that
 /// refuses to start over one misconfigured provider is worse than one that
 /// serves the rest: spec §9's per-provider isolation rule applied to startup.
-fn build_host() -> ProviderHost {
+pub(crate) fn build_host() -> ProviderHost {
     let mut host = ProviderHost::with_log(Arc::new(StderrLog));
     if let Err(err) = host.register(SkeletonProvider) {
         eprintln!("hopd: could not register the skeleton provider: {err}");
