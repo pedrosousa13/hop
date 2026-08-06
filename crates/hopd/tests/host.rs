@@ -140,12 +140,27 @@ fn an_inferred_route_still_reaches_a_registered_general_search_provider() {
     // `Mode::All` as unrelated. `hop query 2+2` would have returned
     // `QueryDone` with nothing, while `hop query hello` still worked. This is
     // the test that would have caught it.
+    //
+    // The item is titled "2+2 Notes" rather than the original "2048": since
+    // issue #103 wired `Pipeline::assemble` into this path, `Ranker::rank`
+    // drops anything that doesn't fuzzy-match the term, and "2048" contains
+    // no `+` at all — `hop-core`'s own `pipeline.rs` tests hit the same wall
+    // and document it (`NOTE ON TEST DATA` on
+    // `inferred_utility_pins_on_top_without_hiding_others`). This test's
+    // subject is routing reaching a `Mode::All` provider at all, not ranking,
+    // so the title only needs to survive the match, not resemble the
+    // original illustrative example.
     let log = Arc::new(RecordingLog::default());
     let daemon = daemon_with(
         vec![ScriptedProvider::new(
             "apps",
             vec![Kind::App],
-            Script::Answer(vec![scripted_item("apps", Kind::App, "app:2048", "2048")]),
+            Script::Answer(vec![scripted_item(
+                "apps",
+                Kind::App,
+                "app:2plus2",
+                "2+2 Notes",
+            )]),
         )],
         log,
     );
@@ -176,7 +191,7 @@ fn an_inferred_route_still_reaches_a_registered_general_search_provider() {
         1,
         "an inferred route must still reach a Mode::All provider"
     );
-    assert_eq!(items[0].title, "2048");
+    assert_eq!(items[0].title, "2+2 Notes");
 }
 
 #[test]

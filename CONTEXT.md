@@ -166,11 +166,15 @@ no longer does. The **provider host** now reads the manifest-check half of
 them — the two reasons that mean a provider lied — through its **log seam**
 every time it runs `CheckedItems::check` on `ProviderHost::run_one`'s path.
 What still goes unlogged is the pin-budget half, minted only inside
-`Pipeline::assemble` itself, which the daemon does not call today (issue
-#103; see **Provider host**) — and, more generally, `Assembly::rejections` stays
-ignorable by any caller that is not the host. Only the first two reasons mean
-a provider lied; a rejection names which, so the reasons are not confused for
-one another.
+`Pipeline::assemble` itself — and the daemon *does* call `assemble` now: the
+**result source** does, on every provider arrival, over the accumulated
+**checked items**. The manifest-check half is still logged, by the
+**provider host** through its **log seam**, *before* the items travel; the
+pin-budget half stays unlogged. What `assemble` returns, `Assembly::rejections`
+as a whole, travels back to hopd's accumulator in `source.rs` — the caller
+that discards it, the two halves arriving together and the pin-budget one with
+them. Only the first two reasons mean a provider lied; a rejection names
+which, so the reasons are not confused for one another.
 
 **Ranked body** — the scored, ordered items.
 
@@ -205,7 +209,8 @@ divergence.
 queries: `hop-core`'s `ProviderHost`. Not a scheduler in the ranking sense —
 it decides *whether* a provider runs for a query and *for how long*, never in
 what order its items appear. Ordering that is `Pipeline::assemble`'s job, and
-the host does not call it (issue #103).
+the host still does not call it — the **result source** does, on every provider
+arrival, over the accumulated **checked items** (issue #103 made that true).
 
 **Registration** — the one moment a provider's manifest is read:
 `Provider::manifest`, called once, at `ProviderHost::register`. What is
@@ -335,27 +340,42 @@ and calculator ones, so what comes back is still a single hardcoded item — but
 it arrives through the host, having passed the **manifest checks**, rather than
 bypassing it.
 
-**Retained set** — the items an exchange has delivered, kept so that a later
-`execute` resolves against what the client was actually shown. One per
-connection, holding the most recent query id's items: a new `Query` replaces it
-whole, and the connection closing drops it. It survives the exchange's
-**terminal frame** and a `Cancel`, on the rule that an item this daemon has
-already shown must not become unresolvable. Bounded by `MAX_ITEMS_PER_QUERY` —
-the per-query cap, which is not the assembly **cap** above: one bounds what a
-query may deliver across every frame of an exchange, the other how many results
-one assembled list may hold.
+**Retained set** — the **last assembled list** an exchange has sent, replaced
+whole by each `results` frame under the replacement-frames rule, kept so that
+a later `execute` resolves against what the client was actually shown (issue
+#59). One per connection, holding the most recent query id's list: a new
+`Query` replaces it whole, and the connection closing drops it. It survives
+the exchange's **terminal frame** and a `Cancel`; an item the daemon has since
+replaced away is no longer resolvable, which is the decision issue #103
+recorded. Bounded by `MAX_ITEMS_PER_RESULTS_FRAME` — `connection.rs`'s
+`forward_batch` truncates one list to it before retaining — not
+`MAX_ITEMS_PER_QUERY`, which now bounds the daemon-side accumulator in the
+**result source** instead.
 
-**Truncate-and-terminate** — what the daemon does at the per-query cap: it
-truncates the batch that crossed the line, delivers what fit, ends the exchange
-with its terminal frame, and drops the source. The two halves of that are
+**Replacement frame** — a `results` frame carrying a query's complete current
+list, which a client swaps its held list for in whole, never an increment. A
+daemon never splits one list across frames; there is one frame per provider
+arrival, each a fresh re-ranked list over everything received so far. What a
+client does with one is the **Retained set**; what it does with a frame for a
+query it is no longer waiting on is the **Stale-frame drop**; the frame that
+ends the exchange is the **Terminal frame**.
+
+**Truncate-and-terminate** — what the daemon does at a cap: it truncates the
+batch that crossed the line, delivers what fit, ends the exchange with its
+terminal frame, and drops the source. Two caps now sit on the daemon; the
+accumulator's `MAX_ITEMS_PER_QUERY`, which bounds what the
+**result source** accumulates in `source.rs`, and the connection's
+`MAX_ITEMS_PER_RESULTS_FRAME`, which bounds one assembled list in
+`connection.rs`'s `forward_batch`. The two halves of that are
 different things in this glossary's terms and are worth keeping apart. Nothing
 delivered is ever **evicted** — that is what the retained set exists for, and
 what keeps a delivered item resolvable. The undelivered remainder is dropped
 with nothing on the wire naming it, so that half is a **truncation** and not a
 **refusal**, however deliberate it is: a capped exchange and a completed one
-carry the same terminal frame. The client's half of the same constant *is* a
-refusal — it errors out rather than printing a shortened list — so the two
-sides of one cap are named differently on purpose.
+carry the same terminal frame. A client's only guard against an oversized list
+is the frame cap at the parse — `de_results_items` refuses a `results` frame
+over `MAX_ITEMS_PER_RESULTS_FRAME` — so that half of the cap *is* a refusal,
+and the two sides of one cap are named differently on purpose.
 
 **Terminal frame** — the one frame that ends an exchange: `DaemonMsg::QueryDone`,
 sent when the source finishes, at the per-query cap, or in answer to a matching
@@ -393,9 +413,10 @@ or by the **validating newtype** that carries it. Two are not, because no
 single frame can break them, and each says so where it is defined:
 `MAX_FRAME_BYTES` is applied by a transport to a frame's length prefix ahead of
 the parse — the **pre-allocation gate** — and `MAX_ITEMS_PER_QUERY` is applied
-by each transport as it accumulates an exchange's items across frames. Where a
-bound is applied is a fact about what it bounds; being applied at the parse is
-not what makes one a bound.
+in the daemon's result source (`source.rs`), where the **checked items** a
+query accumulates across every provider arrival — work no single frame can
+exceed — are capped and truncated. Where a bound is applied is a fact about
+what it bounds; being applied at the parse is not what makes one a bound.
 
 **Content rule** — a restriction on what a wire value may *contain*, as against
 a **bound**, which restricts how large it may be. Content rules live in

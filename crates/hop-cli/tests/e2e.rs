@@ -13,7 +13,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use hop_protocol::framing::{FRAME_PREFIX_LEN, decode_payload, encode_frame, payload_len};
-use hop_protocol::limits::{MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME};
 use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, Item};
 
 /// `CARGO_BIN_EXE_hopd` is not set here: Cargo only defines a
@@ -113,16 +112,24 @@ fn the_cli_query_round_trips_and_exits_zero() {
     let _daemon = spawn_daemon(&hopd_path, runtime_dir.path());
 
     // `SkeletonProvider::query` ignores its query text and always answers
-    // with the same hardcoded item, so any term proves the round trip — this
-    // one is deliberately a nonsense token rather than an ordinary word like
-    // "hello", so it cannot collide with a real application's title, generic
-    // name, comment, keywords or exec command and spuriously pull in a
-    // second item from the apps provider `spawn_daemon` does not otherwise
-    // fully isolate (its own doc comment names the one root it cannot close:
-    // the hardcoded, unparameterized Flatpak system export directory).
+    // with the same hardcoded item, but the daemon now runs that item through
+    // `Pipeline::assemble` (issue #103) before it reaches a client, and
+    // `Ranker::rank` drops anything whose haystack does not fuzzy-match the
+    // term — so a nonsense token that used to prove the round trip by
+    // returning the one hardcoded item now correctly returns nothing.
+    // "walking skeleton" is chosen instead because it matches the skeleton
+    // item's haystack (`Hello from hopd` + `M2.2 walking skeleton`) on both
+    // atoms, while an installed application whose title and subtitle contain
+    // both "walking" and "skeleton" is implausible — but not impossible, so
+    // the assertion below checks the output *contains* the item rather than
+    // assuming it is the only one. That is also why this test does not assert
+    // an exact line count: doing so would depend on what happens to be
+    // installed on whatever machine runs it, which is the one root
+    // `spawn_daemon` cannot close (its own doc comment names it: the
+    // hardcoded, unparameterized Flatpak system export directory).
     let output = Command::new(env!("CARGO_BIN_EXE_hop"))
         .arg("query")
-        .arg("hop-cli-e2e-canary-5c2f91")
+        .arg("walking skeleton")
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
         .output()
         .expect("failed to run hop query");
@@ -135,15 +142,14 @@ fn the_cli_query_round_trips_and_exits_zero() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(
-        lines.len(),
-        1,
-        "expected exactly one line of stdout, got: {stdout:?}"
+    let items: Vec<Item> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line must parse as an Item"))
+        .collect();
+    assert!(
+        items.iter().any(|item| item.title == "Hello from hopd"),
+        "expected the skeleton item among the results, got {stdout:?}"
     );
-
-    let item: Item = serde_json::from_str(lines[0]).expect("line must parse as an Item");
-    assert_eq!(item.title, "Hello from hopd");
 }
 
 #[test]
@@ -239,7 +245,12 @@ fn the_cli_drops_frames_whose_query_id_is_not_current() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
         // A stale frame (wrong id) before, between, and after the real ones:
-        // none of the "stale" titles may reach stdout.
+        // none of the "stale" titles may reach stdout. The real ones grow
+        // cumulatively frame over frame — each carries the complete current
+        // list per `DaemonMsg::Results`' contract, not just what is new —
+        // since that is what a conforming daemon sends and this test's job
+        // is to prove id-filtering, not replacement itself (that is
+        // `the_cli_prints_only_the_last_frames_items` below).
         write_daemon_frame(
             stream,
             &DaemonMsg::Results {
@@ -269,7 +280,7 @@ fn the_cli_drops_frames_whose_query_id_is_not_current() {
             &DaemonMsg::Results {
                 query_id: id,
                 partial: true,
-                items: vec![tiny_item(4, "current two")],
+                items: vec![tiny_item(2, "current one"), tiny_item(4, "current two")],
             },
         );
         write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id + 1 }); // stale done: must NOT end the query
@@ -283,7 +294,11 @@ fn the_cli_drops_frames_whose_query_id_is_not_current() {
             &DaemonMsg::Results {
                 query_id: id,
                 partial: true,
-                items: vec![tiny_item(5, "current three")],
+                items: vec![
+                    tiny_item(2, "current one"),
+                    tiny_item(4, "current two"),
+                    tiny_item(5, "current three"),
+                ],
             },
         );
         write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
@@ -430,89 +445,32 @@ fn the_cli_fails_on_an_error_frame_scoped_to_its_own_query() {
 }
 
 #[test]
-fn the_cli_refuses_a_daemon_that_streams_past_the_per_query_cap() {
+fn the_cli_prints_only_the_last_frames_items_not_every_frame_ever_seen() {
+    // The replace rule itself (`DaemonMsg::Results`' doc comment, issue
+    // #103): each frame is the complete current list, and a client swaps its
+    // held list for it rather than extending. This daemon sends a first
+    // frame, then a second whose items neither superset nor overlap the
+    // first's — under the old append behavior both frames' items would print
+    // (three lines, "old only" among them); under replace only the second
+    // frame's two items survive.
     let runtime_dir = tempfile::tempdir().unwrap();
     let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
-        // One item over the cap, delivered as six frames — each frame is
-        // individually in-bounds; only the exchange total is not.
-        let full: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME)
-            .map(|n| tiny_item(n, "x"))
-            .collect();
-        for _ in 0..5 {
-            write_daemon_frame(
-                stream,
-                &DaemonMsg::Results {
-                    query_id: id,
-                    partial: true,
-                    items: full.clone(),
-                },
-            );
-        }
-        // Last frame pushes the exchange total one past the cap. The CLI is
-        // expected to have already bailed by the time this write happens, so
-        // it must tolerate a broken pipe rather than unwrap — unlike every
-        // other write in this file, this one does not use the panicking
-        // helper.
-        let frame = encode_frame(&DaemonMsg::Results {
-            query_id: id,
-            partial: true,
-            items: vec![tiny_item(9, "the straw")],
-        })
-        .unwrap();
-        let _ = stream.write_all(&frame);
-        // No QueryDone: the CLI must have bailed already; writing more would
-        // hit a closed pipe.
-    });
-
-    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
-        .arg("query")
-        .arg("q")
-        .env("XDG_RUNTIME_DIR", runtime_dir.path())
-        .output()
-        .unwrap();
-    let _ = daemon.join();
-
-    assert!(
-        !output.status.success(),
-        "an over-cap stream must be refused"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(&MAX_ITEMS_PER_QUERY.to_string()),
-        "the refusal must name the cap, got: {stderr}"
-    );
-    assert!(
-        output.stdout.is_empty(),
-        "nothing may be printed for a query that was refused mid-assembly"
-    );
-}
-
-#[test]
-fn the_cli_accepts_a_stream_that_lands_exactly_on_the_per_query_cap() {
-    let runtime_dir = tempfile::tempdir().unwrap();
-    let daemon = fake_daemon(runtime_dir.path(), |stream, id| {
-        // Five frames of MAX_ITEMS_PER_RESULTS_FRAME items land the running
-        // total at exactly MAX_ITEMS_PER_QUERY — precisely what hopd itself
-        // sends when it caps a query (see hop_protocol::limits' docs). This
-        // must be accepted and printed whole, not refused: the brief is
-        // explicit that only *exceeding* the cap is a protocol violation.
-        // This is the positive-path counterpart to the over-cap test above:
-        // together they pin the `>` boundary in `try_run_query` against a
-        // regression to an overly strict `>=`, which would wrongly refuse
-        // this legitimate, exactly-at-cap stream.
-        let full: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME)
-            .map(|n| tiny_item(n, "x"))
-            .collect();
-        for _ in 0..(MAX_ITEMS_PER_QUERY / MAX_ITEMS_PER_RESULTS_FRAME) {
-            write_daemon_frame(
-                stream,
-                &DaemonMsg::Results {
-                    query_id: id,
-                    partial: true,
-                    items: full.clone(),
-                },
-            );
-        }
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(1, "old only")],
+            },
+        );
+        write_daemon_frame(
+            stream,
+            &DaemonMsg::Results {
+                query_id: id,
+                partial: true,
+                items: vec![tiny_item(2, "new one"), tiny_item(3, "new two")],
+            },
+        );
         write_daemon_frame(stream, &DaemonMsg::QueryDone { query_id: id });
     });
 
@@ -526,15 +484,19 @@ fn the_cli_accepts_a_stream_that_lands_exactly_on_the_per_query_cap() {
 
     assert!(
         output.status.success(),
-        "an exactly-at-cap stream must be accepted, stderr: {}",
+        "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("old only"),
+        "the first frame's item must not survive the second frame's replacement, got: {stdout}"
+    );
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(
         lines.len(),
-        MAX_ITEMS_PER_QUERY,
-        "expected exactly {MAX_ITEMS_PER_QUERY} lines, got {}",
-        lines.len()
+        2,
+        "expected exactly the last frame's two items, got: {stdout:?}"
     );
+    assert!(stdout.contains("new one") && stdout.contains("new two"));
 }

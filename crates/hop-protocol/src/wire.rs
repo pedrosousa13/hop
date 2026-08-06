@@ -102,31 +102,65 @@ pub enum DaemonMsg {
     HelloAck {
         api_version: u32,
     },
+    /// One frame of a query's results.
+    ///
+    /// # The replace rule
+    ///
+    /// `items` is the **complete current result list** for `query_id`, never
+    /// an increment on the previous frame: a client receiving this frame
+    /// replaces whatever it is holding for that id rather than appending to
+    /// it. A daemon never splits one list across frames — see
+    /// [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME)
+    /// for what makes that true on the wire — so a `results` frame is never
+    /// "the rest of" the one before it, and a client that concatenates two
+    /// frames' `items` produces a list this daemon never sent.
+    ///
+    /// # Why several frames still arrive for one query
+    ///
+    /// A daemon sends one `results` frame per *provider arrival*, not one per
+    /// query: each frame is a fresh, re-ranked list over everything received
+    /// for the query so far. That is what lets a fast provider's results
+    /// reach the screen while a slow one is still running — no frame waits on
+    /// the slowest provider to be assembled ("No slowest-provider gate", the
+    /// design spec's §3). A query that reaches three providers ordinarily
+    /// produces three `results` frames before its `QueryDone`, each replacing
+    /// the last in full.
     Results {
         query_id: u64,
-        /// `partial` is advisory (`true` = more frames may follow); the terminal
-        /// signal is [`DaemonMsg::QueryDone`], never a `partial: false` frame,
-        /// and clients must key on it.
-        partial: bool,
-        /// Bounded at
-        /// [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME)
-        /// items and refused at the parse if it holds more. That is the bound
-        /// on *this field*, and a daemon may send several partial `results`
-        /// frames for the same `query_id`, so it is not what the exchange sums
-        /// to.
+        /// Advisory, and unchanged in that respect: the terminal signal is
+        /// still [`DaemonMsg::QueryDone`], never a `partial: false` frame, and
+        /// clients must key on that rather than on this field.
         ///
-        /// The exchange total is bounded separately, by
-        /// [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY). No
-        /// single frame can break that one, so nothing here can enforce it:
-        /// a transport applies it as it accumulates, which is what the daemon
-        /// does to what it retains and delivers, and what a client does to
-        /// what it assembles.
+        /// What changed is what `true` *means*. Under the replace rule above
+        /// there is no partial list left to complete — only a series of
+        /// wholesale replacements — so `true` no longer says "more items
+        /// follow"; it says "a later frame may replace this list". Reading it
+        /// the old way, as a promise that this same list will grow, is
+        /// exactly the mistake this paragraph exists to head off.
+        partial: bool,
+        /// The complete current result list for `query_id` — see the replace
+        /// rule above. Bounded at
+        /// [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME)
+        /// items and refused at the parse if it holds more. Under
+        /// replacement that bound is not only this field's: because a client
+        /// holds exactly the last frame it received rather than a sum of
+        /// frames, it is also the effective ceiling on what a client holds
+        /// for this query at any moment.
+        ///
+        /// [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY) bounds
+        /// something else — not this field, and not what a client holds,
+        /// since a client accumulates nothing under replacement, but what the
+        /// daemon accumulates from providers across every arrival in order to
+        /// build each frame. See that constant's docs for where that
+        /// accumulation happens and how it is enforced.
         #[serde(deserialize_with = "limits::de_results_items")]
         items: Vec<Item>,
     },
     /// The one terminal frame of a query exchange; sent when the source finishes,
-    /// when the exchange hits [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY),
-    /// or in answer to a matching `Cancel`.
+    /// when the exchange ends at a cap — the result source's accumulator at
+    /// [`MAX_ITEMS_PER_QUERY`](crate::limits::MAX_ITEMS_PER_QUERY), or the
+    /// connection's defensive [`MAX_ITEMS_PER_RESULTS_FRAME`](crate::limits::MAX_ITEMS_PER_RESULTS_FRAME)
+    /// bound truncating one over-long list — or in answer to a matching `Cancel`.
     ///
     /// # When an exchange ends without one
     ///

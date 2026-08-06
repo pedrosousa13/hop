@@ -143,6 +143,56 @@ fn a_query_streams_several_results_frames_before_its_done_frame() {
     assert_eq!(total_items, 3);
 }
 
+#[test]
+fn a_re_sent_item_is_not_charged_twice() {
+    // Under replace-frame, a source resends the complete current list on
+    // every arrival (see `ResultSource`'s docs) — the *same* 50 items here,
+    // 200 times over. A connection that still charges every item of every
+    // frame against MAX_ITEMS_PER_QUERY (5 000) crosses that cap on the
+    // 100th frame (50 * 100 == 5 000) and ends the exchange early, which is
+    // exactly the regression acceptance criterion 6 names: a re-sent item
+    // must not be charged twice, so all 200 frames must arrive with no
+    // cap-driven QueryDone cutting the run short.
+    let list: Vec<Item> = (0..50).map(item).collect();
+    const {
+        assert!(
+            50 * 200 > MAX_ITEMS_PER_QUERY,
+            "this test proves nothing unless it crosses the old per-connection cap"
+        );
+    }
+    let (events, _events_rx) = mpsc::unbounded_channel();
+    let daemon = start_daemon(ScriptedSource {
+        batches: vec![list; 200],
+        events,
+        delay: Duration::ZERO,
+    });
+    let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
+    hello(&mut stream);
+
+    send(
+        &mut stream,
+        &ClientMsg::Query {
+            id: 5,
+            text: QueryText::new("q").unwrap(),
+        },
+    );
+
+    let mut frames = 0;
+    loop {
+        match recv(&mut stream) {
+            DaemonMsg::Results { query_id: 5, .. } => frames += 1,
+            DaemonMsg::QueryDone { query_id: 5 } => break,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert_eq!(
+        frames, 200,
+        "every re-sent list must produce its own frame; a cap-driven early \
+         QueryDone means re-sent items are still being charged against \
+         MAX_ITEMS_PER_QUERY at the connection"
+    );
+}
+
 /// A source that streams batches forever until cancelled — cancellation is
 /// the only way its work ever stops, so receiving its "cancelled" event is
 /// proof the daemon stopped it rather than letting it run out.
@@ -265,20 +315,25 @@ fn a_cancel_frame_stops_the_active_query_and_answers_query_done() {
 }
 
 #[test]
-fn a_query_streaming_past_the_cap_is_truncated_and_terminated() {
-    // Six batches of one full frame each: 6 000 items offered, the cap is
-    // 5 000. The daemon must deliver exactly the cap, drop the source, and
-    // send exactly one QueryDone — truncation of the remainder, never
-    // eviction of what was delivered, and never a lingering source left to
-    // answer a 6th batch nobody asked for.
-    let batch: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME).map(item).collect();
+fn a_list_over_the_frame_bound_is_truncated_and_terminates() {
+    // One over-long list — MAX_ITEMS_PER_RESULTS_FRAME + 1 items — offered as
+    // a single batch, exactly as a complete replace-frame list arrives. A
+    // second, smaller batch follows behind it in the script; nobody should
+    // ever see it, because a replacement may never be split across frames
+    // (Design decision 3: there is nothing on the wire to tell "the rest of
+    // this list" apart from "a new list replacing it"), so the daemon's only
+    // honest answers are truncate or refuse — and truncate-and-terminate,
+    // the same shape it already uses everywhere else, is what this test
+    // pins: exactly one frame, truncated to the bound, followed by the
+    // exchange's terminal frame and nothing past it.
+    let batch: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME + 1).map(item).collect();
     let (events, mut events_rx) = mpsc::unbounded_channel();
     let daemon = start_daemon(ScriptedSource {
-        batches: vec![batch; 6],
+        batches: vec![batch, vec![item(999_999)]],
         events,
         // See ScriptedSource's doc: paced so the cancellation-observability
         // assertion below is a property of the daemon, not a coin flip on
-        // which side of the receiver drop the last `send` lands.
+        // which side of the receiver drop the second `send` lands.
         delay: Duration::from_millis(5),
     });
     let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
@@ -292,39 +347,46 @@ fn a_query_streaming_past_the_cap_is_truncated_and_terminated() {
         },
     );
 
+    let mut frames = 0;
     let mut total = 0;
     loop {
         match recv(&mut stream) {
             DaemonMsg::Results {
                 query_id: 3, items, ..
-            } => total += items.len(),
+            } => {
+                frames += 1;
+                total += items.len();
+            }
             DaemonMsg::QueryDone { query_id: 3 } => break,
             other => panic!("unexpected frame: {other:?}"),
         }
     }
     assert_eq!(
-        total, MAX_ITEMS_PER_QUERY,
-        "the exchange must deliver exactly the cap and stop"
+        frames, 1,
+        "a replacement may never be split across frames, got {frames}"
+    );
+    assert_eq!(
+        total, MAX_ITEMS_PER_RESULTS_FRAME,
+        "the over-long list must be truncated to exactly the frame bound"
     );
 
-    // The source must actually be dropped at the cap, not just have its
-    // output truncated on the wire: the still-pending 6th batch must be
+    // The source must actually be dropped, not just have its output
+    // truncated on the wire: the still-pending second batch must be
     // refused, which ScriptedSource can only report by observing its `send`
-    // fail. A daemon that hit the cap but forgot to drop the receiver would
-    // instead accept and finish that 6th batch, and this would see
-    // "finished" here instead of "cancelled" — or nothing at all, since the
-    // source would then be blocked forever offering a batch nobody drains.
+    // fail. A daemon that truncated the frame but forgot to drop the
+    // receiver would instead accept and finish that second batch, and this
+    // would see "finished" here instead of "cancelled" — or nothing at all,
+    // since the source would then be blocked forever offering a batch
+    // nobody drains.
     assert_eq!(
         recv_event_within(&mut events_rx, Duration::from_secs(5)),
         Some("cancelled"),
-        "the source must observe its work stopping once the cap is hit, \
-         not run on past it"
+        "the source must observe its work stopping once the frame bound \
+         truncates the exchange, not run on past it"
     );
 
-    // And exactly one QueryDone for this id: the regression this catches
-    // from the other direction is a daemon that still holds the source live
-    // past the cap, drains its pending (empty, capped) batch, and sends a
-    // second QueryDone for the same id nobody is expecting.
+    // And exactly one QueryDone for this id: nothing follows the terminal
+    // frame.
     let mut buf = [0u8; 1];
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
@@ -332,94 +394,7 @@ fn a_query_streaming_past_the_cap_is_truncated_and_terminated() {
     let read = stream.read(&mut buf);
     assert!(
         matches!(read, Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock),
-        "no further frame may follow the cap's QueryDone, got: {read:?}"
-    );
-}
-
-#[test]
-fn a_batch_aligned_with_neither_the_frame_bound_nor_the_cap_still_splits_and_truncates() {
-    // Every other cap test on this file hands the daemon batches of exactly
-    // `MAX_ITEMS_PER_RESULTS_FRAME`, which lets two of `forward_batch`'s
-    // paths go unexercised over a socket: `chunks()` always yields one chunk,
-    // and the batch that fills the cap fills it exactly, so `truncate` is a
-    // no-op. 1 500-item batches are aligned with neither bound and reach
-    // both.
-    //
-    // 1 500 against a 1 000-item frame bound splits every batch into 1 000 +
-    // 500. Against a 5 000-item cap, `room` steps 5 000 → 3 500 → 2 000 →
-    // 500, so the fourth batch crosses the line with `0 < room <
-    // batch.len()` — the truncating branch — and the fifth is refused
-    // outright.
-    let batch: Vec<Item> = (0..MAX_ITEMS_PER_RESULTS_FRAME + MAX_ITEMS_PER_RESULTS_FRAME / 2)
-        .map(item)
-        .collect();
-    assert!(
-        !batch.len().is_multiple_of(MAX_ITEMS_PER_RESULTS_FRAME)
-            && !MAX_ITEMS_PER_QUERY.is_multiple_of(batch.len()),
-        "this test is worth nothing unless the batch size divides neither bound"
-    );
-    let (events, _events_rx) = mpsc::unbounded_channel();
-    let daemon = start_daemon(ScriptedSource {
-        batches: vec![batch; 5],
-        events,
-        delay: Duration::ZERO,
-    });
-    let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
-    hello(&mut stream);
-
-    send(
-        &mut stream,
-        &ClientMsg::Query {
-            id: 4,
-            text: QueryText::new("q").unwrap(),
-        },
-    );
-
-    let mut total = 0;
-    let mut frames = 0;
-    loop {
-        match recv(&mut stream) {
-            DaemonMsg::Results {
-                query_id: 4, items, ..
-            } => {
-                // `recv` decodes through `hop_protocol`, whose parse refuses a
-                // frame over the per-frame bound outright — so a daemon that
-                // stopped splitting batches would fail this test inside the
-                // helper. Asserted here as well so the failure names the rule
-                // rather than the codec.
-                assert!(
-                    items.len() <= MAX_ITEMS_PER_RESULTS_FRAME,
-                    "a source batch over the per-frame bound must be split, got {} items",
-                    items.len()
-                );
-                total += items.len();
-                frames += 1;
-            }
-            DaemonMsg::QueryDone { query_id: 4 } => break,
-            other => panic!("unexpected frame: {other:?}"),
-        }
-    }
-
-    assert_eq!(
-        total, MAX_ITEMS_PER_QUERY,
-        "the crossing batch must be truncated to exactly the room left, not delivered whole"
-    );
-    assert!(
-        frames > MAX_ITEMS_PER_QUERY.div_ceil(MAX_ITEMS_PER_RESULTS_FRAME),
-        "a 1 500-item batch takes two frames, so the cap's worth of items takes \
-         more frames than the cap divided by the frame bound, got {frames}"
-    );
-
-    // Exactly one QueryDone: the fifth batch was refused rather than queued
-    // behind the cap, so nothing follows the terminal frame.
-    let mut buf = [0u8; 1];
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let read = stream.read(&mut buf);
-    assert!(
-        matches!(read, Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock),
-        "no further frame may follow the cap's QueryDone, got: {read:?}"
+        "no further frame may follow the terminal frame, got: {read:?}"
     );
 }
 

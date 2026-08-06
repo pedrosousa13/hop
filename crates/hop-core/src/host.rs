@@ -49,12 +49,14 @@
 //!
 //! Ranking. This module streams each provider's manifest-checked items as its
 //! own batch, in the order providers answer, and never calls
-//! [`Pipeline::assemble`](crate::pipeline::Pipeline::assemble). Wiring
-//! assembly in needs a protocol answer about streaming that issue #56 does
-//! not give: the wire streams append-only batches, while `assemble` is a
-//! whole-list pure function, so "rank the streamed set" means either
-//! re-sending the whole list per batch or gating on the slowest provider, and
-//! spec §3 forbids the latter outright. Tracked as issue #103.
+//! [`Pipeline::assemble`](crate::pipeline::Pipeline::assemble) — still not
+//! enforced here. The protocol answer issue #103 chose is the first of the two
+//! options the problem originally posed — re-sending the whole re-ranked list
+//! per batch rather than gating on the slowest provider — and it is no longer
+//! hypothetical: the wire streams **replacement frames**, where every
+//! `results` frame re-sends the whole re-ranked list, and the daemon's result
+//! source (`hopd`'s `HostSource` accumulator) is where `assemble` now lives,
+//! called per arrival over the accumulated [`CheckedItems`](crate::pipeline::CheckedItems).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -239,6 +241,12 @@ pub enum ProviderEvent<'a> {
     /// rejections, which had nowhere to go before this seam existed. This is
     /// the event that makes ignoring them a mistake rather than a one-character
     /// omission, which is what `pipeline.rs` said a logging seam would buy.
+    /// The same rejections also travel onward past this event, inside the
+    /// [`CheckedItems`] [`ProviderHost::run_one`] sends on its result
+    /// channel — logging them here is what makes silence about them a
+    /// mistake for the host specifically, not what makes them unignorable
+    /// everywhere: the channel's receiver is still free to read only
+    /// `items()` and never call `rejections()` at all.
     Rejected {
         provider: &'a str,
         rejections: &'a [Rejection],
@@ -589,7 +597,7 @@ impl ProviderHost {
     pub fn spawn_query(
         self: &Arc<Self>,
         q: Arc<RoutedQuery>,
-        results: mpsc::Sender<Vec<Item>>,
+        results: mpsc::Sender<CheckedItems>,
     ) -> CancellationFlag {
         let cancel = CancellationFlag::default();
 
@@ -618,13 +626,20 @@ impl ProviderHost {
 
     /// One provider's whole turn: run it under its budget, classify what came
     /// back, check its items against its own manifest, and send what survived.
+    /// What survives is the whole [`CheckedItems`], rejections included, not
+    /// just its items — a caller further downstream that only ever wanted the
+    /// items (today, every caller) can still get them from
+    /// [`CheckedItems::items`], but the type has to reach that caller intact
+    /// for [`Pipeline::assemble`](crate::pipeline::Pipeline::assemble) to ever
+    /// be reachable from this host at all (issue #103): `assemble` accepts
+    /// nothing but a `CheckedItems`, and this is the one place one gets built.
     async fn run_one(
         &self,
         provider: Arc<dyn ErasedProvider>,
         declared: ProviderManifest,
         effective: ProviderManifest,
         q: Arc<RoutedQuery>,
-        results: mpsc::Sender<Vec<Item>>,
+        results: mpsc::Sender<CheckedItems>,
         cancel: CancellationFlag,
     ) {
         let id = effective.id;
@@ -713,17 +728,20 @@ impl ProviderHost {
             });
         }
 
-        let items = checked.into_items();
         self.log.record(ProviderEvent::Answered {
             provider: id,
-            items: items.len(),
+            items: checked.items().len(),
             elapsed: started.elapsed(),
         });
 
-        if items.is_empty() {
+        if checked.items().is_empty() {
             // No send to fail here, so nothing would otherwise notice a
             // dropped receiver on this path — check directly, so a provider
             // that answers empty still relays cancellation to its siblings.
+            // Rejections alone (with no surviving items) take this path too:
+            // there is still nothing to send, and a rejection reaching a
+            // receiver only interested in cancellation buys that receiver
+            // nothing.
             if results.is_closed() {
                 cancel.cancel();
             }
@@ -733,8 +751,9 @@ impl ProviderHost {
         // A failed send means the receiver is gone, which is this seam's
         // cancellation. Setting the flag is what carries that to the siblings
         // still running: they learn it from the flag rather than waiting to
-        // discover their own send failing.
-        if results.send(items).await.is_err() {
+        // discover their own send failing. `checked` travels whole — see this
+        // method's own docs for why.
+        if results.send(checked).await.is_err() {
             cancel.cancel();
         }
     }
@@ -1709,11 +1728,15 @@ mod tests {
         }
     }
 
-    /// Drains every batch a query produces, in arrival order.
-    async fn drain(mut rx: mpsc::Receiver<Vec<Item>>) -> Vec<Item> {
+    /// Drains every batch a query produces, in arrival order, flattening each
+    /// [`CheckedItems`] down to its items — every test below reads results
+    /// this way, and none of them assert on rejections directly, so keeping
+    /// this the shape they see means the widened channel type changes
+    /// nothing about what those assertions read.
+    async fn drain(mut rx: mpsc::Receiver<CheckedItems>) -> Vec<Item> {
         let mut all = Vec::new();
         while let Some(batch) = rx.recv().await {
-            all.extend(batch);
+            all.extend(batch.items().to_vec());
         }
         all
     }
@@ -1910,7 +1933,7 @@ mod tests {
             .await
             .expect("the fast provider's batch must not wait on the slow one")
             .expect("a batch, not a close");
-        assert_eq!(first[0].title, "Firefox");
+        assert_eq!(first.items()[0].title, "Firefox");
     }
 
     #[tokio::test]
