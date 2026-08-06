@@ -413,9 +413,10 @@ or by the **validating newtype** that carries it. Two are not, because no
 single frame can break them, and each says so where it is defined:
 `MAX_FRAME_BYTES` is applied by a transport to a frame's length prefix ahead of
 the parse — the **pre-allocation gate** — and `MAX_ITEMS_PER_QUERY` is applied
-by each transport as it accumulates an exchange's items across frames. Where a
-bound is applied is a fact about what it bounds; being applied at the parse is
-not what makes one a bound.
+in the daemon's result source (`source.rs`), where the **checked items** a
+query accumulates across every provider arrival — work no single frame can
+exceed — are capped and truncated. Where a bound is applied is a fact about
+what it bounds; being applied at the parse is not what makes one a bound.
 
 **Content rule** — a restriction on what a wire value may *contain*, as against
 a **bound**, which restricts how large it may be. Content rules live in
