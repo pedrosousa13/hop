@@ -63,7 +63,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hop_protocol::Item;
+use hop_protocol::{ActionId, ExecOutcome, Item, ItemId};
 use tokio::sync::mpsc;
 
 use crate::pipeline::{CheckedItems, ProviderOutput, Rejection};
@@ -323,6 +323,28 @@ impl ProviderLog for NoopLog {
 /// it.
 pub const MAX_PROVIDER_BUDGET: Duration = Duration::from_millis(50);
 
+/// Ceiling on how long a provider's [`Provider::execute`] may run before the
+/// host gives up on it, defaulting [`HostPolicy::max_execute_budget`].
+///
+/// This mirrors the query path's budget posture ([`MAX_PROVIDER_BUDGET`]) but
+/// is far more generous, on purpose: a query is spec-forbidden from doing real
+/// I/O — the network providers return "a cached-or-pending row synchronously
+/// and push an update frame when the fetch lands" — so 50 ms is a ceiling the
+/// *query* path can honestly enforce. An execute, by contrast, is exactly the
+/// moment a provider may do real work (the apps provider launches a
+/// subprocess and focuses a window, which can take far longer than a
+/// keystroke bound), so 5 s is a "this genuinely hung" bound, not a
+/// performance target.
+///
+/// The bound exists because [`crate::connection`]'s driver awaits
+/// `ResultSource::execute` inline on its one loop: without a ceiling here,
+/// a provider whose `execute` never resolves would wedge the whole connection
+/// — no later `Cancel`, `Query`, or even peer EOF would be processed until the
+/// task happened to finish. A bounded budget makes that a bounded stall, and
+/// `ProviderHost::execute` aborts the task on a miss so provider work does not
+/// outlive the refusal.
+pub const MAX_EXECUTE_BUDGET: Duration = Duration::from_secs(5);
+
 /// The host's own policy, applied to every manifest at registration.
 ///
 /// This is the layer issue #32 found missing: before it, every input to a
@@ -344,6 +366,12 @@ pub struct HostPolicy {
     /// it. The floor exists to make providers cheaper to run, not to make a
     /// cautious provider run more often than it wanted.
     pub min_term_len_floor: usize,
+    /// Ceiling on how long [`ProviderHost::execute`] waits for a provider's
+    /// execute before giving up and aborting it. Defaults to
+    /// [`MAX_EXECUTE_BUDGET`]; a host may set it lower (tests do, to make a
+    /// never-resolving execute fail fast) but nothing lets a provider raise
+    /// it.
+    pub max_execute_budget: Duration,
 }
 
 impl Default for HostPolicy {
@@ -351,6 +379,7 @@ impl Default for HostPolicy {
         HostPolicy {
             max_budget: MAX_PROVIDER_BUDGET,
             min_term_len_floor: 0,
+            max_execute_budget: MAX_EXECUTE_BUDGET,
         }
     }
 }
@@ -757,6 +786,64 @@ impl ProviderHost {
             cancel.cancel();
         }
     }
+
+    /// Executes `action_id` on `item_id`, which `provider` produced in a
+    /// prior query.
+    ///
+    /// The connection resolves the [`Item`] against its retained set first,
+    /// so it already knows `provider`, `item_id` and `action_id`; this method
+    /// is where the registry turns that into a real [`Provider::execute`]
+    /// call. It looks up the registration whose id equals `provider` and
+    /// forwards the outcome, and treats a `provider` that names an item but
+    /// no longer has a registration as a **provider failure** — the item was
+    /// delivered, so this is not an unknown item; only the executor is
+    /// missing.
+    ///
+    /// The future runs on its own task — the same panic isolation the query
+    /// path gets from `tokio::spawn` in [`ProviderHost::spawn_query`] — so a
+    /// provider that unwinds while executing takes down its task, not the
+    /// caller (the connection) with it. A joined panic or cancellation is
+    /// folded into a [`ProviderError::Failed`].
+    pub async fn execute(
+        &self,
+        provider: &str,
+        item_id: ItemId,
+        action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        let Some(registration) = self.providers.iter().find(|r| r.effective.id == provider) else {
+            return Err(ProviderError::Failed(format!(
+                "no provider registered under id `{provider}`"
+            )));
+        };
+
+        let provider_arc = Arc::clone(&registration.provider);
+        let budget = self.policy.max_execute_budget;
+
+        // The future runs on its own task — the same panic isolation the query
+        // path gets from `tokio::spawn` in `ProviderHost::spawn_query` — and is
+        // bounded by `budget`, exactly as `run_one` bounds a query by the
+        // provider's captured budget. The timeout is not optional: this is
+        // awaited inline on the connection's driver loop, so a never-resolving
+        // execute would otherwise wedge the whole connection (see
+        // [`MAX_EXECUTE_BUDGET`] for the full reasoning). On a miss the task
+        // is aborted so provider work does not outlive the refusal.
+        let mut handle = tokio::spawn(provider_arc.execute_erased(item_id, action_id));
+        match tokio::time::timeout(budget, &mut handle).await {
+            Err(_elapsed) => {
+                handle.abort();
+                Err(ProviderError::Failed(format!(
+                    "provider `{provider}` did not finish executing within {budget:?}"
+                )))
+            }
+            Ok(Err(join_error)) if join_error.is_panic() => Err(ProviderError::Failed(format!(
+                "provider `{provider}` panicked while executing"
+            ))),
+            Ok(Err(_cancelled)) => Err(ProviderError::Failed(
+                "the provider's execute task was cancelled".to_string(),
+            )),
+            Ok(Ok(outcome)) => outcome,
+        }
+    }
 }
 
 /// A dyn-compatible view of a [`Provider`], so a host can hold providers of
@@ -793,11 +880,20 @@ trait ErasedProvider: Send + Sync + 'static {
     /// Pairs `items` with this provider's manifest the only way
     /// [`ProviderOutput`](crate::pipeline::ProviderOutput) allows — see the
     /// trait docs for why this method exists here rather than at the call
-    /// site. `run_one` reads the manifest this mints back through
+    /// [`ProviderHost::run_one`] reads the manifest this mints back through
     /// [`ProviderOutput::manifest`](crate::pipeline::ProviderOutput::manifest)
     /// rather than through a separate erased `manifest()` call, so this is
     /// the only [`Provider::manifest`] call this trait makes.
     fn output(&self, items: Vec<Item>) -> ProviderOutput;
+
+    /// [`Provider::execute`] with its future boxed, which is what makes the
+    /// method dyn-compatible. [`ProviderHost::execute`] is the only caller —
+    /// the host owns the `Arc<dyn ErasedProvider>` a registration holds.
+    fn execute_erased(
+        self: Arc<Self>,
+        item_id: ItemId,
+        action_id: ActionId,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecOutcome, ProviderError>> + Send + 'static>>;
 }
 
 impl<P: Provider> ErasedProvider for P {
@@ -811,6 +907,14 @@ impl<P: Provider> ErasedProvider for P {
 
     fn output(&self, items: Vec<Item>) -> ProviderOutput {
         ProviderOutput::from_provider(self, items)
+    }
+
+    fn execute_erased(
+        self: Arc<Self>,
+        item_id: ItemId,
+        action_id: ActionId,
+    ) -> Pin<Box<dyn Future<Output = Result<ExecOutcome, ProviderError>> + Send + 'static>> {
+        Box::pin(Provider::execute(self, item_id, action_id))
     }
 }
 
@@ -1168,6 +1272,225 @@ mod tests {
 
     fn host() -> ProviderHost {
         ProviderHost::with_log(Arc::new(NoopLog))
+    }
+
+    /// A provider whose `execute` records the ids it was handed and answers
+    /// with a fixed, distinguishable outcome — the fixture proving
+    /// [`ProviderHost::execute`] dispatched to the *right* registration.
+    struct RecorderProvider {
+        outcome: ExecOutcome,
+        called_with: Mutex<Option<(String, String)>>,
+    }
+
+    impl RecorderProvider {
+        fn new(outcome: ExecOutcome) -> Self {
+            RecorderProvider {
+                outcome,
+                called_with: Mutex::new(None),
+            }
+        }
+    }
+
+    impl Provider for RecorderProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "recorder",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(10),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            Ok(vec![])
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            item_id: ItemId,
+            action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            *self.called_with.lock().expect("test lock") =
+                Some((item_id.as_str().to_string(), action_id.as_str().to_string()));
+            Ok(self.outcome.clone())
+        }
+    }
+
+    /// A provider whose `execute` never resolves — the liveness hazard issue
+    /// #59's execute bound exists to contain. It yields while it waits so
+    /// `abort` can take effect and no worker thread is pinned for the test.
+    pub(crate) struct HangingExecuteProvider {
+        entered: Arc<AtomicBool>,
+    }
+
+    impl Provider for HangingExecuteProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "hanging-exec",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(10),
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            Ok(vec![])
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            self.entered.store(true, Ordering::SeqCst);
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    /// The liveness guarantee: a provider whose `execute` never resolves must
+    /// make [`ProviderHost::execute`] return the provider-failed error within
+    /// the policy's `max_execute_budget`, not hang the caller (which, in the
+    /// daemon, is the connection's sole driver loop).
+    #[tokio::test]
+    async fn a_never_resolving_execute_is_cut_off_at_the_budget_and_aborted() {
+        let budget = Duration::from_millis(50);
+        let mut host = ProviderHost::new(
+            HostPolicy {
+                max_execute_budget: budget,
+                ..HostPolicy::default()
+            },
+            Arc::new(NoopLog),
+        );
+        let (provider, entered) = {
+            let entered = Arc::new(AtomicBool::new(false));
+            (
+                HangingExecuteProvider {
+                    entered: entered.clone(),
+                },
+                entered,
+            )
+        };
+        host.register(provider).unwrap();
+
+        let started = Instant::now();
+        let err = host
+            .execute(
+                "hanging-exec",
+                ItemId::new("app:1").unwrap(),
+                ActionId::new("open").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the provider must actually be reached before it can hang"
+        );
+        assert!(
+            matches!(err, ProviderError::Failed(_)),
+            "a budget miss must surface as provider-failed, got: {err:?}"
+        );
+        assert!(
+            elapsed < budget + Duration::from_millis(200),
+            "execute must return within the budget instead of hanging, took {elapsed:?}"
+        );
+    }
+
+    /// The host stays usable after the budget cuts off a hanging execute:
+    /// another provider's execute still dispatches, so the cut-off did not
+    /// wedge the host as a whole.
+    #[tokio::test]
+    async fn a_budget_cut_off_does_not_leak_into_other_dispatches() {
+        let mut host = ProviderHost::new(
+            HostPolicy {
+                max_execute_budget: Duration::from_millis(50),
+                ..HostPolicy::default()
+            },
+            Arc::new(NoopLog),
+        );
+        host.register(HangingExecuteProvider {
+            entered: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        let recorder = Arc::new(RecorderProvider::new(ExecOutcome::Done));
+        host.register_arc(recorder.clone()).unwrap();
+
+        // A hanging execute is cut off...
+        host.execute(
+            "hanging-exec",
+            ItemId::new("app:1").unwrap(),
+            ActionId::new("open").unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        // ...and a different provider still dispatches normally afterwards.
+        let got = host
+            .execute(
+                "recorder",
+                ItemId::new("app:2").unwrap(),
+                ActionId::new("run").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, ExecOutcome::Done);
+    }
+
+    #[tokio::test]
+    async fn host_execute_dispatches_to_the_registered_provider_and_forwards_the_outcome() {
+        use hop_protocol::content::CopyText;
+        let outcome = ExecOutcome::CopyText(CopyText::new("hi").unwrap());
+        let provider = Arc::new(RecorderProvider::new(outcome.clone()));
+        let mut host = host();
+        host.register_arc(provider.clone()).unwrap();
+
+        let item_id = ItemId::new("app:1").unwrap();
+        let action_id = ActionId::new("open").unwrap();
+        let got = host
+            .execute("recorder", item_id.clone(), action_id.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            got, outcome,
+            "the host must forward the provider's outcome intact"
+        );
+        assert_eq!(
+            provider.called_with.lock().expect("test lock").as_ref(),
+            Some(&("app:1".to_string(), "open".to_string())),
+            "the ids the connection resolved must reach the registered provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_execute_is_provider_failed_for_an_unregistered_id() {
+        let host = host();
+        let err = host
+            .execute(
+                "ghost",
+                ItemId::new("app:1").unwrap(),
+                ActionId::new("open").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Failed(_)),
+            "a provider named on an item but no longer registered is a \
+             provider failure, not an unknown item, got: {err:?}"
+        );
     }
 
     #[test]
