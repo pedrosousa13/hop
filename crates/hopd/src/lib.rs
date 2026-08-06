@@ -27,6 +27,7 @@ pub(crate) mod connection;
 pub mod runtime_dir;
 pub mod server;
 pub mod source;
+pub mod state_dir;
 
 use std::process::ExitCode;
 
