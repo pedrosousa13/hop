@@ -20,7 +20,10 @@
 //! ## Fixture determinism, and how it's guaranteed
 //!
 //! Issue #61 states plainly that the 10 000-item fixture must be
-//! deterministic. Concretely, that guarantee rests on three properties of
+//! deterministic — meaning it produces the same item-id sequence across
+//! separate `cargo test --release ... --ignored` invocations, in whatever
+//! process and on whatever run this gate executes in, not merely within one
+//! process. Concretely, that guarantee rests on three properties of
 //! [`ten_thousand_item_fixture`] and everything it calls:
 //!
 //! 1. **No RNG anywhere.** Every item's `id`, `title` and `kind` is a pure
@@ -35,11 +38,33 @@
 //!    `HashMap`/`HashSet`, whose iteration order is unspecified across runs
 //!    and process invocations.
 //! 3. **`the_ten_thousand_item_fixture_is_deterministic`**, below, pins this
-//!    directly rather than leaving it to inspection: it builds the
-//!    fixture twice, independently, and asserts the two item-id sequences
-//!    are identical. It is not `#[ignore]`d — it costs building the fixture
-//!    twice (allocation, not ranking), which is fast enough for the ordinary
-//!    debug-mode gate.
+//!    against a literal expected value rather than leaving it to inspection
+//!    — and rather than only comparing two builds against *each other*
+//!    within one process, which is weaker than it looks: it would not catch
+//!    a regression that is stable within a process but varies **across**
+//!    process invocations (the thing a CI gate that runs once per PR
+//!    actually needs). Concretely, the test builds the fixture, computes
+//!    [`id_sequence_digest`] — a dependency-free FNV-1a 64-bit hash (see its
+//!    own docs for why not `std`'s `DefaultHasher`/`HashMap`) over every
+//!    item id in order — and asserts the digest equals
+//!    [`EXPECTED_ID_SEQUENCE_DIGEST`], a `u64` literal written directly in
+//!    this file's source. Because the expected value is a source literal,
+//!    not something the test recomputes and compares against itself, this
+//!    check is run fresh by every process that compiles and runs this
+//!    binary: a future change that made the fixture's construction order-
+//!    or seed-dependent (a `HashMap`-keyed step, for instance) would still
+//!    very likely reproduce the same sequence within a single process (most
+//!    such regressions are stable run-to-run inside one binary invocation)
+//!    but would have no reason to keep landing on this exact, previously-
+//!    recorded digest — so this is a real cross-run check, not a restatement
+//!    of the source-level argument in points 1 and 2. It additionally
+//!    builds the fixture a second time and asserts the two builds agree with
+//!    each other too, as a fast, cheap sanity check that catches an
+//!    obviously nondeterministic construction (e.g. a raw `HashMap` drain)
+//!    immediately, without waiting on a second process. Not `#[ignore]`d —
+//!    the whole test costs building the fixture twice plus one linear hash
+//!    pass (allocation and arithmetic, not ranking), fast enough for the
+//!    ordinary debug-mode gate.
 //!
 //! Every provider answers with exactly [`MAX_ITEMS_PER_PROVIDER_ANSWER`]
 //! (1 000) items — the cap Task 2 added — so nothing here is truncated by
@@ -211,6 +236,47 @@ fn ten_thousand_item_fixture() -> CheckedItems {
     }
     CheckedItems::check(outputs)
 }
+
+/// A minimal FNV-1a 64-bit hash, dependency-free and fixed by the
+/// algorithm's own published constants rather than by any Rust
+/// implementation detail. Deliberately not
+/// `std::collections::hash_map::DefaultHasher`: its own docs disclaim any
+/// stability guarantee for its output "between versions of Rust" or "between
+/// invocations of a program" — exactly the instability
+/// [`id_sequence_digest`] exists to rule out. Deliberately not anything that
+/// touches `HashMap`/`RandomState` either, for the same reason: this digest
+/// exists to be independent of any per-process hasher seed, not incidentally
+/// sensitive to one. FNV-1a's constants are part of the algorithm's public
+/// specification, so the same input bytes hash to the same `u64` on every
+/// run, in every process, on every toolchain, indefinitely.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    })
+}
+
+/// A digest of a fixture's full item-id sequence: every [`ItemId`]'s bytes,
+/// in order, joined by a `\n` — a byte none of this file's formulaic ids
+/// (`"{provider_id}:item-{item_index}"`, see [`formulaic_item`]) ever
+/// contains, so no two distinct id sequences can collide onto the same
+/// joined byte string. See [`fnv1a64`] for why this specific hash and not
+/// `std`'s `DefaultHasher`.
+fn id_sequence_digest(items: &[Item]) -> u64 {
+    let joined = items
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fnv1a64(joined.as_bytes())
+}
+
+/// The expected digest of [`ten_thousand_item_fixture`]'s item-id sequence,
+/// computed once and pinned here as a literal — see the module docs'
+/// "Fixture determinism" section for why a literal, rather than a second
+/// in-process build, is what actually proves cross-run determinism.
+const EXPECTED_ID_SEQUENCE_DIGEST: u64 = 0x316b_08a5_e81b_cf5f;
 
 /// A small, fixed set of realistic query strings — used (cycled through) by
 /// both timing arms so measurement isn't gamed by favorable cache/branch-
@@ -493,10 +559,15 @@ fn bounded_worst_case_completes_promptly_in_release_mode() {
     );
 }
 
-/// Determinism, pinned directly rather than left to inspection: builds the
-/// fixture twice, independently, and asserts the two item-id sequences are
-/// identical. Not `#[ignore]`d — this costs building the fixture twice
-/// (allocation, not ranking), fast enough for the ordinary debug-mode gate.
+/// Determinism, pinned against a literal expected value rather than left to
+/// inspection or proven only within one process — see the module docs'
+/// "Fixture determinism" section for why a source-literal digest is what
+/// actually establishes the cross-run property issue #61 asks for, and why
+/// the weaker double-build-in-one-process comparison this test also does is
+/// kept as a fast, cheap first check rather than relied on alone. Not
+/// `#[ignore]`d — the whole test costs building the fixture twice plus one
+/// linear hash pass (allocation and arithmetic, not ranking), fast enough
+/// for the ordinary debug-mode gate.
 #[test]
 fn the_ten_thousand_item_fixture_is_deterministic() {
     let a = ten_thousand_item_fixture();
@@ -514,5 +585,22 @@ fn the_ten_thousand_item_fixture_is_deterministic() {
         "two independent builds of the fixture must produce the identical \
          item-id sequence in the identical order — the fixture must contain \
          no RNG and no dependence on unordered iteration"
+    );
+
+    let digest = id_sequence_digest(a.items());
+    assert_eq!(
+        digest, EXPECTED_ID_SEQUENCE_DIGEST,
+        "the fixture's item-id sequence hashed to {digest:#x}, not the \
+         literal value recorded in EXPECTED_ID_SEQUENCE_DIGEST. Comparing \
+         against a value written directly in this file's source — not \
+         merely against a second in-process build — is what proves the \
+         fixture is deterministic *across* separate process invocations \
+         (what issue #61's 'deterministic' criterion, and a CI gate that \
+         runs once per PR, actually need), not only within one. If this \
+         fixture's construction intentionally changed, recompute the digest \
+         and update EXPECTED_ID_SEQUENCE_DIGEST deliberately; if it did not \
+         change intentionally, this is the fixture becoming order- or \
+         seed-dependent — the exact regression this assertion exists to \
+         catch."
     );
 }

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hop_core::host::{ProviderEvent, ProviderHost, ProviderLog};
-use hop_core::pipeline::{CheckedItems, Pipeline};
+use hop_core::pipeline::{CheckedItems, FailedCheck, Pipeline, Rejection};
 use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery, route};
 use hop_protocol::{
@@ -51,8 +51,9 @@ use tokio::sync::{Mutex, mpsc};
 ///
 /// **Items must respect `hop_protocol::limits`' per-item field bounds.**
 /// [`Item`]'s fields are public, and those bounds are applied where an item is
-/// *parsed*, so an item handed back through this trait has passed nothing. The
-/// daemon bounds its retained set by item *count*
+/// *parsed*, so an item handed back through this trait has passed nothing
+/// merely by virtue of implementing it. The daemon bounds its retained set by
+/// item *count*
 /// ([`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY)), and
 /// the byte figure that count is justified against is the count multiplied by
 /// those per-item bounds — so a source producing a 100 MB title makes that
@@ -61,11 +62,20 @@ use tokio::sync::{Mutex, mpsc};
 /// [`MAX_FRAME_BYTES`](hop_protocol::limits::MAX_FRAME_BYTES) at encode time,
 /// which surfaces as an `io::Error` that kills the connection with no error
 /// frame — a worse outcome than refusing the item would have been.
-/// [`HostSource`] does not close this gap: [`ProviderHost`]'s per-provider
-/// turn checks an item's `kind` and `provider` against its producer's
-/// manifest and nothing about its field lengths, so a provider that returns
-/// an oversized title reaches this trait exactly as unchecked as this
-/// paragraph warns.
+/// [`HostSource`] closes this gap for the field-length half, as of issue
+/// #61: `ProviderHost::run_one`'s per-provider turn now calls
+/// [`CheckedItems::check`], which rejects an item whose `title`, `subtitle`,
+/// `copy_text`, an action's `label`, or action count is over the same bound
+/// this module already applies at the parse (see
+/// [`FailedCheck::FieldTooLong`]) — a provider that returns an oversized
+/// title is refused before it ever reaches this trait's channel. This is
+/// still a property of [`HostSource`] specifically, not a guarantee this
+/// *trait*'s contract makes: it holds because [`HostSource`] happens to
+/// route every provider's answer through [`CheckedItems::check`] before
+/// sending, not because implementing [`ResultSource`] requires it. A
+/// hypothetical future implementation that hands back items some other way —
+/// bypassing that check — would reach this trait exactly as unchecked as
+/// this paragraph used to describe for every implementation.
 ///
 /// **What a source buffers is daemon memory the cap does not see.** The
 /// receiver returned here lives inside the connection's exchange for the life
@@ -75,11 +85,18 @@ use tokio::sync::{Mutex, mpsc};
 /// batches parks a million items the cap never counts. Every source in this
 /// crate uses capacity 1, and a source with more should have a reason.
 /// [`HostSource`] honours the capacity half — its `start` opens exactly
-/// `mpsc::channel(1)` — but a *single* batch is still whatever one provider
-/// returns: neither [`ProviderHost`] nor this source caps how many items one
-/// provider may answer with, so nothing here stops one `send` from parking
-/// however many a provider sent. Closing that is issue #30's, and it is worth
-/// naming rather than leaving implied that capacity 1 already bounds it.
+/// `mpsc::channel(1)` — and, as of issue #61, the *single-batch* half too: a
+/// batch is still whatever one provider returns, but `ProviderHost::run_one`
+/// now routes every provider's answer through [`CheckedItems::check`] before
+/// this trait's channel ever sees it, and that check truncates the answer to
+/// [`MAX_ITEMS_PER_PROVIDER_ANSWER`](hop_core::pipeline::MAX_ITEMS_PER_PROVIDER_ANSWER)
+/// (1 000 items) before anything is sent. So one `send` here can now park at
+/// most 1 000 items, not "however many a provider sent" — issue #30's gap,
+/// closed at the seam upstream of this trait rather than inside it. Nothing
+/// about *this* trait's contract enforces the cap, the same caveat the
+/// paragraph above ends on: it holds because [`HostSource`] happens to route
+/// through [`CheckedItems::check`], not because implementing [`ResultSource`]
+/// requires it.
 ///
 /// **`send` points must be frequent enough for cancellation to be prompt.**
 /// The channel is the cancellation mechanism (see the module docs), and a
@@ -543,16 +560,65 @@ impl ProviderLog for StderrLog {
             ProviderEvent::Rejected {
                 provider,
                 rejections,
-            } => eprintln!(
-                "hopd: provider {provider} had {} item(s) refused by its own manifest",
-                rejections.len()
-            ),
+            } => eprintln!("{}", rejection_summary_line(provider, rejections)),
             // Skipped is the common case by design — most keystrokes reach
             // most providers not at all — so logging it per keystroke would
             // bury everything above it.
             ProviderEvent::Skipped { .. } => {}
         }
     }
+}
+
+/// Builds [`StderrLog`]'s one line for a [`ProviderEvent::Rejected`] event.
+///
+/// A plain `rejections.len()` used to be the whole count, reported as "N
+/// item(s) refused by its own manifest". That was accurate back when
+/// [`FailedCheck`] had only [`FailedCheck::Kind`] and
+/// [`FailedCheck::Provenance`] — both, genuinely, the item's own manifest
+/// lying. It stopped being accurate once [`FailedCheck::FieldTooLong`] and
+/// [`FailedCheck::TooManyItems`] existed: a `FieldTooLong` rejection has
+/// nothing to do with the manifest (it's a field-size violation), and one
+/// `TooManyItems` rejection stands for its whole `excess` — potentially
+/// thousands of dropped items — not the single item `rejections.len()` would
+/// count it as. Both the count and the stated cause were wrong.
+///
+/// This reports a truthful total (a `TooManyItems` rejection contributes its
+/// `excess`, not 1) broken down by the four causes that can actually reach
+/// [`ProviderEvent::Rejected`] here, one line, in [`StderrLog`]'s existing
+/// `"hopd: provider ..."` voice.
+fn rejection_summary_line(provider: &str, rejections: &[Rejection]) -> String {
+    let (mut bad_kind, mut forged_provenance, mut field_too_long, mut over_the_count_cap) =
+        (0usize, 0usize, 0usize, 0usize);
+
+    for rejection in rejections {
+        match rejection.check {
+            FailedCheck::Kind => bad_kind += 1,
+            FailedCheck::Provenance => forged_provenance += 1,
+            FailedCheck::FieldTooLong { .. } => field_too_long += 1,
+            FailedCheck::TooManyItems { excess } => over_the_count_cap += excess,
+            // `ProviderHost::run_one` builds this event straight from
+            // `CheckedItems::check(vec![output])`'s own rejections, for one
+            // provider's one answer — and `check` itself never produces a
+            // `PinBudget` rejection; that variant is only ever produced
+            // later, inside `Pipeline::assemble`'s pin-budget split, which
+            // this single-provider `check()` call never runs. If that ever
+            // stops being true, this should fail loudly rather than silently
+            // under-count.
+            FailedCheck::PinBudget => unreachable!(
+                "a PinBudget rejection reached ProviderEvent::Rejected, which \
+                 only ever carries CheckedItems::check's own rejections — \
+                 check() never produces PinBudget"
+            ),
+        }
+    }
+
+    let total = bad_kind + forged_provenance + field_too_long + over_the_count_cap;
+    format!(
+        "hopd: provider {provider} had {total} item(s) rejected \
+         ({bad_kind} bad kind, {forged_provenance} forged provenance, \
+         {field_too_long} field too long, {over_the_count_cap} dropped over \
+         the per-answer item cap)"
+    )
 }
 
 /// The walking skeleton's one and only result: every `query` frame gets
@@ -584,6 +650,78 @@ mod tests {
 
     use hop_core::host::{NoopLog, ProviderHost};
     use std::sync::Arc;
+
+    /// A [`Rejection`] naming `check`, otherwise filled with placeholder
+    /// values `rejection_summary_line` never reads.
+    fn rejection(check: FailedCheck) -> Rejection {
+        Rejection {
+            item_id: ItemId::new("provider:item-0").unwrap(),
+            claimed_kind: Kind::App,
+            claimed_provider: "provider".to_string(),
+            producer_id: "provider".to_string(),
+            check,
+        }
+    }
+
+    #[test]
+    fn the_rejection_summary_line_counts_a_too_many_items_rejection_by_its_excess_not_as_one() {
+        // Pins the defect this function exists to fix: a single
+        // `TooManyItems` rejection used to be counted as exactly 1 item by
+        // `rejections.len()`, undercounting a dropped tail of thousands down
+        // to 1. `excess` here is deliberately far larger than 1 to make an
+        // undercount impossible to miss.
+        let line = rejection_summary_line(
+            "files",
+            &[rejection(FailedCheck::TooManyItems { excess: 4_321 })],
+        );
+        assert_eq!(
+            line,
+            "hopd: provider files had 4321 item(s) rejected (0 bad kind, \
+             0 forged provenance, 0 field too long, 4321 dropped over the \
+             per-answer item cap)"
+        );
+    }
+
+    #[test]
+    fn the_rejection_summary_line_states_field_too_long_as_its_own_cause_not_the_manifest() {
+        // The stale message called every rejection "refused by its own
+        // manifest" — true for Kind/Provenance, never true for a field-size
+        // violation. This pins that the cause is now named accurately.
+        let line = rejection_summary_line(
+            "files",
+            &[rejection(FailedCheck::FieldTooLong {
+                field: "Item.title",
+            })],
+        );
+        assert_eq!(
+            line,
+            "hopd: provider files had 1 item(s) rejected (0 bad kind, \
+             0 forged provenance, 1 field too long, 0 dropped over the \
+             per-answer item cap)"
+        );
+    }
+
+    #[test]
+    fn the_rejection_summary_line_sums_a_mix_of_causes_truthfully() {
+        let line = rejection_summary_line(
+            "files",
+            &[
+                rejection(FailedCheck::Kind),
+                rejection(FailedCheck::Kind),
+                rejection(FailedCheck::Provenance),
+                rejection(FailedCheck::FieldTooLong {
+                    field: "Item.subtitle",
+                }),
+                rejection(FailedCheck::TooManyItems { excess: 10 }),
+            ],
+        );
+        assert_eq!(
+            line,
+            "hopd: provider files had 14 item(s) rejected (2 bad kind, \
+             1 forged provenance, 1 field too long, 10 dropped over the \
+             per-answer item cap)"
+        );
+    }
 
     #[tokio::test]
     async fn the_skeleton_provider_answers_through_the_host() {
