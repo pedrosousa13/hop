@@ -298,7 +298,13 @@ provider indexes.
 removed (`firefox.desktop` → `firefox`); the apps provider's items carry it
 as `app:<app id>`, which is what `hop-core`'s alias table also synthesizes
 for an `app` alias boost — see `APPS_PROVIDER_ID`'s own docs for why the two
-must agree.
+must agree. A file name ending in `.desktop` is only a *candidate* app id;
+`scan_apps` claims it only once the file is *understood*, i.e. parsed into
+one of `DesktopEntryOutcome`'s three outcomes — valid (claims the id,
+contributes an item), occluded (claims the id, contributes nothing, for a
+deliberate `Hidden=true`/`NoDisplay=true` entry suppressing a
+lower-precedence one on purpose), or malformed (claims nothing, leaving the
+id free for a lower-precedence root to supply a working entry).
 
 ## Frames
 

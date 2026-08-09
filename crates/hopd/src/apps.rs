@@ -63,16 +63,52 @@ pub(crate) struct ParsedEntry {
     pub(crate) haystack: String,
 }
 
-/// Parses one `.desktop` file's contents into a [`ParsedEntry`], or `None`
-/// if the file has no usable `[Desktop Entry]` group — no `Name=`, or
-/// `Hidden=true`/`NoDisplay=true`.
+/// The three distinct outcomes parsing a `.desktop` file's contents can
+/// produce — named for what each means to [`scan_apps`], the only caller,
+/// not for the syntax that produced them.
+///
+/// Before issue #108, [`parse_desktop_entry`] returned `Option<ParsedEntry>`,
+/// and `None` covered two unrelated situations: the file was malformed, and
+/// the file was valid but deliberately hidden (`Hidden=true`/
+/// `NoDisplay=true`). Because those collapsed into the same value,
+/// [`scan_apps`] could not tell them apart at the point it had to decide
+/// whether to claim the app id — so it claimed early, before validation,
+/// which is what let a corrupt higher-precedence file erase a working
+/// lower-precedence one with no trace. This type exists to stop that
+/// collapse.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DesktopEntryOutcome {
+    /// A usable parsed entry. [`scan_apps`] claims the app id and
+    /// contributes an item.
+    Valid(ParsedEntry),
+    /// Parsed correctly, but deliberately hidden per the freedesktop Desktop
+    /// Entry Specification (`Hidden=true` or `NoDisplay=true`). [`scan_apps`]
+    /// claims the app id and contributes no item — a lower-precedence entry
+    /// with the same id stays suppressed, which is the whole point of the
+    /// convention this outcome exists to honor.
+    Occluded,
+    /// Could not be understood: no usable `Name=`, or a malformed value in a
+    /// key this parser validates (currently only `Exec=`, whose
+    /// unterminated-quote rejection — see [`parse_exec`] — reaches this
+    /// variant, never [`DesktopEntryOutcome::Occluded`]). [`scan_apps`]
+    /// claims *nothing* for this outcome: a same-named entry in a
+    /// lower-precedence root is considered normally. Carries a
+    /// human-readable reason so the caller can log the path and the cause
+    /// together.
+    Malformed(String),
+}
+
+/// Parses one `.desktop` file's contents into a [`DesktopEntryOutcome`].
 ///
 /// Ported from the salvaged `parse_desktop_entry`, adjusted to this crate's
-/// types: the salvaged version built a project-local `SearchItem` directly;
-/// this one stops at a [`ParsedEntry`] so [`build_entry`] can apply
+/// types: the salvaged version built a project-local `SearchItem` directly
+/// and returned `Option`; this one stops at a [`ParsedEntry`] wrapped in
+/// [`DesktopEntryOutcome::Valid`] so [`build_entry`] can apply
 /// `hop-protocol`'s content rules ([`IconName`], [`IconPath`]) before
-/// anything becomes an [`Item`].
-pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
+/// anything becomes an [`Item`] — and so that a malformed file and a
+/// deliberately hidden one, which used to collapse into the same `None`, are
+/// values a caller can tell apart (issue #108).
+pub(crate) fn parse_desktop_entry(content: &str) -> DesktopEntryOutcome {
     let mut name = String::new();
     let mut localized_name = String::new();
     let mut exec: Option<Vec<String>> = None;
@@ -113,28 +149,24 @@ pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
                     Some(argv) => exec = Some(argv),
                     None => {
                         // A malformed Exec= (most importantly, an
-                        // unterminated quote) rejects the whole entry
-                        // rather than guessing at a split — see
-                        // `parse_exec`'s own doc comment. Logged, not
-                        // swallowed: an app that silently vanished from the
-                        // index would otherwise look like a scan bug, not a
-                        // bad .desktop file.
-                        //
-                        // Not asserted by a test, deliberately. Capturing
-                        // stderr from a unit test needs either a new
-                        // dependency (#109's brief forbids adding one) or
-                        // raw fd redirection, and the workspace denies
-                        // `unsafe_code`. The reachable fix is to make the
-                        // rejection a *value* rather than a side effect,
-                        // which is exactly what #108 does when it splits
-                        // this function's `None` into distinct occluded and
-                        // malformed outcomes — the log assertion belongs
-                        // there, on a return value a test can read.
-                        eprintln!(
-                            "hopd: apps provider: rejecting desktop entry: \
-                             malformed Exec= value (unterminated quote): {value:?}"
-                        );
-                        return None;
+                        // unterminated quote) rejects the whole entry rather
+                        // than guessing at a split — see `parse_exec`'s own
+                        // doc comment. This is `DesktopEntryOutcome::
+                        // Malformed`, not `Occluded`: a broken Exec= must
+                        // not suppress a valid lower-precedence entry with
+                        // the same app id (issue #108) the way a deliberate
+                        // `Hidden=true` does. The reason travels as the
+                        // return value itself now, so `scan_apps` is the one
+                        // that logs it — path and reason together, via
+                        // `malformed_log_line` — once this value reaches it;
+                        // that is also what makes the reason a plain value a
+                        // test can assert on directly, rather than requiring
+                        // the stderr capture #109 deliberately left this
+                        // untested over (a new dependency or `unsafe` fd
+                        // redirection, both forbidden here).
+                        return DesktopEntryOutcome::Malformed(format!(
+                            "malformed Exec= value (unterminated quote): {value:?}"
+                        ));
                     }
                 }
             }
@@ -162,13 +194,15 @@ pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
     }
 
     if hidden || no_display {
-        return None;
+        return DesktopEntryOutcome::Occluded;
     }
     if name.is_empty() {
         name = localized_name;
     }
     if name.is_empty() {
-        return None;
+        return DesktopEntryOutcome::Malformed(
+            "no Name= (or Name[locale]=) present in the [Desktop Entry] group".to_string(),
+        );
     }
 
     // Truncated to MAX_TITLE at a char boundary rather than left as-is: this
@@ -196,7 +230,7 @@ pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
     ]
     .join(" ");
 
-    Some(ParsedEntry {
+    DesktopEntryOutcome::Valid(ParsedEntry {
         title,
         exec,
         icon: (!icon.is_empty()).then_some(icon),
@@ -527,31 +561,96 @@ pub(crate) fn flatpak_application_roots(home: Option<&str>) -> Vec<PathBuf> {
 /// that even reading it is not itself the DoS.
 const MAX_DESKTOP_FILE_BYTES: u64 = 256 * 1024;
 
-/// Scans every directory in `roots`, in order, parsing each `.desktop` file
-/// found into an [`AppEntry`]. A root that does not exist or cannot be read
-/// is skipped, not an error — an unconfigured `~/.icons`-style directory on
-/// a fresh machine is normal, not exceptional.
+/// What [`scan_apps`] does with one candidate file once its content has
+/// already been read: whether it claims the file's app id, and if so,
+/// whether it also contributes an item.
 ///
-/// The first entry seen for a given app id wins; a later root offering the
-/// same filename is discarded. This is what makes `roots`' ordering
-/// (user-then-system, from [`xdg_application_roots`]) a real precedence
-/// rule rather than a coincidence of iteration order.
+/// Kept distinct from [`DesktopEntryOutcome`] — rather than reusing it
+/// directly — because this enum additionally covers a case that outcome
+/// cannot express on its own: [`build_entry`] failing on an otherwise
+/// [`DesktopEntryOutcome::Valid`] parse. From `scan_apps`'s point of view
+/// that failure is exactly as malformed as a parse failure — an entry whose
+/// id could not be built must not claim the id it failed to build.
+#[derive(Debug)]
+enum ScanDecision {
+    /// Claims the app id; contributes this item. Boxed only to keep this
+    /// enum's size close to its other variants' — `clippy::large_enum_
+    /// variant` flags `AppEntry` inline here as ~10x the next-largest
+    /// variant's size, and every `ScanDecision` this module builds is
+    /// short-lived (matched once, immediately, in `scan_apps`'s loop body),
+    /// so there is no repeated allocation cost this indirection is trading
+    /// away.
+    Entry(Box<AppEntry>),
+    /// Claims the app id; contributes no item. Reached only for
+    /// [`DesktopEntryOutcome::Occluded`] — a deliberately hidden entry.
+    ClaimOnly,
+    /// Claims nothing. Carries the reason [`scan_apps`] logs alongside the
+    /// file's path.
+    Malformed(String),
+}
+
+/// Decides [`ScanDecision`] for one candidate whose content has already been
+/// read, given the app id its file name contributed.
 ///
-/// Every candidate is `stat`-ed before it is read: anything that is not a
-/// regular file (a symlink resolving to a FIFO or a character device such as
-/// `/dev/zero`, which has no EOF and would hang a `read_to_string` forever)
-/// or that exceeds [`MAX_DESKTOP_FILE_BYTES`] is skipped exactly like a
-/// missing or unreadable file, never read. This check runs after an app id
-/// is marked "seen" in `seen_ids`, matching this function's existing
-/// seen-before-validated ordering (tracked separately; not this change's
-/// concern) — an oversized or special file under a later root still blocks a
-/// same-named entry from a later root the way any other invalid file does.
+/// Pulled out of `scan_apps`'s loop body so this exact decision is
+/// unit-testable without touching disk — which matters most for the
+/// [`ScanDecision::Malformed`] arm reached when [`build_entry`] fails: that
+/// only happens when `app_id` is long enough to push `app:<app_id>` over
+/// [`hop_protocol::limits::MAX_ITEM_ID`] (4 096 bytes), and every common
+/// Linux filesystem enforces a 255-byte `NAME_MAX` on the file name alone —
+/// so there is no real `.desktop` file this crate could ever write to disk
+/// with a name long enough to drive that path through `scan_apps` end to
+/// end.
+fn evaluate_candidate(app_id: String, content: &str) -> ScanDecision {
+    match parse_desktop_entry(content) {
+        DesktopEntryOutcome::Valid(parsed) => match build_entry(app_id, parsed) {
+            Some(entry) => ScanDecision::Entry(Box::new(entry)),
+            None => ScanDecision::Malformed(
+                "parsed successfully but its app id could not be built into an item id \
+                 (over the item id length bound)"
+                    .to_string(),
+            ),
+        },
+        DesktopEntryOutcome::Occluded => ScanDecision::ClaimOnly,
+        DesktopEntryOutcome::Malformed(reason) => ScanDecision::Malformed(reason),
+    }
+}
+
+/// Builds the one line [`scan_apps`] logs for a file skipped as malformed —
+/// path and reason together, so "an app vanished from search with no trace"
+/// (the exact defect issue #108 fixes) is never silently true again. Never
+/// called for a [`ScanDecision::ClaimOnly`] (an occluded entry): a
+/// deliberately hidden entry is ordinary freedesktop behavior, not something
+/// to flag as broken.
 ///
-/// The only place in this module that performs disk I/O other than the
-/// inotify watcher itself (`open_watch`/`spawn_index_watcher`, Task 6) —
-/// called once at startup and once per filesystem-change notification
-/// thereafter, **never** from [`AppIndex::query`] (Task 3).
-pub fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
+/// Extracted as a pure function — mirroring `source.rs`'s
+/// `rejection_summary_line`, which exists for the identical reason — because
+/// capturing stderr in a unit test needs either a new dependency or `unsafe`
+/// fd redirection, and this workspace forbids both. Asserting on this
+/// function's return value is as close as a test can get to pinning what
+/// `scan_apps` actually sends to stderr.
+fn malformed_log_line(path: &Path, reason: &str) -> String {
+    format!("hopd: apps provider: skipping {}: {reason}", path.display())
+}
+
+/// [`scan_apps`]'s actual body, with every malformed-file log line routed
+/// through `log` instead of going straight to stderr. Production code
+/// always passes a sink that `eprintln!`s the line; `scan_tests` below
+/// passes one that records lines into a `Vec` instead, which is how the
+/// tests there pin the criterion `malformed_log_line`'s own doc comment
+/// could only assert in isolation: that a file skipped for a malformed
+/// reason actually reaches the log, and a hidden or valid file produces no
+/// line at all.
+///
+/// The mutation this catches: deleting one of the five `eprintln!`-via-`log`
+/// call sites below (or the `malformed_log_line` call feeding it) while
+/// leaving its `continue` in place. That mutation is invisible to every
+/// test that only inspects `scan_apps`'s returned `Vec<AppEntry>` — the id
+/// still goes unclaimed and the entry still goes missing either way — so
+/// nothing but a test that reads what was logged can tell "skipped and
+/// logged" apart from "skipped in silence," which is the exact regression
+/// issue #108 exists to prevent.
+fn scan_apps_with_log(roots: &[PathBuf], log: &mut dyn FnMut(&str)) -> Vec<AppEntry> {
     let mut seen_ids = HashSet::new();
     let mut entries = Vec::new();
 
@@ -570,28 +669,92 @@ pub fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
             let Some(app_id) = app_id_from_file_name(file_name) else {
                 continue;
             };
-            if !seen_ids.insert(app_id.clone()) {
+            if seen_ids.contains(&app_id) {
                 continue;
             }
+
             let Ok(metadata) = std::fs::metadata(&path) else {
+                log(&malformed_log_line(&path, "could not stat the file"));
                 continue;
             };
-            if !metadata.is_file() || metadata.len() > MAX_DESKTOP_FILE_BYTES {
+            if !metadata.is_file() {
+                log(&malformed_log_line(&path, "not a regular file"));
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            if metadata.len() > MAX_DESKTOP_FILE_BYTES {
+                log(&malformed_log_line(&path, "over the size bound"));
                 continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(err) => {
+                    log(&malformed_log_line(
+                        &path,
+                        &format!("could not be read: {err}"),
+                    ));
+                    continue;
+                }
             };
-            let Some(parsed) = parse_desktop_entry(&content) else {
-                continue;
-            };
-            if let Some(entry) = build_entry(app_id, parsed) {
-                entries.push(entry);
+
+            match evaluate_candidate(app_id.clone(), &content) {
+                ScanDecision::Entry(entry) => {
+                    seen_ids.insert(app_id);
+                    entries.push(*entry);
+                }
+                ScanDecision::ClaimOnly => {
+                    seen_ids.insert(app_id);
+                }
+                ScanDecision::Malformed(reason) => {
+                    log(&malformed_log_line(&path, &reason));
+                }
             }
         }
     }
 
     entries
+}
+
+/// Scans every directory in `roots`, in order, turning each `.desktop` file
+/// found into an [`AppEntry`]. A root that does not exist or cannot be read
+/// is skipped, not an error — an unconfigured `~/.icons`-style directory on
+/// a fresh machine is normal, not exceptional.
+///
+/// A file name ending in `.desktop` is only a *candidate* app id, not yet an
+/// *understood* one. The id is claimed in `seen_ids` only once the candidate
+/// has been stat-ed, read, parsed, and classified — never at candidate time.
+/// [`ScanDecision::Entry`] and [`ScanDecision::ClaimOnly`] claim the id;
+/// [`ScanDecision::Malformed`] claims nothing, whatever produced it: an
+/// unreadable file, a file that is not a regular file, a file over
+/// [`MAX_DESKTOP_FILE_BYTES`], a file [`parse_desktop_entry`] could not
+/// understand, or a parsed file [`build_entry`] could not turn into an item.
+/// Every one of those leaves the id free for a lower-precedence root to
+/// supply a working entry, and every one is logged — path and reason,
+/// via [`malformed_log_line`] — because silence is the specific defect
+/// issue #108 fixes: an app vanishing from search with no diagnostic. The
+/// one case that both claims the id *and* contributes nothing is
+/// `ScanDecision::ClaimOnly`, reached only for a file that parsed correctly
+/// and deliberately opted out via `Hidden=true`/`NoDisplay=true` — the
+/// freedesktop convention for occluding a lower-precedence entry with the
+/// same id on purpose, which is ordinary and is not logged.
+///
+/// This is what makes `roots`' ordering (user-then-system, from
+/// [`xdg_application_roots`]) a real precedence rule: the first *understood*
+/// file for a given id wins, not the first *candidate filename* seen — a
+/// corrupt user-level override no longer erases a working system-level entry
+/// beneath it.
+///
+/// Every candidate is `stat`-ed before it is read: anything that is not a
+/// regular file (a symlink resolving to a FIFO or a character device such as
+/// `/dev/zero`, which has no EOF and would hang a `read_to_string` forever)
+/// or that exceeds [`MAX_DESKTOP_FILE_BYTES`] is skipped exactly like a
+/// missing or unreadable file, never read.
+///
+/// The only place in this module that performs disk I/O other than the
+/// inotify watcher itself (`open_watch`/`spawn_index_watcher`, Task 6) —
+/// called once at startup and once per filesystem-change notification
+/// thereafter, **never** from [`AppIndex::query`] (Task 3).
+pub fn scan_apps(roots: &[PathBuf]) -> Vec<AppEntry> {
+    scan_apps_with_log(roots, &mut |line| eprintln!("{line}"))
 }
 
 #[cfg(test)]
@@ -787,6 +950,364 @@ mod scan_tests {
 
         assert!(scan_apps(&[dir.path().to_path_buf()]).is_empty());
     }
+
+    // --- New coverage: issue #108, a broken higher-precedence entry must
+    // not silently occlude a valid lower-precedence one. ---
+
+    #[test]
+    fn a_corrupt_higher_precedence_file_does_not_hide_a_valid_lower_precedence_entry() {
+        // The triage repro from issue #108: a garbage `firefox.desktop` (no
+        // [Desktop Entry] header at all) in the higher-precedence root used
+        // to claim the "firefox" id and then produce nothing, erasing the
+        // valid entry beneath it — Firefox vanished from the index
+        // entirely, alongside an unrelated control entry that had nothing
+        // to do with the bug.
+        let higher = tempfile::tempdir().unwrap();
+        let lower = tempfile::tempdir().unwrap();
+        fs::write(
+            higher.path().join("firefox.desktop"),
+            "this is not a desktop entry\njust garbage\n",
+        )
+        .unwrap();
+        write_entry(lower.path(), "firefox.desktop", "Firefox");
+        write_entry(lower.path(), "gimp.desktop", "GIMP");
+
+        let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
+        let ids: Vec<&str> = entries.iter().map(|e| e.app_id.as_str()).collect();
+        assert!(
+            ids.contains(&"firefox"),
+            "the valid lower-precedence entry must still be indexed: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"gimp"),
+            "an unrelated entry must be unaffected: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_higher_precedence_file_does_not_hide_a_valid_lower_precedence_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let higher = tempfile::tempdir().unwrap();
+        let lower = tempfile::tempdir().unwrap();
+        let higher_file = higher.path().join("app.desktop");
+        write_entry(higher.path(), "app.desktop", "Unreadable");
+        fs::set_permissions(&higher_file, fs::Permissions::from_mode(0o000)).unwrap();
+
+        if fs::read_to_string(&higher_file).is_ok() {
+            // Running as root (or under some container setups) ignores
+            // permission bits entirely, which would make this test's
+            // premise false rather than its assertion — same escape hatch
+            // as the /dev/zero test above uses for a different
+            // environment-dependent precondition.
+            eprintln!("skipping: this process can read a 0o000 file (likely running as root)");
+            fs::set_permissions(&higher_file, fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        write_entry(lower.path(), "app.desktop", "Valid");
+
+        let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item.title, "Valid");
+
+        // Restore permissions so `TempDir`'s own cleanup on drop can remove
+        // the file without needing directory-only write access to do it.
+        fs::set_permissions(&higher_file, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn a_higher_precedence_file_over_the_size_bound_does_not_hide_a_valid_lower_precedence_entry() {
+        let higher = tempfile::tempdir().unwrap();
+        let lower = tempfile::tempdir().unwrap();
+        let header = "[Desktop Entry]\nName=Huge\nExec=huge\n";
+        let padding = "#".repeat(MAX_DESKTOP_FILE_BYTES as usize + 1 - header.len());
+        fs::write(
+            higher.path().join("app.desktop"),
+            format!("{header}{padding}"),
+        )
+        .unwrap();
+        write_entry(lower.path(), "app.desktop", "Valid");
+
+        let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item.title, "Valid");
+    }
+
+    #[test]
+    fn a_higher_precedence_symlink_to_a_special_file_does_not_hide_a_valid_lower_precedence_entry()
+    {
+        let special = Path::new("/dev/zero");
+        if !special.exists() {
+            eprintln!("skipping: /dev/zero not present on this system");
+            return;
+        }
+
+        let higher = tempfile::tempdir().unwrap();
+        let lower = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(special, higher.path().join("app.desktop")).unwrap();
+        write_entry(lower.path(), "app.desktop", "Valid");
+
+        let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item.title, "Valid");
+    }
+
+    #[test]
+    fn a_malformed_exec_in_a_higher_precedence_entry_does_not_hide_a_valid_lower_precedence_entry()
+    {
+        // The interaction with #109 the brief calls out: a broken Exec=
+        // used to make `parse_desktop_entry` return `None`, exactly like
+        // `Hidden=true` did, so it occluded a valid entry beneath it by
+        // accident. It must map to `DesktopEntryOutcome::Malformed`, never
+        // `Occluded`.
+        let higher = tempfile::tempdir().unwrap();
+        let lower = tempfile::tempdir().unwrap();
+        fs::write(
+            higher.path().join("app.desktop"),
+            "[Desktop Entry]\nName=Broken\nExec=app \"unterminated\n",
+        )
+        .unwrap();
+        write_entry(lower.path(), "app.desktop", "Valid");
+
+        let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item.title, "Valid");
+    }
+
+    #[test]
+    fn evaluate_candidate_is_malformed_when_build_entry_fails_to_construct_the_id() {
+        // `build_entry` only fails when `app_id` is long enough to push
+        // `app:<app_id>` over `MAX_ITEM_ID` (4 096 bytes) — and every common
+        // Linux filesystem enforces a 255-byte `NAME_MAX` on a file name
+        // alone, so there is no real `.desktop` file this crate could ever
+        // write to disk with a name that long (verified empirically: even
+        // ~4 KiB is refused with ENAMETOOLONG well before the bound). This
+        // exercises `scan_apps`'s per-candidate decision directly instead;
+        // the "does this claim the id" half of the behavior — that a
+        // `ScanDecision::Malformed` never inserts into `seen_ids` — is
+        // exercised by the same match arm the tests above already drive
+        // through corrupt/unreadable/oversized/symlink/malformed-Exec
+        // candidates.
+        let over_long_app_id = "a".repeat(hop_protocol::limits::MAX_ITEM_ID);
+        let decision = evaluate_candidate(over_long_app_id, "[Desktop Entry]\nName=X\nExec=x\n");
+        assert!(
+            matches!(decision, ScanDecision::Malformed(_)),
+            "an id build_entry could not construct must not claim the id it failed to build"
+        );
+    }
+
+    #[test]
+    fn a_hidden_higher_precedence_entry_still_occludes_a_valid_lower_precedence_entry() {
+        let higher = tempfile::tempdir().unwrap();
+        let lower = tempfile::tempdir().unwrap();
+        fs::write(
+            higher.path().join("app.desktop"),
+            "[Desktop Entry]\nName=Hidden\nExec=hidden\nHidden=true\n",
+        )
+        .unwrap();
+        write_entry(lower.path(), "app.desktop", "Valid");
+
+        let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
+        assert!(
+            entries.is_empty(),
+            "Hidden=true must keep occluding the lower-precedence entry, \
+             and contribute no item of its own: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_no_display_higher_precedence_entry_still_occludes_a_valid_lower_precedence_entry() {
+        let higher = tempfile::tempdir().unwrap();
+        let lower = tempfile::tempdir().unwrap();
+        fs::write(
+            higher.path().join("app.desktop"),
+            "[Desktop Entry]\nName=NoDisp\nExec=nodisp\nNoDisplay=true\n",
+        )
+        .unwrap();
+        write_entry(lower.path(), "app.desktop", "Valid");
+
+        let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
+        assert!(
+            entries.is_empty(),
+            "NoDisplay=true must keep occluding the lower-precedence entry, \
+             and contribute no item of its own: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_log_line_names_the_path_and_the_reason() {
+        // A focused unit test of the pure line-building function, isolated
+        // from `scan_apps`'s own file-classification logic — the
+        // `scan_apps_with_log`-driven tests below are what actually pin
+        // that `scan_apps` calls this function (and only this function) at
+        // each of the five malformed sites, and never for an occluded or
+        // valid file.
+        let line = malformed_log_line(Path::new("/tmp/x/firefox.desktop"), "not a regular file");
+        assert!(line.contains("/tmp/x/firefox.desktop"), "{line:?}");
+        assert!(line.contains("not a regular file"), "{line:?}");
+    }
+
+    // --- New coverage: issue #108's review follow-up — a file skipped for
+    // a malformed reason must actually be observed to log something naming
+    // the path and the reason, not just be inspected for correctness by
+    // reading the source. `scan_apps_with_log` is the seam that makes the
+    // log itself, not just its would-be content, part of what a test can
+    // assert on. ---
+
+    /// Runs `scan_apps_with_log` over `roots`, returning the entries found
+    /// and every line it logged, in call order.
+    fn scan_and_capture_log(roots: &[PathBuf]) -> (Vec<AppEntry>, Vec<String>) {
+        let mut lines = Vec::new();
+        let entries = scan_apps_with_log(roots, &mut |line| lines.push(line.to_string()));
+        (entries, lines)
+    }
+
+    #[test]
+    fn scan_apps_with_log_reports_a_stat_failure() {
+        // A symlink whose target does not exist: `std::fs::metadata`
+        // follows it and fails with `ENOENT`, which is a different failure
+        // point from every other test here (none of which ever reach the
+        // `std::fs::metadata` error arm at all).
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist"),
+            dir.path().join("broken.desktop"),
+        )
+        .unwrap();
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("broken.desktop"), "{lines:?}");
+        assert!(lines[0].contains("could not stat the file"), "{lines:?}");
+    }
+
+    #[test]
+    fn scan_apps_with_log_reports_a_non_regular_file() {
+        let special = Path::new("/dev/zero");
+        if !special.exists() {
+            eprintln!("skipping: /dev/zero not present on this system");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(special, dir.path().join("evil.desktop")).unwrap();
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("evil.desktop"), "{lines:?}");
+        assert!(lines[0].contains("not a regular file"), "{lines:?}");
+    }
+
+    #[test]
+    fn scan_apps_with_log_reports_a_file_over_the_size_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = "[Desktop Entry]\nName=Huge\nExec=huge\n";
+        let padding = "#".repeat(MAX_DESKTOP_FILE_BYTES as usize + 1 - header.len());
+        fs::write(
+            dir.path().join("huge.desktop"),
+            format!("{header}{padding}"),
+        )
+        .unwrap();
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("huge.desktop"), "{lines:?}");
+        assert!(lines[0].contains("over the size bound"), "{lines:?}");
+    }
+
+    #[test]
+    fn scan_apps_with_log_reports_an_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.desktop");
+        write_entry(dir.path(), "app.desktop", "Unreadable");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+
+        if fs::read_to_string(&file).is_ok() {
+            // Same environment-dependent escape hatch as the other
+            // permission-bit tests in this module: root (or some container
+            // setups) ignores the mode bits entirely.
+            eprintln!("skipping: this process can read a 0o000 file (likely running as root)");
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("app.desktop"), "{lines:?}");
+        assert!(lines[0].contains("could not be read"), "{lines:?}");
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn scan_apps_with_log_reports_a_parse_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("garbage.desktop"),
+            "this is not a desktop entry\njust garbage\n",
+        )
+        .unwrap();
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("garbage.desktop"), "{lines:?}");
+        assert!(lines[0].contains("Name="), "{lines:?}");
+    }
+
+    #[test]
+    fn scan_apps_with_log_emits_nothing_for_a_hidden_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("hidden.desktop"),
+            "[Desktop Entry]\nName=Hidden\nExec=hidden\nHidden=true\n",
+        )
+        .unwrap();
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert!(
+            lines.is_empty(),
+            "a deliberately hidden entry is ordinary, not something to log: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn scan_apps_with_log_emits_nothing_for_a_no_display_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("nodisplay.desktop"),
+            "[Desktop Entry]\nName=NoDisp\nExec=nodisp\nNoDisplay=true\n",
+        )
+        .unwrap();
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert!(
+            lines.is_empty(),
+            "a deliberately hidden entry is ordinary, not something to log: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn scan_apps_with_log_emits_nothing_for_a_valid_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), "firefox.desktop", "Firefox");
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            lines.is_empty(),
+            "a successfully indexed entry has nothing to log: {lines:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -795,14 +1316,28 @@ mod tests {
 
     use super::*;
 
+    /// Unwraps a [`DesktopEntryOutcome::Valid`], panicking with the actual
+    /// variant otherwise. Every test in this module below that only cares
+    /// about a successfully parsed entry reaches for this instead of
+    /// matching `DesktopEntryOutcome` out by hand each time — a plain,
+    /// local helper rather than a `#[cfg(test)]` inherent method on
+    /// `DesktopEntryOutcome` itself, so the return-type change this helper
+    /// papers over stays visible at every call site's diff instead of
+    /// disappearing behind a same-named method.
+    fn parsed(content: &str) -> ParsedEntry {
+        match parse_desktop_entry(content) {
+            DesktopEntryOutcome::Valid(parsed) => parsed,
+            other => panic!("expected DesktopEntryOutcome::Valid, got {other:?}"),
+        }
+    }
+
     // --- Ported from the salvaged Rust parser's own test module. ---
 
     #[test]
     fn parses_a_basic_desktop_entry() {
-        let parsed = parse_desktop_entry(
+        let parsed = parsed(
             "[Desktop Entry]\nName=Firefox\nExec=firefox %u\nIcon=firefox\nKeywords=browser;web;\n",
-        )
-        .expect("desktop entry parses");
+        );
         assert_eq!(parsed.title, "Firefox");
         assert_eq!(parsed.exec, vec!["firefox".to_string()]);
         assert_eq!(parsed.icon.as_deref(), Some("firefox"));
@@ -811,22 +1346,21 @@ mod tests {
 
     #[test]
     fn hidden_and_no_display_entries_are_skipped() {
-        assert!(
-            parse_desktop_entry("[Desktop Entry]\nName=Hidden\nExec=hidden\nHidden=true\n")
-                .is_none()
-        );
-        assert!(
-            parse_desktop_entry("[Desktop Entry]\nName=NoDisp\nExec=nodisp\nNoDisplay=true\n")
-                .is_none()
-        );
+        assert!(matches!(
+            parse_desktop_entry("[Desktop Entry]\nName=Hidden\nExec=hidden\nHidden=true\n"),
+            DesktopEntryOutcome::Occluded
+        ));
+        assert!(matches!(
+            parse_desktop_entry("[Desktop Entry]\nName=NoDisp\nExec=nodisp\nNoDisplay=true\n"),
+            DesktopEntryOutcome::Occluded
+        ));
     }
 
     #[test]
     fn falls_back_to_a_localized_name_when_the_primary_is_missing() {
-        let parsed = parse_desktop_entry(
+        let parsed = parsed(
             "[Desktop Entry]\nName[en_US]=Localized App\nExec=localized-app %U\nType=Application\n",
-        )
-        .expect("desktop entry parses");
+        );
         assert_eq!(parsed.title, "Localized App");
         assert!(parsed.haystack.contains("localized-app"));
         assert!(
@@ -839,26 +1373,28 @@ mod tests {
 
     #[test]
     fn an_entry_with_no_name_at_all_is_skipped() {
-        assert!(parse_desktop_entry("[Desktop Entry]\nExec=nothing\n").is_none());
+        assert!(matches!(
+            parse_desktop_entry("[Desktop Entry]\nExec=nothing\n"),
+            DesktopEntryOutcome::Malformed(_)
+        ));
     }
 
     #[test]
     fn content_outside_the_desktop_entry_group_is_ignored() {
         // A mutation that dropped the `in_desktop_entry` gate would pick up
         // this second group's Name= instead of leaving the file nameless.
-        let parsed = parse_desktop_entry(
+        let outcome = parse_desktop_entry(
             "[Desktop Entry]\nExec=real\n[Desktop Action new-window]\nName=New Window\n",
         );
         assert!(
-            parsed.is_none(),
+            matches!(outcome, DesktopEntryOutcome::Malformed(_)),
             "a Name= outside [Desktop Entry] must not count"
         );
     }
 
     #[test]
     fn field_codes_are_stripped_from_exec() {
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app %f %U --flag %i\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=app %f %U --flag %i\n");
         assert_eq!(parsed.exec, vec!["app".to_string(), "--flag".to_string()]);
     }
 
@@ -867,9 +1403,7 @@ mod tests {
 
     #[test]
     fn a_quoted_program_path_with_spaces_becomes_one_argument_with_no_quote_chars() {
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=\"/opt/My App/bin/app\" --flag\n")
-                .unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=\"/opt/My App/bin/app\" --flag\n");
         assert_eq!(
             parsed.exec,
             vec!["/opt/My App/bin/app".to_string(), "--flag".to_string()]
@@ -882,9 +1416,7 @@ mod tests {
         // internal whitespace was still emitting a program token with a
         // literal leading `"` attached, because the old parser never
         // understood quoting at all.
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=\"/home/pedro/.local/bin/unity\"\n")
-                .unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=\"/home/pedro/.local/bin/unity\"\n");
         assert_eq!(
             parsed.exec,
             vec!["/home/pedro/.local/bin/unity".to_string()]
@@ -893,10 +1425,9 @@ mod tests {
 
     #[test]
     fn a_quoted_argument_with_spaces_reaches_the_result_as_exactly_one_argument() {
-        let parsed = parse_desktop_entry(
+        let parsed = parsed(
             "[Desktop Entry]\nName=X\nExec=ibus-daemon --daemon-args \"--xim --panel disable\"\n",
-        )
-        .unwrap();
+        );
         assert_eq!(
             parsed.exec,
             vec![
@@ -942,7 +1473,7 @@ mod tests {
 
     #[test]
     fn a_field_code_is_stripped_only_as_a_whole_unquoted_argument() {
-        let parsed = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app %f \"%f\"\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=app %f \"%f\"\n");
         assert_eq!(
             parsed.exec,
             vec!["app".to_string(), "%f".to_string()],
@@ -952,8 +1483,7 @@ mod tests {
 
     #[test]
     fn double_percent_resolves_to_a_literal_percent() {
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app --progress=%%\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=app --progress=%%\n");
         assert_eq!(
             parsed.exec,
             vec!["app".to_string(), "--progress=%".to_string()]
@@ -964,8 +1494,35 @@ mod tests {
     fn an_unterminated_quote_rejects_the_whole_entry() {
         assert_eq!(parse_exec("app \"unterminated"), None);
         assert!(
-            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app \"unterminated\n").is_none(),
+            matches!(
+                parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app \"unterminated\n"),
+                DesktopEntryOutcome::Malformed(_)
+            ),
             "a malformed Exec= must reject the whole entry, not guess at a split"
+        );
+    }
+
+    #[test]
+    fn a_malformed_exec_value_is_reported_as_malformed_with_a_reason_naming_the_cause() {
+        // The deferred assertion from #109: that PR left this rejection
+        // untested because capturing stderr from a unit test needs either a
+        // new dependency or `unsafe` fd redirection, both forbidden here,
+        // and said the fix was to make the rejection a *value* once #108
+        // split `None` into distinct occluded and malformed outcomes. This
+        // is that assertion — and it also pins that an unterminated quote
+        // maps to Malformed, never Occluded, so it cannot suppress a valid
+        // lower-precedence entry with the same app id.
+        let outcome = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app \"unterminated\n");
+        let DesktopEntryOutcome::Malformed(reason) = outcome else {
+            panic!("expected DesktopEntryOutcome::Malformed, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("Exec="),
+            "reason must name what was wrong: {reason:?}"
+        );
+        assert!(
+            reason.contains("unterminated"),
+            "reason must describe why: {reason:?}"
         );
     }
 
@@ -973,7 +1530,7 @@ mod tests {
     fn an_empty_exec_value_parses_to_an_empty_argument_vector_not_a_panic() {
         assert_eq!(parse_exec(""), Some(Vec::new()));
         assert_eq!(parse_exec("   "), Some(Vec::new()));
-        let parsed = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=\n");
         assert_eq!(parsed.exec, Vec::<String>::new());
     }
 
@@ -1021,8 +1578,7 @@ mod tests {
         // that stops one character early or late is also caught, not only
         // one that panics or splits a character.
         let long_name = "字".repeat(MAX_TITLE);
-        let parsed =
-            parse_desktop_entry(&format!("[Desktop Entry]\nName={long_name}\nExec=x\n")).unwrap();
+        let parsed = parsed(&format!("[Desktop Entry]\nName={long_name}\nExec=x\n"));
         assert_eq!(
             parsed.title.len(),
             1023,
@@ -1067,7 +1623,7 @@ mod tests {
 
     #[test]
     fn build_entry_sets_the_apps_provider_id_and_the_app_prefixed_item_id() {
-        let parsed = parse_desktop_entry("[Desktop Entry]\nName=Firefox\nExec=firefox\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=Firefox\nExec=firefox\n");
         let entry = build_entry("firefox".to_string(), parsed).unwrap();
         assert_eq!(entry.item.id.as_str(), "app:firefox");
         assert_eq!(entry.item.provider, hop_core::provider::APPS_PROVIDER_ID);
@@ -1082,9 +1638,7 @@ mod tests {
         // `build_entry`'s `Some(AppEntry { ... })` (or filled one from the
         // wrong local) would leave `Item` looking correct while these three
         // carried nothing, or the wrong value.
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=Firefox\nExec=firefox --new-window\n")
-                .unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=Firefox\nExec=firefox --new-window\n");
         let entry = build_entry("firefox".to_string(), parsed).unwrap();
         assert_eq!(entry.app_id, "firefox");
         assert_eq!(
@@ -1096,25 +1650,21 @@ mod tests {
 
     #[test]
     fn a_slash_prefixed_icon_becomes_the_path_arm() {
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\nIcon=/usr/share/pixmaps/x.png\n")
-                .unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=x\nIcon=/usr/share/pixmaps/x.png\n");
         let entry = build_entry("x".to_string(), parsed).unwrap();
         assert!(matches!(entry.item.icon, Some(IconSpec::Path(_))));
     }
 
     #[test]
     fn a_bare_icon_name_becomes_the_name_arm() {
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\nIcon=utilities-terminal\n")
-                .unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=x\nIcon=utilities-terminal\n");
         let entry = build_entry("x".to_string(), parsed).unwrap();
         assert!(matches!(entry.item.icon, Some(IconSpec::Name(_))));
     }
 
     #[test]
     fn a_missing_icon_line_produces_no_icon() {
-        let parsed = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=x\n");
         let entry = build_entry("x".to_string(), parsed).unwrap();
         assert_eq!(entry.item.icon, None);
     }
@@ -1125,8 +1675,7 @@ mod tests {
         // (see `hop-protocol::content`). A mutation that instead propagated
         // that failure with `?` would drop the whole entry over one bad
         // line; this test catches that.
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\nIcon=bad\u{1b}name\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=x\nIcon=bad\u{1b}name\n");
         let entry = build_entry("x".to_string(), parsed).unwrap();
         assert_eq!(entry.item.icon, None);
         assert_eq!(entry.item.title, "X", "the item itself must still be built");
@@ -1134,7 +1683,7 @@ mod tests {
 
     #[test]
     fn every_entry_carries_exactly_one_open_action_agreeing_with_default_action() {
-        let parsed = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=X\nExec=x\n");
         let entry = build_entry("x".to_string(), parsed).unwrap();
         assert_eq!(entry.item.actions.len(), 1);
         assert_eq!(entry.item.actions[0].id, entry.item.default_action);
@@ -1235,11 +1784,21 @@ mod index_tests {
 
     use super::*;
 
+    /// Unwraps a [`DesktopEntryOutcome::Valid`], panicking with the actual
+    /// variant otherwise — see `tests::parsed`'s doc comment for why this is
+    /// a plain local helper rather than a method on `DesktopEntryOutcome`
+    /// itself.
+    fn parsed(content: &str) -> ParsedEntry {
+        match parse_desktop_entry(content) {
+            DesktopEntryOutcome::Valid(parsed) => parsed,
+            other => panic!("expected DesktopEntryOutcome::Valid, got {other:?}"),
+        }
+    }
+
     fn entry(app_id: &str, title: &str) -> AppEntry {
-        let parsed = parse_desktop_entry(&format!(
+        let parsed = parsed(&format!(
             "[Desktop Entry]\nName={title}\nExec={app_id}\nKeywords=browser;\n"
-        ))
-        .unwrap();
+        ));
         build_entry(app_id.to_string(), parsed).unwrap()
     }
 
@@ -1936,9 +2495,19 @@ mod provider_tests {
     use hop_core::router::route;
     use std::sync::Mutex;
 
+    /// Unwraps a [`DesktopEntryOutcome::Valid`], panicking with the actual
+    /// variant otherwise — see `tests::parsed`'s doc comment for why this is
+    /// a plain local helper rather than a method on `DesktopEntryOutcome`
+    /// itself.
+    fn parsed(content: &str) -> ParsedEntry {
+        match parse_desktop_entry(content) {
+            DesktopEntryOutcome::Valid(parsed) => parsed,
+            other => panic!("expected DesktopEntryOutcome::Valid, got {other:?}"),
+        }
+    }
+
     fn one_app_provider(title: &str) -> AppsProvider {
-        let parsed =
-            parse_desktop_entry(&format!("[Desktop Entry]\nName={title}\nExec=x\n")).unwrap();
+        let parsed = parsed(&format!("[Desktop Entry]\nName={title}\nExec=x\n"));
         let entry = build_entry("x".to_string(), parsed).unwrap();
         AppsProvider::new(
             Arc::new(AppIndex::new(vec![entry])),
@@ -2006,7 +2575,7 @@ mod provider_tests {
         // hop_core::aliases synthesizes `app:<appId>` by pure string
         // construction with no way to ask this provider what it would have
         // produced — so the two must already agree.
-        let parsed = parse_desktop_entry("[Desktop Entry]\nName=Terminal\nExec=t\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=Terminal\nExec=t\n");
         let entry = build_entry("org.gnome.Terminal".to_string(), parsed).unwrap();
         assert_eq!(entry.item.id.as_str(), "app:org.gnome.Terminal");
     }
@@ -2045,12 +2614,12 @@ mod provider_tests {
         // that `query` uses the routed term rather than ignoring it.
         let firefox = build_entry(
             "firefox".to_string(),
-            parse_desktop_entry("[Desktop Entry]\nName=Firefox\nExec=firefox\n").unwrap(),
+            parsed("[Desktop Entry]\nName=Firefox\nExec=firefox\n"),
         )
         .unwrap();
         let terminal = build_entry(
             "terminal".to_string(),
-            parse_desktop_entry("[Desktop Entry]\nName=Terminal\nExec=terminal\n").unwrap(),
+            parsed("[Desktop Entry]\nName=Terminal\nExec=terminal\n"),
         )
         .unwrap();
         let provider = Arc::new(AppsProvider::new(
@@ -2086,8 +2655,7 @@ mod provider_tests {
 
     #[tokio::test]
     async fn execute_launches_the_apps_command_when_no_window_is_focusable() {
-        let parsed =
-            parse_desktop_entry("[Desktop Entry]\nName=Firefox\nExec=firefox --new\n").unwrap();
+        let parsed = parsed("[Desktop Entry]\nName=Firefox\nExec=firefox --new\n");
         let entry = build_entry("firefox".to_string(), parsed).unwrap();
         let launcher = Arc::new(RecordingLauncher {
             calls: Mutex::new(Vec::new()),
