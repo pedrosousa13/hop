@@ -11,17 +11,19 @@
 //! connection; the seam it pulls items through is [`source`].
 //!
 //! What it is not yet: a daemon with every provider — the query router and the
-//! provider host are wired ([`source`]), and the walking skeleton's and
-//! [`apps`]'s providers are both registered as of this issue (#57), but #58's
-//! calculator is still a gap — or anything with a lifecycle beyond "runs
-//! until killed". Result *assembly* is no longer one of the gaps: every
-//! provider arrival re-runs `hop-core`'s [`pipeline`](hop_core::pipeline) over
-//! everything received so far for that query and replaces the client's list
-//! with the ranked, boosted, capped result (issue #103; see [`source`] for
-//! the accumulator that does it). Each remaining gap is named where it
-//! applies, in [`runtime_dir`], [`server`] and [`source`].
+//! provider host are wired ([`source`]), and the walking skeleton's,
+//! [`apps`]'s and [`calculator`]'s providers are all registered now
+//! ([`apps`] as of issue #57, [`calculator`] as of this issue, #58) — or
+//! anything with a lifecycle beyond "runs until killed". Result *assembly* is
+//! no longer one of the gaps: every provider arrival re-runs `hop-core`'s
+//! [`pipeline`](hop_core::pipeline) over everything received so far for that
+//! query and replaces the client's list with the ranked, boosted, capped
+//! result (issue #103; see [`source`] for the accumulator that does it).
+//! Each remaining gap is named where it applies, in [`runtime_dir`],
+//! [`server`] and [`source`].
 
 pub mod apps;
+pub mod calculator;
 pub mod config;
 pub(crate) mod connection;
 pub mod runtime_dir;

@@ -37,6 +37,9 @@ pub(crate) fn build_host() -> ProviderHost {
     if let Err(err) = host.register(crate::apps::build_apps_provider()) {
         eprintln!("hopd: could not register the apps provider: {err}");
     }
+    if let Err(err) = host.register(crate::calculator::CalculatorProvider) {
+        eprintln!("hopd: could not register the calculator provider: {err}");
+    }
     host
 }
 
@@ -171,15 +174,16 @@ mod build_host_tests {
     use super::*;
 
     #[test]
-    fn build_host_registers_both_the_skeleton_and_apps_providers() {
-        // Not a behavior test of AppsProvider itself (Task 5 already covers
-        // that) — this pins that `build_host` actually calls the wiring
-        // function this task adds, so a future edit that adds the function
-        // but forgets to call it fails here rather than silently shipping a
-        // daemon with no apps provider registered.
+    fn build_host_registers_the_skeleton_apps_and_calculator_providers() {
+        // Not a behavior test of any one provider (each has its own suite
+        // already) — this pins that `build_host` actually calls every
+        // wiring function this crate has, so a future edit that adds a
+        // provider but forgets to register it fails here rather than
+        // silently shipping a daemon with a gap.
         let host = build_host();
         let ids: Vec<_> = host.manifests().iter().map(|m| m.id).collect();
         assert!(ids.contains(&"skeleton"));
         assert!(ids.contains(&hop_core::provider::APPS_PROVIDER_ID));
+        assert!(ids.contains(&hop_core::provider::CALCULATOR_PROVIDER_ID));
     }
 }

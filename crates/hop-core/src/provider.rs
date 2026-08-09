@@ -45,6 +45,20 @@ use crate::router::{Mode, RoutedQuery};
 /// [`RegistrationError::DuplicateId`](crate::host::RegistrationError::DuplicateId).
 pub const APPS_PROVIDER_ID: &str = "apps";
 
+/// The [`ProviderManifest::id`] the calculator provider answers to (M2.6,
+/// issue #58).
+///
+/// Unlike [`APPS_PROVIDER_ID`], nothing in `hop-core` names this constant as
+/// an alias-boost target today — there is no `AliasTarget` variant for it,
+/// and none is being added by this issue. What this constant still buys is
+/// the provenance half of [`crate::pipeline::CheckedItems::check`]:
+/// `CalculatorProvider::manifest`'s `id` and every item's own `provider`
+/// field must be the *same* string for that item to survive the check, and
+/// a hand-written literal typed twice — once in the manifest, once
+/// wherever an [`Item`](hop_protocol::Item) is built — is a literal that
+/// can drift silently. One constant used in both places cannot.
+pub const CALCULATOR_PROVIDER_ID: &str = "calculator";
+
 /// Static description of what a provider serves and how the scheduler
 /// should treat it. Nothing here is enforced by this module —
 /// [`should_query`] is the one piece of scheduling logic that lives at this

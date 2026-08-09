@@ -17,6 +17,13 @@ inotify = { version = "0.11", default-features = false }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt"] }
 tempfile = "3"
 regex = "1"
+# The v1 design spec names fasteval for the calculator provider (§5's
+# providers table, M2.6 / issue #58). MIT — already covered by deny.toml's
+# existing MIT allow-list entry, so this needs no new license line.
+# `default-features = false` drops the crate's one feature, `alpha-keywords`
+# (word operators `and`/`or`), which is also fasteval's *default* feature and
+# which this provider has no use for.
+fasteval = { version = "0.2", default-features = false }
 # #60's config is TOML (spec §9), and there is no hand-rolled TOML parser worth
 # writing — `toml` covers the file's parse with minimal surface. `serde` here
 # is the feature that enables `toml::Value`/`toml::from_str` (the plan's
