@@ -164,20 +164,6 @@ use hop_protocol::{Action, ActionId, ActionKind, Item, ItemId, Kind, limits::MAX
 /// (never the id, which the bound above shows has room to spare) keeps
 /// the item alive instead — pinned by
 /// `item_tests::an_overlong_title_is_truncated_rather_than_dropping_the_item`.
-// No consumer outside `#[cfg(test)]` until Task 4 wires this into
-// `CalculatorProvider::query` — same shape as `evaluate`'s and
-// `format_result`'s own dead-code exemption while they waited for this
-// function to call them. `cfg_attr(not(test), ...)` rather than a bare
-// `#[expect]`: this module's own tests already call `build_item` directly,
-// so under `--cfg test` it is not dead at all, and an unconditional
-// `#[expect]` would itself go unfulfilled on `cargo test`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 4 (issue #58) wires this into CalculatorProvider::query"
-    )
-)]
 pub(crate) fn build_item(term: &str) -> Option<Item> {
     let value = evaluate(term)?;
     let result = format_result(value);
@@ -216,6 +202,90 @@ fn truncate_to_byte_boundary(s: &str, max: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
+use hop_core::router::{Mode, RoutedQuery};
+use hop_protocol::{CopyText, ExecOutcome};
+
+/// The calculator provider: turns a routed term into zero or one
+/// [`Item`] via [`build_item`], and dispatches its one action by
+/// re-deriving the same result from the item id via [`copy_text_for`].
+/// Holds no state — there is nothing to hold, since evaluation needs
+/// nothing but the term itself (this module's own docs; this plan's
+/// Design decision 6).
+pub struct CalculatorProvider;
+
+impl Provider for CalculatorProvider {
+    fn manifest(&self) -> ProviderManifest {
+        ProviderManifest {
+            // Must be the shared constant, never a hand-written literal —
+            // see this plan's Scope section and the issue's own first
+            // comment. `hop_core::provider::CALCULATOR_PROVIDER_ID`'s own
+            // docs spell out why a drift here would matter.
+            id: CALCULATOR_PROVIDER_ID,
+            kinds: vec![Kind::Calculator],
+            // Mode::Calculator alone, deliberately not Mode::All — see this
+            // plan's Design decision 1. `hop_core::router::route` already
+            // sends both the exclusive `=2+2` and the inferred bare `2+2`
+            // through `Mode::Calculator`, so `should_query`'s literal
+            // containment check already reaches this provider on both
+            // routes with no help from `ProviderHost::selected`'s
+            // augmentation branch. Adding `Mode::All` would instead ask
+            // this provider to attempt an evaluation on every non-math
+            // keystroke of every query, for an outcome that is always
+            // `None`. `crates/hop-core/src/host.rs:1692-1711`'s
+            // `an_inferred_route_selects_both_the_mode_all_provider_and_the_provider_declaring_that_mode`
+            // is `hop-core`'s own worked example of exactly this shape.
+            modes: vec![Mode::Calculator],
+            // 1, not 0: an empty term never evaluates (see `evaluate`'s
+            // own tests), so this skips the guaranteed-failing case — the
+            // bare `=` route — at the pre-filter, before a task is even
+            // spawned.
+            min_term_len: 1,
+            budget: Duration::from_millis(5),
+        }
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        q: Arc<RoutedQuery>,
+        _ctx: QueryCtx,
+    ) -> Result<Vec<Item>, ProviderError> {
+        Ok(build_item(&q.term).into_iter().collect())
+    }
+
+    async fn execute(
+        self: Arc<Self>,
+        item_id: ItemId,
+        _action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        copy_text_for(&item_id)
+            .map(ExecOutcome::CopyText)
+            .ok_or_else(|| {
+                ProviderError::Failed(format!(
+                    "{} is not a live calculator result",
+                    item_id.as_str()
+                ))
+            })
+    }
+}
+
+/// Re-derives the copyable result for `item_id`, the way
+/// `CalculatorProvider::execute` answers its one action: strips the
+/// `calc:` prefix [`build_item`] gave the id, re-evaluates what is left
+/// exactly as `query()` did, and formats it the same way. `None` covers
+/// both "this id was never one of ours" (no `calc:` prefix) and — in
+/// principle, since the same string that built the id always re-evaluates
+/// the same way — the unreachable case where it no longer does; either way
+/// `execute` reports it as an ordinary provider failure, never a panic.
+fn copy_text_for(item_id: &ItemId) -> Option<CopyText> {
+    let term = item_id.as_str().strip_prefix("calc:")?;
+    let value = evaluate(term)?;
+    CopyText::new(format_result(value)).ok()
 }
 
 #[cfg(test)]
@@ -269,6 +339,228 @@ mod item_tests {
         let item = build_item(&term).expect("a long chain of additions still evaluates");
         assert!(item.title.len() <= MAX_TITLE);
         assert!(std::str::from_utf8(item.title.as_bytes()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use hop_core::host::{NoopLog, ProviderHost};
+    use hop_core::pipeline::{CheckedItems, ProviderOutput};
+    use hop_core::provider::{CancellationFlag, should_query};
+    use hop_core::router::route;
+
+    fn ctx() -> QueryCtx {
+        QueryCtx {
+            cancel: CancellationFlag::default(),
+            deadline: std::time::Instant::now() + Duration::from_secs(1),
+        }
+    }
+
+    // --- Manifest shape (Design decision 1). ---
+
+    #[test]
+    fn the_manifest_uses_the_shared_calculator_provider_id_constant() {
+        assert_eq!(CalculatorProvider.manifest().id, CALCULATOR_PROVIDER_ID);
+    }
+
+    #[test]
+    fn the_manifest_declares_only_mode_calculator_and_kind_calculator() {
+        let manifest = CalculatorProvider.manifest();
+        assert_eq!(manifest.modes, vec![Mode::Calculator]);
+        assert_eq!(manifest.kinds, vec![Kind::Calculator]);
+    }
+
+    #[test]
+    fn should_query_reaches_this_manifest_on_both_the_explicit_and_inferred_math_routes() {
+        let manifest = CalculatorProvider.manifest();
+        assert!(
+            should_query(&manifest, &route("=2+2")),
+            "explicit `=` route"
+        );
+        assert!(
+            should_query(&manifest, &route("2+2")),
+            "inferred bare-math route"
+        );
+        assert!(
+            !should_query(&manifest, &route("firefox")),
+            "an ordinary query must not reach this provider"
+        );
+    }
+
+    #[test]
+    fn min_term_len_skips_the_empty_term_but_not_a_single_digit() {
+        let manifest = CalculatorProvider.manifest();
+        assert!(
+            !should_query(&manifest, &route("=")),
+            "an empty term after the `=` sigil is skipped at the pre-filter"
+        );
+        assert!(
+            should_query(&manifest, &route("5")),
+            "a single digit is a term of length 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_with_a_real_host_the_provider_is_selected_for_a_math_looking_query() {
+        let mut host = ProviderHost::with_log(Arc::new(NoopLog));
+        host.register(CalculatorProvider).unwrap();
+        let manifest = &host.manifests()[0];
+        assert!(should_query(manifest, &route("2+2")));
+    }
+
+    // --- The provider's own output survives its own manifest checks. ---
+
+    #[tokio::test]
+    async fn the_providers_own_output_passes_its_own_manifest_checks() {
+        let provider = Arc::new(CalculatorProvider);
+        let items = provider
+            .clone()
+            .query(Arc::new(route("2+2")), ctx())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1, "the fixture must actually produce an item");
+
+        let checked = CheckedItems::check(vec![ProviderOutput::from_provider(&*provider, items)]);
+        assert_eq!(
+            checked.rejections(),
+            &[],
+            "the calculator provider's own honest output must survive its own manifest"
+        );
+        assert_eq!(checked.items().len(), 1);
+    }
+
+    // --- query(): the pure eval-and-format path, driven through Provider. ---
+
+    #[tokio::test]
+    async fn query_returns_the_calculator_item_for_a_math_looking_term() {
+        let provider = Arc::new(CalculatorProvider);
+        let items = provider.query(Arc::new(route("2+2")), ctx()).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "2+2 = 4");
+    }
+
+    #[tokio::test]
+    async fn query_returns_no_items_rather_than_an_error_for_input_that_is_not_an_expression() {
+        let provider = Arc::new(CalculatorProvider);
+        let items = provider
+            .query(Arc::new(route("=hello")), ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            items,
+            vec![],
+            "criterion 4: no items, and Ok — never an Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_returns_no_items_for_a_non_finite_result() {
+        let provider = Arc::new(CalculatorProvider);
+        let items = provider
+            .query(Arc::new(route("=1/0")), ctx())
+            .await
+            .unwrap();
+        assert!(items.is_empty());
+    }
+
+    // --- execute(): re-derives the same result the item's title showed. ---
+
+    #[tokio::test]
+    async fn execute_copies_the_same_result_the_item_was_built_with() {
+        let provider = Arc::new(CalculatorProvider);
+        let item = build_item("10/4").unwrap();
+        let outcome = provider
+            .execute(item.id.clone(), item.default_action.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ExecOutcome::CopyText(CopyText::new("2.5").unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_fails_rather_than_panicking_on_an_id_with_no_calc_prefix() {
+        let provider = Arc::new(CalculatorProvider);
+        let result = provider
+            .execute(
+                ItemId::new("app:firefox").unwrap(),
+                ActionId::new("copy").unwrap(),
+            )
+            .await;
+        assert!(matches!(result, Err(ProviderError::Failed(_))));
+    }
+
+    #[tokio::test]
+    async fn execute_fails_rather_than_panicking_on_a_calc_prefixed_id_that_does_not_evaluate() {
+        let provider = Arc::new(CalculatorProvider);
+        let result = provider
+            .execute(
+                ItemId::new("calc:not an expression").unwrap(),
+                ActionId::new("copy").unwrap(),
+            )
+            .await;
+        assert!(matches!(result, Err(ProviderError::Failed(_))));
+    }
+
+    // --- Criterion 6 (this plan's "no I/O" claim): a structural witness. ---
+
+    #[test]
+    fn the_module_source_touches_no_disk_process_or_network() {
+        // The mechanical half of this plan's Design decision 6 — grepping
+        // this file's own source back, the way
+        // `crates/hop-protocol/src/item.rs`'s
+        // `every_test_this_file_names_in_its_docs_exists` does, and the way
+        // the workspace's root `Cargo.toml` names `grep -rn unsafe_code
+        // crates/` as the spot-check for its own `unsafe_code = "deny"`
+        // claim. Not a substitute for the design argument (there is no
+        // index here to build, unlike `apps.rs`'s `AppIndex`) — a second,
+        // mechanical witness that would fail loudly if a future edit
+        // reached for `std::fs`, spawned a process, or opened a socket on
+        // this path.
+        //
+        // Scoped to non-comment source *before* the first `#[cfg(test)]`
+        // marker, not the raw whole file: a naive `include_str!` scan of
+        // the entire file is self-defeating twice over here. First, this
+        // very needle list would contain the literal string `"std::fs"` as
+        // one of its own array elements, so a scan that reached this test
+        // module's own code would always find it, regardless of what the
+        // production code does. Second, this file's own module doc
+        // comment (top of file) names `std::fs` and `std::process` in
+        // backticks as the very things it promises *not* to use — prose
+        // that is honest and worth keeping, but that also defeats a raw
+        // substring search if comment lines are left in. Dropping the
+        // `#[cfg(test)]`-and-after tail handles the first; dropping
+        // comment lines (`//`, `///`, `//!`) from what remains handles the
+        // second. Design decision 6's own claim is about the module's
+        // *production code*, not its prose, so this scoping matches the
+        // claim actually being checked rather than accidentally widening
+        // it into a check on documentation text.
+        let full_source = include_str!("calculator.rs");
+        let production = full_source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(full_source);
+        let source: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            "std::fs",
+            "std::process",
+            "std::net",
+            "TcpStream",
+            "UdpSocket",
+        ] {
+            assert!(
+                !source.contains(needle),
+                "calculator.rs must not reference {needle}"
+            );
+        }
     }
 }
 
