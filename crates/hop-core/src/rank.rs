@@ -101,6 +101,57 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::router::RoutedQuery;
 
+/// Ceiling on how many **characters** of a query term reach
+/// [`Pattern::new`] — the only call site in this crate that constructs a
+/// nucleo `Pattern` (see [`Matching::for_term`], which truncates to this
+/// many characters *before* that call). Nothing enforces this on the way
+/// in; it is applied unconditionally, inside the ranker, regardless of how
+/// the term arrived.
+///
+/// # Why 256, and why it's a character count, not a byte count
+///
+/// A typed launcher query is a few words; 256 characters is generous for a
+/// legitimate long paste (a sentence, a full path) while keeping worst-case
+/// pattern-construction cost small regardless of what a caller hands this
+/// module. It sits well under
+/// [`hop_protocol::limits::MAX_QUERY_TEXT`] (1 024 **bytes**, the wire's
+/// whole-query cap) — coherent, not competing: `MAX_QUERY_TEXT` bounds what
+/// a client can send at all; `MAX_TERM_CHARS` bounds what actually reaches
+/// `Pattern::new`, and it is the *only* cap on the alias-rewrite sink,
+/// which is **not** wire-bound at all
+/// ([`Pipeline::assemble`](crate::pipeline::Pipeline::assemble) substitutes
+/// an alias's rewrite target — arbitrary text from a config file — as the
+/// effective term; see this module's own docs on why escaping/bounding has
+/// to happen at this one seam). Unlike every constant in
+/// `hop_protocol::limits` (all byte-denominated), this one counts
+/// **characters**: what it bounds is nucleo pattern-construction and match
+/// cost, which scales with character count, not the byte length a wire
+/// frame happens to carry.
+///
+/// # Truncate, not reject — and why that differs from the wire's posture
+///
+/// Truncating rather than rejecting matches the UX cost of the two failure
+/// modes: rejecting an over-length query wholesale would blank the result
+/// list on a legitimate long paste; truncating still returns a plausible
+/// (if degraded) match. This differs from the wire's own "refuse rather
+/// than shorten" identity-field philosophy
+/// (`hop_protocol::limits`'s own docs: "silently shortening an id would
+/// produce a different id") deliberately — a search term is not an
+/// identity, truncating it does not corrupt anything the way truncating an
+/// `ItemId` would.
+///
+/// # Relationship to [`ProviderManifest::min_term_len`](crate::provider::ProviderManifest::min_term_len)
+///
+/// That field is a per-provider **minimum** — a pre-filter deciding
+/// whether to run a provider at all, for a given routed term length. This
+/// constant is a single, global **maximum**, applied inside the ranker
+/// regardless of which provider produced the items being ranked. The two
+/// bound opposite ends of the same axis and never conflict: nothing stops
+/// a manifest from declaring a `min_term_len` above `MAX_TERM_CHARS` (that
+/// provider would simply never run), but no legitimate manifest has reason
+/// to.
+pub const MAX_TERM_CHARS: usize = 256;
+
 /// Per-kind score weights, and the fuzzy-score floor a match must clear.
 pub struct Weights {
     pub per_kind: HashMap<Kind, f32>,
@@ -238,6 +289,9 @@ impl Ranker {
     ///   match at all, or whose fuzzy component alone falls below
     ///   `weights.min_score`, is dropped — the threshold applies to the
     ///   fuzzy score, not the final total.
+    /// - A term longer than [`MAX_TERM_CHARS`] characters is truncated to
+    ///   that many characters before matching — see that constant's doc
+    ///   comment for the full rationale (issue #46 / #61).
     /// - **The term is matched literally.** It is split on unescaped
     ///   whitespace into one atom per word, and that is the only
     ///   interpretation applied: `$`, `!`, `'` and `^` are ordinary
@@ -385,6 +439,17 @@ impl Matching {
     /// Classifies a **trimmed** term. This is where the zero-atom rationale
     /// the rest of the module points at lives, in full.
     ///
+    /// Also truncates the term to at most [`MAX_TERM_CHARS`] characters
+    /// *before* [`Pattern::new`] is called — this is the trust boundary
+    /// issue #46 names, and the only call site in this crate that
+    /// constructs a `Pattern`. See `MAX_TERM_CHARS`'s doc comment for the
+    /// full justification. `term_chars` (used for score normalization; see
+    /// the module docs) is the *truncated* length, not the original, so a
+    /// truncated term's score isn't diluted by counting characters that
+    /// were never matched against. Truncating on `.chars()` rather than a
+    /// byte index is what keeps this safe on multi-byte input: it can
+    /// never split a character, unlike a byte-offset slice would.
+    ///
     /// A term whose pattern carries no atoms must be [`Matching::Nothing`],
     /// never a zero-scoring match. `Pattern::score` short-circuits to
     /// `Some(0)` when `atoms` is empty, and a normalized `0.0` clears the
@@ -411,8 +476,9 @@ impl Matching {
         if term.is_empty() {
             return Matching::Everything;
         }
+        let truncated: String = term.chars().take(MAX_TERM_CHARS).collect();
         let pattern = Pattern::new(
-            term,
+            &truncated,
             CaseMatching::Ignore,
             Normalization::Smart,
             AtomKind::Fuzzy,
@@ -422,7 +488,7 @@ impl Matching {
         } else {
             Matching::Fuzzy {
                 pattern,
-                term_chars: term.chars().count(),
+                term_chars: truncated.chars().count(),
             }
         }
     }
@@ -1320,5 +1386,82 @@ mod tests {
             1,
             "\"workspace\" only appears in the subtitle, not the title"
         );
+    }
+
+    // --- Term-length cap (issue #46 / #61's Task 1): `MAX_TERM_CHARS`
+    // truncates a term before it reaches `Pattern::new`, not after. See
+    // `MAX_TERM_CHARS`'s and `Matching::for_term`'s doc comments.
+
+    #[test]
+    fn term_exactly_at_the_cap_is_unaffected() {
+        let term = "a".repeat(MAX_TERM_CHARS);
+        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term) else {
+            panic!("a non-empty term must classify as Fuzzy");
+        };
+        assert_eq!(
+            term_chars, MAX_TERM_CHARS,
+            "a term of exactly the cap's length must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn term_one_character_over_the_cap_is_truncated() {
+        let term = "a".repeat(MAX_TERM_CHARS + 1);
+        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term) else {
+            panic!("a non-empty term must classify as Fuzzy");
+        };
+        assert_eq!(
+            term_chars, MAX_TERM_CHARS,
+            "term_chars (used for score normalization) must reflect the \
+             truncated length, not the original"
+        );
+    }
+
+    /// Proves truncation happens *before* `Pattern::new`, not merely that
+    /// `term_chars` is capped after the fact: a pathological term far over
+    /// the cap is matched against a haystack of exactly `MAX_TERM_CHARS`
+    /// repeated characters. nucleo's subsequence matcher requires every
+    /// needle character to align, in order, to some haystack character — an
+    /// *un*truncated term needs far more matching characters than the
+    /// haystack has, which has no valid alignment (`None`); a term
+    /// truncated to exactly `MAX_TERM_CHARS` matches the equal-length
+    /// haystack trivially (`Some`). The same technique is used, black-box,
+    /// by `overlong_term_is_truncated_before_pattern_construction` in
+    /// `hop-core/tests/latency.rs`; applied here directly against
+    /// `Matching` since this in-module test already has access to it.
+    #[test]
+    fn overlong_term_pattern_is_built_from_the_truncated_term() {
+        let term = "a".repeat(MAX_TERM_CHARS + 1000);
+        let haystack = "a".repeat(MAX_TERM_CHARS);
+        let Matching::Fuzzy { pattern, .. } = Matching::for_term(&term) else {
+            panic!("a non-empty term must classify as Fuzzy");
+        };
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut buf = Vec::new();
+        let score = pattern.score(Utf32Str::new(&haystack, &mut buf), &mut matcher);
+        assert!(
+            score.is_some(),
+            "the pattern must have been built from the truncated term, or a \
+             haystack of exactly MAX_TERM_CHARS characters has no valid \
+             subsequence alignment against it"
+        );
+    }
+
+    /// Non-ASCII queries are ordinary input for a launcher, not an edge
+    /// case. "é" is two bytes; a byte-index truncation at `MAX_TERM_CHARS`
+    /// would either split a character in two (producing invalid UTF-8) or
+    /// admit half as many characters as intended. Truncating on `.chars()`
+    /// can do neither.
+    #[test]
+    fn truncation_is_char_boundary_safe_for_multi_byte_terms() {
+        let term = "é".repeat(MAX_TERM_CHARS + 5);
+        assert!(
+            term.len() > term.chars().count(),
+            "sanity check: the fixture really is multi-byte"
+        );
+        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term) else {
+            panic!("a non-empty term must classify as Fuzzy");
+        };
+        assert_eq!(term_chars, MAX_TERM_CHARS);
     }
 }

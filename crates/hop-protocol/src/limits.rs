@@ -273,10 +273,31 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// seam, and `hop-core`'s provider host (issue #56), the first code that
 /// accepts items from a provider without parsing them. Landing the host
 /// closed the scheduling gap this comment used to describe as future work,
-/// but it did not add this enforcement: what the host checks an item against
-/// is its producer's declared `kind` and `provider` string, never the length
-/// of a field. The obligation this paragraph describes is still exactly
-/// that — documented, not enforced — wherever an item is built in-process.
+/// but at the time did not add this enforcement: what the host checked an
+/// item against was its producer's declared `kind` and `provider` string,
+/// never the length of a field.
+///
+/// Issue #61 closed the field-length half of that gap, at the one seam every
+/// provider's answer must cross: `hop-core`'s
+/// `pipeline::CheckedItems::check`, called once per provider by
+/// `ProviderHost::run_one` before an answer reaches assembly. It now rejects
+/// an item whose `title`, `subtitle`, `copy_text`, an action's `label`, or
+/// action count is over the same bound this module already applies to that
+/// same field on the wire (see `pipeline::FailedCheck::FieldTooLong`) — so
+/// the specific claim above, "documented, not enforced... wherever an item
+/// is built in-process," is no longer true of a provider's answer, which is
+/// where the overwhelming majority of in-process items originate.
+///
+/// It narrows, though — it does not disappear. `CheckedItems::check` is a
+/// choke point only for callers that go through it: `hop-core`'s
+/// `Ranker::rank` is a public function taking a bare `Vec<Item>`, and a
+/// caller that hand-builds items and calls it directly (or otherwise
+/// constructs and consumes items without ever reaching
+/// `CheckedItems::check`) still gets no field-length enforcement at all,
+/// same as before #61. The obligation this paragraph describes is enforced
+/// at the seam a provider's answer is required to cross to reach assembly;
+/// it is still exactly "documented, not enforced" for an item built and
+/// consumed entirely outside that seam.
 pub const MAX_ITEMS_PER_QUERY: usize = 5_000;
 
 /// Maximum bytes of one frame's JSON payload, exclusive of the 4-byte length

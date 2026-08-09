@@ -65,3 +65,37 @@ jobs:
         with:
           command: check
           arguments: ""
+
+  # A separate job, not a step in `ci`, for the same reason `supply-chain`
+  # is one: a timing failure and a correctness failure are different
+  # problems for a reviewer, and one job would collapse their statuses
+  # together. This one *does* compile the workspace (in `--release`, unlike
+  # `ci`'s debug build), so unlike `supply-chain` it does want the
+  # rustfmt/clippy-less toolchain and the build cache.
+  #
+  # The two tests this job runs (`crates/hop-core/tests/latency.rs`) are
+  # `#[ignore]`d specifically so `ci`'s own `cargo test --workspace` — a
+  # debug build — never runs them: debug-mode Rust is 10-50x slower than
+  # release for CPU-bound fuzzy matching, so a 10ms p95 budget measured in
+  # debug mode would flake on ordinary, unregressed code. `--release` is
+  # therefore load-bearing here, not a performance nicety.
+  #
+  # `--test-threads=1` keeps the two timing tests in this one small binary
+  # from contending with each other for CPU during measurement, which
+  # parallel test execution would otherwise do by default.
+  latency-gate:
+    name: Latency gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Latency gate
+        run: cargo test --release -p hop-core --test latency -- --ignored --test-threads=1
