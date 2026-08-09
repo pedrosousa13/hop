@@ -78,26 +78,101 @@ bullet per row. A `/factory` Loop Session needs every one of them.
   Removing `in-progress` is the unstarted half of the Park and is not
   optional — an issue left carrying it never re-enters the Queue even once
   it is re-labeled `ready-for-agent`.
-- **Blocking**: GitHub's native **sub-issues**. Link one with `gh issue
-  edit <parent> -R pedrosousa13/hop --add-sub-issue <child>`; read them back with
-  `gh issue view <n> -R pedrosousa13/hop --json subIssues,subIssuesSummary`:
+- **Blocking**: the `## Blocked by` **section** in the issue body is the
+  **single canonical mechanism** — not GitHub's native sub-issues, which
+  this `gh` cannot use in either direction (see below), and not the older
+  inline `Blocked by #N` line a few **closed** issues still carry (see the
+  fail-safe below, not a second parser to maintain). Issues filed from a
+  plan carry:
 
-  ```json
-  {"subIssues":{"nodes":[{"number":2,"state":"OPEN","title":"...",
-                          "url":"..."}],
-                "totalCount":1},
-   "subIssuesSummary":{"completed":0,"percentCompleted":0,"total":1}}
+  ```markdown
+  ## Blocked by
+
+  - #53
   ```
 
-  **Direction matters.** A sub-issue is a *child* of its parent, and the
-  child **blocks** the parent: an issue is blocked while any of its
-  sub-issues is still `OPEN`. Equivalently, `subIssuesSummary.completed <
-  subIssuesSummary.total` means blocked. Issues filed from a plan also
-  carry a `Blocked by #N` line in the body, the form `/to-tickets` writes;
-  where that line is present, an open issue it names blocks this one too.
-  `gh issue list` returns neither, so each candidate needs its own `gh
+  An issue with no blockers writes `None - can start immediately` under the
+  same heading, so the heading's presence alone is **not** a blocker signal.
+
+  Parse it with this five-step algorithm, in order — each step exists
+  because a naive version of it was tried and watched to fail:
+
+  1. **Strip fenced code blocks from the body before scanning anything.** A
+     `## Blocked by` heading can appear inside a fenced code block as an
+     example — issue #96's own body does exactly that, quoting the section
+     form inside a fenced snippet while its real section, near the end of
+     the body, says `None - can start immediately`. A parser that scans raw
+     text without stripping fences reads the fenced example as if it were
+     the real section and reports #96 as blocked by a long-closed issue.
+  2. **Find the `## Blocked by` heading.** More than one surviving
+     fence-stripping is ambiguous — treat the issue as **blocked** and
+     report it, never as clear.
+  3. **Skip blank lines after the heading, then read contiguous list items
+     only** (`-` or `*`). Stop at the first line that is not a list item.
+     Every `#N` in those items is a blocker; nothing outside them is. This
+     matters because prose after the list can itself name the issue's own
+     number: #103's section reads `- #57` followed by an explanatory
+     paragraph that happens to mention "#103" — a parser that keeps reading
+     "every `#N` until the next `##`" invents a phantom self-blocker from
+     that paragraph. Stopping at the first non-list-item line avoids it.
+  4. An issue is blocked while any `#N` found this way is still open.
+  5. **A non-zero exit or a parse failure anywhere in this path means
+     blocked, not clear.**
+
+  Read the body with `gh issue view <n> -R pedrosousa13/hop --json body`;
+  `gh issue list` doesn't return it, so each candidate needs its own `gh
   issue view` — check them one at a time, in Queue order, and stop at the
   first unblocked one.
+
+  **Convergence fail-safe.** The section form above is the only one this
+  adapter documents, but it is not the only one the repo has ever used.
+  Seven **closed** issues (#21, #26, #28, #29, #30, #32, #34) carry a
+  legacy bold inline `**Blocked by #N**` line instead, and are deliberately
+  **not** migrated to the section form — Queue selection only ever reads
+  open issues' bodies, so nothing ever parses a closed issue's, and these
+  should not be mistaken for work left undone. An **open** issue is a
+  different matter: if one is ever found carrying `Blocked by #N` text
+  outside the canonical section — the legacy inline form, or anything else
+  shaped like it — treat that issue as **blocked**, or stop and report it
+  for attention, never silently ignore it just because the five-step scan
+  above found nothing. This is what keeps one documented parser safe
+  without maintaining a second one forever: a stray blocker outside the
+  canonical section still fails toward "blocked," not toward "the scan's
+  silence means clear."
+
+  **Sub-issues do not work on the installed `gh` (2.78.0, 2025-08-21), in
+  either direction.** The read this adapter used to document —
+  `gh issue view <n> -R pedrosousa13/hop --json subIssues,subIssuesSummary` —
+  exits **1** with `Unknown JSON field: "subIssues"`; neither that field nor
+  `parent` appears anywhere in `gh issue view --json`'s field list on this
+  version. That is a hard failure, not an empty result — a loop that ignores
+  the exit code, or pipes the output through something like `tail`, reads it
+  as "no blockers" and proceeds. The read that does work is the REST
+  endpoint, `gh api repos/pedrosousa13/hop/issues/<n>/sub_issues`, which
+  returns `[]` for every one of this repo's issues — all 72 of them, open
+  and closed, checked exhaustively rather than sampled. The sub-issue
+  relation is entirely unused here. Writing one is equally impossible: `gh issue edit
+  --help` has no `--add-sub-issue` flag on this `gh`, so there is no command
+  that creates the edge even deliberately. A session that needs to express a
+  blocking relationship must write it into the `## Blocked by` section of
+  the issue body instead — the same convention `/to-tickets` uses — never
+  reach for a sub-issue write, which does not exist on this `gh`.
+
+  **The body section is authoritative.** No issue in this repo carries a
+  sub-issue edge and none can be written, so the body is the only place a
+  blocking relation is ever actually expressed; if the two mechanisms were
+  ever both populated, the body governs.
+
+  **The fail direction is the single most important fact in this bullet: a
+  blocking-parse failure must fail toward "blocked," never toward
+  "unblocked."** A non-zero exit from either read above, a body with more
+  than one `## Blocked by` heading surviving fence-stripping, or any other
+  result that does not parse cleanly all mean treat the issue as blocked and
+  move to the next Queue candidate — never treat a failed or incomplete
+  parse as evidence that no blocker exists. Misreading a blocked issue as
+  unblocked lets a session start work whose foundation does not exist yet;
+  misreading an unblocked issue as blocked only costs one skipped candidate,
+  which Queue order already recovers from on the next check.
 - **Milestone**: a GitHub **milestone** on the issue, not a label. Create
   one with `gh api repos/pedrosousa13/hop/milestones -f title=... -f
   description=...`; list a repo's milestones with `gh api --paginate
@@ -106,9 +181,18 @@ bullet per row. A `/factory` Loop Session needs every one of them.
   are load-bearing: the endpoint returns only open milestones by default
   and pages at 30, and the milestone menu is supposed to show *every*
   milestone in the Project — a stable menu shape matters more than hiding
-  the closed or the empty ones. Set one with `gh issue create --milestone
-  <n-or-title>` at creation, or `gh issue edit <n> -R pedrosousa13/hop --milestone
-  <n-or-title>` afterwards. Read a milestone's completion with `gh api
+  the closed or the empty ones. `--milestone` does not take the same value
+  on every subcommand, though: `gh issue list --milestone` and `gh issue
+  edit --milestone` both accept a milestone number or its title, but `gh
+  issue create --milestone` accepts the **title only** — `gh issue create
+  --help` documents the flag as "by name", with no mention of a number, and
+  a maintainer's own test confirms it: passing a number fails with `could
+  not add to milestone '<n>': '<n>' not found` and creates **no** issue, so
+  the failure is safe to retry, but the message reads as though only the
+  milestone step failed rather than the whole call. Set one with `gh issue
+  create --milestone <title>` at creation, or `gh issue edit <n> -R
+  pedrosousa13/hop --milestone <n-or-title>` afterwards. Read a milestone's
+  completion with `gh api
   repos/pedrosousa13/hop/milestones/<n>` and its `open_issues` / `closed_issues`
   counts — GitHub reports no percentage, so compute one from the pair.
 - **Milestone issue counts**: `gh issue list -R pedrosousa13/hop --state all
@@ -125,11 +209,14 @@ bullet per row. A `/factory` Loop Session needs every one of them.
   `ready-for-agent`.
 - **Open issues**: `gh issue list -R pedrosousa13/hop --state open --milestone
   <n-or-title> --limit 500 --json
-  number,title,labels,milestone,createdAt,assignees,subIssuesSummary`.
-  Drop `--milestone` entirely for an unscoped call. Every open issue,
-  unfiltered by label, unlike Queue listing above. Full ticket facts per
-  issue: `state` derived as under **Milestone issue counts** above,
-  `blockedBy` from the same sub-issue and body check as **Blocking**
+  number,title,labels,milestone,createdAt,assignees,body`. Drop
+  `--milestone` entirely for an unscoped call. `body` replaces the
+  `subIssuesSummary` field this bullet used to request — that field is
+  unknown to `gh issue list --json` on the installed `gh` and makes the
+  whole call exit 1, so it must not appear here or anywhere else in this
+  doc. Every open issue, unfiltered by label, unlike Queue listing above.
+  Full ticket facts per issue: `state` derived as under **Milestone issue
+  counts** above, `blockedBy` from the same body check as **Blocking**
   above, `claimedBy` from `assignees`.
 - **Read an issue**: `gh issue view <n> -R pedrosousa13/hop --json
   title,body,labels,milestone,state,stateReason,comments` — one call.
@@ -171,24 +258,41 @@ Factory plugin's own protocol document — not a file in this repo;
   created lazily by the first charting session: `gh label list -R pedrosousa13/hop`
   first, then `gh label create <label> -R pedrosousa13/hop` only for the names that
   are missing. Never create a label you haven't first confirmed is missing.
-- **Child tickets**: GitHub's native sub-issues — `gh issue edit <map> -R
-  pedrosousa13/hop --add-sub-issue <ticket>`, the same relation the loop's
-  **Blocking** bullet reads. No conflict: under that bullet an open child
-  blocks its parent, and a map with open tickets *is* a map that isn't
-  finished — the map never carries `ready-for-agent`, so nothing ever
-  checks it as a Queue candidate anyway.
+- **Child tickets**: GitHub's native sub-issues would be the natural fit —
+  and this bullet used to document `gh issue edit <map> --add-sub-issue
+  <ticket>` for it — but that relation is **unavailable** on the installed
+  `gh` (2.78.0): `gh issue edit --help` has no `--add-sub-issue` flag, so
+  there is no command that creates it, and `gh api
+  repos/pedrosousa13/hop/issues/<n>/sub_issues` confirms none exist today.
+  Express map→ticket parentage the same way the **Blocking** bullet above
+  expresses blocking — in the ticket body — by naming the map's issue
+  number in the ticket (e.g. a `Part of #<map>` line). This is the same
+  fallback the wayfinder skill's own doc anticipates for a tracker that
+  lacks a working native relationship; it just also applies to parentage,
+  not only blocking, on this `gh`.
 - **Blocking between tickets**: a sub-issue has exactly one parent and the
-  map holds that slot, so ticket-to-ticket edges use the body convention
-  the loop already reads — a `Blocked by #N` line in the blocked ticket's
-  body, added in a second pass once every ticket has a number. A ticket is
-  blocked while any issue such a line names is still open.
-- **Frontier**: read the map's children from `gh issue view <map> -R
-  pedrosousa13/hop --json subIssues`, keep the `OPEN` ones, then confirm each
-  candidate with its own `gh issue view <n> -R pedrosousa13/hop --json
-  assignees,body,state` — unclaimed means no assignee; unblocked means no
-  `Blocked by #N` line naming a still-open issue. The per-candidate view is
-  the authority here for the same reason it is in Queue selection: the
-  listing lags.
+  map holds that slot, so ticket-to-ticket edges use the same body
+  convention the loop's **Blocking** bullet reads — a `## Blocked by`
+  section in the blocked ticket's body, added in a second pass once every
+  ticket has a number. Parse and fail-direction rules are identical to that
+  bullet's: five-step canonical parse, fail toward blocked on any ambiguity
+  or parse failure, and the same convergence fail-safe for stray
+  `Blocked by #N` text outside the section.
+- **Frontier**: do **not** reach for `--json subIssues` here. It is an
+  unknown JSON field on this `gh` and exits 1, the same hard failure as the
+  loop's **Blocking** bullet describes, and the working REST read
+  (`gh api repos/pedrosousa13/hop/issues/<n>/sub_issues`, per that bullet)
+  returns `[]` for every issue in this repo — so even the call that *does*
+  run has no child relation to report. Enumerate candidates instead from
+  the body-reference convention in
+  **Child tickets** above: `gh issue list -R pedrosousa13/hop --state open
+  --limit 500 --json number,body`, then keep the ones whose body names the
+  map (`#<map>`). Confirm each candidate with its own `gh issue view <n> -R
+  pedrosousa13/hop --json assignees,body,state` — unclaimed means no
+  assignee; unblocked means no `Blocked by` text naming a still-open issue,
+  read per the loop's **Blocking** bullet. The per-candidate view is the
+  authority here for the same reason it is in Queue selection: the listing
+  lags.
 - **Claim**: `gh issue edit <n> -R pedrosousa13/hop --add-assignee @me` — the
   assignee is the claim; an open, unassigned ticket is unclaimed.
 - **Resolve**: post the resolution with `gh issue comment`, then `gh issue
