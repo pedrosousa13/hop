@@ -57,6 +57,106 @@ pub(crate) fn evaluate(expr: &str) -> Option<f64> {
     }
 }
 
+/// Decimal places [`format_result`] keeps before trimming trailing zeros —
+/// generous enough that `1/3` reads as `"0.3333333333"` rather than the
+/// full `f64` precision (`0.3333333333333333`), which would print
+/// sixteen-plus digits of noise for the common case (`0.1 + 0.2` is
+/// `0.30000000000000004` in `f64` — see the test table).
+const FIXED_DECIMALS: usize = 10;
+
+/// At or above this magnitude, [`format_result`] switches to exponential
+/// notation rather than printing a wall of digits: `"1e20"` reads as a
+/// calculator answer, `"100000000000000000000"` reads as a typo.
+const EXPONENTIAL_ABOVE: f64 = 1e15;
+
+/// Below this magnitude (and not exactly zero), [`format_result`] also
+/// switches to exponential notation. Chosen with a full order of magnitude
+/// of margin over the point where fixed formatting at [`FIXED_DECIMALS`]
+/// places rounds a genuinely nonzero value down to a string of all zeros —
+/// measured directly: `format!("{:.10}", 4.9e-11)` is `"0.0000000000"`,
+/// `format!("{:.10}", 5e-11)` is `"0.0000000001"`. `1e-9` sits well clear of
+/// that rounding boundary rather than exactly on it.
+const EXPONENTIAL_BELOW: f64 = 1e-9;
+
+/// Formats an already-finite `value` for display and for
+/// [`hop_protocol::CopyText`] alike.
+///
+/// `2.0 + 2.0` must read as `"4"`, never `"4.0"` — the rule: an exact zero
+/// (which also catches negative zero, since `-0.0 == 0.0`) prints as
+/// `"0"`; a magnitude inside `[EXPONENTIAL_BELOW, EXPONENTIAL_ABOVE)`
+/// prints fixed at [`FIXED_DECIMALS`] places with trailing zeros — and a
+/// trailing decimal point, once they're gone — trimmed; anything outside
+/// that range prints in Rust's own `{:e}` form, which is already minimal
+/// and needs no further trimming.
+///
+/// Every case in this doc comment, and more, is pinned by
+/// `format_tests::format_result_matches_the_verified_table` below —
+/// verified against a real `rustc` run before being written into this
+/// plan, not estimated.
+// No consumer outside `#[cfg(test)]` until Task 3 wires this into
+// `build_item`, matching `evaluate`'s own reasoning above.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 3 (issue #58) wires this into build_item"
+    )
+)]
+pub(crate) fn format_result(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = value.abs();
+    if !(EXPONENTIAL_BELOW..EXPONENTIAL_ABOVE).contains(&magnitude) {
+        return format!("{value:e}");
+    }
+    trim_trailing_zeros(&format!("{value:.FIXED_DECIMALS$}"))
+}
+
+/// Strips trailing `0`s after a decimal point, then the point itself if
+/// nothing is left after it. A no-op on a string with no `.` at all — never
+/// produced by `format!("{value:.FIXED_DECIMALS$}")` since
+/// `FIXED_DECIMALS > 0`, but the guard costs nothing and keeps this
+/// function correct for any caller, not just its one today.
+fn trim_trailing_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn format_result_matches_the_verified_table() {
+        let cases: &[(f64, &str)] = &[
+            (4.0, "4"),
+            (-4.0, "-4"),
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0 / 3.0, "0.3333333333"),
+            (0.1 + 0.2, "0.3"),
+            (10.0 / 4.0, "2.5"),
+            (2f64.sqrt(), "1.4142135624"),
+            (1e14, "100000000000000"),
+            (1e15, "1e15"),
+            (1e20, "1e20"),
+            (1e-9, "0.000000001"),
+            (9e-10, "9e-10"),
+            (1e-15, "1e-15"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                &format_result(*value),
+                expected,
+                "format_result({value}) should be {expected}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
