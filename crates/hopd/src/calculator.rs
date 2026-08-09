@@ -15,7 +15,17 @@
 //! `fasteval`'s own grammar has no percent-of operator, and this module
 //! does not add one.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use fasteval::EmptyNamespace;
+use hop_core::provider::{
+    CALCULATOR_PROVIDER_ID, Provider, ProviderError, ProviderManifest, QueryCtx,
+};
+use hop_core::router::{Mode, RoutedQuery};
+use hop_protocol::{
+    Action, ActionId, ActionKind, CopyText, ExecOutcome, Item, ItemId, Kind, limits::MAX_TITLE,
+};
 
 /// Evaluates `expr` as an arithmetic expression, folding every failure
 /// mode into `None`: a parse error (an unbalanced paren, a bare `%` with no
@@ -102,9 +112,6 @@ fn trim_trailing_zeros(s: &str) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-use hop_core::provider::CALCULATOR_PROVIDER_ID;
-use hop_protocol::{Action, ActionId, ActionKind, Item, ItemId, Kind, limits::MAX_TITLE};
-
 /// Builds the single item a routed term produces, or `None` if [`evaluate`]
 /// could not turn it into a finite result — the one branch point between
 /// "show a calculator item" and "show nothing," shared by
@@ -129,9 +136,10 @@ use hop_protocol::{Action, ActionId, ActionKind, Item, ItemId, Kind, limits::MAX
 /// - This is already the shape the rest of the tree assumes:
 ///   `crates/hop-core/src/pipeline.rs` and `crates/hop-core/src/rank.rs`
 ///   both build `Kind::Calculator` test fixtures as `"calc:2+2"`,
-///   `"calc:terminal"` and similar (`pipeline.rs:1215`, `:1890`, `:2285`;
-///   `rank.rs:785`, among others) — this function matches a scheme the
-///   tree already leans on, rather than inventing a third one.
+///   `"calc:terminal"` and similar — each file's `tests` module has an
+///   `item(...)` fixture helper, and every `Kind::Calculator` call built
+///   through it uses a `calc:`-prefixed id — this function matches a
+///   scheme the tree already leans on, rather than inventing a third one.
 ///
 /// # `ItemId::new` cannot fail here, and is still checked rather than
 /// unwrapped
@@ -204,13 +212,6 @@ fn truncate_to_byte_boundary(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
-use hop_core::router::{Mode, RoutedQuery};
-use hop_protocol::{CopyText, ExecOutcome};
-
 /// The calculator provider: turns a routed term into zero or one
 /// [`Item`] via [`build_item`], and dispatches its one action by
 /// re-deriving the same result from the item id via [`copy_text_for`].
@@ -237,9 +238,9 @@ impl Provider for CalculatorProvider {
             // augmentation branch. Adding `Mode::All` would instead ask
             // this provider to attempt an evaluation on every non-math
             // keystroke of every query, for an outcome that is always
-            // `None`. `crates/hop-core/src/host.rs:1692-1711`'s
-            // `an_inferred_route_selects_both_the_mode_all_provider_and_the_provider_declaring_that_mode`
-            // is `hop-core`'s own worked example of exactly this shape.
+            // `None`. `crates/hop-core/src/host.rs`'s `tests` module has
+            // `hop-core`'s own worked example of exactly this shape:
+            // `an_inferred_route_selects_both_the_mode_all_provider_and_the_provider_declaring_that_mode`.
             modes: vec![Mode::Calculator],
             // 1, not 0: an empty term never evaluates (see `evaluate`'s
             // own tests), so this skips the guaranteed-failing case — the
@@ -258,6 +259,26 @@ impl Provider for CalculatorProvider {
         Ok(build_item(&q.term).into_iter().collect())
     }
 
+    /// Ignores `_action_id` — safe today, for a reason worth writing down
+    /// rather than leaving implicit.
+    ///
+    /// # Why ignoring the argument is sound
+    ///
+    /// `crates/hopd/src/connection.rs`'s dispatch loop refuses an
+    /// `action_id` that is not on the *retained* item's own `actions`
+    /// list — a check of the shape `if !item.actions.iter().any(|a| a.id
+    /// == action_id)` — and answers the client with `ErrorCode::
+    /// UnknownAction` before this `execute` is ever reached. [`build_item`]
+    /// attaches exactly one action (`"copy"`, [`ActionKind::Copy`]) to
+    /// every calculator item it builds, so any `action_id` that survives
+    /// that upstream check can only be the id of that one action — there
+    /// is no second action for this call to have been asked to
+    /// distinguish itself from.
+    ///
+    /// If [`build_item`] ever grows a second action, this stops being true
+    /// and becomes a real bug: this `execute` would need to start
+    /// switching on `action_id`, fixed in the very same change that adds
+    /// the second action, not after.
     async fn execute(
         self: Arc<Self>,
         item_id: ItemId,
@@ -539,6 +560,20 @@ mod provider_tests {
         // *production code*, not its prose, so this scoping matches the
         // claim actually being checked rather than accidentally widening
         // it into a check on documentation text.
+        //
+        // This split-on-first-marker approach has one failure mode of its
+        // own, and it is silent rather than loud: if a future
+        // `#[cfg(test)]`-gated helper is ever placed *before* this file's
+        // real test modules, `.split("#[cfg(test)]").next()` truncates at
+        // that earlier marker, and everything below it — including all of
+        // this module's actual production code — drops out of `source`
+        // unseen. The needle loop below would then find none of its
+        // needles not because the module is clean, but because it was
+        // never looked at, and the test would keep passing while checking
+        // almost nothing. The two assertions immediately below guard
+        // against exactly that: they require the scanned region to still
+        // contain named production landmarks, so a truncation that loses
+        // the real code turns this test red instead of green.
         let full_source = include_str!("calculator.rs");
         let production = full_source
             .split("#[cfg(test)]")
@@ -549,6 +584,17 @@ mod provider_tests {
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(
+            source.contains("pub struct CalculatorProvider"),
+            "the scanned region lost CalculatorProvider's declaration — the \
+             #[cfg(test)] split likely truncated before reaching production \
+             code, which would make the needle checks below pass vacuously"
+        );
+        assert!(
+            source.contains("pub(crate) fn evaluate"),
+            "the scanned region lost evaluate's signature — same \
+             truncation risk as above"
+        );
         for needle in [
             "std::fs",
             "std::process",
