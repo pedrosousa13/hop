@@ -1,4 +1,32 @@
 //! Client/daemon message frames exchanged over the (future) IPC transport.
+//!
+//! # Where peer trust comes from
+//!
+//! Not from anything below. [`ClientMsg::Hello`] and [`DaemonMsg::HelloAck`]
+//! carry a version number and nothing that identifies who is holding the
+//! other end of the socket — no credential, no token, no peer id. Completing
+//! the handshake proves only that a peer speaks the same `api_version`, not
+//! that it is anyone in particular.
+//!
+//! What actually gates who can open the socket in the first place is
+//! filesystem permissions, set by `hopd` and invisible from this crate: the
+//! socket file is narrowed to mode 0600 right after `bind`
+//! (`crates/hopd/src/server.rs`), and the runtime directory holding it is
+//! created at mode 0700 (`crates/hopd/src/runtime_dir.rs`). A Linux peer
+//! credential check — `SO_PEERCRED` — would corroborate that a connecting
+//! process really is who the socket's ownership implies, but nothing in this
+//! workspace consults one today; there is no connection-handling code that
+//! asks. Reaching the socket is the only bar there is.
+//!
+//! The consequence: any process that can open the socket is fully
+//! authorized. The bounds and content rules this crate enforces — documented
+//! on [`ClientMsg`], [`DaemonMsg`] and throughout [`limits`] — constrain a
+//! confused or careless peer and bound how much memory and work one
+//! connection can cost. They are not an access-control layer over a hostile
+//! peer, because a hostile peer that reached the socket is already inside
+//! whatever boundary those rules draw. See
+//! `docs/security/2026-08-02-m2-socket-boundary-threat-model.md`, "Where peer
+//! trust comes from", for the fuller argument this section summarizes.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,9 +58,24 @@ use crate::redaction::QueryText;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    Hello {
-        api_version: u32,
-    },
+    /// The handshake. A client must send this as the first frame on every
+    /// connection, naming the `api_version` it speaks; only after a matching
+    /// [`DaemonMsg::HelloAck`] does a daemon accept anything else.
+    ///
+    /// # This crate states the rule; nothing here enforces it
+    ///
+    /// `Hello` is an ordinary variant of this enum, sitting beside `Query`,
+    /// `Cancel` and `Execute` with nothing marking it as a pre-session
+    /// message — there is no session type encoding "handshake completed", so
+    /// nothing in these types refuses an `Execute` sent first. What actually
+    /// refuses it is `hopd`'s connection driver
+    /// (`crates/hopd/src/connection.rs`), which tracks handshake state itself
+    /// and answers a first frame that is not `Hello` with
+    /// [`ErrorCode::HandshakeRequired`] before closing the connection. That
+    /// is this daemon's behavior, not a guarantee the contract makes — an
+    /// implementer of a second daemon has to track the same state and refuse
+    /// the same way itself; reading these types alone will not tell it to.
+    Hello { api_version: u32 },
     /// A query from the client.
     ///
     /// A `Query` on a connection with a query already active cancels that query
@@ -80,9 +123,7 @@ pub enum ClientMsg {
     /// Cancels the active query if `id` names it (the daemon answers
     /// `QueryDone { query_id: id }`); dropped silently otherwise, because a
     /// cancel racing a natural `QueryDone` is ordinary traffic.
-    Cancel {
-        id: u64,
-    },
+    Cancel { id: u64 },
     Execute {
         query_id: u64,
         item_id: ItemId,
@@ -99,6 +140,21 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMsg {
+    /// Answers [`ClientMsg::Hello`], echoing back `api_version`. `hopd` sends
+    /// this only after accepting a `Hello` whose version already matched
+    /// [`API_VERSION`](crate::API_VERSION), so in this daemon's behavior the
+    /// value here is always that same constant reflected back, never a
+    /// counter-offer.
+    ///
+    /// # No capability set, today
+    ///
+    /// This is everything the ack carries. There is no feature list, no
+    /// negotiated option, no set of capabilities beyond the bare version
+    /// number — a peer learns compatibility from `api_version` alone and has
+    /// no way to ask what else this daemon supports. Adding one, a
+    /// `capabilities` field or similar, is a wire-contract change like any
+    /// other: existing peers do not expect it and have to be updated to read
+    /// it, the same distinction [`ErrorCode`]'s docs draw for a new variant.
     HelloAck {
         api_version: u32,
     },
