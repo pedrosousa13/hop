@@ -47,9 +47,11 @@ use hop_protocol::{
 // it is actually describing: "no consumer *outside tests* yet."
 pub(crate) struct ParsedEntry {
     pub(crate) title: String,
-    /// The `Exec=` value, field codes (`%f`, `%U`, ...) stripped — ready to
-    /// split on whitespace into a program and its arguments.
-    pub(crate) exec: String,
+    /// The `Exec=` value, parsed exactly once by [`parse_exec`]: quoting
+    /// resolved per the freedesktop Desktop Entry Specification and field
+    /// codes (`%f`, `%U`, ...) stripped. `exec[0]` is the program, `exec[1..]`
+    /// its arguments — nothing downstream splits this again.
+    pub(crate) exec: Vec<String>,
     /// `None` when `Icon=` was absent or empty. `Some` either way — a bare
     /// theme name or an absolute path — with the arm decided at
     /// [`build_entry`], since only there is the value handed to
@@ -73,7 +75,7 @@ pub(crate) struct ParsedEntry {
 pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
     let mut name = String::new();
     let mut localized_name = String::new();
-    let mut exec = String::new();
+    let mut exec: Option<Vec<String>> = None;
     let mut keywords = String::new();
     let mut generic_name = String::new();
     let mut comment = String::new();
@@ -106,8 +108,35 @@ pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
                 localized_name = value.trim().to_string();
             }
         } else if let Some(value) = line.strip_prefix("Exec=") {
-            if exec.is_empty() {
-                exec = sanitize_exec(value);
+            if exec.is_none() {
+                match parse_exec(value) {
+                    Some(argv) => exec = Some(argv),
+                    None => {
+                        // A malformed Exec= (most importantly, an
+                        // unterminated quote) rejects the whole entry
+                        // rather than guessing at a split — see
+                        // `parse_exec`'s own doc comment. Logged, not
+                        // swallowed: an app that silently vanished from the
+                        // index would otherwise look like a scan bug, not a
+                        // bad .desktop file.
+                        //
+                        // Not asserted by a test, deliberately. Capturing
+                        // stderr from a unit test needs either a new
+                        // dependency (#109's brief forbids adding one) or
+                        // raw fd redirection, and the workspace denies
+                        // `unsafe_code`. The reachable fix is to make the
+                        // rejection a *value* rather than a side effect,
+                        // which is exactly what #108 does when it splits
+                        // this function's `None` into distinct occluded and
+                        // malformed outcomes — the log assertion belongs
+                        // there, on a return value a test can read.
+                        eprintln!(
+                            "hopd: apps provider: rejecting desktop entry: \
+                             malformed Exec= value (unterminated quote): {value:?}"
+                        );
+                        return None;
+                    }
+                }
             }
         } else if let Some(value) = line.strip_prefix("Keywords=") {
             if keywords.is_empty() {
@@ -151,9 +180,16 @@ pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
     // allows it, not because it is expected to fire.
     let title = truncate_to_byte_boundary(&name, MAX_TITLE);
 
+    // The exec vector as a space-joined string exists only for the
+    // haystack — build_entry/AppEntry carry the real Vec<String> onward for
+    // launching, but AppIndex::query's substring filter still wants one
+    // string to search, exactly as it did when `exec` itself was a String.
+    let exec = exec.unwrap_or_default();
+    let exec_haystack = exec.join(" ");
+
     let merged_keywords = [
         title.as_str(),
-        exec.as_str(),
+        exec_haystack.as_str(),
         keywords.as_str(),
         generic_name.as_str(),
         comment.as_str(),
@@ -168,17 +204,167 @@ pub(crate) fn parse_desktop_entry(content: &str) -> Option<ParsedEntry> {
     })
 }
 
-/// Strips `%`-prefixed field codes (`%f`, `%F`, `%u`, `%U`, `%i`, `%c`, `%k`,
-/// ...) from an `Exec=` value, ported verbatim from the salvaged parser.
-/// These placeholders are filled in by whatever launches the entry with
-/// arguments the launcher doesn't have (a file to open, an icon path); with
-/// none supplied, dropping the token is the specification's own answer for
-/// an application invoked with no arguments.
-fn sanitize_exec(raw: &str) -> String {
-    raw.split_whitespace()
-        .filter(|token| !token.starts_with('%'))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The field codes the Desktop Entry Specification defines for `Exec=`
+/// (`%f`, `%F`, `%u`, `%U`, `%d`, `%D`, `%n`, `%N`, `%i`, `%c`, `%k`, `%v`,
+/// `%m`). [`parse_exec`] drops one of these only when it is a whole,
+/// *unquoted* argument — see that function's doc comment for why quoting and
+/// this list interact the way they do.
+const FIELD_CODES: [&str; 13] = [
+    "%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v", "%m",
+];
+
+/// Undoes the Desktop Entry Specification's general string escaping — the
+/// `\\`, `\s`, `\n`, `\t`, `\r` sequences every string-typed value (not just
+/// `Exec=`) is defined in terms of — before [`parse_exec`]'s own quoting
+/// rule ever runs. This is what makes the *double*-escaping rule in that
+/// function's doc comment fall out for free: a raw `\\` collapses to one `\`
+/// here, and if quoting then requires that `\` to itself be escaped, the
+/// author had to write two of them, i.e. four backslashes in the file.
+///
+/// A backslash followed by anything else (`\"`, `` \` ``, `\$`, or a
+/// character this escape does not define) is left untouched, backslash and
+/// all — those are not this layer's escapes, they belong to the quoting
+/// layer downstream (`\"`, `` \` `` and `\$` are exactly the three, beyond
+/// `\\` itself, [`parse_exec`] resolves inside a quoted argument), and
+/// leaving them alone here is what lets that layer see them at all.
+///
+/// **Deliberately wired into `Exec=` only.** The escaping described above is
+/// defined for every string-typed key, but [`parse_desktop_entry`] still
+/// hands `Name=`, `GenericName=`, `Comment=` and `Keywords=` through
+/// unescaped, so a `\s` in one of those reaches the client as the literal
+/// two characters. Fixing that changes displayed text rather than launch
+/// behavior, which is a different blast radius from this function's own
+/// reason for existing, and #109's brief scoped it out. Tracked separately;
+/// do not read this function's presence as evidence the other keys are
+/// handled.
+fn unescape_general_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('\\') => {
+                out.push('\\');
+                chars.next();
+            }
+            Some('s') => {
+                out.push(' ');
+                chars.next();
+            }
+            Some('n') => {
+                out.push('\n');
+                chars.next();
+            }
+            Some('t') => {
+                out.push('\t');
+                chars.next();
+            }
+            Some('r') => {
+                out.push('\r');
+                chars.next();
+            }
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Parses an `Exec=` value into an ordered argument vector per the
+/// freedesktop Desktop Entry Specification's quoting rules — the *only*
+/// place in this module that splits an `Exec=` line into a program and its
+/// arguments. (The pre-#109 shape of this module split twice: once here,
+/// dropping anything starting with `%` by a raw-token guess with no notion
+/// of quoting, and again in `SystemLauncher::launch`, splitting on
+/// whitespace a second time — which is exactly what broke on a quoted
+/// `Exec=` value, since neither site ever looked for a `"`.)
+///
+/// Passes, each over the whole value in order:
+///
+/// 1. [`unescape_general_string`] — the desktop-entry-wide backslash
+///    escapes, which the specification applies before any key-specific
+///    parsing (here, this function's own quoting rule) runs.
+/// 2. Tokenizing on whitespace, where a double-quoted run is one argument
+///    (its whitespace preserved) with its own backslash escapes — `\"`,
+///    `` \` ``, `\$`, `\\` — resolved, backslash dropped. Quoted and
+///    unquoted runs may concatenate into a single argument (`--app="value"`
+///    is one token, not two) with no separating whitespace between them. An
+///    opening `"` with no matching close before the value ends is
+///    malformed: this function returns `None` rather than guessing at a
+///    split, and the caller ([`parse_desktop_entry`]) rejects the whole
+///    entry over it rather than launching a guess.
+/// 3. Per resulting argument: dropped entirely if it is a whole *unquoted*
+///    field code (see [`FIELD_CODES`]) — a quoted argument that happens to
+///    read `"%f"` survives verbatim, since quoting it is how an author says
+///    "this is not a field code" — otherwise `%%` within it resolves to a
+///    literal `%`. Deliberately in that order, not the reverse: an author
+///    writing `%%f` to mean the literal text "%f" would otherwise have that
+///    intent erased if `%%` were collapsed to `%` *before* the field-code
+///    check ran, since the collapsed result would then read as the exact
+///    field code `%f` and get dropped.
+///
+/// An empty or whitespace-only value is not malformed: it parses to
+/// `Some(vec![])`, matching this function's pre-#109 behavior of producing
+/// an empty exec in that case and leaving "no program to launch" to
+/// whichever [`Launcher`] the empty vector eventually reaches.
+fn parse_exec(raw: &str) -> Option<Vec<String>> {
+    let unescaped = unescape_general_string(raw);
+    let mut chars = unescaped.chars().peekable();
+
+    // (argument text, whether any part of it came from inside quotes) —
+    // the second field is what lets step 3 tell a quoted "%f" apart from an
+    // unquoted %f without re-scanning the original value.
+    let mut args: Vec<(String, bool)> = Vec::new();
+    let mut current = String::new();
+    let mut current_quoted = false;
+    let mut current_present = false;
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            if current_present {
+                args.push((std::mem::take(&mut current), current_quoted));
+                current_present = false;
+                current_quoted = false;
+            }
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            chars.next();
+            current_present = true;
+            current_quoted = true;
+            loop {
+                match chars.next() {
+                    None => return None, // unterminated quote: malformed
+                    Some('"') => break,
+                    Some('\\') => match chars.peek() {
+                        Some(&next) if matches!(next, '"' | '`' | '$' | '\\') => {
+                            current.push(next);
+                            chars.next();
+                        }
+                        _ => current.push('\\'),
+                    },
+                    Some(other) => current.push(other),
+                }
+            }
+            continue;
+        }
+        current.push(c);
+        current_present = true;
+        chars.next();
+    }
+    if current_present {
+        args.push((current, current_quoted));
+    }
+
+    Some(
+        args.into_iter()
+            .filter(|(token, quoted)| *quoted || !FIELD_CODES.contains(&token.as_str()))
+            .map(|(token, _)| token.replace("%%", "%"))
+            .collect(),
+    )
 }
 
 /// Truncates `s` to at most `max` bytes, never splitting a multi-byte
@@ -267,7 +453,7 @@ pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntr
 pub struct AppEntry {
     pub(crate) app_id: String,
     pub(crate) item: Item,
-    pub(crate) exec: String,
+    pub(crate) exec: Vec<String>,
     pub(crate) haystack: String,
 }
 
@@ -618,7 +804,7 @@ mod tests {
         )
         .expect("desktop entry parses");
         assert_eq!(parsed.title, "Firefox");
-        assert_eq!(parsed.exec, "firefox");
+        assert_eq!(parsed.exec, vec!["firefox".to_string()]);
         assert_eq!(parsed.icon.as_deref(), Some("firefox"));
         assert!(parsed.haystack.contains("browser"));
     }
@@ -673,7 +859,151 @@ mod tests {
     fn field_codes_are_stripped_from_exec() {
         let parsed =
             parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app %f %U --flag %i\n").unwrap();
-        assert_eq!(parsed.exec, "app --flag");
+        assert_eq!(parsed.exec, vec!["app".to_string(), "--flag".to_string()]);
+    }
+
+    // --- New coverage: issue #109, `Exec=` quoting per the freedesktop
+    // Desktop Entry Specification, parsed exactly once into a Vec<String>. ---
+
+    #[test]
+    fn a_quoted_program_path_with_spaces_becomes_one_argument_with_no_quote_chars() {
+        let parsed =
+            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=\"/opt/My App/bin/app\" --flag\n")
+                .unwrap();
+        assert_eq!(
+            parsed.exec,
+            vec!["/opt/My App/bin/app".to_string(), "--flag".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_quoted_program_path_without_spaces_has_its_quote_chars_stripped() {
+        // The live failure on this machine: a quoted `Exec=` with no
+        // internal whitespace was still emitting a program token with a
+        // literal leading `"` attached, because the old parser never
+        // understood quoting at all.
+        let parsed =
+            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=\"/home/pedro/.local/bin/unity\"\n")
+                .unwrap();
+        assert_eq!(
+            parsed.exec,
+            vec!["/home/pedro/.local/bin/unity".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_quoted_argument_with_spaces_reaches_the_result_as_exactly_one_argument() {
+        let parsed = parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=ibus-daemon --daemon-args \"--xim --panel disable\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.exec,
+            vec![
+                "ibus-daemon".to_string(),
+                "--daemon-args".to_string(),
+                "--xim --panel disable".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn backslash_escapes_inside_a_quoted_argument_are_resolved_and_the_backslash_dropped() {
+        // The trailing `\\\\` (four backslashes) is deliberate, not a typo:
+        // representing one literal backslash needs four backslashes in the
+        // file — see the double-escaping test below for why. The other
+        // three escapes (`\"`, `` \` ``, `\$`) need only the single
+        // backslash the quoting rule itself defines, since the general
+        // desktop-entry string escape (applied first, by
+        // `unescape_general_string`) does not recognize any of the three
+        // and passes them through untouched for the quoting layer to
+        // resolve.
+        let parsed = parse_exec(r#"app "quote:\" backtick:\` dollar:\$ slash:\\\\""#).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                "app".to_string(),
+                "quote:\" backtick:` dollar:$ slash:\\".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_literal_backslash_written_per_the_double_escaping_rule_yields_exactly_one_backslash() {
+        // The general desktop-entry string escape (`\\` -> `\`) runs before
+        // the quoting rule's own backslash escape (`\\` -> `\`), so a
+        // *literal* backslash inside a quoted argument must be written as
+        // four backslashes in the file: two collapse to one under the
+        // general string escape, then that one pair collapses to one
+        // backslash under the quoting rule.
+        let parsed = parse_exec(r#"app "one\\\\two""#).unwrap();
+        assert_eq!(parsed, vec!["app".to_string(), r"one\two".to_string()]);
+    }
+
+    #[test]
+    fn a_field_code_is_stripped_only_as_a_whole_unquoted_argument() {
+        let parsed = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app %f \"%f\"\n").unwrap();
+        assert_eq!(
+            parsed.exec,
+            vec!["app".to_string(), "%f".to_string()],
+            "the unquoted %f must be dropped; the quoted \"%f\" must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn double_percent_resolves_to_a_literal_percent() {
+        let parsed =
+            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app --progress=%%\n").unwrap();
+        assert_eq!(
+            parsed.exec,
+            vec!["app".to_string(), "--progress=%".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_quote_rejects_the_whole_entry() {
+        assert_eq!(parse_exec("app \"unterminated"), None);
+        assert!(
+            parse_desktop_entry("[Desktop Entry]\nName=X\nExec=app \"unterminated\n").is_none(),
+            "a malformed Exec= must reject the whole entry, not guess at a split"
+        );
+    }
+
+    #[test]
+    fn an_empty_exec_value_parses_to_an_empty_argument_vector_not_a_panic() {
+        assert_eq!(parse_exec(""), Some(Vec::new()));
+        assert_eq!(parse_exec("   "), Some(Vec::new()));
+        let parsed = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=\n").unwrap();
+        assert_eq!(parsed.exec, Vec::<String>::new());
+    }
+
+    #[test]
+    fn unquoted_exec_still_splits_on_whitespace_exactly_as_before() {
+        let parsed = parse_exec("firefox --new-window https://example.com").unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                "firefox".to_string(),
+                "--new-window".to_string(),
+                "https://example.com".to_string(),
+            ]
+        );
+    }
+
+    // --- Regression coverage: the real-world shapes that motivated #109. ---
+
+    #[test]
+    fn regression_google_chrome_with_a_quoted_app_flag() {
+        let parsed =
+            parse_exec(r#"google-chrome --app="https://app.hey.com/" --name=HEY"#).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                "google-chrome".to_string(),
+                "--app=https://app.hey.com/".to_string(),
+                "--name=HEY".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -757,7 +1087,10 @@ mod tests {
                 .unwrap();
         let entry = build_entry("firefox".to_string(), parsed).unwrap();
         assert_eq!(entry.app_id, "firefox");
-        assert_eq!(entry.exec, "firefox --new-window");
+        assert_eq!(
+            entry.exec,
+            vec!["firefox".to_string(), "--new-window".to_string()]
+        );
         assert!(entry.haystack.contains("firefox"));
     }
 
@@ -956,7 +1289,7 @@ mod index_tests {
         let found = index
             .find_by_item_id(&ItemId::new("app:firefox").unwrap())
             .expect("must find the entry it was built from");
-        assert_eq!(found.exec, "firefox");
+        assert_eq!(found.exec, vec!["firefox".to_string()]);
     }
 
     #[test]
@@ -1071,29 +1404,33 @@ impl WindowSource for EmptyWindowSource {
 
 /// Starts a new process for a desktop entry's `Exec=` command.
 pub trait Launcher: Send + Sync + 'static {
-    /// Spawns `exec` (already split from the desktop entry's `Exec=` line,
-    /// field codes stripped) as a new, detached process. The
-    /// [`focus_or_launch`] fallback once no focusable window exists — the
-    /// seam that lets tests substitute a fake that records a call instead
-    /// of actually starting a GUI application.
-    fn launch(&self, exec: &str) -> Result<(), String>;
+    /// Spawns `argv` — already parsed from the desktop entry's `Exec=` line
+    /// by [`parse_exec`] at index time, quoting resolved and field codes
+    /// stripped — as a new, detached process. `argv[0]` is the program,
+    /// `argv[1..]` its arguments; this trait does no splitting of its own
+    /// (contrast the pre-#109 contract, where `exec` was one whitespace-
+    /// joined string and the first token found by splitting on whitespace
+    /// again was taken as the program — the very split that broke on any
+    /// quoted `Exec=` value). The [`focus_or_launch`] fallback once no
+    /// focusable window exists — the seam that lets tests substitute a fake
+    /// that records a call instead of actually starting a GUI application.
+    fn launch(&self, argv: &[String]) -> Result<(), String>;
 }
 
-/// The real [`Launcher`]: `exec`'s first whitespace-separated token is the
-/// program, the rest are its arguments — `exec` has already had field codes
-/// stripped by [`sanitize_exec`] at parse time. Standard streams are
-/// discarded and detached from the daemon's own terminal, if it has one; a
-/// launched app is not expected to write anything hopd should see.
+/// The real [`Launcher`]: `argv[0]` is the program, `argv[1..]` its
+/// arguments — no splitting here at all, since [`parse_exec`] has already
+/// resolved quoting and stripped field codes at parse time. Standard streams
+/// are discarded and detached from the daemon's own terminal, if it has one;
+/// a launched app is not expected to write anything hopd should see.
 pub struct SystemLauncher;
 
 impl Launcher for SystemLauncher {
-    fn launch(&self, exec: &str) -> Result<(), String> {
-        let mut parts = exec.split_whitespace();
-        let program = parts
-            .next()
-            .ok_or_else(|| "desktop entry has an empty Exec= command".to_string())?;
+    fn launch(&self, argv: &[String]) -> Result<(), String> {
+        let [program, args @ ..] = argv else {
+            return Err("desktop entry has an empty Exec= command".to_string());
+        };
         std::process::Command::new(program)
-            .args(parts)
+            .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1159,7 +1496,7 @@ pub(crate) fn focus_or_launch(
     windows: &dyn WindowSource,
     launcher: &dyn Launcher,
     app_id: &str,
-    exec: &str,
+    exec: &[String],
 ) -> Result<(), String> {
     if let Some(window) = find_focusable_window(windows, app_id) {
         if window.minimized {
@@ -1212,15 +1549,18 @@ mod focus_or_launch_tests {
 
     /// A [`Launcher`] that records whether it was called, never actually
     /// spawning a process — every test in this module must run without a
-    /// real GUI application installed.
+    /// real GUI application installed. Records each call's argv space-joined
+    /// back into one string, matching this fake's pre-#109 recording shape
+    /// (when `Launcher::launch` itself took one already-joined string) so
+    /// this module's existing assertions read unchanged.
     #[derive(Default)]
     struct FakeLauncher {
         launched: Mutex<Vec<String>>,
     }
 
     impl Launcher for FakeLauncher {
-        fn launch(&self, exec: &str) -> Result<(), String> {
-            self.launched.lock().unwrap().push(exec.to_string());
+        fn launch(&self, argv: &[String]) -> Result<(), String> {
+            self.launched.lock().unwrap().push(argv.join(" "));
             Ok(())
         }
     }
@@ -1245,7 +1585,7 @@ mod focus_or_launch_tests {
         };
         let launcher = FakeLauncher::default();
 
-        assert!(focus_or_launch(&windows, &launcher, "firefox", "firefox").is_ok());
+        assert!(focus_or_launch(&windows, &launcher, "firefox", &["firefox".to_string()]).is_ok());
         assert_eq!(
             *windows.calls.lock().unwrap(),
             vec![("activate", "w1".to_string())]
@@ -1263,7 +1603,7 @@ mod focus_or_launch_tests {
         };
         let launcher = FakeLauncher::default();
 
-        assert!(focus_or_launch(&windows, &launcher, "firefox", "firefox").is_ok());
+        assert!(focus_or_launch(&windows, &launcher, "firefox", &["firefox".to_string()]).is_ok());
         assert_eq!(
             *windows.calls.lock().unwrap(),
             vec![
@@ -1285,7 +1625,7 @@ mod focus_or_launch_tests {
             ..Default::default()
         };
         let launcher = FakeLauncher::default();
-        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        focus_or_launch(&windows, &launcher, "firefox", &["firefox".to_string()]).unwrap();
         assert_eq!(
             *windows.calls.lock().unwrap(),
             vec![("activate", "w1".to_string())]
@@ -1300,7 +1640,15 @@ mod focus_or_launch_tests {
         let windows = FakeWindows::default();
         let launcher = FakeLauncher::default();
 
-        assert!(focus_or_launch(&windows, &launcher, "firefox", "firefox --new-window").is_ok());
+        assert!(
+            focus_or_launch(
+                &windows,
+                &launcher,
+                "firefox",
+                &["firefox".to_string(), "--new-window".to_string()]
+            )
+            .is_ok()
+        );
         assert_eq!(
             *launcher.launched.lock().unwrap(),
             vec!["firefox --new-window".to_string()]
@@ -1319,7 +1667,15 @@ mod focus_or_launch_tests {
         };
         let launcher = FakeLauncher::default();
 
-        assert!(focus_or_launch(&windows, &launcher, "brave-browser.desktop", "brave").is_ok());
+        assert!(
+            focus_or_launch(
+                &windows,
+                &launcher,
+                "brave-browser.desktop",
+                &["brave".to_string()]
+            )
+            .is_ok()
+        );
         assert_eq!(
             *windows.calls.lock().unwrap(),
             vec![("activate", "w1".to_string())]
@@ -1342,7 +1698,7 @@ mod focus_or_launch_tests {
         };
         let launcher = FakeLauncher::default();
 
-        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        focus_or_launch(&windows, &launcher, "firefox", &["firefox".to_string()]).unwrap();
         assert!(
             windows.calls.lock().unwrap().is_empty(),
             "skip_taskbar window must not be used"
@@ -1360,7 +1716,7 @@ mod focus_or_launch_tests {
         };
         let launcher = FakeLauncher::default();
 
-        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        focus_or_launch(&windows, &launcher, "firefox", &["firefox".to_string()]).unwrap();
         assert!(windows.calls.lock().unwrap().is_empty());
         assert_eq!(launcher.launched.lock().unwrap().len(), 1);
     }
@@ -1386,7 +1742,7 @@ mod focus_or_launch_tests {
         };
         let launcher = FakeLauncher::default();
 
-        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        focus_or_launch(&windows, &launcher, "firefox", &["firefox".to_string()]).unwrap();
         assert_eq!(
             *windows.calls.lock().unwrap(),
             vec![("activate", "w2".to_string())],
@@ -1414,7 +1770,7 @@ mod focus_or_launch_tests {
             ..Default::default()
         };
         let launcher = FakeLauncher::default();
-        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        focus_or_launch(&windows, &launcher, "firefox", &["firefox".to_string()]).unwrap();
         assert_eq!(
             *windows.calls.lock().unwrap(),
             vec![("activate", "owned".to_string())]
@@ -1436,7 +1792,7 @@ mod focus_or_launch_tests {
             &windows,
             &launcher,
             "org.gnome.terminal.desktop",
-            "gnome-terminal",
+            &["gnome-terminal".to_string()],
         )
         .unwrap();
         assert_eq!(
@@ -1453,7 +1809,7 @@ mod focus_or_launch_tests {
             ..Default::default()
         };
         let launcher = FakeLauncher::default();
-        focus_or_launch(&windows, &launcher, "firefox", "firefox").unwrap();
+        focus_or_launch(&windows, &launcher, "firefox", &["firefox".to_string()]).unwrap();
         assert!(windows.calls.lock().unwrap().is_empty());
         assert_eq!(launcher.launched.lock().unwrap().len(), 1);
     }
@@ -1463,19 +1819,18 @@ mod focus_or_launch_tests {
         // Asserts on the error *message*, not just `is_err()`: on Linux,
         // `Command::new("").spawn()` already fails at the OS level (empty
         // program name), so `is_err()` alone would pass even with the
-        // explicit `ok_or_else` guard deleted from `SystemLauncher::launch`
+        // explicit slice-pattern guard deleted from `SystemLauncher::launch`
         // — it would just report a generic OS error instead of this
         // domain-specific one. Checking the message is what actually pins
         // the guard's existence.
-        let err = SystemLauncher.launch("").unwrap_err();
+        //
+        // An empty `argv` is the only shape this layer sees for "no
+        // program": [`parse_exec`] already collapses both an empty and a
+        // whitespace-only `Exec=` value to `vec![]` upstream, at parse time.
+        let err = SystemLauncher.launch(&[]).unwrap_err();
         assert!(
             err.contains("empty Exec="),
             "must report the empty-Exec= guard, not a generic spawn failure: {err}"
-        );
-        let err = SystemLauncher.launch("   ").unwrap_err();
-        assert!(
-            err.contains("empty Exec="),
-            "whitespace-only must also trip the guard: {err}"
         );
     }
 
@@ -1488,7 +1843,7 @@ mod focus_or_launch_tests {
         assert!(source.all_windows().is_empty());
 
         let launcher = FakeLauncher::default();
-        focus_or_launch(&source, &launcher, "firefox", "firefox").unwrap();
+        focus_or_launch(&source, &launcher, "firefox", &["firefox".to_string()]).unwrap();
         assert_eq!(launcher.launched.lock().unwrap().len(), 1);
     }
 }
@@ -1723,8 +2078,8 @@ mod provider_tests {
     }
 
     impl Launcher for RecordingLauncher {
-        fn launch(&self, exec: &str) -> Result<(), String> {
-            self.calls.lock().unwrap().push(exec.to_string());
+        fn launch(&self, argv: &[String]) -> Result<(), String> {
+            self.calls.lock().unwrap().push(argv.join(" "));
             Ok(())
         }
     }
