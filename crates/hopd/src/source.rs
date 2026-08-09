@@ -139,6 +139,30 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
         item_id: ItemId,
         action_id: ActionId,
     ) -> impl Future<Output = Result<ExecOutcome, ProviderError>> + Send;
+
+    /// Records that the user reached `item_id` while typing `query` — a
+    /// launch, in `hop-core`'s [`Learning`](hop_core::learning::Learning)
+    /// vocabulary.
+    ///
+    /// This is issue #60's seam for turning a successful [`execute`](Self::execute)
+    /// into learning: `crates/hopd/src/connection.rs`'s Execute arm calls this
+    /// only once `execute` has already answered `Ok`, before it sends
+    /// `Executed` back to the peer — a launch is a successful action, not an
+    /// attempted one, so a refused or failed execute never reaches this
+    /// method. `query` is the accepted text of the query the item was
+    /// resolved under (`Exchange::text`), and `item_id` is the same id
+    /// `execute` was just called with; the connection is the only place that
+    /// holds both, which is why this seam is driven from there rather than
+    /// folded into `execute` itself.
+    ///
+    /// [`HostSource`] records the launch against its `Pipeline`'s
+    /// [`Learning`](hop_core::learning::Learning) store and, when it was
+    /// built with a store path, persists it — see its impl for what happens
+    /// if that persist fails. A test or scripted source is free to make this
+    /// a no-op where its scenario does not care about learning, the same way
+    /// most of this crate's scripted sources already treat `execute`'s
+    /// outcome as the only thing worth scripting.
+    fn record_launch(&self, query: &str, item_id: &ItemId) -> impl Future<Output = ()> + Send;
 }
 
 /// The walking skeleton's item, as a real [`Provider`].
@@ -242,12 +266,9 @@ pub struct HostSource {
     /// from the real config. `None` for a test-built source that only wants
     /// the `Learning` in-memory behavior without a store to save to.
     ///
-    /// `start`/`execute` do not save yet: Task 4 of issue #60 adds `record_launch`
-    /// to [`ResultSource`], which is the field's first reader (it saves the
-    /// store back to this path). Until then nothing reads it, so it is
-    /// suppressed from the dead-code lint the way a genuinely-yet-unused
-    /// seam is; the moment Task 4 lands this attribute comes off.
-    #[allow(dead_code)]
+    /// Read by [`HostSource::record_launch`], which saves the store back to
+    /// this path whenever it is `Some` — see that method for what happens if
+    /// the save fails.
     learning_path: Option<PathBuf>,
 }
 
@@ -414,6 +435,30 @@ impl ResultSource for HostSource {
         action_id: ActionId,
     ) -> Result<ExecOutcome, ProviderError> {
         self.host.execute(provider, item_id, action_id).await
+    }
+
+    /// Locks the pipeline, records the launch against its `Learning` store,
+    /// and — when this source was built with a store path
+    /// ([`HostSource::with_config`]) — saves it back out.
+    ///
+    /// A save failure is logged via `eprintln!` (the same seam
+    /// [`StderrLog`] uses) and otherwise ignored: this method's caller,
+    /// `connection.rs`'s Execute arm, calls it only after `execute` already
+    /// answered `Ok` and is about to send `Executed` — a persistence hiccup
+    /// here must not turn that already-successful execute into a
+    /// client-visible error, and the in-memory record above still took, so
+    /// the next launch (or the next successful save) still has it.
+    async fn record_launch(&self, query: &str, item_id: &ItemId) {
+        let mut pipeline = self.pipeline.lock().await;
+        pipeline.learning.record_launch(query, item_id);
+        if let Some(path) = &self.learning_path
+            && let Err(err) = pipeline.learning.save(path)
+        {
+            eprintln!(
+                "hopd: failed to save the learning store to {}: {err}",
+                path.display()
+            );
+        }
     }
 }
 

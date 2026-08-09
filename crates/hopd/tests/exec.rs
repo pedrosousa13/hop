@@ -16,12 +16,15 @@
 mod common;
 
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{hello, recv, send, start_daemon};
 use hop_core::host::{HostPolicy, NoopLog, ProviderHost};
+use hop_core::learning::Learning;
+use hop_core::pipeline::Pipeline;
 use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery};
 use hop_protocol::{
@@ -68,11 +71,17 @@ enum ExecBehavior {
 /// records every `execute` call it receives. `start_daemon` clones the source
 /// per connection, so the shared `calls` list survives to be asserted after a
 /// refusal — proving the daemon never dispatched to the source on a refusal.
+///
+/// `launches` records every `record_launch` call the same way, as
+/// `(query, item_id)` pairs — the genuine observation issue #60's Task 4 owes:
+/// that a successful execute records one, and a failed or refused one records
+/// none, rather than an assertion that would hold either way.
 #[derive(Clone)]
 struct ExecSource {
     item: Option<Item>,
     behavior: ExecBehavior,
     calls: Arc<Mutex<Vec<(String, String, String)>>>,
+    launches: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl ResultSource for ExecSource {
@@ -104,6 +113,17 @@ impl ResultSource for ExecSource {
                 ExecBehavior::Done => Ok(ExecOutcome::Done),
                 ExecBehavior::Fail(msg) => Err(ProviderError::Failed(msg)),
             }
+        }
+    }
+
+    fn record_launch(&self, query: &str, item_id: &ItemId) -> impl Future<Output = ()> + Send {
+        let launches = self.launches.clone();
+        let entry = (query.to_string(), item_id.as_str().to_string());
+        async move {
+            launches
+                .lock()
+                .expect("no test panics holding this")
+                .push(entry);
         }
     }
 }
@@ -155,6 +175,7 @@ fn a_successful_execute_round_trips_and_reaches_the_source() {
         item: Some(item("app:1", &["open"])),
         behavior: ExecBehavior::Done,
         calls: Arc::new(Mutex::new(Vec::new())),
+        launches: Arc::new(Mutex::new(Vec::new())),
     };
     let daemon = start_daemon(source.clone());
 
@@ -183,6 +204,12 @@ fn a_successful_execute_round_trips_and_reaches_the_source() {
         )],
         "the item's provider and both resolved ids must reach the source"
     );
+    assert_eq!(
+        source.launches.lock().unwrap().as_slice(),
+        &[("q".to_string(), "app:1".to_string())],
+        "a successful execute must record a launch keyed on the accepted \
+         query text and the resolved item id"
+    );
 }
 
 #[test]
@@ -191,6 +218,7 @@ fn an_execute_for_an_undelivered_item_is_refused_and_not_acted_on() {
         item: Some(item("app:1", &["open"])),
         behavior: ExecBehavior::Done,
         calls: Arc::new(Mutex::new(Vec::new())),
+        launches: Arc::new(Mutex::new(Vec::new())),
     };
     let daemon = start_daemon(source.clone());
 
@@ -238,6 +266,7 @@ fn an_execute_naming_a_stale_query_id_is_refused() {
         item: Some(item("app:1", &["open"])),
         behavior: ExecBehavior::Done,
         calls: Arc::new(Mutex::new(Vec::new())),
+        launches: Arc::new(Mutex::new(Vec::new())),
     };
     let daemon = start_daemon(source.clone());
 
@@ -264,6 +293,7 @@ fn an_execute_for_an_action_the_item_does_not_offer_is_refused() {
         item: Some(item("app:1", &["open"])),
         behavior: ExecBehavior::Done,
         calls: Arc::new(Mutex::new(Vec::new())),
+        launches: Arc::new(Mutex::new(Vec::new())),
     };
     let daemon = start_daemon(source.clone());
 
@@ -289,6 +319,7 @@ fn a_provider_execute_failure_is_a_query_scoped_provider_failed() {
         item: Some(item("app:1", &["open"])),
         behavior: ExecBehavior::Fail("boom".to_string()),
         calls: Arc::new(Mutex::new(Vec::new())),
+        launches: Arc::new(Mutex::new(Vec::new())),
     };
     let daemon = start_daemon(source.clone());
 
@@ -312,6 +343,14 @@ fn a_provider_execute_failure_is_a_query_scoped_provider_failed() {
             "open".to_string()
         )],
         "the provider must be reached before it can fail"
+    );
+    // The negative case this seam owes: `execute` genuinely ran and answered
+    // `Err`, so `source.launches` shows exactly what a bug that recorded
+    // launches unconditionally would leave behind — this is a real
+    // observation, not an assertion that would hold either way.
+    assert!(
+        source.launches.lock().unwrap().is_empty(),
+        "a failed execute must never record a launch"
     );
 }
 
@@ -456,5 +495,141 @@ fn a_hanging_execute_is_bounded_and_the_connection_stays_responsive() {
     assert!(
         answered_again,
         "the connection must remain usable after a bounded execute"
+    );
+}
+
+/// A provider whose `execute` always succeeds — the launch-persistence test
+/// below needs the *production* dispatch path (a real [`ProviderHost`]
+/// through a real [`HostSource`]), unlike [`ExecSource`]'s own scripted
+/// `execute`, because it is [`HostSource::record_launch`] under test here,
+/// not the connection's dispatch.
+struct LaunchableProvider;
+
+impl Provider for LaunchableProvider {
+    fn manifest(&self) -> ProviderManifest {
+        ProviderManifest {
+            id: "launchable",
+            kinds: vec![Kind::Action],
+            modes: vec![Mode::All],
+            min_term_len: 0,
+            budget: Duration::from_millis(10),
+        }
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        _q: Arc<RoutedQuery>,
+        _ctx: QueryCtx,
+    ) -> Result<Vec<Item>, ProviderError> {
+        Ok(vec![Item {
+            id: ItemId::new("launchable:1").unwrap(),
+            kind: Kind::Action,
+            title: "Launchable".to_string(),
+            subtitle: None,
+            icon: None,
+            actions: vec![Action {
+                id: ActionId::new("open").unwrap(),
+                kind: ActionKind::Open,
+                label: "Open".to_string(),
+            }],
+            default_action: ActionId::new("open").unwrap(),
+            copy_text: None,
+            append_to_end: false,
+            provider: "launchable".to_string(),
+        }])
+    }
+
+    async fn execute(
+        self: Arc<Self>,
+        _item_id: ItemId,
+        _action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        Ok(ExecOutcome::Done)
+    }
+}
+
+/// A launch driven through a real socket, over the production `HostSource`
+/// (not a scripted source), lands in the learning store on disk at the path
+/// `HostSource::with_config` was built with — proving Design decisions 5 and
+/// 6 of issue #60's plan are wired end to end, not merely that the trait
+/// method exists.
+///
+/// `hop-core`'s own `learning` tests already pin `Learning::save`'s atomicity
+/// and 0600 mode; this test does not re-prove those internals, only that
+/// *this* wiring actually calls `save` and that the file it produces carries
+/// that mode.
+#[test]
+fn a_successful_execute_persists_a_launch_to_the_learning_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("learning.json");
+
+    let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+    host.register(LaunchableProvider).unwrap();
+    let pipeline = Arc::new(tokio::sync::Mutex::new(Pipeline::default()));
+    let source = HostSource::with_config(
+        Arc::new(host),
+        pipeline,
+        hopd::source::MAX_RESULTS,
+        Some(store_path.clone()),
+    );
+    let daemon = start_daemon(source);
+
+    let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
+    hello(&mut stream);
+    send(
+        &mut stream,
+        &ClientMsg::Query {
+            id: 1,
+            text: QueryText::new("launchable").unwrap(),
+        },
+    );
+    let mut delivered = Vec::new();
+    loop {
+        match recv(&mut stream) {
+            DaemonMsg::Results {
+                query_id: 1, items, ..
+            } => delivered = items,
+            DaemonMsg::QueryDone { query_id: 1 } => break,
+            other => panic!("unexpected frame during query: {other:?}"),
+        }
+    }
+    assert!(
+        delivered.iter().any(|i| i.id.as_str() == "launchable:1"),
+        "the provider's item must survive assembly, got {delivered:?}"
+    );
+
+    // No store file exists before anything has been launched.
+    assert!(
+        !store_path.exists(),
+        "the store must not be written before any launch is recorded"
+    );
+
+    let reply = execute(&mut stream, 1, "launchable:1", "open");
+    assert_eq!(
+        reply,
+        DaemonMsg::Executed {
+            query_id: 1,
+            outcome: ExecOutcome::Done,
+        },
+        "the execute must succeed for the launch to be recorded at all"
+    );
+
+    // `record_launch` runs (and saves) before `Executed` goes out on the
+    // wire — see connection.rs's Execute arm — so by the time `execute`
+    // above returned, the save has already happened.
+    let meta = std::fs::metadata(&store_path)
+        .expect("a successful execute must have written the learning store");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "the persisted store must be owner-only, per Learning::save's contract"
+    );
+
+    let reloaded = Learning::load(&store_path);
+    let recent = reloaded.recent_launches(10);
+    assert!(
+        recent.iter().any(|(id, _)| id == "launchable:1"),
+        "the launch recorded through the socket must be the one that landed \
+         on disk, got {recent:?}"
     );
 }
