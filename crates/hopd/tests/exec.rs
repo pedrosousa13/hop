@@ -634,13 +634,12 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
     );
 }
 
-/// Two launches through the same [`HostSource`] both survive to disk, in
-/// order, once each — the behavior the generation-gated save in
-/// `HostSource::record_launch` exists to preserve now that the pipeline
-/// lock is no longer held across the save. A gating bug (an off-by-one on
-/// the generation comparison, say) would most plausibly manifest as the
-/// *second* save being wrongly treated as stale and skipped, silently
-/// dropping it; this pins that it is not.
+/// Two launches through the same [`HostSource`] both survive to disk, once
+/// each — the behavior `HostSource::record_launch`'s `save_lock` exists to
+/// preserve now that the pipeline lock is no longer held across the save. A
+/// bug in that serialization would most plausibly manifest as the *second*
+/// save clobbering the file with a snapshot that lost the first launch;
+/// this pins that it does not.
 #[test]
 fn two_sequential_launches_both_land_in_the_learning_store() {
     let dir = tempfile::tempdir().unwrap();
