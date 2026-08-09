@@ -198,12 +198,14 @@ fn acquire_listener(
                 );
             }
 
-            // SAFETY: `found.fd` came from `activation::inherited_fd`, which
-            // only returns `Some` once `LISTEN_PID` has matched this
-            // process's own pid — the sd_listen_fds(3) contract's own
-            // guarantee at that point is that the named descriptor is a
-            // valid, open, already-bound-and-listening socket this process
-            // now owns exclusively. This is the only `unsafe` in this crate,
+            // SAFETY: `found.fd` came from `activation::inherited_fd`, this
+            // crate's own re-implementation of the sd_listen_fds(3)
+            // protocol, which only returns `Some` once `LISTEN_PID` has
+            // matched this process's own pid — systemd's anti-spoofing
+            // check. That match is what makes the descriptor trustworthy:
+            // it relies on a service manager honoring the same protocol
+            // having already bound and listened on it, and handed over sole
+            // ownership. This is the only `unsafe` in this crate,
             // and the only one in this workspace's production code
             // (root `Cargo.toml`'s `[workspace.lints.rust] unsafe_code`
             // doc comment; the tree's one prior `unsafe` is test-only, in

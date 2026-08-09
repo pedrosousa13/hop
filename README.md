@@ -62,4 +62,5 @@ systemctl --user enable --now hopd.socket
 The daemon starts the first time something connects to
 `$XDG_RUNTIME_DIR/hop/hopd.sock`; `hop query <text>` (once `hop-cli` is
 installed the same way) is enough to trigger it. `systemctl --user status
-hopd.service` confirms it is running afterward.
+hopd.service` confirms it is running afterward. If the unit ever declares
+more than one socket, hopd uses only the first and warns on stderr.

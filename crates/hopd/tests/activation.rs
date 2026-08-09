@@ -257,7 +257,16 @@ fn a_query_over_an_inherited_listener_is_served_without_hopd_rebinding_the_socke
         "the socket file must be the exact one this test bound, never rebound by hopd"
     );
 
-    // Criterion 5, under activation specifically.
+    // Criterion 5, under activation specifically: this test process is the
+    // one that bound the socket at 0600 and made the runtime directory at
+    // 0700, so these assertions cannot prove activation *applies* those
+    // modes — only that hopd's activation path leaves them as the service
+    // manager set them, neither chmod'ing nor rebinding. In production
+    // it's the shipped `.socket` unit's `SocketMode=0600` and
+    // `DirectoryMode=0700` that enforce the modes, pinned by server.rs's
+    // `the_socket_unit_declares_the_modes_activation_must_carry` and
+    // applied by systemd itself — which nothing in this repository's
+    // automated tests exercises.
     let socket_mode = std::fs::metadata(&daemon.socket_path)
         .unwrap()
         .permissions()
