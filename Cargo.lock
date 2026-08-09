@@ -104,6 +104,7 @@ dependencies = [
  "hop-core",
  "hop-protocol",
  "inotify",
+ "libc",
  "tempfile",
  "thiserror",
  "tokio",
