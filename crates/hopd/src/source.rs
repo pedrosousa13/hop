@@ -19,6 +19,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hop_core::host::{ProviderEvent, ProviderHost, ProviderLog};
@@ -270,6 +271,17 @@ pub struct HostSource {
     /// this path whenever it is `Some` — see that method for what happens if
     /// the save fails.
     learning_path: Option<PathBuf>,
+    /// Hands each `record_launch` call a generation number while it still
+    /// holds `pipeline`'s lock, so generations are assigned in exactly the
+    /// order launches were recorded. See [`HostSource::record_launch`] for
+    /// what that ordering buys.
+    next_save_generation: Arc<AtomicU64>,
+    /// The highest generation ([`HostSource::next_save_generation`]) that
+    /// has actually been written to `learning_path`. Guards the write
+    /// itself — held across the blocking save, but only that, never across
+    /// `pipeline`'s lock — so saves are serialized against each other
+    /// without serializing against query assembly.
+    highest_saved_generation: Arc<Mutex<u64>>,
 }
 
 impl HostSource {
@@ -283,6 +295,8 @@ impl HostSource {
             pipeline: Arc::new(Mutex::new(Pipeline::default())),
             max_results: MAX_RESULTS,
             learning_path: None,
+            next_save_generation: Arc::new(AtomicU64::new(0)),
+            highest_saved_generation: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -301,6 +315,8 @@ impl HostSource {
             pipeline,
             max_results: MAX_RESULTS,
             learning_path: None,
+            next_save_generation: Arc::new(AtomicU64::new(0)),
+            highest_saved_generation: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -323,6 +339,8 @@ impl HostSource {
             pipeline,
             max_results,
             learning_path,
+            next_save_generation: Arc::new(AtomicU64::new(0)),
+            highest_saved_generation: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -437,27 +455,86 @@ impl ResultSource for HostSource {
         self.host.execute(provider, item_id, action_id).await
     }
 
-    /// Locks the pipeline, records the launch against its `Learning` store,
-    /// and — when this source was built with a store path
-    /// ([`HostSource::with_config`]) — saves it back out.
+    /// Locks the pipeline just long enough to record the launch against its
+    /// `Learning` store and, when this source was built with a store path
+    /// ([`HostSource::with_config`]), clone the state a save needs — the
+    /// clone crosses into the save below, not the lock, so `pipeline` is
+    /// free again before any I/O starts. This follows the same discipline
+    /// [`HostSource::start`] documents above ("locked only across `assemble`
+    /// itself... holding the guard past it would block every other query
+    /// sharing this `Pipeline`"): `Learning::save` is synchronous and does a
+    /// blocking write + fsync + rename, so holding `pipeline`'s guard across
+    /// it would stall every other connection's query assembly for as long as
+    /// the disk takes. The save itself then runs on a blocking-pool thread
+    /// via [`tokio::task::spawn_blocking`], so it stalls neither `pipeline`'s
+    /// other callers nor the async runtime's worker threads.
+    ///
+    /// # Two launches racing to save
+    ///
+    /// Dropping the pipeline lock before saving means two concurrent
+    /// launches' saves can run on different blocking-pool threads at once,
+    /// and the one that started first is not guaranteed to *finish* first —
+    /// left alone, that would let an older, smaller snapshot's write land
+    /// after a newer one's and silently erase the newer launch. This is
+    /// guarded against, not merely accepted as a risk: every launch is
+    /// stamped with a generation number from `next_save_generation`,
+    /// assigned while `pipeline` is still locked, so generation order always
+    /// matches the true order launches were recorded in. `save` only ever
+    /// runs while holding `highest_saved_generation`'s guard (across the
+    /// blocking save, deliberately — this lock exists only to serialize
+    /// writers against each other, nothing else waits on it), and only if
+    /// its generation is still greater than what that guard already
+    /// remembers; a stale generation is skipped rather than written. Because
+    /// each generation's clone is taken from the same `Learning`, under the
+    /// same `pipeline` lock that serializes every other generation's clone,
+    /// a later generation's snapshot always carries everything an earlier
+    /// one did — so the generation that *does* write already carries any
+    /// launch a skipped, older generation would have. Saves can still be
+    /// reordered relative to each other (a last-writer-wins race on which
+    /// generation's bytes are the ones actually on disk at any moment), but
+    /// no recorded launch is ever lost by it: the file only ever moves
+    /// forward.
     ///
     /// A save failure is logged via `eprintln!` (the same seam
-    /// [`StderrLog`] uses) and otherwise ignored: this method's caller,
-    /// `connection.rs`'s Execute arm, calls it only after `execute` already
-    /// answered `Ok` and is about to send `Executed` — a persistence hiccup
-    /// here must not turn that already-successful execute into a
-    /// client-visible error, and the in-memory record above still took, so
-    /// the next launch (or the next successful save) still has it.
+    /// [`StderrLog`] uses) and otherwise ignored, as is a panic inside the
+    /// blocking task: this method's caller, `connection.rs`'s Execute arm,
+    /// calls it only after `execute` already answered `Ok` and is about to
+    /// send `Executed` — a persistence hiccup here must not turn that
+    /// already-successful execute into a client-visible error, and the
+    /// in-memory record above still took, so the next launch (or the next
+    /// successful save) still has it.
     async fn record_launch(&self, query: &str, item_id: &ItemId) {
-        let mut pipeline = self.pipeline.lock().await;
-        pipeline.learning.record_launch(query, item_id);
-        if let Some(path) = &self.learning_path
-            && let Err(err) = pipeline.learning.save(path)
-        {
-            eprintln!(
+        let snapshot = {
+            let mut pipeline = self.pipeline.lock().await;
+            pipeline.learning.record_launch(query, item_id);
+            self.learning_path.as_ref().map(|path| {
+                let generation = self.next_save_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                (pipeline.learning.clone(), path.clone(), generation)
+            })
+        };
+
+        let Some((learning, path, generation)) = snapshot else {
+            return;
+        };
+
+        let mut highest_saved = self.highest_saved_generation.lock().await;
+        if generation <= *highest_saved {
+            // A later launch's save already landed; ours would only
+            // regress the file to older content it already carries.
+            return;
+        }
+
+        let path_for_save = path.clone();
+        match tokio::task::spawn_blocking(move || learning.save(&path_for_save)).await {
+            Ok(Ok(())) => *highest_saved = generation,
+            Ok(Err(err)) => eprintln!(
                 "hopd: failed to save the learning store to {}: {err}",
                 path.display()
-            );
+            ),
+            Err(join_err) => eprintln!(
+                "hopd: learning store save task for {} panicked: {join_err}",
+                path.display()
+            ),
         }
     }
 }

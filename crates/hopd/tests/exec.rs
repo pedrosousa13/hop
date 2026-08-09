@@ -633,3 +633,66 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
          on disk, got {recent:?}"
     );
 }
+
+/// Two launches through the same [`HostSource`] both survive to disk, in
+/// order, once each — the behavior the generation-gated save in
+/// `HostSource::record_launch` exists to preserve now that the pipeline
+/// lock is no longer held across the save. A gating bug (an off-by-one on
+/// the generation comparison, say) would most plausibly manifest as the
+/// *second* save being wrongly treated as stale and skipped, silently
+/// dropping it; this pins that it is not.
+#[test]
+fn two_sequential_launches_both_land_in_the_learning_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("learning.json");
+
+    let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+    host.register(LaunchableProvider).unwrap();
+    let pipeline = Arc::new(tokio::sync::Mutex::new(Pipeline::default()));
+    let source = HostSource::with_config(
+        Arc::new(host),
+        pipeline,
+        hopd::source::MAX_RESULTS,
+        Some(store_path.clone()),
+    );
+    let daemon = start_daemon(source);
+
+    let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
+    hello(&mut stream);
+
+    for query_id in [1u64, 2u64] {
+        send(
+            &mut stream,
+            &ClientMsg::Query {
+                id: query_id,
+                text: QueryText::new("launchable").unwrap(),
+            },
+        );
+        loop {
+            match recv(&mut stream) {
+                DaemonMsg::Results { .. } => {}
+                DaemonMsg::QueryDone { query_id: id } if id == query_id => break,
+                other => panic!("unexpected frame during query {query_id}: {other:?}"),
+            }
+        }
+
+        let reply = execute(&mut stream, query_id, "launchable:1", "open");
+        assert_eq!(
+            reply,
+            DaemonMsg::Executed {
+                query_id,
+                outcome: ExecOutcome::Done,
+            },
+            "each execute must succeed for its launch to be recorded"
+        );
+    }
+
+    let reloaded = Learning::load(&store_path);
+    let frequent = reloaded.frequent_launches(1, &[]);
+    assert_eq!(
+        frequent,
+        vec![("launchable:1".to_string(), 2)],
+        "both launches must have reached the file that made it to disk \
+         last, not just the first or the second, got {frequent:?}"
+    );
+}
