@@ -116,9 +116,12 @@ pub enum ConfigError {
     /// <= MAX_ITEMS_PER_RESULTS_FRAME)`). Refused at load time instead of
     /// clamping, exactly as the assertion refuses a raised constant.
     #[error(
-        "config `max_results` = {value} exceeds the maximum of {MAX_ITEMS_PER_RESULTS_FRAME} items per results frame"
+        "config `max_results` in {} is {value}, which exceeds the maximum of {MAX_ITEMS_PER_RESULTS_FRAME} items per results frame",
+        .path.display()
     )]
     MaxResultsOverFrame {
+        /// The config path that carried the bad value.
+        path: PathBuf,
         /// The offending value.
         value: usize,
     },
@@ -234,7 +237,10 @@ fn validate_max_results(path: &Path, n: i64) -> Result<usize, ConfigError> {
     }
     let n = n as usize;
     if n > MAX_ITEMS_PER_RESULTS_FRAME {
-        return Err(ConfigError::MaxResultsOverFrame { value: n });
+        return Err(ConfigError::MaxResultsOverFrame {
+            path: path.to_owned(),
+            value: n,
+        });
     }
     Ok(n)
 }
@@ -313,12 +319,17 @@ mod tests {
 
         let err = Config::load_from_env(Some(dir.path().to_string_lossy().into_owned()), None)
             .unwrap_err();
-        match err {
-            ConfigError::MaxResultsOverFrame { value } => {
-                assert_eq!(value, MAX_ITEMS_PER_RESULTS_FRAME + 1);
+        match &err {
+            ConfigError::MaxResultsOverFrame { path: p, value } => {
+                assert_eq!(*p, path);
+                assert_eq!(*value, MAX_ITEMS_PER_RESULTS_FRAME + 1);
             }
             other => panic!("expected MaxResultsOverFrame, got {other:?}"),
         }
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "error message must name the config path: {err}"
+        );
     }
 
     #[test]
