@@ -341,3 +341,49 @@ mod acquire_listener_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod systemd_unit_tests {
+    use super::*;
+
+    const SOCKET_UNIT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contrib/systemd/hopd.socket"
+    ));
+    const SERVICE_UNIT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contrib/systemd/hopd.service"
+    ));
+
+    #[test]
+    fn the_socket_unit_names_the_same_path_this_module_binds_to_standalone() {
+        // A cross-check, not a duplicate literal: if SOCKET_FILE_NAME ever
+        // changes, this fails instead of the unit file silently drifting
+        // from what a standalone-started hopd actually binds to.
+        assert!(
+            SOCKET_UNIT.contains(&format!("ListenStream=%t/hop/{SOCKET_FILE_NAME}")),
+            "the socket unit's ListenStream= must name %t/hop/{SOCKET_FILE_NAME}"
+        );
+    }
+
+    #[test]
+    fn the_socket_unit_declares_the_modes_activation_must_carry() {
+        // Design decision 3: under activation hopd itself sets neither
+        // mode, so the unit file is the only place these are enforced.
+        assert!(SOCKET_UNIT.contains("SocketMode=0600"));
+        assert!(SOCKET_UNIT.contains("DirectoryMode=0700"));
+    }
+
+    #[test]
+    fn the_socket_unit_is_enablable_on_its_own() {
+        assert!(
+            SOCKET_UNIT.contains("WantedBy=sockets.target"),
+            "without an [Install] target, `systemctl --user enable hopd.socket` has nothing to link"
+        );
+    }
+
+    #[test]
+    fn the_service_unit_has_an_exec_start() {
+        assert!(SERVICE_UNIT.contains("ExecStart="));
+    }
+}

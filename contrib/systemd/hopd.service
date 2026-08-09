@@ -1,0 +1,14 @@
+# hop launcher daemon — user service unit, started by hopd.socket on first
+# connection (socket activation). Not meant to be enabled or started
+# directly; `systemctl --user enable --now hopd.socket` is the entry point
+# — see README.md.
+[Unit]
+Description=hop launcher daemon
+
+[Service]
+Type=simple
+# %h is systemd's user-home-directory specifier. This assumes
+# `cargo install --path crates/hopd` (README.md), which places the binary
+# at ~/.cargo/bin/hopd — edit this line if hopd is built or installed
+# elsewhere.
+ExecStart=%h/.cargo/bin/hopd
