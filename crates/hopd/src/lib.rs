@@ -22,6 +22,7 @@
 //! applies, in [`runtime_dir`], [`server`] and [`source`].
 
 pub mod apps;
+pub mod calculator;
 pub mod config;
 pub(crate) mod connection;
 pub mod runtime_dir;
