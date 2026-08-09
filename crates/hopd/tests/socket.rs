@@ -358,10 +358,10 @@ fn an_unset_runtime_dir_is_a_startup_error() {
 fn a_malformed_config_is_a_startup_error() {
     // Issue #60 criterion 2: a config that exists but does not parse must
     // refuse to start the daemon loudly, never fall back to defaults. Config
-    // resolves ahead of the runtime dir in `run()`, so this daemon exits
-    // before binding a socket at all — hence no socket-path assertion here,
-    // and the stderr naming the offending file is the proof it got as far as
-    // reading it.
+    // resolves ahead of the runtime dir in `run()`, so this daemon must exit
+    // before binding a socket at all — the socket-path assertion below is
+    // the direct proof of that, and the stderr naming the offending file is
+    // the proof it got as far as reading it.
     let temp = tempfile::tempdir().unwrap();
     let config_root = temp.path().join("isolated-xdg-config-home");
     let config_dir = config_root.join("hop");
@@ -369,6 +369,7 @@ fn a_malformed_config_is_a_startup_error() {
     // `max_results = =` is not valid TOML: an `=` where a value is expected.
     std::fs::write(config_dir.join("config.toml"), "max_results = =\n").unwrap();
 
+    let runtime_dir = temp.path().join("runtime");
     let output = Command::new(env!("CARGO_BIN_EXE_hopd"))
         .env("XDG_CONFIG_HOME", &config_root)
         .env(
@@ -376,7 +377,7 @@ fn a_malformed_config_is_a_startup_error() {
             temp.path().join("isolated-xdg-state-home"),
         )
         .env("HOME", temp.path().join("isolated-home"))
-        .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("XDG_DATA_DIRS", "")
         .output()
         .expect("failed to run hopd");
@@ -389,5 +390,15 @@ fn a_malformed_config_is_a_startup_error() {
     assert!(
         stderr.contains("config.toml") && stderr.contains("not valid TOML"),
         "stderr must name the malformed config and say it did not parse, got: {stderr}"
+    );
+
+    // `output()` already waited for the process to exit, so this is not a
+    // race against a still-running daemon: a malformed config must never
+    // reach the point of binding a socket at all, in `runtime_dir/hop/`
+    // (the same layout `spawn_daemon` and every other test here expects).
+    let socket_path = runtime_dir.join("hop").join("hopd.sock");
+    assert!(
+        !socket_path.exists(),
+        "a malformed config must be refused before any socket is bound, found {socket_path:?}"
     );
 }
