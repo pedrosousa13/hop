@@ -77,11 +77,15 @@ impl Drop for DaemonProcess {
 /// `build_apps_provider`'s deliberately parameterless signature does not
 /// offer.
 fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
-    // `state_dir::resolve` and `config::load` each treat a missing parent
-    // *base* directory as an error — neither creates recursively, only the
-    // `hop` dir inside it (state) or the config file inside it (config) —
-    // so the isolated roots the env usages point at must already exist, or
-    // the daemon would refuse to start before it ever binds a socket.
+    // `state_dir::resolve` treats a missing parent *base* directory as an
+    // error — it creates only the `hop` dir inside it, not recursively — so
+    // the isolated state-home root must already exist, or the daemon would
+    // refuse to start before it ever binds a socket. `config::load` has no
+    // such requirement: `fs::read_to_string` returns `NotFound` just the same
+    // whether the leaf file or an ancestor directory is missing, and
+    // `config::load` maps any `NotFound` to `Ok(Config::default())` — so
+    // pre-creating the config root here is not load-bearing for it. It is
+    // done anyway to keep the two isolated roots symmetric.
     std::fs::create_dir_all(runtime_dir.join("isolated-xdg-state-home")).unwrap();
     std::fs::create_dir_all(runtime_dir.join("isolated-xdg-config-home")).unwrap();
 
@@ -309,8 +313,33 @@ fn the_runtime_dir_is_created_at_mode_0700_and_the_socket_at_0600() {
 
 #[test]
 fn an_unset_runtime_dir_is_a_startup_error() {
+    // This test does not use `spawn_daemon`: it wants the daemon's real
+    // stderr (`spawn_daemon` discards both streams), and it does not wait for
+    // a socket that this daemon must never bind. But since issue #60, `run()`
+    // resolves `config::load()` and `state_dir::resolve()` *before* it ever
+    // checks `XDG_RUNTIME_DIR` — so, exactly like `spawn_daemon`, this process
+    // must pin `HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME` to an isolated temp
+    // dir rather than inherit the real test process's environment. Left
+    // unpinned, this test would read the developer's real `~/.config/hop` and
+    // create `~/.local/state/hop` as a side effect, and — if that real config
+    // happened to be malformed — would fail on the wrong assertion entirely
+    // (a config-parse error, not a missing-`XDG_RUNTIME_DIR` one).
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("isolated-xdg-state-home")).unwrap();
+    std::fs::create_dir_all(temp.path().join("isolated-xdg-config-home")).unwrap();
+
     let output = Command::new(env!("CARGO_BIN_EXE_hopd"))
         .env_remove("XDG_RUNTIME_DIR")
+        .env("HOME", temp.path().join("isolated-home"))
+        .env(
+            "XDG_CONFIG_HOME",
+            temp.path().join("isolated-xdg-config-home"),
+        )
+        .env(
+            "XDG_STATE_HOME",
+            temp.path().join("isolated-xdg-state-home"),
+        )
+        .env("XDG_DATA_DIRS", "")
         .output()
         .expect("failed to run hopd");
 

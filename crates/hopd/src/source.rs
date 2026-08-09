@@ -420,7 +420,7 @@ impl ResultSource for HostSource {
 /// The daemon's [`ProviderLog`]: one line per event on stderr.
 ///
 /// Deliberately the crudest thing that satisfies issue #34's criterion, and
-/// consistent with how this crate already reports — [`crate::server::serve`]
+/// consistent with how this crate already reports — [`crate::server::serve_with`]
 /// logs accept and connection errors with `eprintln!` too. Spec §9's
 /// `tracing` with an env-filter is the eventual backend, and the
 /// [`ProviderLog`] seam is what lets it arrive without touching a call site.

@@ -69,7 +69,7 @@ enum ReadEvent {
     /// and closes.
     Refused { code: ErrorCode, message: String },
     /// The transport failed mid-read. The driver surfaces it to
-    /// [`crate::server::serve`]'s log seam; there is no peer left worth
+    /// [`crate::server::serve_with`]'s log seam; there is no peer left worth
     /// answering.
     Failed(io::Error),
 }
@@ -507,7 +507,7 @@ enum ReadOutcome {
 /// its end between frames, which ends the connection with no error to send.
 /// An `io::Error` other than EOF (a read that fails mid-frame, for instance)
 /// travels to the driver as [`ReadEvent::Failed`] and, from there, out of
-/// [`handle_connection`] to the `eprintln!` in [`crate::server::serve`]'s
+/// [`handle_connection`] to the `eprintln!` in [`crate::server::serve_with`]'s
 /// spawned task — the same "log and move on" path an accept error takes.
 async fn read_frame(read_half: &mut OwnedReadHalf) -> io::Result<Option<ReadOutcome>> {
     let mut prefix = [0u8; FRAME_PREFIX_LEN];

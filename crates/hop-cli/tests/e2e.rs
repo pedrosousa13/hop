@@ -79,10 +79,13 @@ impl Drop for DaemonProcess {
 /// residual, unclosable risk — see `hopd/tests/socket.rs`'s `spawn_daemon`
 /// doc comment for the fuller account of why that root can't be closed here.
 fn spawn_daemon(hopd_path: &Path, runtime_dir: &Path) -> DaemonProcess {
-    // `state_dir::resolve` and `config::load` each treat a missing parent
-    // *base* directory as an error — neither creates recursively — so the
-    // isolated roots the env usages point at must exist first, mirroring
-    // `hopd/tests/socket.rs`'s `spawn_daemon`.
+    // `state_dir::resolve` treats a missing parent *base* directory as an
+    // error — it creates only the `hop` dir inside it, not recursively — so
+    // the isolated state-home root must exist first, mirroring
+    // `hopd/tests/socket.rs`'s `spawn_daemon`. `config::load` has no such
+    // requirement (a missing leaf file or a missing ancestor directory both
+    // map to `Ok(Config::default())`); the config root is pre-created anyway
+    // to keep the two isolated roots symmetric.
     std::fs::create_dir_all(runtime_dir.join("isolated-xdg-state-home")).unwrap();
     std::fs::create_dir_all(runtime_dir.join("isolated-xdg-config-home")).unwrap();
 
