@@ -51,7 +51,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hop_core::pipeline::{CheckedItems, MAX_ITEMS_PER_PROVIDER_ANSWER, Pipeline, ProviderOutput};
+use hop_core::pipeline::{
+    CheckedItems, FailedCheck, MAX_ITEMS_PER_PROVIDER_ANSWER, Pipeline, ProviderOutput,
+};
 use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::rank::MAX_TERM_CHARS;
 use hop_core::router::{Mode, RoutedQuery};
@@ -326,10 +328,24 @@ fn oversized_provider_input_is_truncated_before_ranking() {
         "a single provider answer over the cap must be truncated to exactly \
          MAX_ITEMS_PER_PROVIDER_ANSWER before ranking ever sees the rest"
     );
-    assert!(
-        checked.rejections().is_empty(),
-        "items past the cap are truncated silently, not rejected — an item \
-         never inspected has nothing to be rejected for"
+    // Review remediation (issue #61 Task 2 review): items past the cap are
+    // each truncated silently — none of them is individually inspected, so
+    // none is individually rejected — but issue #30's "excess recorded"
+    // wording means the truncation itself is no longer silent: it is
+    // recorded as exactly one Rejection for the whole over-limit answer,
+    // regardless of how many items were actually dropped.
+    assert_eq!(
+        checked.rejections().len(),
+        1,
+        "the truncated tail is recorded as exactly one Rejection for the \
+         whole over-limit answer, not one per dropped item"
+    );
+    assert_eq!(
+        checked.rejections()[0].check,
+        FailedCheck::TooManyItems {
+            excess: far_more_than_the_cap - MAX_ITEMS_PER_PROVIDER_ANSWER,
+        },
+        "the recorded excess must match how many items were actually dropped"
     );
 }
 

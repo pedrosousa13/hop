@@ -307,16 +307,30 @@ pub const MAX_PINNED_ITEMS_PER_QUERY: usize = 3;
 /// do its own pre-filtering rather than dumping an entire index into one
 /// `query()` answer.
 ///
-/// # Truncate, not reject
+/// # Truncate the tail, and record the excess
 ///
-/// The tail is silently dropped — the same "truncate-and-terminate, nothing
-/// on the wire naming it" precedent `hopd::source`'s own accumulator already
-/// uses for its own count cap
+/// The tail is dropped without inspecting any dropped item individually —
+/// the same "truncate-and-terminate" precedent `hopd::source`'s own
+/// accumulator already uses for its own count cap
 /// ([`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY)).
-/// Unlike a field-length violation (see [`FailedCheck::FieldTooLong`]), an
-/// item past this cap was never inspected at all, so there is nothing to
-/// reject it *for*: the cap is about how much of a provider's answer assembly
-/// is willing to look at, not about anything a dropped item did wrong.
+/// Unlike a field-length violation (see [`FailedCheck::FieldTooLong`]), no
+/// dropped item is individually rejected: nothing about any one of them was
+/// inspected, so there is nothing to reject any one of them *for* — the cap
+/// is about how much of a provider's answer assembly is willing to look at,
+/// not about anything a dropped item did wrong.
+///
+/// That is not the same as the truncation going unrecorded, though. Issue
+/// #30's Agent Brief — the acceptance text this cap exists to satisfy —
+/// says over-limit input must be "truncated or rejected... with the excess
+/// recorded, not silently carried through the expensive path", and a count
+/// past this cap is exactly that: over-limit input. [`CheckedItems::check`]
+/// records it as one [`Rejection`] per over-limit answer
+/// ([`FailedCheck::TooManyItems`], carrying how many items were dropped) —
+/// never one rejection per dropped item, which would make the rejection
+/// list itself unbounded and defeat the point of capping the input in the
+/// first place. One aggregate rejection is what "the excess recorded"
+/// costs here, and it costs the same O(1) regardless of how far over the
+/// cap a hostile answer was.
 ///
 /// This bounds what *assembly* does with a provider's answer. It does
 /// nothing about the cost a hostile provider's own `query()` paid to build a
@@ -328,13 +342,16 @@ pub const MAX_ITEMS_PER_PROVIDER_ANSWER: usize = 1_000;
 /// Which check an item failed, and so why assembly declined it. See
 /// [`Rejection`].
 ///
-/// Three of the four are checks [`CheckedItems::check`] runs against the
+/// Three of the five are checks [`CheckedItems::check`] runs against the
 /// item itself, and all three are about a claim the item made — its `kind`,
-/// its `provider`, or the size of one of its fields. The fourth is not a
-/// claim at all: [`FailedCheck::PinBudget`] records an item assembly had no
-/// room to honor. Read the variant before treating a rejection as evidence
-/// that a provider lied — only [`FailedCheck::Kind`], [`FailedCheck::Provenance`]
-/// and [`FailedCheck::FieldTooLong`] are that.
+/// its `provider`, or the size of one of its fields. The other two are not
+/// about any one item's claim: [`FailedCheck::TooManyItems`] records that a
+/// provider's whole answer was over the item-count cap, decided before any
+/// item in it was individually inspected, and [`FailedCheck::PinBudget`]
+/// records an item assembly had no room to honor even though it passed
+/// every check above. Read the variant before treating a rejection as
+/// evidence that a provider lied — only [`FailedCheck::Kind`],
+/// [`FailedCheck::Provenance`] and [`FailedCheck::FieldTooLong`] are that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailedCheck {
     /// The item's `kind` is not among the producing provider's declared
@@ -368,6 +385,34 @@ pub enum FailedCheck {
         /// own docs for the exact spelling used.
         field: &'static str,
     },
+    /// The producing provider's whole answer had more than
+    /// [`MAX_ITEMS_PER_PROVIDER_ANSWER`] items. `excess` is how many were
+    /// dropped — the amount past the cap, not the answer's whole length.
+    ///
+    /// Recorded once per over-limit *answer*, never once per dropped item:
+    /// an unbounded rejection list would defeat the count cap's own
+    /// purpose, so this variant trades per-item detail for a bound, the
+    /// same trade the truncation itself makes. See
+    /// [`MAX_ITEMS_PER_PROVIDER_ANSWER`]'s "Truncate the tail, and record
+    /// the excess" section for why one aggregate rejection satisfies issue
+    /// #30's "with the excess recorded" wording without reintroducing
+    /// unbounded per-item work.
+    ///
+    /// Unlike [`FailedCheck::Kind`], [`FailedCheck::Provenance`] and
+    /// [`FailedCheck::FieldTooLong`], the descriptive fields on the
+    /// [`Rejection`] this produces do not describe an item that failed a
+    /// check — no single item did; the dropped ones were never inspected.
+    /// They describe one concrete item sampled from the dropped tail (the
+    /// first item past the cap), read at a fixed O(1) offset rather than
+    /// found by scanning it, so the rejection names something real rather
+    /// than a fabricated placeholder. See [`Rejection`]'s own docs for how
+    /// its fields read under this variant.
+    TooManyItems {
+        /// How many items were dropped: `output.items.len()` minus
+        /// [`MAX_ITEMS_PER_PROVIDER_ANSWER`], not the answer's whole
+        /// length.
+        excess: usize,
+    },
     /// The item is flagged `append_to_end` and the **pin budget** had nothing
     /// left to spend on it: either its producer already had its
     /// [`MAX_PINNED_ITEMS_PER_PROVIDER`] pins, or the query had already
@@ -375,9 +420,11 @@ pub enum FailedCheck {
     /// Assembly refused it the pinned path rather than granting it placement
     /// no later step could take back.
     ///
-    /// Unlike the three above, this says nothing about the item: it passed
-    /// every check above it — an item any of those rejected never reaches
-    /// the pinned path at all — and it is here only because its producer's
+    /// Unlike the three per-item checks above (and unlike
+    /// [`FailedCheck::TooManyItems`], which is about an answer rather than
+    /// an item at all), this says nothing about the item: it passed every
+    /// check above it — an item any of those rejected never reaches the
+    /// pinned path at all — and it is here only because its producer's
     /// share, or the query's total, was already spent. Which items spend the
     /// budget is provider-supplied order, so the same item can be honored on
     /// one query and refused on the next as other providers' answers change
@@ -397,6 +444,16 @@ pub enum FailedCheck {
 /// proves nothing on its own. What the checks bought is that the string is the
 /// producer's *real* manifest id rather than a claim the item made — the same
 /// fact `producer_id` asserts everywhere, arrived at earlier.
+///
+/// They read differently again under [`FailedCheck::TooManyItems`]: no
+/// single item failed anything there — the dropped items were never
+/// inspected — so `item_id`, `claimed_kind` and `claimed_provider` describe
+/// one concrete item sampled from the dropped tail (the first item past the
+/// cap) rather than an item the check actually ran against. `producer_id`
+/// is unaffected by that: it still names the producer whose answer was
+/// truncated, read the same way every other variant reads it — from the
+/// manifest [`CheckedItems::check`] checked against, not from the sampled
+/// item's own (unchecked) claim.
 ///
 /// Rejections are *returned as data* rather than logged from here, because
 /// [`Pipeline::assemble`] is pure — it runs on every keystroke and may not
@@ -495,20 +552,34 @@ impl CheckedItems {
     /// dropped first, so the loop below — and every allocation, comparison
     /// and possible [`Rejection`] it might produce — never runs more than
     /// that many times per output, regardless of what the provider claims to
-    /// send. See [`MAX_ITEMS_PER_PROVIDER_ANSWER`] for why the cap is a
-    /// truncation and not a rejection of the whole output.
+    /// send. An over-limit answer also produces exactly one [`Rejection`] of
+    /// its own, [`FailedCheck::TooManyItems`], recording how many items were
+    /// dropped — issue #30's "excess recorded" requirement — without turning
+    /// the dropped tail into one rejection per item, which would reopen the
+    /// unbounded cost the truncation exists to close. See
+    /// [`MAX_ITEMS_PER_PROVIDER_ANSWER`] for why the cap is a truncation of
+    /// the tail and not a rejection of the whole output.
     ///
-    /// DECISION: an item that fails more than one of the three checks above
-    /// is reported once, against the earliest of them to run — [`FailedCheck::Kind`],
-    /// then [`FailedCheck::Provenance`], then [`FailedCheck::FieldTooLong`].
-    /// A rejection identifies an item that is already gone; enumerating every
-    /// way in which it lied would make the rejection list a variable-length
-    /// report of a single event, for no gain to the only consumer it has (a
-    /// future logging seam that wants to say what was dropped and why). The
-    /// same one-report-per-item rule this comment already stated for the two
-    /// original checks extends unchanged to the field-length check added
-    /// alongside them: it is simply one more condition in the same chain,
-    /// checked after the two that were already there.
+    /// DECISION: an item that fails more than one of the three per-item
+    /// checks below is reported once, against the earliest of them to run —
+    /// [`FailedCheck::Kind`], then [`FailedCheck::Provenance`], then
+    /// [`FailedCheck::FieldTooLong`]. A rejection identifies an item that is
+    /// already gone; enumerating every way in which it lied would make the
+    /// rejection list a variable-length report of a single event, for no
+    /// gain to the only consumer it has (a future logging seam that wants to
+    /// say what was dropped and why). The same one-report-per-item rule this
+    /// comment already stated for the two original checks extends unchanged
+    /// to the field-length check added alongside them: it is simply one more
+    /// condition in the same chain, checked after the two that were already
+    /// there.
+    ///
+    /// [`FailedCheck::TooManyItems`] is not part of that chain and does not
+    /// compete with it: it is produced once per over-limit *answer*, before
+    /// the per-item loop even starts, on items the loop never sees at all.
+    /// A provider that both floods its answer (`TooManyItems`) and lies
+    /// about a surviving item's kind (`FailedCheck::Kind`) is reported for
+    /// both — two separate rejections for two separate facts, neither one
+    /// counted against the other.
     ///
     /// Note what this does *not* check: that the producing manifest itself is
     /// truthful. A provider that honestly declares `id: "evil"` and `kinds:
@@ -523,10 +594,34 @@ impl CheckedItems {
         let mut rejections = Vec::new();
 
         for mut output in outputs {
+            // Records the whole truncated tail as one Rejection, before it
+            // is dropped: issue #30's "excess recorded" requirement, without
+            // turning the dropped tail into one rejection per item, which
+            // would make the rejection list itself unbounded — exactly the
+            // failure mode this cap exists to close. `sample` is the first
+            // item past the cap: real data, not a fabricated placeholder,
+            // read at a fixed O(1) offset rather than found by scanning the
+            // tail, so recording the excess costs nothing proportional to
+            // how far over the cap the answer was.
+            let received = output.items.len();
+            if received > MAX_ITEMS_PER_PROVIDER_ANSWER {
+                let sample = &output.items[MAX_ITEMS_PER_PROVIDER_ANSWER];
+                rejections.push(Rejection {
+                    item_id: sample.id.clone(),
+                    claimed_kind: sample.kind.clone(),
+                    claimed_provider: sample.provider.clone(),
+                    producer_id: output.manifest.id.to_string(),
+                    check: FailedCheck::TooManyItems {
+                        excess: received - MAX_ITEMS_PER_PROVIDER_ANSWER,
+                    },
+                });
+            }
+
             // Bounds the per-item loop below to at most this many iterations
             // for this output, before a single item is inspected — see
             // MAX_ITEMS_PER_PROVIDER_ANSWER for why this is a truncation of
-            // the excess rather than a rejection of the whole answer.
+            // the excess rather than a rejection of each dropped item
+            // individually.
             output.items.truncate(MAX_ITEMS_PER_PROVIDER_ANSWER);
 
             // Each item is checked against `output.manifest` and nothing
@@ -561,6 +656,23 @@ impl CheckedItems {
                     Some(FailedCheck::FieldTooLong {
                         field: "Item.copy_text",
                     })
+                // Count before labels, deliberately: `actions.len()` is O(1)
+                // (`Vec::len` is a stored field, not a scan), but the
+                // `.any(...)` label check below it is O(actions.len()) even
+                // when it finds nothing — and nothing upstream of this loop
+                // bounds how large an item's own `actions` vector is before
+                // this check runs. Checking the count first means a
+                // hostile item with an oversized `actions` vector of short
+                // labels is rejected in O(1), before the label scan ever
+                // touches it. Swapping this back — even though it reads as
+                // a harmless "checks in declaration order" tidy-up — would
+                // reopen exactly the unbounded per-item scan this cap
+                // exists to close. See
+                // `tests::an_item_over_both_the_action_count_and_a_label_bound_is_reported_against_the_count`.
+                } else if item.actions.len() > MAX_ACTIONS_PER_ITEM {
+                    Some(FailedCheck::FieldTooLong {
+                        field: "Item.actions",
+                    })
                 } else if item
                     .actions
                     .iter()
@@ -568,10 +680,6 @@ impl CheckedItems {
                 {
                     Some(FailedCheck::FieldTooLong {
                         field: "Action.label",
-                    })
-                } else if item.actions.len() > MAX_ACTIONS_PER_ITEM {
-                    Some(FailedCheck::FieldTooLong {
-                        field: "Item.actions",
                     })
                 } else {
                     None
@@ -2381,8 +2489,17 @@ mod tests {
         assert!(checked.rejections().is_empty());
     }
 
+    // Review remediation (issue #61 Task 2 review, finding "count-cap
+    // recording"): this test used to be named
+    // `a_provider_answer_one_over_the_cap_drops_the_tail_silently` and
+    // asserted `checked.rejections().is_empty()` — that was the plan's
+    // original Decision 1 choice, later found not to satisfy issue #30's
+    // "truncated... with the excess recorded" wording. Truncation is still
+    // silent about each *individual* dropped item (none of them is
+    // inspected, so none is rejected), but the truncation event itself is
+    // now recorded as one Rejection. Renamed and rewritten to match.
     #[test]
-    fn a_provider_answer_one_over_the_cap_drops_the_tail_silently() {
+    fn a_provider_answer_one_over_the_cap_drops_the_tail_and_records_the_excess() {
         let checked = CheckedItems::check(vec![output(
             "test",
             ALL_KINDS.to_vec(),
@@ -2393,17 +2510,57 @@ mod tests {
             MAX_ITEMS_PER_PROVIDER_ANSWER,
             "the one item over the cap must not survive"
         );
-        assert!(
-            checked.rejections().is_empty(),
-            "the excess is truncated away before a single item is inspected, \
-             so it is dropped silently rather than turned into a Rejection — \
-             there is nothing to reject it for"
-        );
         assert_eq!(
             checked.items().last().unwrap().id.as_str(),
             format!("app:{}", MAX_ITEMS_PER_PROVIDER_ANSWER - 1),
             "the surviving items are the head of the answer, not an \
              arbitrary subset"
+        );
+        assert_eq!(
+            checked.rejections().len(),
+            1,
+            "the excess is recorded as one Rejection for the whole \
+             truncated answer, not one per dropped item — issue #30's \
+             \"excess recorded\" wording, without reopening the unbounded \
+             per-item cost the count cap exists to close"
+        );
+        assert_eq!(
+            checked.rejections()[0].check,
+            FailedCheck::TooManyItems { excess: 1 },
+            "exactly one item was over the cap"
+        );
+        assert_eq!(
+            checked.rejections()[0].item_id.as_str(),
+            format!("app:{MAX_ITEMS_PER_PROVIDER_ANSWER}"),
+            "the rejection describes the first item past the cap, as a \
+             concrete sample of what was dropped"
+        );
+        assert_eq!(
+            checked.rejections()[0].producer_id,
+            "test",
+            "the rejection still names the actual producer, the same way \
+             every other check's rejection does"
+        );
+    }
+
+    #[test]
+    fn a_provider_answer_far_over_the_cap_still_records_exactly_one_rejection() {
+        let checked = CheckedItems::check(vec![output(
+            "test",
+            ALL_KINDS.to_vec(),
+            many_items(MAX_ITEMS_PER_PROVIDER_ANSWER + 5_000),
+        )]);
+        assert_eq!(checked.items().len(), MAX_ITEMS_PER_PROVIDER_ANSWER);
+        assert_eq!(
+            checked.rejections().len(),
+            1,
+            "however large the excess, assembly records it as one \
+             Rejection — one per dropped item would be unbounded, \
+             defeating the whole point of the count cap"
+        );
+        assert_eq!(
+            checked.rejections()[0].check,
+            FailedCheck::TooManyItems { excess: 5_000 }
         );
     }
 
@@ -2569,6 +2726,41 @@ mod tests {
             FailedCheck::FieldTooLong {
                 field: "Item.actions"
             }
+        );
+    }
+
+    /// Review remediation (issue #61 Task 2 review, finding 1 — Important):
+    /// `check()`'s two `actions`-related checks must run count-first,
+    /// label-second, so an item whose `actions` vector is over
+    /// `MAX_ACTIONS_PER_ITEM` is rejected in O(1) before the O(`actions.len()`)
+    /// label scan ever touches it. An item with many short-labelled actions
+    /// (no label individually violates its own bound) can't tell the two
+    /// orders apart by outcome alone — both would eventually report
+    /// `Item.actions` — so this test instead makes an item fail *both*
+    /// checks at once: only the fixed order (count first) reports
+    /// `Item.actions` here; the order the review flagged would have scanned
+    /// straight to the over-long label and reported `Action.label` instead,
+    /// after paying for the full scan.
+    #[test]
+    fn an_item_over_both_the_action_count_and_a_label_bound_is_reported_against_the_count() {
+        let mut evil = item_with_action_count(MAX_ACTIONS_PER_ITEM + 1);
+        evil.actions[0].label = "a".repeat(MAX_ACTION_LABEL + 1);
+
+        let checked = CheckedItems::check(vec![output("test", ALL_KINDS.to_vec(), vec![evil])]);
+        assert!(checked.items().is_empty());
+        assert_eq!(
+            checked.rejections().len(),
+            1,
+            "one failing item must be one rejection, however many checks it fails"
+        );
+        assert_eq!(
+            checked.rejections()[0].check,
+            FailedCheck::FieldTooLong {
+                field: "Item.actions"
+            },
+            "the count check now runs before the label scan, so an item \
+             over both bounds is reported against the count — the label \
+             scan never runs at all"
         );
     }
 
