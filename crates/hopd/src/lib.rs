@@ -22,6 +22,7 @@
 //! Each remaining gap is named where it applies, in [`runtime_dir`],
 //! [`server`] and [`source`].
 
+pub(crate) mod activation;
 pub mod apps;
 pub mod calculator;
 pub mod config;
