@@ -179,9 +179,10 @@ fn a_launch_recorded_in_one_daemon_lifetime_survives_a_restart_into_a_second() {
     );
 
     // Ends lifetime 1. Dropping `daemon1` tears down its tokio runtime,
-    // which aborts the spawned server task and closes the socket —
-    // everything this daemon held in memory (its `Pipeline`, its
-    // `ProviderHost`) goes with it. Only what `record_launch` already wrote
+    // which aborts the spawned server task and drops the listener, so
+    // nothing accepts on that socket again — everything this daemon held in
+    // memory (its `Pipeline`, its `ProviderHost`) goes with it. Only what
+    // `record_launch` already wrote
     // to `store_path` survives past this point, exactly what a real process
     // restart would leave behind.
     drop(stream1);
