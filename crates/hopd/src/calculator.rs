@@ -2,7 +2,7 @@
 //! `fasteval` and offers the formatted result as a single, copyable item.
 //!
 //! Every function in this module is pure — no `std::fs`, no `std::process`,
-//! no network client anywhere in this file (acceptance criterion 4 on
+//! no network client anywhere in this file (acceptance criterion 6 on
 //! issue #58; pinned structurally once the whole module exists, by
 //! `provider_tests::the_module_source_touches_no_disk_process_or_network`
 //! in Task 4). There is no index to build, no state to watch, and no cache
@@ -35,20 +35,6 @@ use fasteval::EmptyNamespace;
 /// `is_finite()` check below, this function would hand a caller a value it
 /// could format and show as `"1/0 = inf"`, which is exactly the "error
 /// item" acceptance criterion 4 forbids, just spelled differently.
-// No consumer outside `#[cfg(test)]` until Task 3 wires this into
-// `build_item` — matching `crates/hopd/src/apps.rs`'s own precedent for the
-// identical shape of problem (`parse_desktop_entry` et al., landed with no
-// caller ahead of the directory scan that used them). `cfg_attr(not(test),
-// ...)` rather than a bare `#[expect]`: this module's own tests already call
-// `evaluate` directly, so under `--cfg test` it is not dead at all, and an
-// unconditional `#[expect]` would itself go unfulfilled on `cargo test`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 3 (issue #58) wires this into build_item"
-    )
-)]
 pub(crate) fn evaluate(expr: &str) -> Option<f64> {
     let mut ns = EmptyNamespace;
     match fasteval::ez_eval(expr, &mut ns) {
@@ -93,15 +79,6 @@ const EXPONENTIAL_BELOW: f64 = 1e-9;
 /// `format_tests::format_result_matches_the_verified_table` below —
 /// verified against a real `rustc` run before being written into this
 /// plan, not estimated.
-// No consumer outside `#[cfg(test)]` until Task 3 wires this into
-// `build_item`, matching `evaluate`'s own reasoning above.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no consumer until Task 3 (issue #58) wires this into build_item"
-    )
-)]
 pub(crate) fn format_result(value: f64) -> String {
     if value == 0.0 {
         return "0".to_string();
@@ -123,6 +100,176 @@ fn trim_trailing_zeros(s: &str) -> String {
         return s.to_string();
     }
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+use hop_core::provider::CALCULATOR_PROVIDER_ID;
+use hop_protocol::{Action, ActionId, ActionKind, Item, ItemId, Kind, limits::MAX_TITLE};
+
+/// Builds the single item a routed term produces, or `None` if [`evaluate`]
+/// could not turn it into a finite result — the one branch point between
+/// "show a calculator item" and "show nothing," shared by
+/// `CalculatorProvider::query` (Task 4) with no other logic layered on top
+/// of it.
+///
+/// # The item id encodes the expression, not the result
+///
+/// The id is `calc:<term>` — the *expression* the user typed, not the
+/// number it evaluates to. Two facts, both checked before writing this
+/// function, argue for this over the alternative (encoding the formatted
+/// result instead):
+///
+/// - [`hop_core::learning::Learning::record_launch`] and
+///   [`hop_core::learning::Learning::boost_for`] both key **only** on the
+///   bare item id string — `crates/hop-core/src/learning.rs`'s `record`
+///   and `boost_for` never look past `item_id.as_str()`. If the id encoded
+///   the result, `2+2` and `1+3` — two different expressions that happen
+///   to land on the same number — would share one learning key, and
+///   launching one would boost the other. Encoding the expression keeps
+///   every distinct query its own row.
+/// - This is already the shape the rest of the tree assumes:
+///   `crates/hop-core/src/pipeline.rs` and `crates/hop-core/src/rank.rs`
+///   both build `Kind::Calculator` test fixtures as `"calc:2+2"`,
+///   `"calc:terminal"` and similar (`pipeline.rs:1215`, `:1890`, `:2285`;
+///   `rank.rs:785`, among others) — this function matches a scheme the
+///   tree already leans on, rather than inventing a third one.
+///
+/// # `ItemId::new` cannot fail here, and is still checked rather than
+/// unwrapped
+///
+/// `term` reaches this function, in production, only after routing, and
+/// [`hop_protocol::limits::MAX_QUERY_TEXT`] bounds a query's raw text at
+/// 1 024 bytes — the largest `term` this function is ever handed by
+/// `CalculatorProvider`. `"calc:"` adds 5 more, for 1 029 at the absolute
+/// worst case, comfortably under [`hop_protocol::limits::MAX_ITEM_ID`]'s
+/// 4 096. So the `.ok()?` below can be proven never to fire for any term
+/// that arrived through the router — the guard exists because the type
+/// allows the possibility, not because it is expected to, matching the
+/// same reasoning `crates/hopd/src/apps.rs`'s `build_entry` gives for its
+/// own `ItemId::new(...).ok()?`. This module's own tests call `build_item`
+/// directly with hand-written terms that do not go through that bound at
+/// all, so the guard is real for them.
+///
+/// # The title is truncated; the id is not
+///
+/// `title` is `"<term> = <result>"`, which can exceed
+/// [`hop_protocol::limits::MAX_TITLE`] (1 024 bytes) even though `term`
+/// alone cannot exceed 1 024: a term at or near that query bound, plus
+/// `" = "` and the formatted result, clears it. Unlike `ItemId::new`
+/// above, this is **not** a guard against something that cannot happen — a
+/// long, syntactically valid, evaluable expression really can reach this
+/// function, and without truncation
+/// [`hop_core::pipeline::CheckedItems::check`] would reject the whole item
+/// outright as a field-too-long rejection, silently dropping a
+/// correctly-computed answer. Truncating the title at a char boundary
+/// (never the id, which the bound above shows has room to spare) keeps
+/// the item alive instead — pinned by
+/// `item_tests::an_overlong_title_is_truncated_rather_than_dropping_the_item`.
+// No consumer outside `#[cfg(test)]` until Task 4 wires this into
+// `CalculatorProvider::query` — same shape as `evaluate`'s and
+// `format_result`'s own dead-code exemption while they waited for this
+// function to call them. `cfg_attr(not(test), ...)` rather than a bare
+// `#[expect]`: this module's own tests already call `build_item` directly,
+// so under `--cfg test` it is not dead at all, and an unconditional
+// `#[expect]` would itself go unfulfilled on `cargo test`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no consumer until Task 4 (issue #58) wires this into CalculatorProvider::query"
+    )
+)]
+pub(crate) fn build_item(term: &str) -> Option<Item> {
+    let value = evaluate(term)?;
+    let result = format_result(value);
+    let id = ItemId::new(format!("calc:{term}")).ok()?;
+    let title = truncate_to_byte_boundary(&format!("{term} = {result}"), MAX_TITLE);
+
+    Some(Item {
+        id,
+        kind: Kind::Calculator,
+        title,
+        subtitle: None,
+        icon: None,
+        actions: vec![Action {
+            id: ActionId::new("copy").expect("within bounds by construction"),
+            kind: ActionKind::Copy,
+            label: "Copy".to_string(),
+        }],
+        default_action: ActionId::new("copy").expect("within bounds by construction"),
+        copy_text: None,
+        append_to_end: false,
+        provider: CALCULATOR_PROVIDER_ID.to_string(),
+    })
+}
+
+/// Truncates `s` to at most `max` bytes, never splitting a multi-byte
+/// character. Ported verbatim from `crates/hopd/src/apps.rs`'s function of
+/// the same name — not shared via a common module; see this plan's Design
+/// decision 7 for why `hopd/src/` stays flat rather than growing a shared
+/// module for one ten-line function.
+fn truncate_to_byte_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+#[cfg(test)]
+mod item_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn build_item_sets_the_calc_prefixed_id_and_the_expr_equals_result_title() {
+        let item = build_item("2+2").expect("2+2 evaluates");
+        assert_eq!(item.id.as_str(), "calc:2+2");
+        assert_eq!(item.title, "2+2 = 4");
+        assert_eq!(item.kind, Kind::Calculator);
+        assert_eq!(item.provider, CALCULATOR_PROVIDER_ID);
+    }
+
+    #[test]
+    fn build_item_carries_exactly_one_copy_action_agreeing_with_default_action() {
+        let item = build_item("2+2").unwrap();
+        assert_eq!(item.actions.len(), 1);
+        assert_eq!(item.actions[0].kind, ActionKind::Copy);
+        assert_eq!(item.actions[0].id, item.default_action);
+    }
+
+    #[test]
+    fn build_item_leaves_the_items_own_copy_text_field_unset() {
+        // Deliberate — see this plan's Scope section on why the Copy
+        // action + execute() round trip is the sole mechanism for
+        // acceptance criterion 3, not a second, redundant path.
+        let item = build_item("2+2").unwrap();
+        assert_eq!(item.copy_text, None);
+    }
+
+    #[test]
+    fn build_item_returns_none_for_input_evaluate_refuses() {
+        assert!(build_item("hello").is_none());
+        assert!(build_item("1/0").is_none());
+        assert!(build_item("").is_none());
+    }
+
+    #[test]
+    fn an_overlong_title_is_truncated_rather_than_dropping_the_item() {
+        // "1" then "+1" repeated 510 times is a valid, evaluable expression
+        // 1021 bytes long — short of MAX_QUERY_TEXT (a real router-derived
+        // term could be this long), but long enough that
+        // "<term> = <result>" (1021 + " = 511" = 1027 bytes) clears
+        // MAX_TITLE (1024).
+        let term = format!("1{}", "+1".repeat(510));
+        assert_eq!(term.len(), 1021);
+        let item = build_item(&term).expect("a long chain of additions still evaluates");
+        assert!(item.title.len() <= MAX_TITLE);
+        assert!(std::str::from_utf8(item.title.as_bytes()).is_ok());
+    }
 }
 
 #[cfg(test)]
