@@ -21,6 +21,9 @@
 //! carries the [`FailedCheck`] that produced it precisely so the two are told
 //! apart.
 
+use hop_protocol::limits::{
+    MAX_ACTION_LABEL, MAX_ACTIONS_PER_ITEM, MAX_COPY_TEXT, MAX_SUBTITLE, MAX_TITLE,
+};
 use hop_protocol::{Item, ItemId, Kind};
 
 use crate::aliases::Aliases;
@@ -278,15 +281,60 @@ pub const MAX_PINNED_ITEMS_PER_PROVIDER: usize = 1;
 /// vanishes.
 pub const MAX_PINNED_ITEMS_PER_QUERY: usize = 3;
 
+/// Maximum items [`CheckedItems::check`] accepts from one provider's single
+/// [`ProviderOutput`] — one producer's answer to one query. Enforced by
+/// truncating `output.items` to this many *before* the per-item loop begins,
+/// so the loop itself, and every allocation it might do, is bounded to at
+/// most this many iterations regardless of what a provider claims to send.
+///
+/// # Why the same number as a wire-frame cap, at a different layer
+///
+/// Deliberately the same value as
+/// [`MAX_ITEMS_PER_RESULTS_FRAME`](hop_protocol::limits::MAX_ITEMS_PER_RESULTS_FRAME) —
+/// reused, not coincidental, and not a shared constant either, because the two
+/// bound different things at different points in the pipeline. That module's
+/// cap bounds one **wire frame**, applied at deserialization on the
+/// client-facing edge: no *client* need ever be shown more than that many
+/// items at once. This constant bounds one **provider's answer**, applied
+/// where that answer enters assembly — well before boosting, ranking, or a
+/// results frame is ever built. Reusing the number says the same thing at
+/// this earlier layer that the wire already says at the outer one: no single
+/// provider should be able to hand assembly more raw material than a client
+/// could ever legitimately be shown in one frame. Every provider that exists
+/// today (the skeleton, the apps provider) answers with a handful to a few
+/// hundred items; 1 000 is generous headroom, revisitable if a future bulk
+/// provider (files, M5) needs its own pagination story — that provider would
+/// do its own pre-filtering rather than dumping an entire index into one
+/// `query()` answer.
+///
+/// # Truncate, not reject
+///
+/// The tail is silently dropped — the same "truncate-and-terminate, nothing
+/// on the wire naming it" precedent `hopd::source`'s own accumulator already
+/// uses for its own count cap
+/// ([`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY)).
+/// Unlike a field-length violation (see [`FailedCheck::FieldTooLong`]), an
+/// item past this cap was never inspected at all, so there is nothing to
+/// reject it *for*: the cap is about how much of a provider's answer assembly
+/// is willing to look at, not about anything a dropped item did wrong.
+///
+/// This bounds what *assembly* does with a provider's answer. It does
+/// nothing about the cost a hostile provider's own `query()` paid to build a
+/// larger `Vec<Item>` before returning it — that cost is bounded elsewhere
+/// ([`ProviderHost::run_one`](crate::host::ProviderHost)'s existing
+/// budget/timeout enforcement) and is out of this constant's scope.
+pub const MAX_ITEMS_PER_PROVIDER_ANSWER: usize = 1_000;
+
 /// Which check an item failed, and so why assembly declined it. See
 /// [`Rejection`].
 ///
-/// Two of the three are the manifest checks [`CheckedItems::check`] runs, and
-/// both are about a claim the item made for itself. The third is not a claim
-/// at all: [`FailedCheck::PinBudget`] records an item assembly had no room to
-/// honor. Read the variant before treating a rejection as evidence that a
-/// provider lied — only [`FailedCheck::Kind`] and [`FailedCheck::Provenance`]
-/// are that.
+/// Three of the four are checks [`CheckedItems::check`] runs against the
+/// item itself, and all three are about a claim the item made — its `kind`,
+/// its `provider`, or the size of one of its fields. The fourth is not a
+/// claim at all: [`FailedCheck::PinBudget`] records an item assembly had no
+/// room to honor. Read the variant before treating a rejection as evidence
+/// that a provider lied — only [`FailedCheck::Kind`], [`FailedCheck::Provenance`]
+/// and [`FailedCheck::FieldTooLong`] are that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailedCheck {
     /// The item's `kind` is not among the producing provider's declared
@@ -299,6 +347,27 @@ pub enum FailedCheck {
     /// [`ProviderManifest::id`]. The item claims to have come from somewhere
     /// it did not.
     Provenance,
+    /// One of the item's variable-length fields is over the bound
+    /// `hop_protocol::limits` already applies to that same field when it
+    /// arrives by socket — `title` ([`MAX_TITLE`]), `subtitle`
+    /// ([`MAX_SUBTITLE`]), `copy_text` ([`MAX_COPY_TEXT`]), an action's
+    /// `label` ([`MAX_ACTION_LABEL`]), or the number of `actions`
+    /// ([`MAX_ACTIONS_PER_ITEM`]). `field` names which one, as the same
+    /// `Type.field` spelling `hop_protocol::limits`'s own deserializers use
+    /// (e.g. `"Item.title"`, `"Action.label"`) — not a new naming scheme,
+    /// so grepping a field name finds both layers that bound it.
+    ///
+    /// An item built in-process and never parsed off the wire had passed no
+    /// length check at all until this variant existed — the gap
+    /// [`hop_protocol::limits::MAX_ITEMS_PER_QUERY`]'s own docs used to call
+    /// "documented, not enforced... wherever an item is built in-process".
+    /// This is where it now is enforced, for the one seam every provider's
+    /// answer must cross: [`CheckedItems::check`].
+    FieldTooLong {
+        /// Which field broke its bound, as `Type.field` — see this variant's
+        /// own docs for the exact spelling used.
+        field: &'static str,
+    },
     /// The item is flagged `append_to_end` and the **pin budget** had nothing
     /// left to spend on it: either its producer already had its
     /// [`MAX_PINNED_ITEMS_PER_PROVIDER`] pins, or the query had already
@@ -306,12 +375,13 @@ pub enum FailedCheck {
     /// Assembly refused it the pinned path rather than granting it placement
     /// no later step could take back.
     ///
-    /// Unlike the two above, this says nothing about the item: it passed both
-    /// manifest checks — an item either of those rejected never reaches the
-    /// pinned path at all — and it is here only because its producer's share,
-    /// or the query's total, was already spent. Which items spend the budget is
-    /// provider-supplied order, so the same item can be honored on one query
-    /// and refused on the next as other providers' answers change around it.
+    /// Unlike the three above, this says nothing about the item: it passed
+    /// every check above it — an item any of those rejected never reaches
+    /// the pinned path at all — and it is here only because its producer's
+    /// share, or the query's total, was already spent. Which items spend the
+    /// budget is provider-supplied order, so the same item can be honored on
+    /// one query and refused on the next as other providers' answers change
+    /// around it.
     PinBudget,
 }
 
@@ -319,8 +389,10 @@ pub enum FailedCheck {
 ///
 /// The four descriptive fields mean the same thing under every
 /// [`FailedCheck`], but they read differently under
-/// [`FailedCheck::PinBudget`]: that item passed both manifest checks, so
-/// `claimed_provider` and `producer_id` are filled from the same string and
+/// [`FailedCheck::PinBudget`]: that item passed every check
+/// [`CheckedItems::check`] runs against an item itself (kind, provenance,
+/// field length), so `claimed_provider` and `producer_id` are filled from
+/// the same string and
 /// are equal by construction. Their equality is not the interesting part and
 /// proves nothing on its own. What the checks bought is that the string is the
 /// producer's *real* manifest id rather than a claim the item made — the same
@@ -351,8 +423,10 @@ pub struct Rejection {
     /// The [`ProviderManifest::id`] of the provider that actually produced
     /// the item, which is what the claims above were checked against.
     pub producer_id: String,
-    /// Which check failed. An item that fails both *manifest* checks is
-    /// reported once, against the kind check — see [`CheckedItems::check`].
+    /// Which check failed. An item that fails more than one of
+    /// [`CheckedItems::check`]'s three per-item checks (kind, provenance,
+    /// field length) is reported once, against whichever runs first — see
+    /// that function's `DECISION` comment.
     pub check: FailedCheck,
 }
 
@@ -402,21 +476,39 @@ pub struct CheckedItems {
 }
 
 impl CheckedItems {
-    /// Runs both manifest checks over every provider's output, in the order
+    /// Runs every per-item check over each provider's output, in the order
     /// the outputs were given, keeping each provider's items in the order
-    /// that provider returned them.
+    /// that provider returned them — after first truncating each output's
+    /// own item count to [`MAX_ITEMS_PER_PROVIDER_ANSWER`].
     ///
-    /// An item is kept only if its `kind` is one its producer declared, and
-    /// its `provider` string equals its producer's manifest `id`. Anything
-    /// else becomes a [`Rejection`] and never reaches boosts, dedupe,
-    /// filtering or ranking.
+    /// An item is kept only if its `kind` is one its producer declared, its
+    /// `provider` string equals its producer's manifest `id`, and none of its
+    /// variable-length fields (`title`, `subtitle`, `copy_text`, an action's
+    /// `label`, or the number of `actions`) is over the bound
+    /// `hop_protocol::limits` already applies to that same field on the wire
+    /// — see [`FailedCheck::FieldTooLong`]. Anything else becomes a
+    /// [`Rejection`] and never reaches boosts, dedupe, filtering or ranking.
     ///
-    /// DECISION: an item that fails both checks is reported once, against
-    /// [`FailedCheck::Kind`]. A rejection identifies an item that is already
-    /// gone; enumerating every way in which it lied would make the rejection
-    /// list a variable-length report of a single event, for no gain to the
-    /// only consumer it has (a future logging seam that wants to say what was
-    /// dropped and why).
+    /// The truncation runs *before* this loop even starts, not as one more
+    /// condition inside it: a provider answering with far more than
+    /// [`MAX_ITEMS_PER_PROVIDER_ANSWER`] items has the tail of `output.items`
+    /// dropped first, so the loop below — and every allocation, comparison
+    /// and possible [`Rejection`] it might produce — never runs more than
+    /// that many times per output, regardless of what the provider claims to
+    /// send. See [`MAX_ITEMS_PER_PROVIDER_ANSWER`] for why the cap is a
+    /// truncation and not a rejection of the whole output.
+    ///
+    /// DECISION: an item that fails more than one of the three checks above
+    /// is reported once, against the earliest of them to run — [`FailedCheck::Kind`],
+    /// then [`FailedCheck::Provenance`], then [`FailedCheck::FieldTooLong`].
+    /// A rejection identifies an item that is already gone; enumerating every
+    /// way in which it lied would make the rejection list a variable-length
+    /// report of a single event, for no gain to the only consumer it has (a
+    /// future logging seam that wants to say what was dropped and why). The
+    /// same one-report-per-item rule this comment already stated for the two
+    /// original checks extends unchanged to the field-length check added
+    /// alongside them: it is simply one more condition in the same chain,
+    /// checked after the two that were already there.
     ///
     /// Note what this does *not* check: that the producing manifest itself is
     /// truthful. A provider that honestly declares `id: "evil"` and `kinds:
@@ -430,7 +522,13 @@ impl CheckedItems {
         let mut items = Vec::new();
         let mut rejections = Vec::new();
 
-        for output in outputs {
+        for mut output in outputs {
+            // Bounds the per-item loop below to at most this many iterations
+            // for this output, before a single item is inspected — see
+            // MAX_ITEMS_PER_PROVIDER_ANSWER for why this is a truncation of
+            // the excess rather than a rejection of the whole answer.
+            output.items.truncate(MAX_ITEMS_PER_PROVIDER_ANSWER);
+
             // Each item is checked against `output.manifest` and nothing
             // else. Hoisting the declared kinds or the ids out of this loop —
             // into one set spanning every provider that answered — would look
@@ -443,6 +541,38 @@ impl CheckedItems {
                     Some(FailedCheck::Kind)
                 } else if item.provider != output.manifest.id {
                     Some(FailedCheck::Provenance)
+                } else if item.title.len() > MAX_TITLE {
+                    Some(FailedCheck::FieldTooLong {
+                        field: "Item.title",
+                    })
+                } else if item
+                    .subtitle
+                    .as_ref()
+                    .is_some_and(|subtitle| subtitle.len() > MAX_SUBTITLE)
+                {
+                    Some(FailedCheck::FieldTooLong {
+                        field: "Item.subtitle",
+                    })
+                } else if item
+                    .copy_text
+                    .as_ref()
+                    .is_some_and(|copy_text| copy_text.len() > MAX_COPY_TEXT)
+                {
+                    Some(FailedCheck::FieldTooLong {
+                        field: "Item.copy_text",
+                    })
+                } else if item
+                    .actions
+                    .iter()
+                    .any(|action| action.label.len() > MAX_ACTION_LABEL)
+                {
+                    Some(FailedCheck::FieldTooLong {
+                        field: "Action.label",
+                    })
+                } else if item.actions.len() > MAX_ACTIONS_PER_ITEM {
+                    Some(FailedCheck::FieldTooLong {
+                        field: "Item.actions",
+                    })
                 } else {
                     None
                 };
@@ -463,7 +593,7 @@ impl CheckedItems {
         CheckedItems { items, rejections }
     }
 
-    /// The items that passed both checks, in the order [`CheckedItems::check`]
+    /// The items that passed every check, in the order [`CheckedItems::check`]
     /// received them.
     ///
     /// A borrow, not a second route around the check: it lends what already
@@ -2221,6 +2351,252 @@ mod tests {
             3,
             "truncating items must not touch rejections, even when there are \
              more of them than the item cap"
+        );
+    }
+
+    // --- Task 2 (issue #61 / #30): provider-answer count and per-field
+    // length caps in `CheckedItems::check`. ---
+
+    /// `count` well-formed items, each short enough to pass every field
+    /// check, so a test built on this is demonstrably about the *count* cap
+    /// alone.
+    fn many_items(count: usize) -> Vec<Item> {
+        (0..count)
+            .map(|n| item(Kind::App, &format!("app:{n}"), "Alpha"))
+            .collect()
+    }
+
+    #[test]
+    fn a_provider_answer_of_exactly_the_cap_is_unaffected() {
+        let checked = CheckedItems::check(vec![output(
+            "test",
+            ALL_KINDS.to_vec(),
+            many_items(MAX_ITEMS_PER_PROVIDER_ANSWER),
+        )]);
+        assert_eq!(
+            checked.items().len(),
+            MAX_ITEMS_PER_PROVIDER_ANSWER,
+            "exactly MAX_ITEMS_PER_PROVIDER_ANSWER items must all survive"
+        );
+        assert!(checked.rejections().is_empty());
+    }
+
+    #[test]
+    fn a_provider_answer_one_over_the_cap_drops_the_tail_silently() {
+        let checked = CheckedItems::check(vec![output(
+            "test",
+            ALL_KINDS.to_vec(),
+            many_items(MAX_ITEMS_PER_PROVIDER_ANSWER + 1),
+        )]);
+        assert_eq!(
+            checked.items().len(),
+            MAX_ITEMS_PER_PROVIDER_ANSWER,
+            "the one item over the cap must not survive"
+        );
+        assert!(
+            checked.rejections().is_empty(),
+            "the excess is truncated away before a single item is inspected, \
+             so it is dropped silently rather than turned into a Rejection — \
+             there is nothing to reject it for"
+        );
+        assert_eq!(
+            checked.items().last().unwrap().id.as_str(),
+            format!("app:{}", MAX_ITEMS_PER_PROVIDER_ANSWER - 1),
+            "the surviving items are the head of the answer, not an \
+             arbitrary subset"
+        );
+    }
+
+    /// An item whose `title` is exactly [`MAX_TITLE`] bytes.
+    fn item_with_title(title: &str) -> Item {
+        item(Kind::App, "app:title", title)
+    }
+
+    #[test]
+    fn title_at_the_bound_passes_one_over_is_rejected() {
+        let at_bound = checked(vec![item_with_title(&"a".repeat(MAX_TITLE))]);
+        assert_eq!(
+            at_bound.items().len(),
+            1,
+            "exactly MAX_TITLE bytes must pass"
+        );
+
+        let over = CheckedItems::check(vec![output(
+            "test",
+            ALL_KINDS.to_vec(),
+            vec![item_with_title(&"a".repeat(MAX_TITLE + 1))],
+        )]);
+        assert!(over.items().is_empty());
+        assert_eq!(
+            over.rejections()[0].check,
+            FailedCheck::FieldTooLong {
+                field: "Item.title"
+            }
+        );
+    }
+
+    /// An item whose `subtitle` is exactly `len` bytes.
+    fn item_with_subtitle(len: usize) -> Item {
+        Item {
+            subtitle: Some("a".repeat(len)),
+            ..item(Kind::App, "app:subtitle", "Alpha")
+        }
+    }
+
+    #[test]
+    fn subtitle_at_the_bound_passes_one_over_is_rejected() {
+        let at_bound = checked(vec![item_with_subtitle(MAX_SUBTITLE)]);
+        assert_eq!(
+            at_bound.items().len(),
+            1,
+            "exactly MAX_SUBTITLE bytes must pass"
+        );
+
+        let over = CheckedItems::check(vec![output(
+            "test",
+            ALL_KINDS.to_vec(),
+            vec![item_with_subtitle(MAX_SUBTITLE + 1)],
+        )]);
+        assert!(over.items().is_empty());
+        assert_eq!(
+            over.rejections()[0].check,
+            FailedCheck::FieldTooLong {
+                field: "Item.subtitle"
+            }
+        );
+    }
+
+    /// An item whose `copy_text` is exactly `len` bytes.
+    fn item_with_copy_text(len: usize) -> Item {
+        Item {
+            copy_text: Some("a".repeat(len)),
+            ..item(Kind::App, "app:copy", "Alpha")
+        }
+    }
+
+    #[test]
+    fn copy_text_at_the_bound_passes_one_over_is_rejected() {
+        let at_bound = checked(vec![item_with_copy_text(MAX_COPY_TEXT)]);
+        assert_eq!(
+            at_bound.items().len(),
+            1,
+            "exactly MAX_COPY_TEXT bytes must pass"
+        );
+
+        let over = CheckedItems::check(vec![output(
+            "test",
+            ALL_KINDS.to_vec(),
+            vec![item_with_copy_text(MAX_COPY_TEXT + 1)],
+        )]);
+        assert!(over.items().is_empty());
+        assert_eq!(
+            over.rejections()[0].check,
+            FailedCheck::FieldTooLong {
+                field: "Item.copy_text"
+            }
+        );
+    }
+
+    /// An item with one action whose `label` is exactly `len` bytes.
+    fn item_with_action_label(len: usize) -> Item {
+        Item {
+            actions: vec![Action {
+                id: ActionId::new("open").unwrap(),
+                kind: ActionKind::Open,
+                label: "a".repeat(len),
+            }],
+            ..item(Kind::App, "app:action-label", "Alpha")
+        }
+    }
+
+    #[test]
+    fn action_label_at_the_bound_passes_one_over_is_rejected() {
+        let at_bound = checked(vec![item_with_action_label(MAX_ACTION_LABEL)]);
+        assert_eq!(
+            at_bound.items().len(),
+            1,
+            "exactly MAX_ACTION_LABEL bytes must pass"
+        );
+
+        let over = CheckedItems::check(vec![output(
+            "test",
+            ALL_KINDS.to_vec(),
+            vec![item_with_action_label(MAX_ACTION_LABEL + 1)],
+        )]);
+        assert!(over.items().is_empty());
+        assert_eq!(
+            over.rejections()[0].check,
+            FailedCheck::FieldTooLong {
+                field: "Action.label"
+            }
+        );
+    }
+
+    /// An item with exactly `count` actions, each well within the label
+    /// bound, so a test built on this is demonstrably about the *count* of
+    /// actions and not any one action's length.
+    fn item_with_action_count(count: usize) -> Item {
+        let actions = (0..count)
+            .map(|n| Action {
+                id: ActionId::new(format!("action:{n}")).unwrap(),
+                kind: ActionKind::Open,
+                label: "Open".into(),
+            })
+            .collect();
+        Item {
+            actions,
+            ..item(Kind::App, "app:action-count", "Alpha")
+        }
+    }
+
+    #[test]
+    fn action_count_at_the_bound_passes_one_over_is_rejected() {
+        let at_bound = checked(vec![item_with_action_count(MAX_ACTIONS_PER_ITEM)]);
+        assert_eq!(
+            at_bound.items().len(),
+            1,
+            "exactly MAX_ACTIONS_PER_ITEM actions must pass"
+        );
+
+        let over = CheckedItems::check(vec![output(
+            "test",
+            ALL_KINDS.to_vec(),
+            vec![item_with_action_count(MAX_ACTIONS_PER_ITEM + 1)],
+        )]);
+        assert!(over.items().is_empty());
+        assert_eq!(
+            over.rejections()[0].check,
+            FailedCheck::FieldTooLong {
+                field: "Item.actions"
+            }
+        );
+    }
+
+    /// The other half of the "ranks identically" argument Task 2 adds on top
+    /// of the existing suite continuing to pass unmodified: an item that
+    /// fails more than one check is reported once, against whichever check
+    /// runs first — here, a wrong `kind` *and* an over-long `title` on the
+    /// same item. `CheckedItems::check`'s loop runs the kind check before
+    /// any field-length check, so the single rejection this produces must be
+    /// [`FailedCheck::Kind`], not [`FailedCheck::FieldTooLong`].
+    #[test]
+    fn an_item_failing_both_a_manifest_check_and_a_field_length_check_is_reported_once() {
+        let mut evil = item_with_title(&"a".repeat(MAX_TITLE + 1));
+        evil.kind = Kind::Window;
+        evil.provider = "calc".into();
+
+        let checked = CheckedItems::check(vec![output("calc", vec![Kind::Calculator], vec![evil])]);
+        assert!(checked.items().is_empty());
+        assert_eq!(
+            checked.rejections().len(),
+            1,
+            "one failing item must be one rejection, however many checks it fails"
+        );
+        assert_eq!(
+            checked.rejections()[0].check,
+            FailedCheck::Kind,
+            "the kind check runs before any field-length check, so that is \
+             what the single rejection is reported against"
         );
     }
 }
