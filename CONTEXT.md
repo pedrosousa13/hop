@@ -157,24 +157,35 @@ its producer declared, and every item's provider string is its producer's
 manifest id. Assembly accepts nothing else, so an item's self-description is
 never taken on trust.
 
-**Rejection** — one item assembly declined, and why: it failed one of the two
-manifest checks, or it was a pinned item the **pin budget** could not afford.
-Returned as data alongside the assembled items rather than logged directly,
-because `Pipeline::assemble` runs on every keystroke and may not have side
-effects. That used to mean rejections went unlogged everywhere, full stop; it
-no longer does. The **provider host** now reads the manifest-check half of
-them — the two reasons that mean a provider lied — through its **log seam**
-every time it runs `CheckedItems::check` on `ProviderHost::run_one`'s path.
-What still goes unlogged is the pin-budget half, minted only inside
+**Rejection** — one item assembly declined, and why. `CheckedItems::check`
+produces four of the five reasons `FailedCheck` distinguishes. Two are the
+**manifest checks**: the item's `kind` is not one its producer declared, or
+its `provider` string is not its producer's manifest id — the two ways an
+item's self-description can be a lie. A third, `FailedCheck::FieldTooLong`,
+is not a manifest check and not evidence of one: it means a field was over
+the same length bound `hop-protocol`'s own parse already applies, which says
+an item was too big, not that it claimed to be something it was not. A
+fourth, `FailedCheck::TooManyItems`, is not about any one item at all — it
+records a whole provider answer over the per-answer item cap, decided before
+any item in it was inspected. The fifth reason, `FailedCheck::PinBudget`, is
+minted only later, inside `Pipeline::assemble`, for a pinned item the **pin
+budget** could not afford even though it passed every check above. Returned
+as data alongside the assembled items rather than logged directly, because
+`Pipeline::assemble` runs on every keystroke and may not have side effects.
+That used to mean rejections went unlogged everywhere, full stop; it no
+longer does. The **provider host** now reads everything `CheckedItems::check`
+itself can produce — all four reasons above, tallied truthfully by cause
+rather than as one undifferentiated count (a `TooManyItems` rejection stands
+for its whole dropped excess, not one item) — through its **log seam**, every
+time it runs `CheckedItems::check` on `ProviderHost::run_one`'s path. What
+still goes unlogged is the pin-budget reason, minted only inside
 `Pipeline::assemble` itself — and the daemon *does* call `assemble` now: the
 **result source** does, on every provider arrival, over the accumulated
-**checked items**. The manifest-check half is still logged, by the
-**provider host** through its **log seam**, *before* the items travel; the
-pin-budget half stays unlogged. What `assemble` returns, `Assembly::rejections`
-as a whole, travels back to hopd's accumulator in `source.rs` — the caller
-that discards it, the two halves arriving together and the pin-budget one with
-them. Only the first two reasons mean a provider lied; a rejection names
-which, so the reasons are not confused for one another.
+**checked items**. What `assemble` returns, `Assembly::rejections` as a
+whole, travels back to hopd's accumulator in `source.rs` — the caller that
+discards it, the logged four and the unlogged pin-budget reason arriving
+together. Only the two manifest checks mean a provider lied; a rejection
+names which reason it was, so the five are never confused for one another.
 
 **Ranked body** — the scored, ordered items.
 

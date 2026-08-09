@@ -1058,6 +1058,7 @@ mod tests {
 
     use super::*;
     use crate::provider::{APPS_PROVIDER_ID, ProviderError, QueryCtx};
+    use hop_protocol::limits::MAX_ITEMS_PER_RESULTS_FRAME;
     use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId};
     use std::sync::Arc;
     use std::time::Duration;
@@ -2564,6 +2565,33 @@ mod tests {
         );
     }
 
+    // House precedent: `hop-protocol::limits` pins its own cross-constant
+    // relationship the same way —
+    // `the_per_query_cap_admits_at_least_one_full_frame` asserts
+    // `MAX_ITEMS_PER_QUERY >= MAX_ITEMS_PER_RESULTS_FRAME` rather than
+    // trusting prose to keep the two from drifting apart. This is that
+    // test's counterpart for `MAX_ITEMS_PER_PROVIDER_ANSWER`.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_provider_answer_cap_never_exceeds_what_one_frame_can_carry() {
+        // `MAX_ITEMS_PER_PROVIDER_ANSWER`'s own docs call it "deliberately
+        // the same value" as `MAX_ITEMS_PER_RESULTS_FRAME` — reused, not
+        // shared as one constant, because the two bound different things at
+        // different layers (raw provider material entering assembly, versus
+        // one wire frame leaving the daemon). Being reused rather than
+        // shared means a future retune of either constant would not fail to
+        // compile if the two drifted apart; only this module's prose would
+        // notice. What must actually keep holding is not numeric equality —
+        // nothing downstream breaks if the provider-answer cap ends up
+        // strictly below the frame cap, only if it ends up above it — it is
+        // the promise the docs give for why the number was reused at all:
+        // "no single provider should be able to hand assembly more raw
+        // material than a client could ever legitimately be shown in one
+        // frame". That is an upper bound, so this asserts `<=`, not `==`;
+        // the relation, not either number, is the invariant.
+        assert!(MAX_ITEMS_PER_PROVIDER_ANSWER <= MAX_ITEMS_PER_RESULTS_FRAME);
+    }
+
     /// An item whose `title` is exactly [`MAX_TITLE`] bytes.
     fn item_with_title(title: &str) -> Item {
         item(Kind::App, "app:title", title)
@@ -2789,6 +2817,75 @@ mod tests {
             FailedCheck::Kind,
             "the kind check runs before any field-length check, so that is \
              what the single rejection is reported against"
+        );
+    }
+
+    // Review remediation (issue #61 review, Spec axis: "ordinary queries
+    // rank identically" was only "partially met" — reasonable inference,
+    // nothing directly pinned). Everything above this point that argues
+    // ordinary ranking is unperturbed does so by construction: a
+    // `.chars().take(MAX_TERM_CHARS)` is a no-op under the cap, and
+    // `output.items.truncate(MAX_ITEMS_PER_PROVIDER_ANSWER)` is a no-op
+    // under 1 000 items. That is a sound argument, but it is an argument,
+    // not an assertion — nothing actually runs an ordinary query and checks
+    // the order that comes out. This test is that check.
+    #[test]
+    fn an_ordinary_query_ranks_identically_to_its_pinned_baseline() {
+        let mut pipeline = Pipeline::default();
+        // A small, realistic mix of kinds for one query — nowhere near any
+        // cap this branch touches: 6 items against
+        // MAX_ITEMS_PER_PROVIDER_ANSWER's 1 000, single-digit-byte titles
+        // against MAX_TITLE, a 7-character term against MAX_TERM_CHARS. A
+        // regression that perturbed ordinary ranking would have to do so
+        // through the ranking logic itself, not through anything a cap or a
+        // truncation could plausibly touch at this size — which is exactly
+        // why a passing run here is evidence for "ordinary queries rank
+        // identically", not just an argument for it.
+        let items = vec![
+            item(Kind::Window, "window:firefox-github", "Firefox — GitHub"),
+            item(Kind::App, "app:firefox", "Firefox"),
+            item(Kind::Action, "action:restart-firefox", "Restart Firefox"),
+            item(Kind::File, "file:firefox-conf", "firefox.conf"),
+            // Deliberately does not contain "firefox" anywhere: proves the
+            // pinned order below isn't just "everything that was handed in,
+            // in some order" — the ranker actually filters, not only sorts.
+            item(Kind::App, "app:terminal", "Terminal"),
+            pinned(
+                Kind::WebSearch,
+                "web:search-firefox",
+                "Search the web for firefox",
+            ),
+        ];
+
+        let out = pipeline.assemble("firefox", checked(items), 10).items;
+
+        let ids: Vec<&str> = out.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "window:firefox-github",
+                "action:restart-firefox",
+                "app:firefox",
+                "file:firefox-conf",
+                "web:search-firefox",
+            ],
+            "an ordinary query's ranked order no longer matches this pinned \
+             baseline. Window (weight 30) leads Action (25) leads App (20) \
+             leads File (12) — the documented weight tiers, undisturbed by \
+             fuzzy-match differences among these titles — with the pinned \
+             WebSearch tail last regardless of score, and 'Terminal' \
+             correctly absent for matching nothing. If this changed because \
+             of a deliberate ranking change, update the pinned `vec!` \
+             above; if it changed because of a cap retune, a truncation \
+             change, or `term_chars` normalization touching this instead, \
+             that is the regression issue #61/#46's 'ordinary queries rank \
+             identically' criterion exists to catch"
+        );
+        assert_eq!(
+            out.len(),
+            5,
+            "'Terminal' must be filtered out, not merely sorted last — a \
+             non-matching item surviving would inflate this count"
         );
     }
 }
