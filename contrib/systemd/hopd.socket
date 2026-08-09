@@ -1,0 +1,25 @@
+# hop launcher daemon — user socket unit.
+#
+# Installed and enabled per README.md's "Running hopd as a systemd user
+# service" section. `%t` is systemd's runtime-directory specifier — the
+# same $XDG_RUNTIME_DIR/hop that `runtime_dir::resolve()` computes, so this
+# path always matches what a standalone-started hopd would have bound
+# itself (crates/hopd/src/server.rs, SOCKET_FILE_NAME).
+#
+# `Service=` is left unset: it defaults to the service unit with the same
+# name (hopd.service), which is what this pair uses.
+[Unit]
+Description=hop launcher daemon socket
+
+[Socket]
+ListenStream=%t/hop/hopd.sock
+# 0600/0700 close the socket and its directory to every uid but this one's
+# — the same bound a standalone-started hopd enforces itself
+# (crates/hopd/src/server.rs). Under activation hopd never touches either
+# (see server.rs's "Socket activation" doc section), so this unit is the
+# only place these are set.
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

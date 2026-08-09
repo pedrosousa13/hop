@@ -25,6 +25,12 @@ toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Task 4 of docs/superpowers/plans/2026-08-09-issue-62-socket-activation.md:
+# a pre_exec closure needs dup2/fcntl to hand a spawned test process a
+# pre-bound fd at a fixed number, reproducing sd_listen_fds(3) without a
+# real systemd session. libc is already a workspace dependency (used today
+# by hop-protocol); this crate did not need it until this test.
+libc.workspace = true
 
 [lints]
 workspace = true

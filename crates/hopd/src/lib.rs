@@ -22,6 +22,7 @@
 //! Each remaining gap is named where it applies, in [`runtime_dir`],
 //! [`server`] and [`source`].
 
+pub(crate) mod activation;
 pub mod apps;
 pub mod calculator;
 pub mod config;
@@ -63,12 +64,18 @@ use crate::source::HostSource;
 ///
 /// # Shutdown
 ///
-/// None beyond the process being killed. [`server::serve_with`]'s accept
-/// loop has no exit beyond an unrecoverable startup error, so under normal
-/// operation this function does not return at all. Signal handling and any
-/// orderly shutdown belong to issue #62 (socket activation and lifecycle) —
-/// this daemon's only contribution to "restart works" is the stale-socket
-/// removal [`server::serve_with`] documents in place.
+/// None beyond the process being killed, still. [`server::serve_with`]'s
+/// accept loop has no exit beyond an unrecoverable startup error, so under
+/// normal operation this function does not return at all. Issue #62 added
+/// *activation* — [`server::acquire_listener`] accepting a listener systemd
+/// already bound, instead of always binding one itself — not lifecycle: no
+/// signal handler exists, and nothing tears this process down when its
+/// `.socket` unit stops. Orderly shutdown remains unowned by any filed
+/// issue as of this writing. This daemon's only contribution to "restart
+/// works" is still the stale-socket removal `server::serve_with`'s
+/// standalone path documents in place — unreachable, now, on the activated
+/// path, which never touches the socket file at all (see
+/// [`server::acquire_listener`]).
 pub fn run() -> ExitCode {
     // Config is resolved first, ahead of even the runtime dir: a malformed
     // config must refuse to start the daemon before anything binds a socket

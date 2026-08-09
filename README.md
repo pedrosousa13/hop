@@ -43,3 +43,24 @@ table are later M2 slices. `hop-cli` is the only binary that talks to
 ```sh
 cargo test --workspace
 ```
+
+## Running hopd as a systemd user service
+
+`hopd` can run standalone (bind its own socket — the path every test in
+this repository exercises) or under systemd socket activation, where the
+`.socket` unit binds the socket and starts `hopd` on first connection.
+
+```sh
+cargo install --path crates/hopd
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/hopd.socket contrib/systemd/hopd.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hopd.socket
+```
+
+`hopd.service` is never started or enabled directly — only its socket is.
+The daemon starts the first time something connects to
+`$XDG_RUNTIME_DIR/hop/hopd.sock`; `hop query <text>` (once `hop-cli` is
+installed the same way) is enough to trigger it. `systemctl --user status
+hopd.service` confirms it is running afterward. If the unit ever declares
+more than one socket, hopd uses only the first and warns on stderr.
