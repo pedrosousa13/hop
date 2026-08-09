@@ -27,37 +27,9 @@ use std::os::fd::RawFd;
 /// The first (and, for this daemon, only) inherited descriptor's number,
 /// fixed by the sd_listen_fds(3) protocol itself — not configurable, and
 /// not this daemon's choice.
-// This module lands a commit ahead of its only production caller
-// (`server::acquire_listener`, Task 2 of this crate's implementation plan),
-// so outside this module's own tests nothing constructs or reads these items
-// yet. `cfg_attr(not(test), expect(dead_code, ...))` — not a bare
-// `#[expect]` — because this module's own tests (below) already use every
-// item, so an unconditional `#[expect]` would go unfulfilled under `cargo
-// test` itself. Per-item, not module-wide, matching this crate's own
-// precedent (`apps.rs`'s `ParsedEntry`) and, before that,
-// `hop-protocol`'s single-statement `#[expect(unsafe_code)]`: the moment
-// Task 2 gives an item a real caller, that item's own expectation goes
-// unfulfilled and `-D warnings` fails the build, so the attribute deletes
-// itself rather than outliving its reason.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into server::acquire_listener by Task 2 of this crate's \
-                  socket-activation plan; until then only this module's own tests use it"
-    )
-)]
 pub(crate) const SD_LISTEN_FDS_START: RawFd = 3;
 
 /// What [`inherited_fd`] found.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into server::acquire_listener by Task 2 of this crate's \
-                  socket-activation plan; until then only this module's own tests use it"
-    )
-)]
 pub(crate) struct InheritedFd {
     /// Always [`SD_LISTEN_FDS_START`] — hopd listens on exactly one socket,
     /// so this is the only descriptor it ever reads.
@@ -84,14 +56,6 @@ pub(crate) struct InheritedFd {
 /// standalone" — never an error. See this module's own doc comment for why
 /// a value that fails to check out is treated as absence rather than
 /// something worth reporting.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into server::acquire_listener by Task 2 of this crate's \
-                  socket-activation plan; until then only this module's own tests use it"
-    )
-)]
 pub(crate) fn inherited_fd(
     lookup: impl Fn(&str) -> Option<String>,
     self_pid: u32,
