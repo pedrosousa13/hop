@@ -18,6 +18,9 @@ hop-protocol = { path = "../hop-protocol", version = "0.1.0" }
 # per-connection read/write loop.
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-util"] }
 inotify.workspace = true
+# already a workspace dependency; ConfigError is thiserror-derived.
+thiserror.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

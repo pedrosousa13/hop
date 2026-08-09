@@ -17,6 +17,7 @@
 //! than waiting for #57's apps provider to make it real.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,6 +139,30 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
         item_id: ItemId,
         action_id: ActionId,
     ) -> impl Future<Output = Result<ExecOutcome, ProviderError>> + Send;
+
+    /// Records that the user reached `item_id` while typing `query` — a
+    /// launch, in `hop-core`'s [`Learning`](hop_core::learning::Learning)
+    /// vocabulary.
+    ///
+    /// This is issue #60's seam for turning a successful [`execute`](Self::execute)
+    /// into learning: `crates/hopd/src/connection.rs`'s Execute arm calls this
+    /// only once `execute` has already answered `Ok`, before it sends
+    /// `Executed` back to the peer — a launch is a successful action, not an
+    /// attempted one, so a refused or failed execute never reaches this
+    /// method. `query` is the accepted text of the query the item was
+    /// resolved under (`Exchange::text`), and `item_id` is the same id
+    /// `execute` was just called with; the connection is the only place that
+    /// holds both, which is why this seam is driven from there rather than
+    /// folded into `execute` itself.
+    ///
+    /// [`HostSource`] records the launch against its `Pipeline`'s
+    /// [`Learning`](hop_core::learning::Learning) store and, when it was
+    /// built with a store path, persists it — see its impl for what happens
+    /// if that persist fails. A test or scripted source is free to make this
+    /// a no-op where its scenario does not care about learning, the same way
+    /// most of this crate's scripted sources already treat `execute`'s
+    /// outcome as the only thing worth scripting.
+    fn record_launch(&self, query: &str, item_id: &ItemId) -> impl Future<Output = ()> + Send;
 }
 
 /// The walking skeleton's item, as a real [`Provider`].
@@ -203,13 +228,16 @@ impl Provider for SkeletonProvider {
     }
 }
 
-/// The `max_results` the daemon passes to [`Pipeline::assemble`] on every
-/// arrival.
+/// The default `max_results` the daemon passes to [`Pipeline::assemble`]
+/// on every arrival — the value [`HostSource`] built without the config-aware
+/// constructor ([`HostSource::with_config`]) uses, and what an absent config's
+/// `Config` falls back to.
 ///
 /// A launcher renders tens of rows, not thousands, so this is sized for what
 /// a person can look at rather than for what the pipeline could produce.
-/// Issue #60's config load is where it becomes a setting a user can change;
-/// until then it is a constant because nothing yet reads one in.
+/// A config that sets its own `max_results` uses that value instead; this
+/// constant remains the default and the value the compile-time
+/// replace-frame assertion below guards.
 pub const MAX_RESULTS: usize = 50;
 
 // Design decision 3: one assembled list must fit one `results` frame — a
@@ -230,6 +258,24 @@ const _: () = assert!(MAX_RESULTS <= MAX_ITEMS_PER_RESULTS_FRAME);
 pub struct HostSource {
     host: Arc<ProviderHost>,
     pipeline: Arc<Mutex<Pipeline>>,
+    /// How many results [`Pipeline::assemble`] is asked for on every arrival.
+    /// [`HostSource::new`] and [`HostSource::with_pipeline`] default this to
+    /// [`MAX_RESULTS`]; [`HostSource::with_config`] sets it from the config.
+    max_results: usize,
+    /// Where this daemon's `Learning` store lives, when this source was built
+    /// from the real config. `None` for a test-built source that only wants
+    /// the `Learning` in-memory behavior without a store to save to.
+    ///
+    /// Read by [`HostSource::record_launch`], which saves the store back to
+    /// this path whenever it is `Some` — see that method for what happens if
+    /// the save fails.
+    learning_path: Option<PathBuf>,
+    /// Serializes saves to `learning_path` against each other — held across
+    /// the blocking save, but only ever that, never across `pipeline`'s lock
+    /// — so two launches can't write out of order. See
+    /// [`HostSource::record_launch`] for why this is enough on its own,
+    /// with no generation bookkeeping needed.
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl HostSource {
@@ -241,6 +287,9 @@ impl HostSource {
         HostSource {
             host,
             pipeline: Arc::new(Mutex::new(Pipeline::default())),
+            max_results: MAX_RESULTS,
+            learning_path: None,
+            save_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -254,7 +303,36 @@ impl HostSource {
     /// [`HostSource`] cannot otherwise drive: seeding aliases or learning
     /// needs a `Pipeline` built by hand, and this is the only way in.
     pub fn with_pipeline(host: Arc<ProviderHost>, pipeline: Arc<Mutex<Pipeline>>) -> Self {
-        HostSource { host, pipeline }
+        HostSource {
+            host,
+            pipeline,
+            max_results: MAX_RESULTS,
+            learning_path: None,
+            save_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// A source over `host`, sharing a caller-supplied `pipeline` and the
+    /// config-derived assembly cap and learning-store path.
+    ///
+    /// This is what `run()` wires (Design decision 7 of issue #60): the
+    /// pipeline carries the `Learning` store loaded from `learning_path`, and
+    /// `max_results` is the config's value rather than the [`MAX_RESULTS`]
+    /// default. `learning_path` is `None` for a source (a test, say) that
+    /// wants in-memory `Learning` behavior without a store to persist to.
+    pub fn with_config(
+        host: Arc<ProviderHost>,
+        pipeline: Arc<Mutex<Pipeline>>,
+        max_results: usize,
+        learning_path: Option<PathBuf>,
+    ) -> Self {
+        HostSource {
+            host,
+            pipeline,
+            max_results,
+            learning_path,
+            save_lock: Arc::new(Mutex::new(())),
+        }
     }
 }
 
@@ -282,6 +360,9 @@ impl ResultSource for HostSource {
         let routed = Arc::new(route(text.as_str()));
         self.host.spawn_query(routed, host_tx);
         let pipeline = Arc::clone(&self.pipeline);
+        // Captured alongside `pipeline` so the spawned accumulator reads the
+        // caller-configured cap without borrowing `self` across the spawn.
+        let max_results = self.max_results;
 
         // The task returns — dropping `host_rx`, its receiving half of the
         // host's own channel — the moment a downstream send fails, rather
@@ -330,7 +411,7 @@ impl ResultSource for HostSource {
                 // `Pipeline` for the length of an `.await` for no reason.
                 let assembly = {
                     let mut pipeline = pipeline.lock().await;
-                    pipeline.assemble(text.as_str(), accumulated.clone(), MAX_RESULTS)
+                    pipeline.assemble(text.as_str(), accumulated.clone(), max_results)
                 };
                 // `Assembly::rejections` is discarded here: the host already
                 // logged the manifest-check half of it through its own log
@@ -364,12 +445,75 @@ impl ResultSource for HostSource {
     ) -> Result<ExecOutcome, ProviderError> {
         self.host.execute(provider, item_id, action_id).await
     }
+
+    /// Records the launch against the pipeline's `Learning` store and, when
+    /// this source was built with a store path ([`HostSource::with_config`]),
+    /// saves it back out. `pipeline` is locked twice, briefly, rather than
+    /// once for the whole method: once to make the in-memory record, and —
+    /// only if there is somewhere to save to — again, later, just to clone
+    /// the `Learning` a save needs. Neither lock is held anywhere near the
+    /// save itself, which runs on a blocking-pool thread via
+    /// [`tokio::task::spawn_blocking`]. This is the same discipline
+    /// [`HostSource::start`] documents above ("locked only across `assemble`
+    /// itself... holding the guard past it would block every other query
+    /// sharing this `Pipeline`"): `Learning::save` is synchronous and does a
+    /// blocking write + fsync + rename, so holding `pipeline`'s guard across
+    /// it — or blocking a runtime worker thread on it directly — would stall
+    /// every other connection's query assembly, or other scheduled tokio
+    /// tasks, for as long as the disk takes.
+    ///
+    /// What serializes concurrent launches' saves against each other is
+    /// `save_lock`, held across the clone *and* the blocking save (that is
+    /// the point of it — nothing but a save ever waits on it, so holding it
+    /// across I/O costs nothing `pipeline`'s other callers can feel). Because
+    /// the clone is taken after winning `save_lock`, not before, it always
+    /// reads whatever is currently in `pipeline.learning` — which already
+    /// includes every launch recorded by the time this call wins the race,
+    /// including ones from other calls still ahead of it in the queue. So a
+    /// concurrent save can only ever write a superset of what came before
+    /// it; there is nothing to compare or skip, and no recorded launch can
+    /// be lost.
+    ///
+    /// A save failure is logged via `eprintln!` (the same seam
+    /// [`StderrLog`] uses) and otherwise ignored, as is a panic inside the
+    /// blocking task: this method's caller, `connection.rs`'s Execute arm,
+    /// calls it only after `execute` already answered `Ok` and is about to
+    /// send `Executed` — a persistence hiccup here must not turn that
+    /// already-successful execute into a client-visible error, and the
+    /// in-memory record above still took, so the next launch (or the next
+    /// successful save) still has it.
+    async fn record_launch(&self, query: &str, item_id: &ItemId) {
+        {
+            let mut pipeline = self.pipeline.lock().await;
+            pipeline.learning.record_launch(query, item_id);
+        }
+
+        let Some(path) = self.learning_path.as_ref() else {
+            return;
+        };
+
+        let _save_guard = self.save_lock.lock().await;
+        let learning = self.pipeline.lock().await.learning.clone();
+
+        let path_for_save = path.clone();
+        match tokio::task::spawn_blocking(move || learning.save(&path_for_save)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => eprintln!(
+                "hopd: failed to save the learning store to {}: {err}",
+                path.display()
+            ),
+            Err(join_err) => eprintln!(
+                "hopd: learning store save task for {} panicked: {join_err}",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// The daemon's [`ProviderLog`]: one line per event on stderr.
 ///
 /// Deliberately the crudest thing that satisfies issue #34's criterion, and
-/// consistent with how this crate already reports — [`crate::server::serve`]
+/// consistent with how this crate already reports — [`crate::server::serve_with`]
 /// logs accept and connection errors with `eprintln!` too. Spec §9's
 /// `tracing` with an env-filter is the eventual backend, and the
 /// [`ProviderLog`] seam is what lets it arrive without touching a call site.
@@ -949,6 +1093,83 @@ mod tests {
              highest-ranked \"low\" items — a per-batch-then-concatenate \
              implementation would instead keep every \"low\" item and only \
              \"high\"'s first 20"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_config_assembles_to_the_configured_max_results_not_the_default() {
+        // `with_config`'s `max_results` is what the accumulator hands the
+        // pipeline on every assembly, so a value other than `MAX_RESULTS`
+        // must be honored: two providers give 30 items each (60 together,
+        // over both the configured 25 and the 50 default), and the final
+        // assembled frame must hold exactly the configured 25 — not
+        // `MAX_RESULTS`. This is the wiring issue #60's `run()` drives, so
+        // proving it here pins the seam in-process without spawning a binary.
+        let low_items: Vec<Item> = (0..30)
+            .map(|n| {
+                item(
+                    Kind::File,
+                    &format!("low:{n:02}"),
+                    &format!("low-{n:02}"),
+                    "low",
+                )
+            })
+            .collect();
+        let high_items: Vec<Item> = (0..30)
+            .map(|n| {
+                item(
+                    Kind::Window,
+                    &format!("high:{n:02}"),
+                    &format!("high-{n:02}"),
+                    "high",
+                )
+            })
+            .collect();
+
+        let low = ItemsProvider {
+            id: "low",
+            kinds: vec![Kind::File],
+            items: low_items,
+            delay: Duration::ZERO,
+            budget: Duration::from_millis(20),
+        };
+        let high = ItemsProvider {
+            id: "high",
+            kinds: vec![Kind::Window],
+            items: high_items,
+            delay: Duration::from_millis(60),
+            budget: Duration::from_millis(200),
+        };
+        let policy = HostPolicy {
+            max_budget: Duration::from_millis(200),
+            ..HostPolicy::default()
+        };
+        let mut host = ProviderHost::new(policy, Arc::new(NoopLog));
+        host.register(low).unwrap();
+        host.register(high).unwrap();
+
+        let source = HostSource::with_config(
+            Arc::new(host),
+            Arc::new(Mutex::new(Pipeline::default())),
+            25,
+            None,
+        );
+        let mut rx = source.start(QueryText::new("").unwrap());
+
+        let _first = rx
+            .recv()
+            .await
+            .expect("the low provider's arrival must send a frame");
+        let second = rx
+            .recv()
+            .await
+            .expect("the high provider's arrival must send a frame");
+
+        assert_eq!(
+            second.len(),
+            25,
+            "with_config must assemble to its configured 25 max_results, \
+             not the MAX_RESULTS default of 50"
         );
     }
 

@@ -17,6 +17,15 @@ inotify = { version = "0.11", default-features = false }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt"] }
 tempfile = "3"
 regex = "1"
+# #60's config is TOML (spec §9), and there is no hand-rolled TOML parser worth
+# writing — `toml` covers the file's parse with minimal surface. `serde` here
+# is the feature that enables `toml::Value`/`toml::from_str` (the plan's
+# `parse`-only spelling exposes only the low-level AST and no `from_str`); it
+# pulls serde *core* into toml, not `display` — the config load is read-only —
+# and needs no serde dependency in the consuming crate, because the config is
+# read out of toml's own `Value` rather than derived. MIT/Apache-2.0, on
+# `deny.toml`'s allow list.
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
 # Every member crate opts in with `[lints] workspace = true`. A workspace lint no
 # crate inherits is a gate that does nothing, so any new member must do the same.

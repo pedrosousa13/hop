@@ -15,11 +15,30 @@ use hop_core::host::ProviderHost;
 use tokio::net::UnixListener;
 
 use crate::connection::handle_connection;
-use crate::source::{HostSource, ResultSource, SkeletonProvider, StderrLog};
+use crate::source::{ResultSource, SkeletonProvider, StderrLog};
 
 /// The socket's file name inside the runtime directory
 /// [`crate::runtime_dir::resolve`] returns.
 const SOCKET_FILE_NAME: &str = "hopd.sock";
+
+/// Builds the daemon's provider host: the registry every query runs through.
+///
+/// Registration failures are a programming error rather than an operating
+/// condition — the only ids registered here are literals in this function, so
+/// a duplicate means two lines in this file chose the same one. It is reported
+/// and the provider skipped rather than panicking, because a daemon that
+/// refuses to start over one misconfigured provider is worse than one that
+/// serves the rest: spec §9's per-provider isolation rule applied to startup.
+pub(crate) fn build_host() -> ProviderHost {
+    let mut host = ProviderHost::with_log(Arc::new(StderrLog));
+    if let Err(err) = host.register(SkeletonProvider) {
+        eprintln!("hopd: could not register the skeleton provider: {err}");
+    }
+    if let Err(err) = host.register(crate::apps::build_apps_provider()) {
+        eprintln!("hopd: could not register the apps provider: {err}");
+    }
+    host
+}
 
 /// Binds `<runtime_dir>/hopd.sock` and serves connections until an error
 /// stops the accept loop or the process is killed — whichever comes first.
@@ -27,6 +46,11 @@ const SOCKET_FILE_NAME: &str = "hopd.sock";
 /// `runtime_dir` is assumed already created at 0700 by
 /// [`crate::runtime_dir::resolve`]; this function does not create it, only
 /// the socket file inside it.
+///
+/// [`crate::run`] is this function's production caller: it builds a
+/// config-aware [`HostSource`](crate::source::HostSource) over
+/// [`build_host`]'s provider registry and calls this function directly, so
+/// everything documented below is exactly what the binary does.
 ///
 /// # Stale-socket removal is provisional
 ///
@@ -67,43 +91,19 @@ const SOCKET_FILE_NAME: &str = "hopd.sock";
 /// the time this function runs, and reaching a path inside it requires
 /// traverse on every component, so the parent directory's mode is what
 /// carries the access control during that window, not the socket file's.
-pub async fn serve(runtime_dir: &Path) -> io::Result<()> {
-    serve_with(runtime_dir, HostSource::new(Arc::new(build_host()))).await
-}
-
-/// Builds the daemon's provider host: the registry every query runs through.
 ///
-/// Registration failures are a programming error rather than an operating
-/// condition — the only ids registered here are literals in this function, so
-/// a duplicate means two lines in this file chose the same one. It is reported
-/// and the provider skipped rather than panicking, because a daemon that
-/// refuses to start over one misconfigured provider is worse than one that
-/// serves the rest: spec §9's per-provider isolation rule applied to startup.
-fn build_host() -> ProviderHost {
-    let mut host = ProviderHost::with_log(Arc::new(StderrLog));
-    if let Err(err) = host.register(SkeletonProvider) {
-        eprintln!("hopd: could not register the skeleton provider: {err}");
-    }
-    if let Err(err) = host.register(crate::apps::build_apps_provider()) {
-        eprintln!("hopd: could not register the apps provider: {err}");
-    }
-    host
-}
-
-/// [`serve`], generic over what answers the queries.
+/// # The integration seam
 ///
-/// This is the integration seam. A test injects a scripted [`ResultSource`]
-/// here — one that streams several batches, or stalls, or floods past
+/// This function is also generic over what answers the queries, which is
+/// what makes it the seam tests use: a test injects a scripted
+/// [`ResultSource`] here — one that streams several batches, or stalls, or
+/// floods past
 /// [`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY) — and
 /// then drives it over a real socket with a real client, so what the suite
 /// pins is the daemon's actual wire behaviour rather than a mock agreeing
 /// with itself. Everything else about the connection is the production path,
 /// unchanged: the only thing a test gets to choose is where the items come
 /// from.
-///
-/// [`serve`] passes a [`HostSource`] over the daemon's real provider host and
-/// is what the binary runs; every behaviour documented on [`serve`] is
-/// documented about this function too.
 pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::Result<()> {
     let socket_path = runtime_dir.join(SOCKET_FILE_NAME);
 

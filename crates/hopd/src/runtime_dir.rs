@@ -1,6 +1,6 @@
 //! Locates and creates hopd's runtime directory: `$XDG_RUNTIME_DIR/hop`.
 //!
-//! This is the directory [`crate::server::serve`] binds `hopd.sock` inside,
+//! This is the directory [`crate::server::serve_with`] binds `hopd.sock` inside,
 //! and its mode is the access control the socket itself relies on during the
 //! brief window between `bind` and the explicit `chmod` to 0600 — see that
 //! module's docs. Getting this directory's mode right at creation, with no

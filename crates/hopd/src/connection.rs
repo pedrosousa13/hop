@@ -69,7 +69,7 @@ enum ReadEvent {
     /// and closes.
     Refused { code: ErrorCode, message: String },
     /// The transport failed mid-read. The driver surfaces it to
-    /// [`crate::server::serve`]'s log seam; there is no peer left worth
+    /// [`crate::server::serve_with`]'s log seam; there is no peer left worth
     /// answering.
     Failed(io::Error),
 }
@@ -100,6 +100,16 @@ enum ReadEvent {
 struct Exchange {
     /// The `query_id` every frame of this exchange carries.
     id: u64,
+    /// The accepted text of this exchange's query, retained for
+    /// [`ResultSource::record_launch`]: the learning store keys on
+    /// `(query, item_id)`, and this connection is the only place that holds
+    /// both the query it accepted and the item an `Execute` frame resolves
+    /// against. Set once, from the `Query` arm's `ClientMsg::Query::text`,
+    /// and never mutated afterward — a new `Query` replaces the whole
+    /// exchange rather than this field alone, which is what keeps it in
+    /// agreement with `id` and `delivered` for the same reason those two
+    /// live in one struct (see this struct's own docs).
+    text: String,
     /// The live source, or `None` once this exchange has ended.
     source: Option<mpsc::Receiver<Vec<Item>>>,
     /// The last list [`forward_batch`] sent, bounded by
@@ -276,8 +286,10 @@ async fn handle_message<S: ResultSource>(
             // moved on and would drop them as stale anyway. The retained set
             // is replaced along with it, because what the client is looking
             // at is now this query's results and nothing else.
+            let text_owned = text.clone().into_string();
             *exchange = Some(Exchange {
                 id,
+                text: text_owned,
                 source: Some(source.start(text)),
                 delivered: Vec::new(),
             });
@@ -372,8 +384,15 @@ async fn handle_message<S: ResultSource>(
             // that is not bounds-checked here, and the client only needs the
             // classification, not the payload.
             let provider = item.provider.clone();
-            match source.execute(&provider, item_id, action_id).await {
+            match source.execute(&provider, item_id.clone(), action_id).await {
                 Ok(outcome) => {
+                    // A launch is a successful action, not an attempted one:
+                    // this fires only once `execute` has already answered
+                    // `Ok`, and before `Executed` goes out — see
+                    // `ResultSource::record_launch`'s docs for why the
+                    // connection is what drives this rather than `execute`
+                    // itself.
+                    source.record_launch(&active.text, &item_id).await;
                     send_msg(write_half, &DaemonMsg::Executed { query_id, outcome }).await?
                 }
                 Err(_) => {
@@ -507,7 +526,7 @@ enum ReadOutcome {
 /// its end between frames, which ends the connection with no error to send.
 /// An `io::Error` other than EOF (a read that fails mid-frame, for instance)
 /// travels to the driver as [`ReadEvent::Failed`] and, from there, out of
-/// [`handle_connection`] to the `eprintln!` in [`crate::server::serve`]'s
+/// [`handle_connection`] to the `eprintln!` in [`crate::server::serve_with`]'s
 /// spawned task — the same "log and move on" path an accept error takes.
 async fn read_frame(read_half: &mut OwnedReadHalf) -> io::Result<Option<ReadOutcome>> {
     let mut prefix = [0u8; FRAME_PREFIX_LEN];
@@ -641,6 +660,7 @@ mod tests {
         let (_peer, mut write_half) = write_half_pair();
         let mut exchange = Some(Exchange {
             id: 1,
+            text: "q".to_string(),
             source: None,
             delivered: Vec::new(),
         });
@@ -705,9 +725,18 @@ mod tests {
     /// succeeds with [`ExecOutcome::Done`] or fails, per its construction.
     /// `start` never emits anything — these tests drive `handle_message`
     /// directly against an exchange whose `delivered` the test populated.
+    ///
+    /// `launches` records every `record_launch` call the same way `calls`
+    /// records `execute` calls, so a test can make a genuine observation
+    /// about whether the Execute arm invoked it — in particular, that it
+    /// does not on a refused or failed execute (see
+    /// `a_provider_execute_error_is_query_scoped_provider_failed`), rather
+    /// than asserting something that would hold even if the wiring were
+    /// missing entirely.
     #[derive(Clone)]
     struct ScriptedSource {
         calls: Arc<Mutex<Vec<String>>>,
+        launches: Arc<Mutex<Vec<String>>>,
         fail: bool,
     }
 
@@ -738,6 +767,17 @@ mod tests {
                 }
             }
         }
+
+        fn record_launch(&self, query: &str, item_id: &ItemId) -> impl Future<Output = ()> + Send {
+            let launches = self.launches.clone();
+            let entry = format!("{query}|{item_id}");
+            async move {
+                launches
+                    .lock()
+                    .expect("no test panics holding this")
+                    .push(entry);
+            }
+        }
     }
 
     /// Reads one frame off `peer` and decodes it as a [`DaemonMsg`], so a test
@@ -757,10 +797,12 @@ mod tests {
         let mut state = HandshakeState::Ready;
         let source = ScriptedSource {
             calls: Arc::new(Mutex::new(Vec::new())),
+            launches: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
         let mut exchange = Some(Exchange {
             id: 7,
+            text: "hello world".to_string(),
             source: None,
             delivered: vec![item_with_action("app:1", &["open"])],
         });
@@ -793,6 +835,12 @@ mod tests {
             &["test|app:1|open".to_string()],
             "the item's provider and both resolved ids must reach the source"
         );
+        assert_eq!(
+            source.launches.lock().expect("test lock").as_slice(),
+            &["hello world|app:1".to_string()],
+            "a successful execute must record a launch keyed on the \
+             exchange's accepted query text and the resolved item id"
+        );
     }
 
     #[tokio::test]
@@ -800,11 +848,13 @@ mod tests {
         let mut state = HandshakeState::Ready;
         let source = ScriptedSource {
             calls: Arc::new(Mutex::new(Vec::new())),
+            launches: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
         // The live exchange is id 7; the frame names id 8.
         let mut exchange = Some(Exchange {
             id: 7,
+            text: "q".to_string(),
             source: None,
             delivered: vec![item_with_action("app:1", &["open"])],
         });
@@ -846,6 +896,7 @@ mod tests {
         let mut state = HandshakeState::Ready;
         let source = ScriptedSource {
             calls: Arc::new(Mutex::new(Vec::new())),
+            launches: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
         let mut exchange: Option<Exchange> = None;
@@ -883,11 +934,13 @@ mod tests {
         let mut state = HandshakeState::Ready;
         let source = ScriptedSource {
             calls: Arc::new(Mutex::new(Vec::new())),
+            launches: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
         // The live query delivered "app:1" only, so "app:2" was never shown.
         let mut exchange = Some(Exchange {
             id: 7,
+            text: "q".to_string(),
             source: None,
             delivered: vec![item_with_action("app:1", &["open"])],
         });
@@ -926,11 +979,13 @@ mod tests {
         let mut state = HandshakeState::Ready;
         let source = ScriptedSource {
             calls: Arc::new(Mutex::new(Vec::new())),
+            launches: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
         // The item only offers "open"; the frame asks for "delete".
         let mut exchange = Some(Exchange {
             id: 7,
+            text: "q".to_string(),
             source: None,
             delivered: vec![item_with_action("app:1", &["open"])],
         });
@@ -969,10 +1024,12 @@ mod tests {
         let mut state = HandshakeState::Ready;
         let source = ScriptedSource {
             calls: Arc::new(Mutex::new(Vec::new())),
+            launches: Arc::new(Mutex::new(Vec::new())),
             fail: true,
         };
         let mut exchange = Some(Exchange {
             id: 7,
+            text: "q".to_string(),
             source: None,
             delivered: vec![item_with_action("app:1", &["open"])],
         });
@@ -1007,6 +1064,17 @@ mod tests {
             source.calls.lock().expect("test lock").as_slice(),
             &["test|app:1|open".to_string()],
             "the provider must be reached before it can fail"
+        );
+        // The negative case this seam owes: a launch is a *successful*
+        // action, so a provider failure — which the source above genuinely
+        // received and answered `Err` to, not merely a refusal that never
+        // reached it — must not produce a recorded launch either. Asserting
+        // `is_empty()` here is a real observation because `source.launches`
+        // would show exactly what went wrong if the Execute arm called
+        // `record_launch` unconditionally instead of only on `Ok`.
+        assert!(
+            source.launches.lock().expect("test lock").is_empty(),
+            "a provider failure must never record a launch"
         );
     }
 }

@@ -335,7 +335,20 @@ struct LearningEntry {
 /// [`Learning::frequent_launches`] and [`Learning::is_empty`] are also
 /// public, carried over from the salvage as-is for later milestones (surfacing
 /// learning insights to the user is explicitly out of scope here).
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// `Clone` is what lets a caller take a snapshot of the in-memory state and
+/// let go of whatever lock protects it before doing something slow with the
+/// copy — `hopd`'s `HostSource::record_launch` is exactly that caller: it
+/// clones the pipeline's `Learning` while still holding the pipeline's lock
+/// (a fast, in-memory copy — every dimension a save touches is bounded, see
+/// `MAX_STORE_BYTES` above), then saves the clone after releasing it, so a
+/// blocking `save` never holds a lock anything else is waiting on. `Clone`
+/// duplicates data an outside caller could already reach no other way than
+/// through what `Learning` itself already exposes; it grants no new route to
+/// bypass the private fields' invariants the way `Deserialize` does (see
+/// below), since a clone can only ever hold a copy of an already-valid
+/// `Learning`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Learning {
     /// Only ever read during a [`Learning::load`], where the second parse
     /// branch needs somewhere to put a file's `version` before checking it

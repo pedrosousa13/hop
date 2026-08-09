@@ -55,9 +55,11 @@ impl Drop for DaemonProcess {
 /// The one test that needs the daemon's stderr —
 /// `an_unset_runtime_dir_is_a_startup_error` — does not use this helper.
 ///
-/// `HOME`, `XDG_DATA_HOME` and `XDG_DATA_DIRS` are pinned to paths under
-/// `runtime_dir` that this test never populates, rather than left to
-/// whatever the developer or CI box running this suite happens to have set.
+/// `HOME`, `XDG_DATA_HOME`, `XDG_DATA_DIRS`, and — since issue #60 made
+/// `hopd` resolve a config and state dir at startup — `XDG_CONFIG_HOME` and
+/// `XDG_STATE_HOME`, are pinned to paths under `runtime_dir` that this test
+/// never populates, rather than left to whatever the developer or CI box
+/// running this suite happens to have set.
 /// Since issue #57, this spawned `hopd` registers a real, environment-backed
 /// apps provider (`hopd::apps::build_apps_provider`) alongside the skeleton
 /// one, and that provider answers from whatever `.desktop` files actually
@@ -75,11 +77,31 @@ impl Drop for DaemonProcess {
 /// `build_apps_provider`'s deliberately parameterless signature does not
 /// offer.
 fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
+    // `state_dir::resolve` treats a missing parent *base* directory as an
+    // error — it creates only the `hop` dir inside it, not recursively — so
+    // the isolated state-home root must already exist, or the daemon would
+    // refuse to start before it ever binds a socket. `config::load` has no
+    // such requirement: `fs::read_to_string` returns `NotFound` just the same
+    // whether the leaf file or an ancestor directory is missing, and
+    // `config::load` maps any `NotFound` to `Ok(Config::default())` — so
+    // pre-creating the config root here is not load-bearing for it. It is
+    // done anyway to keep the two isolated roots symmetric.
+    std::fs::create_dir_all(runtime_dir.join("isolated-xdg-state-home")).unwrap();
+    std::fs::create_dir_all(runtime_dir.join("isolated-xdg-config-home")).unwrap();
+
     let child = Command::new(env!("CARGO_BIN_EXE_hopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("HOME", runtime_dir.join("isolated-home"))
         .env("XDG_DATA_HOME", runtime_dir.join("isolated-xdg-data-home"))
         .env("XDG_DATA_DIRS", "")
+        .env(
+            "XDG_CONFIG_HOME",
+            runtime_dir.join("isolated-xdg-config-home"),
+        )
+        .env(
+            "XDG_STATE_HOME",
+            runtime_dir.join("isolated-xdg-state-home"),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -291,8 +313,33 @@ fn the_runtime_dir_is_created_at_mode_0700_and_the_socket_at_0600() {
 
 #[test]
 fn an_unset_runtime_dir_is_a_startup_error() {
+    // This test does not use `spawn_daemon`: it wants the daemon's real
+    // stderr (`spawn_daemon` discards both streams), and it does not wait for
+    // a socket that this daemon must never bind. But since issue #60, `run()`
+    // resolves `config::load()` and `state_dir::resolve()` *before* it ever
+    // checks `XDG_RUNTIME_DIR` — so, exactly like `spawn_daemon`, this process
+    // must pin `HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME` to an isolated temp
+    // dir rather than inherit the real test process's environment. Left
+    // unpinned, this test would read the developer's real `~/.config/hop` and
+    // create `~/.local/state/hop` as a side effect, and — if that real config
+    // happened to be malformed — would fail on the wrong assertion entirely
+    // (a config-parse error, not a missing-`XDG_RUNTIME_DIR` one).
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("isolated-xdg-state-home")).unwrap();
+    std::fs::create_dir_all(temp.path().join("isolated-xdg-config-home")).unwrap();
+
     let output = Command::new(env!("CARGO_BIN_EXE_hopd"))
         .env_remove("XDG_RUNTIME_DIR")
+        .env("HOME", temp.path().join("isolated-home"))
+        .env(
+            "XDG_CONFIG_HOME",
+            temp.path().join("isolated-xdg-config-home"),
+        )
+        .env(
+            "XDG_STATE_HOME",
+            temp.path().join("isolated-xdg-state-home"),
+        )
+        .env("XDG_DATA_DIRS", "")
         .output()
         .expect("failed to run hopd");
 
@@ -304,5 +351,54 @@ fn an_unset_runtime_dir_is_a_startup_error() {
     assert!(
         stderr.contains("XDG_RUNTIME_DIR"),
         "stderr must name the missing variable, got: {stderr}"
+    );
+}
+
+#[test]
+fn a_malformed_config_is_a_startup_error() {
+    // Issue #60 criterion 2: a config that exists but does not parse must
+    // refuse to start the daemon loudly, never fall back to defaults. Config
+    // resolves ahead of the runtime dir in `run()`, so this daemon must exit
+    // before binding a socket at all — the socket-path assertion below is
+    // the direct proof of that, and the stderr naming the offending file is
+    // the proof it got as far as reading it.
+    let temp = tempfile::tempdir().unwrap();
+    let config_root = temp.path().join("isolated-xdg-config-home");
+    let config_dir = config_root.join("hop");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    // `max_results = =` is not valid TOML: an `=` where a value is expected.
+    std::fs::write(config_dir.join("config.toml"), "max_results = =\n").unwrap();
+
+    let runtime_dir = temp.path().join("runtime");
+    let output = Command::new(env!("CARGO_BIN_EXE_hopd"))
+        .env("XDG_CONFIG_HOME", &config_root)
+        .env(
+            "XDG_STATE_HOME",
+            temp.path().join("isolated-xdg-state-home"),
+        )
+        .env("HOME", temp.path().join("isolated-home"))
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("XDG_DATA_DIRS", "")
+        .output()
+        .expect("failed to run hopd");
+
+    assert!(
+        !output.status.success(),
+        "hopd must exit non-zero on a malformed config"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config.toml") && stderr.contains("not valid TOML"),
+        "stderr must name the malformed config and say it did not parse, got: {stderr}"
+    );
+
+    // `output()` already waited for the process to exit, so this is not a
+    // race against a still-running daemon: a malformed config must never
+    // reach the point of binding a socket at all, in `runtime_dir/hop/`
+    // (the same layout `spawn_daemon` and every other test here expects).
+    let socket_path = runtime_dir.join("hop").join("hopd.sock");
+    assert!(
+        !socket_path.exists(),
+        "a malformed config must be refused before any socket is bound, found {socket_path:?}"
     );
 }
