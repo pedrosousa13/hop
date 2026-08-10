@@ -1030,12 +1030,28 @@ fn looks_like_a_persistence_hash(id_part: &str) -> bool {
 /// for secrecy, and appears in the clear in every persisted key regardless
 /// of which branch step 1 took.
 fn persistence_key(provider: &str, raw_id: &str, persist_plaintext: bool) -> String {
-    let id_part = if persist_plaintext {
-        raw_id.to_string()
-    } else {
-        format!("sha256:{:x}", Sha256::digest(raw_id.as_bytes()))
-    };
-    provider_scoped_key(provider, &id_part)
+    if persist_plaintext {
+        return provider_scoped_key(provider, raw_id);
+    }
+    // The hash branch used to build the hash as its own `String`
+    // (`format!("sha256:{:x}", ...)`) and then hand it to
+    // `provider_scoped_key`, which allocated a *second* `String` to wrap
+    // it — two allocations per call, on a path
+    // [`Learning::frequency_boost`] runs once per candidate item on every
+    // keystroke. This builds the whole key in one buffer instead: `format!`
+    // allocates the `<n>:<provider>:sha256:` prefix, `reserve` grows it
+    // once to fit the fixed 64-byte hex digest that follows, and `write!`
+    // appends into that same buffer rather than concatenating a second one.
+    // Produces the identical string `provider_scoped_key(provider,
+    // &format!("sha256:{:x}", digest))` did; `persistence_key_partitions_on_the_bool_alone_not_on_the_raw_ids_shape`
+    // pins the output, not the allocation count, so it catches a mistake
+    // here regardless.
+    use std::fmt::Write as _;
+    let mut key = format!("{}:{}:sha256:", provider.len(), provider);
+    key.reserve(64);
+    write!(key, "{:x}", Sha256::digest(raw_id.as_bytes()))
+        .expect("writing a hex digest into a String never fails");
+    key
 }
 
 /// Re-key every entry of a freshly parsed store's `global_frequency`,
@@ -1949,7 +1965,22 @@ impl Learning {
     /// half of the boost-theft gap: before it, `evil` presenting
     /// `app:firefox` matched exactly the entries `apps` had earned on the
     /// same id, because the inner map was keyed on the bare id alone.
+    ///
+    /// The `self.selections.is_empty()` guard below is checked before the
+    /// query is even normalized — a query text of any length still returns
+    /// `0` against an empty selections table, so there is nothing this
+    /// function could find, and no reason to allocate the lookup key
+    /// (`provider_scoped_key`, one `String` per call) or the lowercased
+    /// query to find it with. This is the same trade `rank::Boosts`'s own
+    /// scoring loop already makes for `by_provider_item` — skip the
+    /// allocation the empty case can never use — applied here for the
+    /// identical reason: a hostile or absent-minded caller cannot make this
+    /// function allocate more per call, only zero providers with any
+    /// recorded selection can make it allocate at all.
     fn query_boost(&self, provider: &str, query: &str, result_id: &str) -> i32 {
+        if self.selections.is_empty() {
+            return 0;
+        }
         let normalized = query.trim().to_lowercase();
         if normalized.is_empty() {
             return 0;
@@ -1991,7 +2022,24 @@ impl Learning {
     /// a lookup that dropped `provider` from that key, the same way, would
     /// miss nothing: it would instead find *any* provider's entry for the
     /// same raw id, which is issue #72's boost-theft gap exactly.
+    ///
+    /// Guarded on `self.global_frequency.is_empty()` for the same reason
+    /// [`Learning::query_boost`] is guarded on `self.selections.is_empty()`
+    /// — an empty map can answer nothing, so there is no reason to pay
+    /// [`persistence_key`]'s cost (a `String` allocation, and for a
+    /// provider not currently opted into plaintext persistence, a SHA-256
+    /// digest) to build a key for it. This is on the query path, called
+    /// once per candidate item — [`crate::pipeline::Pipeline::assemble`]'s
+    /// loop calls [`Learning::boost_for`] for every item `CheckedItems`
+    /// handed it, which the latency gate's fixture holds at 10 000 — so an
+    /// unconditional hash here was measurable at that scale even though the
+    /// hash itself is fast in isolation. Skipping it whenever there is
+    /// nothing recorded is what actually pays for itself: a fresh install,
+    /// and the latency fixture, hash nothing at all.
     fn frequency_boost(&self, provider: &str, result_id: &str) -> i32 {
+        if self.global_frequency.is_empty() {
+            return 0;
+        }
         let now = now_ms();
         let persist_plaintext = self.plaintext_providers.contains(provider);
         if let Some(entry) =
