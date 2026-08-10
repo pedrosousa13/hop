@@ -781,8 +781,8 @@ fn is_known_safe_shape(stripped: &str) -> bool {
 /// the fixed-width, fixed-case form `format!("{:x}", …)` always writes a
 /// 32-byte SHA-256 digest as. Anything shorter, longer, or carrying an
 /// uppercase hex digit is not this shape, however much it starts the same
-/// way — see [`persistence_key`]'s doc comment for why that distinction is
-/// load-bearing rather than pedantic.
+/// way — see [`rekeyed_global_frequency`]'s doc comment for the one caller
+/// that needs this distinction, and why.
 fn is_already_a_persistence_hash(stripped: &str) -> bool {
     match stripped.strip_prefix("sha256:") {
         Some(hex) => {
@@ -795,11 +795,14 @@ fn is_already_a_persistence_hash(stripped: &str) -> bool {
     }
 }
 
-/// The key [`Learning::record`] and [`Learning::load`] both use for
-/// `global_frequency` — issue #39, Decision 2's shape half. This is the one
-/// function that decides what an id looks like once it can reach disk, and
-/// every site that reads or writes that map calls it, so the two are kept
-/// in sync by construction rather than by convention.
+/// The key [`Learning::record`] and every `global_frequency` lookup use —
+/// issue #39, Decision 2's shape half. This is the one function that
+/// decides what a *raw* id looks like once it can reach disk, and every
+/// site on the live record/lookup path calls it, so the two are kept in
+/// sync by construction rather than by convention. [`Learning::load`]'s
+/// re-keying pass is the one caller that does *not* call this directly on
+/// every stored key — see [`rekeyed_global_frequency`] for why, and for the
+/// one case that split off from here to make room for it.
 ///
 /// # The rule
 ///
@@ -807,66 +810,41 @@ fn is_already_a_persistence_hash(stripped: &str) -> bool {
 ///    from before this existed, and still the only step some ids need.
 /// 2. If the stripped id is a [`is_known_safe_shape`] — `app:`, `utility:`
 ///    or `web-search:` — persist that string, in the clear.
-/// 3. Otherwise — `calc:` included, and every id a provider this code has
-///    never heard of mints — persist `sha256:` followed by the lowercase
-///    hex SHA-256 digest of `raw_id` **as it arrived**, not the stripped
-///    form. Hashing the raw id rather than the stripped one matters for
-///    exactly the ids that reach this branch: nothing has stripped their
-///    payload, so the payload is what gets hashed away.
+/// 3. Otherwise — `calc:` included, every id a provider this code has never
+///    heard of mints, **and an id that already begins `sha256:`** — persist
+///    `sha256:` followed by the lowercase hex SHA-256 digest of `raw_id`
+///    **as it arrived**, not the stripped form. Hashing the raw id rather
+///    than the stripped one matters for exactly the ids that reach this
+///    branch: nothing has stripped their payload, so the payload is what
+///    gets hashed away.
 ///
-/// # Why this has to be idempotent on its own output
+/// This function is total in the sense the brief asks for: there is no id
+/// for which it returns its input unchanged except a known-safe shape. An
+/// id shaped exactly like this function's own output — `sha256:` plus 64
+/// lowercase hex characters — is *not* treated as already-hashed here; it
+/// is hashed again, landing under `sha256:` followed by the digest of that
+/// whole string. `an_id_beginning_sha256_is_hashed_rather_than_written_through`
+/// pins this with the exposing shape the brief asks for: a raw id that is a
+/// syntactically valid 64-character hex digest, not merely a short
+/// look-alike. (An *earlier* version of this function special-cased that
+/// shape to make [`Learning::load`]'s re-keying idempotent — see
+/// [`rekeyed_global_frequency`] for where that case now lives instead, and
+/// why living here was wrong: it made this function pass an already-hashed
+/// id through unhashed on the record path too, not only on re-key.)
 ///
-/// The rule above is one `if`/`else`, but the real branch structure has a
-/// third case ([`is_already_a_persistence_hash`]) folded into the second:
-/// a stripped id already shaped exactly like this function's own hashing
-/// output is treated the same as a known-safe shape and returned unchanged,
-/// rather than being hashed again.
+/// # Why the partition is provable
 ///
-/// That case is not academic — it is the ordinary path every hashed id
-/// takes on its *second* trip through this function. [`Learning::load`]
-/// re-keys whatever it finds in `global_frequency` through this same
-/// function ([`rekeyed_global_frequency`]), because a legacy store's keys
-/// need converting and nothing on load can tell a legacy key from one this
-/// module already wrote. A hashed entry this module saved is exactly a
-/// `sha256:`-plus-64-hex string in the file, so without this case, the very
-/// next load would hash it *again* — `sha256:` followed by the digest of
-/// the string `"sha256:<64 hex chars>"`, not the digest of the raw id that
-/// produced it. `frequency_boost` would keep computing the single-hashed
-/// key from the raw id, the double-hashed key sitting in the map would
-/// never match it, and every hashed provider's learning would silently die
-/// on its first restart — the exact failure mode this module's docs and
-/// [`rekeyed_global_frequency`]'s doc comment say re-keying exists to avoid,
-/// reintroduced by re-keying itself. `a_hashed_ids_learning_survives_a_save_and_load_round_trip`
-/// is this failure mode, pinned as a test.
-///
-/// This does cost something at the margin: a raw id that a provider mints
-/// as literally `sha256:` followed by 64 lowercase hex characters — not the
-/// hash of anything, just a string that happens to look like one — persists
-/// unchanged rather than being hashed, which is a narrower guarantee than
-/// "every unrecognized id is hashed." No provider in this tree mints ids
-/// that way, and one that started to would be creating a fixed-width opaque
-/// token indistinguishable from this function's own output regardless —
-/// there is no payload such an id could carry that hashing would have hidden
-/// anyway. `persistence_key_partitions_known_safe_shapes_from_hashed_ids`
-/// pins the case this margin does *not* cover: a raw id shaped like a hash
-/// but not one — `"sha256:not-a-real-hash"`, 15 characters after the colon —
-/// is still hashed like any other unrecognized id, because it fails the
-/// 64-lowercase-hex-digit check above.
-///
-/// # Why the partition is still provable
-///
-/// A key this returns begins `app:`, `utility:` or `web-search:` (branch 2,
-/// including the id-scrubbing rule's shapes), or `sha256:` followed by
-/// exactly 64 lowercase hex digits (branch 3, and the idempotent case of
-/// branch 2 folded into it above) — and no input reaches both. So a
-/// plaintext key and a hashed key can never collide on the same string:
-/// doing so would require a plaintext key to begin `sha256:`, which
-/// [`is_known_safe_shape`] does not allow through branch 2, or a hashed key
-/// to begin one of the other three prefixes, which branch 3 never produces.
-/// A raw id that begins `sha256:` but is not the exact shape this function
-/// writes — crafted to look like one, or simply short — is not a known-safe
-/// shape and is not [`is_already_a_persistence_hash`] either, so it falls
-/// through to being hashed, never written through unhashed.
+/// A key this returns begins `app:`, `utility:` or `web-search:` (branch 2)
+/// or `sha256:` (branch 3), and no input reaches both branches — they are
+/// `if`/`else`. So a plaintext key and a hashed key can never collide on
+/// the same string: doing so would require a plaintext key to begin
+/// `sha256:`, which [`is_known_safe_shape`] does not allow through branch
+/// 2, or a hashed key to begin one of the other three prefixes, which
+/// branch 3 never produces (SHA-256 hex never starts with a
+/// colon-terminated word). An id that itself begins `sha256:` — one already
+/// in this format, or one crafted to look like it — is not a known-safe
+/// shape, so it falls to branch 3 and is hashed again, never written
+/// through as though it were already a persistence key.
 ///
 /// # What the hash is not
 ///
@@ -881,25 +859,64 @@ fn is_already_a_persistence_hash(stripped: &str) -> bool {
 /// explicitly not this function's job.
 fn persistence_key(raw_id: &str) -> String {
     let stripped = canonicalize_result_id(raw_id);
-    if is_known_safe_shape(&stripped) || is_already_a_persistence_hash(&stripped) {
+    if is_known_safe_shape(&stripped) {
         stripped
     } else {
         format!("sha256:{:x}", Sha256::digest(raw_id.as_bytes()))
     }
 }
 
-/// Re-key every entry of a freshly parsed store's `global_frequency` through
-/// [`persistence_key`], merging any two source entries that land on the same
-/// key.
+/// Re-key every entry of a freshly parsed store's `global_frequency`,
+/// merging any two source entries that land on the same key.
 ///
 /// This is [`Learning::load`]'s half of the persistence-key rule (see
 /// [`persistence_key`]): a store written before issue #39 — or one that
 /// simply is not v1's own output — can hold entries in any shape at all,
-/// including raw ones this key function would now hash. Applying the key
+/// including raw ones [`persistence_key`] would now hash. Applying that
 /// function on the way in is what turns those into the same keys `record`
 /// would have produced, so a legacy `calc:` entry keeps its learning under
 /// the hash a fresh record of the same id would use, instead of sitting
 /// unread beside it forever.
+///
+/// # Why this does not simply call `persistence_key` on every key
+///
+/// [`persistence_key`] hashes an id shaped `sha256:` + 64 lowercase hex
+/// like any other unrecognized id (see its own doc comment) — which is
+/// correct for a *raw* id arriving at `record`, but wrong for a key already
+/// sitting in `global_frequency` on disk: that key may well be exactly
+/// [`persistence_key`]'s own prior output for some raw id, since a store
+/// this module saved is nothing but such keys. Re-keying it again would
+/// hash the *string* `"sha256:<64 hex>"`, landing on a different key than a
+/// fresh `persistence_key` call over the original raw id computes — so
+/// `frequency_boost`'s lookup, which always calls [`persistence_key`]
+/// directly on the raw id, would never find the entry again after its
+/// *first* post-save load. Every hashed provider's learning would die not
+/// on some later restart but on the very next one.
+/// `a_hashed_ids_learning_survives_a_save_and_load_round_trip` pins the fix:
+/// a key already shaped like this module's own hash
+/// ([`is_already_a_persistence_hash`]) is left exactly as it is here,
+/// rather than being run through [`persistence_key`] a second time.
+///
+/// # The one case this cannot resolve, and is not trying to
+///
+/// A key shaped `sha256:` + 64 lowercase hex in the file is treated as
+/// already a persistence key — but nothing on load can actually prove that.
+/// A *legacy* v1 store predating issue #39 could contain a genuine plaintext
+/// id that happens to have exactly this shape (a provider that, however
+/// implausibly, minted one), and this pass would leave it exactly as
+/// written rather than hashing it — the one id in a legacy store that would
+/// escape the migration every other legacy entry gets. Telling the two
+/// apart would need a marker this format does not carry: `STORE_VERSION`
+/// stays at 1 (issue #38 refuses a version mismatch in either direction
+/// rather than migrating across it, so bumping it would discard every
+/// existing store instead of converting this one case), and nothing else in
+/// a `PersistedLearningStore` says which hop version wrote a given key. This
+/// is accepted as the shape of the problem, not a gap to close here: no
+/// provider in this tree mints ids that way, and an id that did would be a
+/// fixed-width opaque token carrying no payload hashing would have hidden
+/// regardless.
+///
+/// # The merge itself
 ///
 /// A collision is not hypothetical once re-keying is in play: two source
 /// entries with different raw ids — a `utility:calculator:2+2` and a
@@ -924,7 +941,11 @@ fn rekeyed_global_frequency(
 ) -> HashMap<String, LearningEntry> {
     let mut out: HashMap<String, LearningEntry> = HashMap::new();
     for (id, entry) in input {
-        let key = persistence_key(id);
+        let key = if is_already_a_persistence_hash(id) {
+            id.clone()
+        } else {
+            persistence_key(id)
+        };
         let aggregate = out.entry(key).or_insert(LearningEntry {
             count: 0,
             last_ms: 0,
@@ -3887,7 +3908,9 @@ mod tests {
     // not one of the three known-safe prefixes, so it is hashed like any
     // other unrecognized id rather than being written through as though it
     // already were a persistence key — see `persistence_key`'s doc comment
-    // for why that matters for the partition being provable at all.
+    // for why that matters for the partition being provable at all. This is
+    // the short, non-hash-shaped case; the full 64-hex-character case below
+    // is the exposing shape the brief specifically asks for.
     #[test]
     fn an_id_beginning_sha256_is_hashed_rather_than_written_through() {
         let dir = tempfile::tempdir().unwrap();
@@ -3908,6 +3931,81 @@ mod tests {
         assert!(
             saved.contains(&expected),
             "it should be hashed again, under sha256(raw_id) and not raw_id itself, got: {saved}"
+        );
+    }
+
+    /// A raw id shaped *exactly* like this module's own persistence-hash
+    /// output: `sha256:` followed by 64 lowercase hex characters, not a
+    /// short look-alike. `is_already_a_persistence_hash` is what would
+    /// mistake this for an already-computed key if `persistence_key` used it
+    /// on the record path — it does not (see `rekeyed_global_frequency`'s
+    /// doc comment for why that guard lives on the load path only) — so
+    /// this must still be hashed like any other unrecognized raw id.
+    fn hash_shaped_raw_id() -> String {
+        format!("sha256:{}", "deadbeef".repeat(8))
+    }
+
+    // The brief's own required pin, with the exact exposing shape: a raw id
+    // that is a syntactically valid 64-character hex digest must still be
+    // hashed on the record path, and must not appear verbatim in the
+    // written file's bytes.
+    #[test]
+    fn a_raw_id_shaped_exactly_like_a_persistence_hash_is_hashed_rather_than_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let raw = hash_shaped_raw_id();
+        assert_eq!(
+            raw.len(),
+            "sha256:".len() + 64,
+            "must be the exact hash shape, not a short look-alike"
+        );
+        let item_id = ItemId::new(raw.clone()).unwrap();
+
+        let mut store = Learning::load(&path);
+        store.record_launch("q", &item_id);
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains(&raw),
+            "a raw id already shaped like a persistence hash must still be hashed on the \
+             record path rather than written through verbatim, got: {saved}"
+        );
+        let expected = format!("sha256:{:x}", Sha256::digest(raw.as_bytes()));
+        assert!(
+            saved.contains(&expected),
+            "it should be hashed under sha256(raw_id), not passed through as raw_id \
+             itself, got: {saved}"
+        );
+    }
+
+    // The end-to-end consistency this fix depends on: record stores this
+    // shape under sha256(raw_id) (the test above), load's re-keying pass
+    // recognizes the stored key as already a persistence hash and leaves it
+    // alone (`rekeyed_global_frequency`), and `frequency_boost`'s lookup
+    // recomputes sha256(raw_id) fresh from the same raw id — so the boost
+    // must still apply after a restart, exactly as for any other hashed id.
+    // A regression that put the idempotency guard back inside
+    // `persistence_key` itself would still pass this test (both record and
+    // lookup would agree on leaving the id alone) but would fail the test
+    // above; a regression that dropped the guard entirely would fail this
+    // one instead, by double-hashing on load. Both tests are needed.
+    #[test]
+    fn a_raw_id_shaped_like_a_persistence_hash_still_receives_its_boost_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let raw = hash_shaped_raw_id();
+        let item_id = ItemId::new(raw).unwrap();
+
+        let mut store = Learning::load(&path);
+        store.record_launch("q", &item_id);
+        store.save(&path).unwrap();
+
+        let reloaded = Learning::load(&path);
+        assert!(
+            reloaded.boost_for("q", &item_id) > 0.0,
+            "a raw id shaped like a persistence hash must still receive its boost after \
+             a restart"
         );
     }
 
