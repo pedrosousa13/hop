@@ -117,6 +117,11 @@ fn a_panicking_provider_does_not_empty_the_frame_for_the_others() {
                 ..
             } => items.extend(batch),
             DaemonMsg::QueryDone { query_id: 1 } => break,
+            // #127's routed frame leads every exchange. This suite is about
+            // the provider host's isolation and budgets, not routing, so it is
+            // tolerated here; the modes it reports are asserted in
+            // assembly.rs and calculator.rs.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame: {other:?}"),
         }
     }
@@ -183,6 +188,11 @@ fn an_inferred_route_still_reaches_a_registered_general_search_provider() {
                 ..
             } => items.extend(batch),
             DaemonMsg::QueryDone { query_id: 9 } => break,
+            // #127's routed frame leads every exchange. This suite is about
+            // the provider host's isolation and budgets, not routing, so it is
+            // tolerated here; the modes it reports are asserted in
+            // assembly.rs and calculator.rs.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame: {other:?}"),
         }
     }
@@ -221,6 +231,17 @@ fn a_hanging_provider_is_cut_off_and_the_query_still_terminates() {
         },
     );
 
+    // A provider cut off at its budget produces no items, so this exchange is
+    // #127's routed frame then `QueryDone` with nothing between — the same
+    // no-Results shape the zero-match tests pin, reached by a different route.
+    assert_eq!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted {
+            query_id: 7,
+            mode: Mode::All,
+            exclusive: false,
+        }
+    );
     let done = recv(&mut stream);
     assert_eq!(done, DaemonMsg::QueryDone { query_id: 7 });
     assert!(log.lines().iter().any(|l| l == "budget-miss hanging"));
@@ -253,6 +274,17 @@ fn a_providers_hostile_error_text_never_reaches_the_client() {
         },
     );
 
+    // The routed frame carries no provider-authored text — only a mode from a
+    // closed set and a bool — so it cannot be a channel for the hostile string
+    // this test is about. Read past it to reach the frame that could have been.
+    assert_eq!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted {
+            query_id: 2,
+            mode: Mode::All,
+            exclusive: false,
+        }
+    );
     let done = recv(&mut stream);
     assert!(
         matches!(done, DaemonMsg::QueryDone { query_id: 2 }),
@@ -342,6 +374,20 @@ fn a_fast_providers_items_arrive_before_a_slow_providers_budget_expires() {
             id: 3,
             text: QueryText::new("firefox").unwrap(),
         },
+    );
+
+    // Consumed before the clock starts: this test's claim is about how long
+    // the fast provider's *results* wait on the hanging one, so #127's routed
+    // frame must sit outside the measured window. It is already on the wire —
+    // the daemon sends it from the query arm before starting the source — so
+    // timing it would silently fold two measurements into one.
+    assert_eq!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted {
+            query_id: 3,
+            mode: Mode::All,
+            exclusive: false,
+        }
     );
 
     let started = Instant::now();

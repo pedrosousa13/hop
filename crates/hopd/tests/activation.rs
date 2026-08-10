@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use common::{recv, send};
 use hop_protocol::framing::{FRAME_PREFIX_LEN, decode_payload, encode_frame, payload_len};
-use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, QueryText};
+use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, Mode, QueryText};
 
 /// The same protocol constant `hopd::activation::SD_LISTEN_FDS_START`
 /// names — duplicated here rather than imported, because that module is
@@ -230,6 +230,21 @@ fn a_query_over_an_inherited_listener_is_served_without_hopd_rebinding_the_socke
             text: QueryText::new("walking skeleton").unwrap(),
         },
     );
+    // `QueryRouted` is the first frame of any accepted query as of #127, ahead
+    // of results and ahead of `QueryDone`. Asserted rather than skipped: this
+    // test reads frames in order, so it is a free place to pin the ordering
+    // rule that a mode label can be rendered before the first item arrives.
+    // "walking skeleton" names no mode, so it routes to the `All` fallback,
+    // non-exclusive.
+    assert_eq!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted {
+            query_id: 1,
+            mode: Mode::All,
+            exclusive: false,
+        }
+    );
+
     let results = recv(&mut stream);
     let DaemonMsg::Results {
         query_id, items, ..

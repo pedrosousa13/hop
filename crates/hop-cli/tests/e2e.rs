@@ -355,9 +355,16 @@ fn the_version_subcommand_prints_both_versions() {
         stdout.contains(env!("CARGO_PKG_VERSION")),
         "stdout must contain the CLI's own version, got: {stdout:?}"
     );
+    // Derived from `API_VERSION` rather than written as a literal. The point
+    // of this assertion is that `hop version` reports the protocol version it
+    // actually speaks — a hardcoded number tests that the constant has one
+    // particular value, which is a different and much less useful claim, and
+    // it is what made this test fail on the #127 bump rather than catching
+    // anything.
+    let expected = format!("protocol {}", hop_protocol::API_VERSION);
     assert!(
-        stdout.contains("protocol 1"),
-        "stdout must contain the protocol version, got: {stdout:?}"
+        stdout.contains(&expected),
+        "stdout must contain {expected:?}, got: {stdout:?}"
     );
 }
 

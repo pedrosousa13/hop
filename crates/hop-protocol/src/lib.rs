@@ -4,6 +4,7 @@ pub mod content;
 pub mod framing;
 pub mod item;
 pub mod limits;
+pub mod mode;
 pub mod redaction;
 pub mod wire;
 
@@ -11,6 +12,7 @@ pub use content::*;
 pub use framing::*;
 pub use item::*;
 pub use limits::*;
+pub use mode::*;
 pub use redaction::*;
 pub use wire::*;
 
@@ -37,4 +39,17 @@ pub use wire::*;
 /// socket, a meaning change with no version change is the exact failure a
 /// handshake is for, and this paragraph is a record of why one prior
 /// exception was safe, not a policy that the next one will be too.
-pub const API_VERSION: u32 = 1;
+/// **[2026-08-10] The exception above ended, and this is the bump that ended
+/// it.** Issue #127 added [`DaemonMsg::QueryRouted`](crate::DaemonMsg), a
+/// frame the daemon now sends for *every* accepted query. That is additive
+/// rather than a semantics change, so the paragraph above would have
+/// tolerated it — but the failure mode without a bump is the bad kind. A
+/// `hop` built before this commit passes a `1 == 1` handshake, connects
+/// happily, and then fails on its first query with a deserialization error
+/// about an unknown variant, which reads as a corrupt daemon rather than a
+/// stale client. With the bump it fails at the handshake saying exactly what
+/// is wrong. Stale binaries in `~/.cargo/bin` and `~/.local/bin` are ordinary,
+/// so that clean failure is worth more than the "gate against a client that
+/// does not exist" cost the paragraph above weighed — the client does exist,
+/// on any machine where `cargo install` ran once.
+pub const API_VERSION: u32 = 2;

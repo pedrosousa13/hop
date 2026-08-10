@@ -126,6 +126,9 @@ fn query_and_execute(stream: &mut UnixStream, query_id: u64) -> DaemonMsg {
                 ..
             } if id == query_id => delivered = items,
             DaemonMsg::QueryDone { query_id: id } if id == query_id => break,
+            // #127's routed frame leads every exchange; this test is about
+            // learning-store persistence across a restart, not routing.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame during query {query_id}: {other:?}"),
         }
     }
