@@ -1,7 +1,7 @@
 # Hop Launcher v1 — Design Spec
 
 Date: 2026-07-30
-Status: Approved; amended 2026-07-31, 2026-08-03, 2026-08-04
+Status: Approved; amended 2026-07-31, 2026-08-03, 2026-08-04, 2026-08-10
 Decisions by: Pedro Sousa
 
 **Amendment, 2026-07-31.** Amended after a grilling session over the milestone
@@ -24,6 +24,13 @@ shows the `Send + Sync + 'static`, `Arc`-argument signature #56 actually
 landed, in place of the borrowed signature it replaced) and §6 (the
 amendment note now says #29 is closed by #56, and that #21 landed earlier,
 with #54). Each change is marked **[Amended 2026-08-04]** in place.
+
+**Amendment, 2026-08-10.** Amended by the #80 design grill, whose own output is
+`docs/superpowers/specs/2026-08-10-hop-m3-frontend-design.md`. One section
+changed: §3 (the latency contract now says what the 10 ms is measured over, and
+what it is not — decision D1). The change is marked **[Amended 2026-08-10]** in
+place. Nothing else in this document was re-opened: the grill found five of its
+eight questions already answered here, and treated them as settled.
 
 ## 1. What this is
 
