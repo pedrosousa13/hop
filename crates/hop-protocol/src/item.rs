@@ -722,6 +722,23 @@ mod tests {
     }
 
     #[test]
+    fn item_copy_text_wrong_type_names_its_field() {
+        // A number where a string is wanted is refused before
+        // `CopyText::new_named` ever runs — by serde's own `invalid_type`,
+        // formatted from `ValidatedOpt::expecting` or `Validated::expecting`
+        // depending on which one actually judges it (see the doc comment on
+        // `limits::ValidatedOpt` for why it is `Validated`'s `expecting` that
+        // fires here, not `ValidatedOpt`'s own). This pins the observable
+        // behavior, not which visitor produces it: either way, the refusal
+        // must name `Item.copy_text`.
+        let mut json = full_item_json();
+        json["copy_text"] = json!(42);
+        let err =
+            serde_json::from_str::<Item>(&json.to_string()).expect_err("a number is not a string");
+        assert!(err.to_string().contains("Item.copy_text"), "got: {err}");
+    }
+
+    #[test]
     fn item_copy_text_over_long_and_control_bearing_is_reported_as_over_long() {
         // Length is checked before content, so a value breaking both rules is
         // reported as over-long rather than as a forbidden character — the

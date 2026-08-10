@@ -564,6 +564,38 @@ where
     })
 }
 
+/// The visitor `validated_opt` drives to deserialize an `Option<T>` for a
+/// validating newtype.
+///
+/// # `expecting`'s field name is currently unreachable
+///
+/// `expecting` below writes `self.field`, matching every other visitor in
+/// this module, but no parse this crate exercises today can actually reach
+/// it, for the same reason [`BoundedOptString`]'s cannot: `deserialize_option`
+/// only ever calls one of this visitor's other three methods, never falls
+/// through to the default `invalid_type` that would format a message from
+/// `expecting` at all. `visit_none` and `visit_unit` answer `null` and
+/// absence, and `visit_some` hands anything else straight to [`validated`],
+/// which drives [`Validated`] over the same `field` instead — so a present,
+/// wrong-typed value is judged (and named) there, not here. Both
+/// deserializers this crate drives an `Option<T>` field through — serde_json's
+/// own, and the internally-tagged `ContentDeserializer` that
+/// [`ClientMsg`](crate::wire::ClientMsg) and
+/// [`DaemonMsg`](crate::wire::DaemonMsg) buffer into — agree on that
+/// null-or-`visit_some` split, so there is no parse in this codebase today
+/// that would make `deserialize_option` reach for a fourth arm and fall back
+/// to `expecting`.
+///
+/// Leaving `expecting` fieldless anyway was considered, on the strength of
+/// that unreachability, and rejected, for the same reason it was rejected on
+/// [`BoundedOptString`]: `field` is already in scope on this struct, matching
+/// it costs nothing here, and a future `Deserializer` — or a future serde
+/// version — is free to route `deserialize_option` differently for a type it
+/// cannot special-case. An `expecting` that stayed fieldless would then
+/// silently reopen the exact gap issue #82 closed elsewhere, discovered only
+/// if somebody thought to check this one arm again. Naming the field costs
+/// one comparison against a constant; leaving it unnamed bets against every
+/// future deserializer keeping today's shape.
 struct ValidatedOpt<T, F> {
     field: &'static str,
     max: usize,
@@ -581,8 +613,8 @@ where
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "null or a string of at most {} bytes that its type accepts",
-            self.max
+            "{} to be null or a string of at most {} bytes that its type accepts",
+            self.field, self.max
         )
     }
 
