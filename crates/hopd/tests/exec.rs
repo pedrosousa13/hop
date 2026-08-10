@@ -507,6 +507,14 @@ fn a_hanging_execute_is_bounded_and_the_connection_stays_responsive() {
 /// through a real [`HostSource`]), unlike [`ExecSource`]'s own scripted
 /// `execute`, because it is [`HostSource::record_launch`] under test here,
 /// not the connection's dispatch.
+///
+/// Its item id is `app:launchable:1` rather than `launchable:1` — an
+/// `app:`-shaped id is what `hop_core::learning`'s persistence-key rule
+/// (issue #39) persists in the clear, which is what lets the assertions
+/// below check the on-disk store by the literal id string. `hop-core`'s own
+/// `learning` tests already cover an id that hashes; this test is about the
+/// wiring from a real socket exchange to a real save, not about the key
+/// rule itself.
 struct LaunchableProvider;
 
 impl Provider for LaunchableProvider {
@@ -526,7 +534,7 @@ impl Provider for LaunchableProvider {
         _ctx: QueryCtx,
     ) -> Result<Vec<Item>, ProviderError> {
         Ok(vec![Item {
-            id: ItemId::new("launchable:1").unwrap(),
+            id: ItemId::new("app:launchable:1").unwrap(),
             kind: Kind::Action,
             title: "Launchable".to_string(),
             subtitle: None,
@@ -602,7 +610,9 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
         }
     }
     assert!(
-        delivered.iter().any(|i| i.id.as_str() == "launchable:1"),
+        delivered
+            .iter()
+            .any(|i| i.id.as_str() == "app:launchable:1"),
         "the provider's item must survive assembly, got {delivered:?}"
     );
 
@@ -612,7 +622,7 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
         "the store must not be written before any launch is recorded"
     );
 
-    let reply = execute(&mut stream, 1, "launchable:1", "open");
+    let reply = execute(&mut stream, 1, "app:launchable:1", "open");
     assert_eq!(
         reply,
         DaemonMsg::Executed {
@@ -636,7 +646,7 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
     let reloaded = Learning::load(&store_path);
     let recent = reloaded.recent_launches(10);
     assert!(
-        recent.iter().any(|(id, _)| id == "launchable:1"),
+        recent.iter().any(|(id, _)| id == "app:launchable:1"),
         "the launch recorded through the socket must be the one that landed \
          on disk, got {recent:?}"
     );
@@ -687,7 +697,7 @@ fn two_sequential_launches_both_land_in_the_learning_store() {
             }
         }
 
-        let reply = execute(&mut stream, query_id, "launchable:1", "open");
+        let reply = execute(&mut stream, query_id, "app:launchable:1", "open");
         assert_eq!(
             reply,
             DaemonMsg::Executed {
@@ -702,7 +712,7 @@ fn two_sequential_launches_both_land_in_the_learning_store() {
     let frequent = reloaded.frequent_launches(1, &[]);
     assert_eq!(
         frequent,
-        vec![("launchable:1".to_string(), 2)],
+        vec![("app:launchable:1".to_string(), 2)],
         "both launches must have reached the file that made it to disk \
          last, not just the first or the second, got {frequent:?}"
     );

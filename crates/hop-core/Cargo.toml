@@ -26,6 +26,13 @@ thiserror.workspace = true
 nucleo-matcher.workspace = true
 tokio.workspace = true
 regex.workspace = true
+# Issue #39 (Decision 2's shape half): a `global_frequency` id outside the
+# three known-safe shapes persists as `sha256:<hex>` of the raw id rather
+# than the id itself. This defends accidental disclosure — a backup, a
+# support bundle, a bare `cat` of the state directory — not confidentiality
+# against someone who already holds the store, since hashing has no secret
+# input to hide behind. MIT OR Apache-2.0, on `deny.toml`'s allow list.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile.workspace = true

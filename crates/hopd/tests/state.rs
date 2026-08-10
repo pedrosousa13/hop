@@ -40,6 +40,13 @@ use hopd::source::HostSource;
 /// (`ProviderHost` + `HostSource`) this test needs, since it is
 /// `HostSource::record_launch`'s load/save wiring under test, not a
 /// scripted source's own (test-defined) behavior.
+///
+/// Its item id is `app:restartable:1` rather than `restartable:1` — an
+/// `app:`-shaped id is what `hop_core::learning`'s persistence-key rule
+/// (issue #39) persists in the clear, which is what lets this file assert
+/// on the on-disk store by the literal id string. This test is about the
+/// load/save boundary across a restart, not about the key rule itself,
+/// which `hop-core`'s own `learning` tests cover directly.
 struct RestartableProvider;
 
 impl Provider for RestartableProvider {
@@ -59,7 +66,7 @@ impl Provider for RestartableProvider {
         _ctx: QueryCtx,
     ) -> Result<Vec<Item>, ProviderError> {
         Ok(vec![Item {
-            id: ItemId::new("restartable:1").unwrap(),
+            id: ItemId::new("app:restartable:1").unwrap(),
             kind: Kind::Action,
             title: "Restartable".to_string(),
             subtitle: None,
@@ -106,7 +113,7 @@ fn build_source(store_path: &std::path::Path) -> HostSource {
     )
 }
 
-/// Queries `stream` for `"restartable"`, then executes `"restartable:1"`'s
+/// Queries `stream` for `"restartable"`, then executes `"app:restartable:1"`'s
 /// `"open"` action against `query_id`, and returns the `Executed` reply.
 /// Shared by both lifetimes below since the round trip is identical in each.
 fn query_and_execute(stream: &mut UnixStream, query_id: u64) -> DaemonMsg {
@@ -133,7 +140,9 @@ fn query_and_execute(stream: &mut UnixStream, query_id: u64) -> DaemonMsg {
         }
     }
     assert!(
-        delivered.iter().any(|i| i.id.as_str() == "restartable:1"),
+        delivered
+            .iter()
+            .any(|i| i.id.as_str() == "app:restartable:1"),
         "the provider's item must survive assembly, got {delivered:?}"
     );
 
@@ -141,7 +150,7 @@ fn query_and_execute(stream: &mut UnixStream, query_id: u64) -> DaemonMsg {
         stream,
         &ClientMsg::Execute {
             query_id,
-            item_id: ItemId::new("restartable:1").unwrap(),
+            item_id: ItemId::new("app:restartable:1").unwrap(),
             action_id: ActionId::new("open").unwrap(),
         },
     );
@@ -204,7 +213,7 @@ fn a_launch_recorded_in_one_daemon_lifetime_survives_a_restart_into_a_second() {
         reloaded_directly
             .recent_launches(10)
             .iter()
-            .any(|(id, _)| id == "restartable:1"),
+            .any(|(id, _)| id == "app:restartable:1"),
         "the launch recorded in lifetime 1 must survive a fresh \
          Learning::load in lifetime 2, got {:?}",
         reloaded_directly.recent_launches(10)
@@ -240,7 +249,7 @@ fn a_launch_recorded_in_one_daemon_lifetime_survives_a_restart_into_a_second() {
     let frequent = final_store.frequent_launches(1, &[]);
     assert_eq!(
         frequent,
-        vec![("restartable:1".to_string(), 2)],
+        vec![("app:restartable:1".to_string(), 2)],
         "both the lifetime-1 launch and the lifetime-2 launch, recorded \
          across two independent daemon lifetimes sharing one store file, \
          must both be present, got {frequent:?}"

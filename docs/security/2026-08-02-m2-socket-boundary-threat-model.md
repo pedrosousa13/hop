@@ -116,6 +116,59 @@ descendants, #72, #78, #85's wire-signal half, #88, #93, #98, #104 — are
 unchanged by this pass: closing a stale note is not the same claim as
 closing a gap, and nothing here asserts the latter where the code does not.
 
+**Amendment, 2026-08-10.** A second, later amendment sharing this document's
+date with the one above — issue #102's audit and this one are different
+events that happen to fall on the same calendar day. This one records issue
+#39's own implementation landing (`193dc4d`, `e83c373`), Decision 2's shape
+half: `persistence_key` (`hop-core`'s `learning.rs`) now decides, at
+`Learning::record` and every `global_frequency` lookup, whether a raw id
+persists in the clear or as `sha256:<hex>`. Four things follow.
+
+First, the passage under "What the contract enforces today" headed "Query
+text is not written by `Learning`'s persistence path" is falsified as a
+claim about the whole persistence path, though it is exactly true of what it
+is actually about, `selections`: the same path also writes
+`global_frequency`, and the calculator provider (#58, `3b53a7a`) mints an
+item id as `calc:{term}` straight from the routed query text
+(`crates/hopd/src/calculator.rs:178`), so every launched calculation reached
+`learning.json` verbatim, as its id, from #58's landing until this round's
+fix. Per this document's rule, the claim is not rewritten — it is annotated
+in place.
+
+Second, T11's "Today" column and Decision 2's "Where today's code stands"
+both describe `canonicalize_result_id`'s fall-through — an id matching
+neither `utility:` nor `web-search:` written to disk unchanged — as the live
+behaviour. It no longer is: `persistence_key` sits between that fall-through
+and the disk now. Both passages were accurate when written and are
+annotated in place rather than rewritten.
+
+Third, "What the implementing slice must still settle" posed six open
+questions. Three are answered by this landing and marked so: which shapes
+count as known-safe (exactly `app:`, `utility:<kind>` and
+`web-search:<service>`, independent of any manifest flag), the hash function
+and its dependency (`sha2`, clean against `cargo deny check`), and the
+stored-format version bump (none — `STORE_VERSION` stays 1, and a legacy
+entry is re-keyed as it loads instead). Three remain open and are marked as
+still open rather than left to look resolved by proximity: the manifest
+opt-in field, still absent from `ProviderManifest` and riding with #72;
+whether the hash is salted, left unsalted deliberately this round because
+issue #88's decided `learning.key` sibling file is the natural future home
+for a salt, and a second key file before that one exists was not worth
+inventing; and the empty-query view's behaviour for a provider that did not
+opt in, still M3's.
+
+Fourth, one accepted residual this landing introduces and documents rather
+than closes: a legacy store already holding a plaintext key shaped exactly
+like `sha256:` plus 64 lowercase hex digits cannot be told apart, on load,
+from a key this module hashed itself — `stored_key_needs_no_rekeying`'s own
+doc comment (`learning.rs`) states why nothing in the v1 format distinguishes
+the two. No passage in this document claimed otherwise, so nothing needed
+annotating for it; it is recorded here so a reader of Decision 2 knows it
+exists.
+
+Each changed passage below is marked **[Amended 2026-08-10]** in place, the
+same shape this document's other amendments already use.
+
 ---
 
 ## What this is
@@ -466,12 +519,23 @@ and `redaction.rs`:73–117 prices that disclosure rather than filing it under
 
 **Query text is not written by `Learning`'s persistence path.**
 `Learning::save` writes a `PersistedLearningStore`, which has no `selections`
-field (`learning.rs`:369–372 [Amended 2026-08-10]), and the in-memory
+field (`learning.rs`:386–390 [Amended 2026-08-10]), and the in-memory
 `selections` map is `#[serde(default, skip_serializing)]`
-(`learning.rs`:361–362 [Amended 2026-08-10]). The test
+(`learning.rs`:379–380 [Amended 2026-08-10]). The test
 `save_and_load_round_trip_without_persisting_query_keys` asserts the saved
 file does not contain the query key. That is a statement about this path in
 this module, not about code that does not exist yet.
+**[Amended 2026-08-10]** True of `selections`, and only of `selections` — the
+paragraph above is about the query key specifically, not about every string
+the persistence path writes. `global_frequency`, the map `Learning::record`
+also writes on the same path, kept a raw item id verbatim until this round:
+the calculator provider (#58, `3b53a7a`) mints an id as `calc:{term}`
+straight from the routed query text (`crates/hopd/src/calculator.rs:178`),
+so every launched calculation reached `learning.json` in the clear, as its
+id, from #58's landing until issue #39's fix (`193dc4d`, `e83c373`) — see
+Decision 2, "Where today's code stands." The claim about `selections` was
+correct and is left as written; it never extended to the id channel, and
+this document should not be read as though it did.
 
 **Closed enums.** `Kind`, `ActionKind`, `ErrorCode`, `ExecOutcome` and the
 message enums carry no `#[serde(other)]` catch-all, so an unknown variant is a
@@ -577,7 +641,7 @@ exists yet.
 | T8 | A provider aiming a command-shaped outcome at a client | `executed`, and `Item.icon` on `results` | Content rules on `CopyText`/`OpenUrl` (#23, closed) and on `IconName`/`IconPath` (#24, closed) | Residual on both halves, and an **open** issue owns each: `Item.copy_text` still reaches the clipboard as a bare bounded string ([#78](https://github.com/pedrosousa13/hop/issues/78), open), and an icon path is validated but not contained — the roots are documented, not enforced, so a regular file outside them still opens ([#93](https://github.com/pedrosousa13/hop/issues/93), open, split out of #24 for this half) |
 | T9 | Keystrokes reaching the journal, then a shared bundle | Logging | No logging dependency. `QueryText` redacts (#27, closed) — **in `hop-protocol` only**. `route` takes a `&str` and `RoutedQuery` (`router.rs`:257–258) derives `Debug` over a plain `String` term, so the same text formats verbatim in `hop-core`; `router.rs`:249–256 says not to treat one as safe to log ([#83](https://github.com/pedrosousa13/hop/issues/83), open). **[Amended 2026-08-10]** #83 is now **closed** (`8bd6550`): `RoutedQuery` (`router.rs`:378–393) carries `term` and `raw` as `RoutedText`, which redacts under `Debug` the same way `QueryText` does, so the same text no longer formats verbatim in `hop-core`; `router.rs`:363–377 states the change in place | Any added logging keeps the redacting type at the field, and #83 carries the redaction across the crate boundary rather than stopping at `route`. **[Amended 2026-08-10]** Landed — see the Today column |
 | T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the `version` is refused on mismatch and a future-dated timestamp clamped (#38, closed by `59fd5fe`); the version probe and the per-condition `LoadReport` are #43's (closed by `056893e`, which replaced #38's two per-branch checks); a persisted `count` is saturated at the boundary (#44, closed by `edb8258`). **Two residuals, one owner**: still no integrity check, so a plausible forged store passes all of it — and eviction still prefers a clamped future-dated entry, which `96d5713` left open and `59fd5fe` explicitly did not close (#88, open) | #88's integrity check, which is what lets a forged entry be *refused* rather than clamped, sequenced with #72 and with Decision 2 on the same load path |
-| T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:707–721 [Amended 2026-08-10]) | Decision 2 |
+| T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:737–751 [Amended 2026-08-10]). **[Amended 2026-08-10]** Decision 2's shape half has landed (#39, `193dc4d`, `e83c373`): `persistence_key` (`learning.rs`) now sits between that scrubbing and disk — an id outside the three known-safe shapes persists as `sha256:<hex>` rather than unchanged. | Decision 2. **[Amended 2026-08-10]** Shape half done; the manifest opt-in half is still open, riding with #72 |
 | T12 | Cross-provider boost theft | Provider seam | `CheckedItems::check` closes provenance forgery; the store keys on a bare id (#72) | A provider dimension in the store key |
 | T13 | Connection flood / socket occupancy | Accept loop | An accept loop exists (#54) and spawns one unbounded task per peer (`server.rs`, `serve_with`); nothing caps concurrent connections, aggregate memory across them, or the accept rate, and `read_frame` has no read timeout, so a peer that sends a valid length prefix and then stalls holds a task and its payload buffer open indefinitely (`connection.rs` says so in place) | Belongs to [#98](https://github.com/pedrosousa13/hop/issues/98); this document does not settle it. #54 and #55 have both landed and neither took it: #55 bounded per-*query* retained state (T3) and deliberately left every connection-level bound to #98 |
 | T14 | A provider opts in to plaintext persistence for ids that carry user content | Manifest, under Decision 2's consequence | The opt-in field does not exist yet (`provider.rs`:85–121 [Amended 2026-08-10]). `CheckedItems::check` verifies an item's kind and provider id, and inspects nothing about what the id *contains* | Documentation a provider author reads before setting the field, and the extension store's PR review (spec §6) as the gate. No code check can verify the claim |
@@ -818,6 +882,13 @@ timestamp per key (`learning.rs`, `LearningEntry`) and looks keys up by
 equality — so learning keeps working on a hashed id exactly as it does on a
 plaintext one.
 
+**[Amended 2026-08-10]** This rule's shape half is implemented: issue #39's
+landing (`193dc4d`, `e83c373`) added `persistence_key` (`hop-core`'s
+`learning.rs`), which `Learning::record` and every `global_frequency` lookup
+now go through — see `CONTEXT.md`'s **Persistence key** entry for the term,
+and "Where today's code stands" and "What the implementing slice must still
+settle" below for what changed and what is still open.
+
 ### Why
 
 **Third-party providers keep learning at all, and that is the deciding
@@ -930,13 +1001,23 @@ project goal (spec §1, §6).
 
 ### Where today's code stands
 
-`canonicalize_result_id` (`learning.rs`:707–721 [Amended 2026-08-10]) strips dynamic payloads for
+`canonicalize_result_id` (`learning.rs`:737–751 [Amended 2026-08-10]) strips dynamic payloads for
 two prefixes, `utility:` and `web-search:`. An id that matches neither falls
-through to `result_id.to_string()` (`learning.rs`:720 [Amended 2026-08-10]) and is written into
+through to `result_id.to_string()` (`learning.rs`:750 [Amended 2026-08-10]) and is written into
 plaintext JSON with the 90-day retention `PERSIST_RETENTION_MS` sets. So does
 an id that carries one of the two prefixes with an empty first segment after
 it — `utility:` alone takes the same fall-through, since the guard requires a
 non-empty segment.
+
+**[Amended 2026-08-10]** The fall-through above no longer reaches disk
+unchanged. Issue #39's fix (`193dc4d`, `e83c373`) added `persistence_key`
+(`learning.rs`), which every write and lookup on `global_frequency` now goes
+through: `canonicalize_result_id`'s own behaviour is unchanged, and its
+output still falls through unchanged for `calc:` and for any id this code
+has never heard of — but `persistence_key` is what that fallen-through
+string reaches next, and it replaces it with `sha256:<hex>` of the raw id
+before anything is written to disk, rather than the plaintext this paragraph
+describes.
 
 Two facts about that worth carrying into the implementing slice:
 
@@ -970,9 +1051,19 @@ Two facts about that worth carrying into the implementing slice:
   the opposite fails open on the very content Decision 2 exists to keep off
   disk. There is also a third answer — no default at all, with the field
   required, so a manifest that omits it does not build.
+  **[Amended 2026-08-10]** Still unsettled: issue #39's landing (`193dc4d`,
+  `e83c373`) implemented Decision 2's shape half only. `ProviderManifest`
+  (`provider.rs`) carries no such field today, and every question this
+  bullet poses is unchanged — it rides with #72.
 - **Which shapes count as known-safe**, and how that list relates to the opt-in
   — whether a built-in provider is covered by a shape, by the manifest flag, or
   by both.
+  **[Amended 2026-08-10]** The shape half is settled by issue #39's landing
+  (`193dc4d`, `e83c373`): exactly three prefixes, `app:`, `utility:<kind>`
+  and `web-search:<service>` (`is_known_safe_shape`, `learning.rs`), checked
+  independently of any manifest flag. The opt-in half of this bullet's
+  question is unanswered, since the field itself still does not exist — see
+  the manifest-field bullet above.
 - **The hash function, and the dependency it brings.** Neither crate lists a
   hashing or cryptographic dependency today (`crates/*/Cargo.toml`), so this
   adds one. The gate it will meet now exists:
@@ -1004,12 +1095,22 @@ Two facts about that worth carrying into the implementing slice:
   comment passes `cargo test --workspace` with nothing for a grep to find. Both
   limits are recorded in place rather than claimed away; neither has an issue
   of its own, which is why they are stated here.
+  **[Amended 2026-08-10]** Settled by issue #39's landing (`193dc4d`,
+  `e83c373`): `sha2` (`hop-core/Cargo.toml`, default features), the digest
+  `persistence_key` (`learning.rs`) formats as `sha256:<lowercase hex>`.
+  `cargo deny check` is clean on all four sub-checks against the gate this
+  bullet anticipated.
 - **Whether the hash is salted per install.** Unsalted, the same path hashes
   identically on every machine, so one precomputed table serves every user.
   Salted, that is closed, but the salt has to live somewhere — and if it lives
   beside the store it travels in the same backup, which returns the property to
   roughly what it was. This is a real trade and the slice should make it
   deliberately.
+  **[Amended 2026-08-10]** Decided, deliberately, by issue #39's landing:
+  unsalted. Issue #88's decided `learning.key` sibling file is the natural
+  future home for a salt, and inventing a second key file before that one
+  exists was judged not worth it this round — the trade above is made, not
+  merely deferred, and #88 is where it would be revisited.
 - **The stored-format version bump, and what happens to existing files.** This
   is the same load path [#37](https://github.com/pedrosousa13/hop/issues/37)
   and [#38](https://github.com/pedrosousa13/hop/issues/38) have already
@@ -1027,12 +1128,28 @@ Two facts about that worth carrying into the implementing slice:
   what makes a shape-changing bump report `UnrecognizedVersion` rather than
   corruption. #72's third question asks precisely for this to be sequenced
   rather than run in parallel.
+  **[Amended 2026-08-10]** Settled by issue #39's landing (`193dc4d`,
+  `e83c373`): no bump. `STORE_VERSION` stays 1, and `rekeyed_global_frequency`
+  (`learning.rs`) migrates a legacy entry to its persistence key as the store
+  loads, so an existing file keeps working rather than being refused wholesale
+  the way a version mismatch would refuse it. One residual this introduces,
+  documented rather than closed: a legacy store already holding a plaintext
+  key shaped exactly like this module's own hash output cannot be told apart,
+  on load, from a key this module hashed itself —
+  `stored_key_needs_no_rekeying`'s own doc comment states why nothing in the
+  v1 format distinguishes the two.
 - **How the empty-query view behaves for a provider that did not opt in.** The
   consequence above settles the rule — those items are learned and not
   renderable there — but not what the view *shows* in their place: a gap, a
   built-ins-only list, or something that tells the user learning is working
   even though the row is absent. M3 builds that screen (spec §8), and it should
   arrive knowing this rather than discovering it.
+  **[Amended 2026-08-10]** Still open: issue #39's landing implemented
+  Decision 2's shape half only, and did not touch `recent_launches` /
+  `frequent_launches` beyond having them return persistence keys rather than
+  raw ids for a non-safe-shaped id (`learning.rs`) — a behaviour change with
+  no visible effect yet, since nothing surfaces either function to a user
+  today. This bullet's question is unchanged and remains M3's.
 
 ---
 
@@ -1067,8 +1184,8 @@ What has to be true for this model to describe reality rather than intent:
 | [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation. #55 answered the first two — 5 000, item count only, reasoning in `hop_protocol::limits` — and left the third half-answered: the daemon truncates the undelivered remainder rather than evicting what it delivered, but says nothing on the wire that lets a client tell a capped exchange from a completed one, so its half is still a truncation and not a refusal. **[Amended 2026-08-10]** #59 (`4c1aff4`) has since landed and settled the sub-question this row used to pose to it — a cap-truncated id and a never-emitted one are deliberately not distinguished — without touching this remaining half: no wire signal for a capped exchange exists yet, and none of the closed M2 slices added one. See Decision 1's settled answers |
 | [#60](https://github.com/pedrosousa13/hop/issues/60) | **[Amended 2026-08-10] Landed.** A real state directory, which is where `learning.json`'s path stops being hypothetical |
 | [#62](https://github.com/pedrosousa13/hop/issues/62) | **[Amended 2026-08-10] Landed.** Socket activation, which moves socket creation into a unit file (`contrib/systemd/hopd.socket`) |
-| [#39](https://github.com/pedrosousa13/hop/issues/39) | Decision 2's rule, sequenced with #72 and #88 on the load path #37, #38, #43 and #44 have already changed — plus the `ProviderManifest` opt-in field the recents consequence needs, which does not exist today (`provider.rs`:85–121 [Amended 2026-08-10]) and changes the plugin seam. The field's **default is an open question**, not something this model settles |
-| [#57](https://github.com/pedrosousa13/hop/issues/57), M5 providers | Whatever the manifest field's default turns out to be, applied to each built-in provider: either each one declares whether its ids are safe to persist in plaintext, or the default covers those that say nothing. Open until #39 decides the default |
+| [#39](https://github.com/pedrosousa13/hop/issues/39) | Decision 2's rule, sequenced with #72 and #88 on the load path #37, #38, #43 and #44 have already changed — plus the `ProviderManifest` opt-in field the recents consequence needs, which does not exist today (`provider.rs`:85–121 [Amended 2026-08-10]) and changes the plugin seam. The field's **default is an open question**, not something this model settles. **[Amended 2026-08-10]** The shape half has **landed** (`193dc4d`, `e83c373`) — see Decision 2, "Where today's code stands." The manifest opt-in field is unchanged by that landing and still does not exist; it rides with #72, as before |
+| [#57](https://github.com/pedrosousa13/hop/issues/57), M5 providers | Whatever the manifest field's default turns out to be, applied to each built-in provider: either each one declares whether its ids are safe to persist in plaintext, or the default covers those that say nothing. **[Amended 2026-08-10]** Not "open until #39 decides the default": #39 landed the shape half only and explicitly deferred the manifest default to #72 (see the #39 row above) — open until #72 decides it |
 | M3 (spec §8) | The empty-query view's behaviour for a provider that did not opt in — learned, ranked, and absent from that screen |
 | [#93](https://github.com/pedrosousa13/hop/issues/93) | The icon-root check #24 deliberately left out, and the open half of T8's pair: allowed roots computed at startup from `XDG_DATA_DIRS` and the icon theme spec's locations, enforced by whatever resolves the path, and checked against what the path resolves to rather than against the string |
 | [#83](https://github.com/pedrosousa13/hop/issues/83) | The open half of T9's pair: `RoutedQuery` holds the term as a plain `String` under a derived `Debug`, so the redaction `QueryText` applies in `hop-protocol` stops at `route`, which takes a `&str`. **[Amended 2026-08-10]** **Closed** (`8bd6550`): `RoutedQuery`'s `term` and `raw` are now `RoutedText`, which redacts under `Debug` the way `QueryText` does — see T9 |

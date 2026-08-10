@@ -63,6 +63,23 @@
 //!   *do* with a report is not decided here, and neither is preserving the
 //!   file a report is about: `save` still overwrites it, which
 //!   [`Learning::save`] says.
+//! - An unrecognized id no longer reaches disk verbatim (issue #39, Decision
+//!   2's shape half). The salvage — and this module, until now — persisted
+//!   `global_frequency`'s key as whatever [`canonicalize_result_id`] made of
+//!   the raw id, which strips a payload from exactly two providers'
+//!   ids and leaves every other one, `calc:{term}`'s raw query text among
+//!   them, untouched. [`persistence_key`] replaces that as the map's key
+//!   function: three known-safe shapes still persist in the clear, and
+//!   everything else — `calc:` included — persists as a SHA-256 hash of the
+//!   raw id instead. The change is at the boundary an id enters the store
+//!   rather than at `save`: [`Learning::record`] keys `global_frequency` by
+//!   [`persistence_key`] directly, [`Learning::frequency_boost`] computes
+//!   the same key before its lookup, and a load re-keys whatever it finds
+//!   through [`rekeyed_global_frequency`] — so a v1 store's plaintext
+//!   entries migrate in place rather than going unmatched by every lookup
+//!   that now keys by hash. [`persistence_key`]'s own doc comment has the
+//!   rule and what hashing does and does not buy; `selections` is untouched,
+//!   being in-memory only.
 //!
 //! Nothing outside `load` and `save` touches the filesystem.
 //!
@@ -140,6 +157,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use hop_protocol::{ItemId, MAX_ITEM_ID, MAX_QUERY_TEXT};
 
@@ -647,11 +665,11 @@ fn apply_decay(raw: i32, last_ms: u64, now: u64) -> i32 {
 /// This is the one place that ceiling is defined. `deserialize_saturating_count`
 /// applies it at the point a [`LearningEntry`] is deserialized,
 /// [`Learning::query_boost`] / [`Learning::frequency_boost`] apply it again
-/// themselves, and `canonicalized_global_frequency` applies it once more on
-/// the way back out to disk (see its own doc comment for why) — so a count
-/// is safe whether it just came off disk, was built directly in memory (a
-/// test, say), grew past the line via `record`'s `saturating_add`, or was
-/// just merged from two counts that were each already at the line.
+/// themselves, and [`rekeyed_global_frequency`] applies it once more when a
+/// load merges two colliding entries (see its own doc comment for why) — so
+/// a count is safe whether it just came off disk, was built directly in
+/// memory (a test, say), grew past the line via `record`'s `saturating_add`,
+/// or was just merged from two counts that were each already at the line.
 fn saturating_count_i32(count: u32) -> i32 {
     count.min(i32::MAX as u32) as i32
 }
@@ -704,6 +722,18 @@ fn evict_lru_outer(map: &mut HashMap<String, HashMap<String, LearningEntry>>, ma
     }
 }
 
+/// Strips a dynamic payload off `utility:` and `web-search:` ids, leaving
+/// the fixed `utility:<kind>` / `web-search:<service>` shape behind. Every
+/// other id — `app:`, `calc:`, anything a provider this code has never heard
+/// of mints — passes through unchanged.
+///
+/// This is step one of [`persistence_key`], not a persistence decision on
+/// its own: what this returns still carries a payload for every id it did
+/// not recognize, and [`persistence_key`] is what decides whether the result
+/// is safe to write in the clear. Kept as a separate function because its
+/// job is narrower and worth naming — "strip a payload" is a fact about the
+/// two providers that put one in the id, where "is this safe to persist" is
+/// a fact about the whole id space.
 fn canonicalize_result_id(result_id: &str) -> String {
     if let Some(utility_tail) = result_id.strip_prefix("utility:") {
         let utility_kind = utility_tail.split(':').next().unwrap_or_default();
@@ -720,20 +750,353 @@ fn canonicalize_result_id(result_id: &str) -> String {
     result_id.to_string()
 }
 
-/// Merging two already-bounded counts on the raw `u32` would let the sum
-/// exceed what [`saturating_count_i32`] can round-trip (two entries near
-/// `i32::MAX` sum to something only `u32` can hold), writing a count to disk
-/// that the next [`Learning::load`] would have to saturate right back down.
-/// Routing the merge through [`saturating_count_i32`] itself — out to `i32`
-/// and back — keeps the aggregate on the same `i32::MAX` ceiling everything
-/// else in this module already uses, so nothing this function writes ever
-/// needs saturating again on the way back in.
-fn canonicalized_global_frequency(
+/// Whether `stripped` has one of the three known-safe plaintext prefixes —
+/// a bare prefix check, nothing more. This alone is **not** what decides
+/// whether a *raw* id may persist in the clear; see
+/// [`raw_id_proves_a_known_safe_shape`] for that stricter question and why
+/// the two are different functions rather than one.
+///
+/// What this *is* for: recognizing a string already sitting in
+/// `global_frequency` — on disk, or freshly re-keyed — as already being in
+/// one of the three final plaintext shapes, so [`rekeyed_global_frequency`]
+/// can leave it alone rather than running it back through
+/// [`persistence_key`]. By the time a key reaches that check, whatever
+/// stripping was ever going to happen already has: `record` only ever
+/// writes `app:<rest>` unchanged or the *output* of
+/// [`canonicalize_result_id`] for `utility:`/`web-search:`, never a raw
+/// unstripped payload — a bare prefix check is exactly right for a value
+/// with that provenance, unlike for a raw id fresh off a provider, where
+/// the prefix alone cannot tell a stripped kind from a payload that merely
+/// looks like one (see [`raw_id_proves_a_known_safe_shape`]).
+fn is_known_safe_shape(stripped: &str) -> bool {
+    stripped.starts_with("app:")
+        || stripped.starts_with("utility:")
+        || stripped.starts_with("web-search:")
+}
+
+/// Whether `raw_id` — as it arrived, before any stripping — proves it is
+/// safe for [`persistence_key`] to persist in the clear. This is the check
+/// that runs on the *record* path, over the raw id a provider minted, and
+/// it is stricter than [`is_known_safe_shape`]'s bare prefix check on
+/// purpose.
+///
+/// - `app:<rest>` — a desktop-entry id, unconditionally. `<rest>` names
+///   which `.desktop` file matched, not anything the user entered; the set
+///   of possible values is exactly what is installed on the system, which
+///   is not secret and is not authored by this user's input.
+///   [`canonicalize_result_id`] never touches an `app:` id, so there is no
+///   stripping step to prove here.
+/// - `utility:<kind>` and `web-search:<service>` — safe **only when a
+///   payload was actually stripped**, which means the raw id carried a
+///   *second* colon after the prefix: `utility:<kind>:<payload>`, not bare
+///   `utility:<kind>`. [`canonicalize_result_id`] returns
+///   `format!("utility:{kind}")` whenever the segment right after the
+///   prefix is non-empty, whether or not anything followed it — so a raw
+///   `utility:2+2` (one segment, no payload to strip) and the *result* of
+///   stripping `utility:calculator:2+2` down to `utility:calculator` are
+///   not distinguishable from the stripped string alone: both are
+///   `"utility:<word>"`-shaped, plausible-kind strings. A prefix check on
+///   the stripped output, on its own, cannot tell "a kind was isolated from
+///   a payload" from "the whole raw id happened to already look like
+///   one" — and the second case is exactly a provider minting
+///   `utility:<raw user content>` with no second colon, which is the
+///   payload Decision 2 exists to hash. Requiring the second colon on the
+///   *raw* id is what makes "a payload was stripped" a checked fact rather
+///   than an inference from what the output looks like. Fail-closed on the
+///   ambiguous case: a single-segment `utility:X` is not provably a kind,
+///   so it hashes rather than persisting in the clear.
+///
+/// No `Kind::Utility` provider exists in this tree today, and `calc:`
+/// already hashes regardless (it matches neither prefix), so the gap this
+/// closes was dormant rather than exploited — but the guarantee has to hold
+/// for a provider this code has never seen, which is the whole point of a
+/// *known-safe* shape rather than a *trusted* one.
+///
+/// # Why this is not also what [`rekeyed_global_frequency`] uses
+///
+/// This function needs the *raw* id to do its job — the second-colon
+/// evidence lives only there, and stripping destroys it. A key already
+/// sitting in `global_frequency` — on disk, or read back mid-re-key — is
+/// never that raw id; it is either a hash or [`canonicalize_result_id`]'s
+/// *output*, and running this check against an output that this module
+/// itself already reduced to `utility:<kind>` would find no second colon
+/// (there is nothing left to strip) and wrongly hash a key that was already
+/// safe. [`is_known_safe_shape`]'s plain prefix check is what
+/// [`rekeyed_global_frequency`] uses instead, and its own doc comment says
+/// why that is the right check for a value with that provenance.
+fn raw_id_proves_a_known_safe_shape(raw_id: &str) -> bool {
+    if raw_id.starts_with("app:") {
+        return true;
+    }
+    for prefix in ["utility:", "web-search:"] {
+        if let Some(tail) = raw_id.strip_prefix(prefix) {
+            let kind = tail.split(':').next().unwrap_or_default();
+            // `tail.len() > kind.len()` is true exactly when there is a
+            // byte at `tail[kind.len()]`, and `split(':').next()` only
+            // stops short of the whole tail at a `:` — so this is "a
+            // second colon followed the kind," i.e. a real payload was
+            // there to strip, not "the kind happens to be short."
+            if !kind.is_empty() && tail.len() > kind.len() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `stripped` is already exactly the shape [`persistence_key`]'s
+/// hashing branch produces: `sha256:` followed by 64 lowercase hex digits —
+/// the fixed-width, fixed-case form `format!("{:x}", …)` always writes a
+/// 32-byte SHA-256 digest as. Anything shorter, longer, or carrying an
+/// uppercase hex digit is not this shape, however much it starts the same
+/// way — see [`rekeyed_global_frequency`]'s doc comment for the one caller
+/// that needs this distinction, and why.
+fn is_already_a_persistence_hash(stripped: &str) -> bool {
+    match stripped.strip_prefix("sha256:") {
+        Some(hex) => {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
+}
+
+/// The key [`Learning::record`] and every `global_frequency` lookup use —
+/// issue #39, Decision 2's shape half. This is the one function that
+/// decides what a *raw* id looks like once it can reach disk, and every
+/// site on the live record/lookup path calls it, so the two are kept in
+/// sync by construction rather than by convention. [`Learning::load`]'s
+/// re-keying pass is the one caller that does *not* call this directly on
+/// every stored key — see [`rekeyed_global_frequency`] for why, and for the
+/// one case that split off from here to make room for it.
+///
+/// # The rule
+///
+/// 1. Strip a dynamic payload with [`canonicalize_result_id`] — unchanged
+///    from before this existed, and still the only step some ids need.
+/// 2. If the *raw* id is [`is_known_safe_shape`] — `app:`, or `utility:`/
+///    `web-search:` with a payload actually stripped (see that function's
+///    doc comment for why the check runs against the raw id and not the
+///    stripped one) — persist the stripped string, in the clear.
+/// 3. Otherwise — `calc:`, a single-segment `utility:X`/`web-search:X` with
+///    no payload to prove it apart from the rest of the id, every id a
+///    provider this code has never heard of mints, and an id that already
+///    begins `sha256:` — persist `sha256:` followed by the lowercase hex
+///    SHA-256 digest of `raw_id` **as it arrived**, not the stripped form.
+///    Hashing the raw id rather than the stripped one matters for exactly
+///    the ids that reach this branch: nothing has stripped their payload,
+///    so the payload is what gets hashed away.
+///
+/// This function is total in the sense the brief asks for: there is no id
+/// for which it returns its input unchanged except a known-safe shape. An
+/// id shaped exactly like this function's own output — `sha256:` plus 64
+/// lowercase hex characters — is *not* treated as already-hashed here; it
+/// is hashed again, landing under `sha256:` followed by the digest of that
+/// whole string. `an_id_beginning_sha256_is_hashed_rather_than_written_through`
+/// pins this with the exposing shape the brief asks for: a raw id that is a
+/// syntactically valid 64-character hex digest, not merely a short
+/// look-alike. (An *earlier* version of this function special-cased that
+/// shape to make [`Learning::load`]'s re-keying idempotent — see
+/// [`rekeyed_global_frequency`] for where that case now lives instead, and
+/// why living here was wrong: it made this function pass an already-hashed
+/// id through unhashed on the record path too, not only on re-key.)
+///
+/// # Why the partition is provable
+///
+/// A key this returns begins `app:`, `utility:` or `web-search:` (branch 2)
+/// or `sha256:` (branch 3), and no input reaches both branches — they are
+/// `if`/`else`. So a plaintext key and a hashed key can never collide on
+/// the same string: doing so would require a plaintext key to begin
+/// `sha256:`, which [`is_known_safe_shape`] does not allow through branch
+/// 2 (a raw id already spelled `sha256:...` has no second colon proving a
+/// stripped payload, so it does not qualify), or a hashed key to begin one
+/// of the other three prefixes, which branch 3 never produces (SHA-256 hex
+/// never starts with a colon-terminated word). An id that itself begins
+/// `sha256:` — one already in this format, or one crafted to look like it —
+/// is not a known-safe shape, so it falls to branch 3 and is hashed again,
+/// never written through as though it were already a persistence key.
+///
+/// # What the hash is not
+///
+/// It is not confidentiality against someone who can read the store file:
+/// SHA-256 has no secret input here, so anyone who suspects a particular
+/// query recovers it by hashing their guess and comparing. What it defends
+/// is disclosure to someone who is *not* looking for anything in
+/// particular — a backup, a support bundle, a `cat` of a config directory —
+/// where a plaintext `calc:$(rm -rf ~)` or a search term is legible on
+/// sight and a hex digest is not. Confidentiality against a targeted reader
+/// of the file needs a secret (a per-installation salt, at minimum) and is
+/// explicitly not this function's job.
+fn persistence_key(raw_id: &str) -> String {
+    let stripped = canonicalize_result_id(raw_id);
+    if raw_id_proves_a_known_safe_shape(raw_id) {
+        stripped
+    } else {
+        format!("sha256:{:x}", Sha256::digest(raw_id.as_bytes()))
+    }
+}
+
+/// Whether a key already sitting in `global_frequency` (on disk, or mid
+/// re-key) is already in its final persisted form, so
+/// [`rekeyed_global_frequency`] can skip [`persistence_key`] for it
+/// entirely — see that function's doc comment for why calling
+/// [`persistence_key`] unconditionally on every stored key would be wrong,
+/// not merely redundant, and how that reasoning leads here.
+///
+/// Three cases, checked in order:
+///
+/// 1. Already shaped like this module's own hash
+///    ([`is_already_a_persistence_hash`]) — settled.
+/// 2. Not one of the three known-safe prefixes at all
+///    ([`is_known_safe_shape`]) — not settled; some other raw or legacy id
+///    (`calc:2+2`, an unknown provider's id, …) that needs the full
+///    [`persistence_key`] treatment.
+/// 3. One of the three prefixes, and it is `app:` — settled
+///    unconditionally, since [`canonicalize_result_id`] never touches an
+///    `app:` id and there is nothing further to check.
+/// 4. `utility:`/`web-search:` — settled only if
+///    [`raw_id_proves_a_known_safe_shape`] finds **no** second colon. A
+///    second colon here means the stored string is not actually a settled
+///    `utility:<kind>`/`web-search:<service>` key at all, but a raw,
+///    never-stripped id that happens to carry that prefix — a hand-written
+///    or otherwise malformed store's `utility:calculator:2+2`, say — and
+///    must be routed through [`persistence_key`] instead of trusted as-is.
+///
+/// # The one case this cannot resolve, and is not trying to
+///
+/// Cases 1 and 4 above accept a stored key on trust once it has the right
+/// *shape*, and neither can prove how that shape came to be. A *legacy*
+/// store — v1 predating issue #39's fix for the finding above, or simply
+/// not this module's own output — could contain a genuine plaintext id
+/// that happens to already have one of these shapes:
+///
+/// - `sha256:` + 64 lowercase hex, from a provider that, however
+///   implausibly, minted one (case 1, [`is_already_a_persistence_hash`]).
+/// - A single-segment `utility:X` or `web-search:X` written by an older
+///   version of this same module, which had exactly the ambiguity
+///   [`raw_id_proves_a_known_safe_shape`] now closes on the record path —
+///   or written by any other code that never checked at all (case 4).
+///
+/// Either way, this function reports the entry as already settled and
+/// [`rekeyed_global_frequency`] leaves it exactly as written rather than
+/// hashing it — the one shape of id in a legacy store that escapes the
+/// migration every other legacy entry gets. Telling a genuine instance of
+/// either shape apart from a merely coincidental one would need a marker
+/// this format does not carry: `STORE_VERSION` stays at 1 (issue #38
+/// refuses a version mismatch in either direction rather than migrating
+/// across it, so bumping it would discard every existing store instead of
+/// converting this one case), and nothing else in a
+/// `PersistedLearningStore` says which hop version — or which check — wrote
+/// a given key. This is accepted as the shape of the problem, not a gap to
+/// close here: no provider in this tree mints ids either way, and an id
+/// that did would be a fixed-width opaque token (the hash case) or would
+/// have to collide with a real `.desktop`-adjacent kind name from a
+/// nonexistent `Kind::Utility` provider (the `utility:`/`web-search:`
+/// case) — neither carries a payload hashing would have hidden regardless.
+fn stored_key_needs_no_rekeying(id: &str) -> bool {
+    if is_already_a_persistence_hash(id) {
+        return true;
+    }
+    if !is_known_safe_shape(id) {
+        return false;
+    }
+    id.starts_with("app:") || !raw_id_proves_a_known_safe_shape(id)
+}
+
+/// Re-key every entry of a freshly parsed store's `global_frequency`,
+/// merging any two source entries that land on the same key.
+///
+/// This is [`Learning::load`]'s half of the persistence-key rule (see
+/// [`persistence_key`]): a store written before issue #39 — or one that
+/// simply is not v1's own output — can hold entries in any shape at all,
+/// including raw ones [`persistence_key`] would now hash. Applying that
+/// function on the way in is what turns those into the same keys `record`
+/// would have produced, so a legacy `calc:` entry keeps its learning under
+/// the hash a fresh record of the same id would use, instead of sitting
+/// unread beside it forever.
+///
+/// # Why this does not simply call `persistence_key` on every key
+///
+/// [`persistence_key`] answers a different question than this pass needs
+/// answered, and answering the wrong one here is actively wrong rather than
+/// merely redundant, for two separate shapes of stored key:
+///
+/// - A key shaped `sha256:` + 64 lowercase hex. [`persistence_key`] hashes
+///   an id in this shape like any other unrecognized id (see its own doc
+///   comment) — correct for a *raw* id arriving at `record`, but wrong for
+///   a key already sitting in `global_frequency` on disk: that key may well
+///   be exactly [`persistence_key`]'s own prior output for some raw id,
+///   since a store this module saved is nothing but such keys. Re-keying it
+///   again would hash the *string* `"sha256:<64 hex>"`, landing on a
+///   different key than a fresh `persistence_key` call over the original
+///   raw id computes — so `frequency_boost`'s lookup, which always calls
+///   [`persistence_key`] directly on the raw id, would never find the entry
+///   again after its *first* post-save load. Every hashed provider's
+///   learning would die not on some later restart but on the very next
+///   one. `a_hashed_ids_learning_survives_a_save_and_load_round_trip` pins
+///   the fix: a key already shaped like this module's own hash
+///   ([`is_already_a_persistence_hash`]) is left exactly as it is here,
+///   rather than being run through [`persistence_key`] a second time.
+/// - A key already shaped `app:`/`utility:`/`web-search:`.
+///   [`persistence_key`] calls [`raw_id_proves_a_known_safe_shape`], which
+///   needs the *raw* id's second colon as evidence that
+///   [`canonicalize_result_id`] actually stripped a payload (see that
+///   function's doc comment for the full reasoning — this is issue #39's
+///   fix for a review finding on the shape rule itself). A key already
+///   sitting in `global_frequency` is never that raw id; it is
+///   [`canonicalize_result_id`]'s *output*, which by definition has no
+///   payload left to prove was there — `web-search:duckduckgo` has no
+///   second colon whether it came from stripping
+///   `web-search:duckduckgo:<payload>` or was never anything but exactly
+///   that. Calling [`raw_id_proves_a_known_safe_shape`] on it would find no
+///   evidence and hash a key that was already safely in the clear, breaking
+///   the ordinary round trip for every genuinely-stripped `utility:`/
+///   `web-search:` entry the moment it survives one save and load. But a
+///   bare prefix check ([`is_known_safe_shape`]) is not enough on its own
+///   either: it cannot tell `web-search:duckduckgo` (already reduced,
+///   nothing left to strip) apart from `web-search:duckduckgo:<payload>`
+///   (still carrying one, and in genuine need of
+///   [`canonicalize_result_id`]) — both start with `web-search:`. The
+///   second colon that settles it either way is exactly what
+///   [`raw_id_proves_a_known_safe_shape`] already checks, so
+///   [`stored_key_needs_no_rekeying`] combines the two: a bare-prefix match
+///   with **no** second colon is accepted as already settled, one **with**
+///   a second colon still needs the full [`persistence_key`] treatment. See
+///   [`stored_key_needs_no_rekeying`]'s own doc comment for the residual
+///   neither check can close.
+///
+/// # The merge itself
+///
+/// A collision is not hypothetical once re-keying is in play: two source
+/// entries with different raw ids — a `utility:calculator:2+2` and a
+/// `utility:calculator:9+9`, say, or a raw id and an already-canonical form
+/// of the same id — can land on one key. Dropping either would discard real
+/// learning the store actually recorded, so they are merged instead: counts
+/// sum (saturating, the same posture [`deserialize_saturating_count`] takes
+/// for the same reason — see [`saturating_count_i32`]'s doc comment), and
+/// `last_ms` takes the later of the two, since that is the more recent
+/// launch either source entry attests to.
+///
+/// Was `canonicalized_global_frequency` and ran inside [`Learning::save`],
+/// keying only through [`canonicalize_result_id`] rather than the full
+/// [`persistence_key`] rule. Moved to the load path because the key a
+/// lookup computes has to be the key a launch was recorded under, across a
+/// restart — hashing only on the way to disk would leave `global_frequency`
+/// keyed by raw id in memory while a reload keyed it by hash, silently
+/// breaking every hashed provider's learning. See [`Learning::record`] and
+/// [`Learning::purge_and_bound`] for the two ends of where that moved to.
+fn rekeyed_global_frequency(
     input: &HashMap<String, LearningEntry>,
 ) -> HashMap<String, LearningEntry> {
     let mut out: HashMap<String, LearningEntry> = HashMap::new();
     for (id, entry) in input {
-        let key = canonicalize_result_id(id);
+        let key = if stored_key_needs_no_rekeying(id) {
+            id.clone()
+        } else {
+            persistence_key(id)
+        };
         let aggregate = out.entry(key).or_insert(LearningEntry {
             count: 0,
             last_ms: 0,
@@ -956,9 +1319,10 @@ impl Learning {
     }
 
     /// Everything a freshly parsed store owes before [`Learning::load`] hands
-    /// it out: drop entries whose key is over [`MAX_ITEM_ID`] bytes, clamp
-    /// every `last_ms` in the future back to now, drop entries that have
-    /// expired, then evict whatever is still over `MAX_GLOBAL_ENTRIES`.
+    /// it out: drop entries whose key is over [`MAX_ITEM_ID`] bytes, re-key
+    /// what survives through [`persistence_key`] (merging any collisions),
+    /// clamp every `last_ms` in the future back to now, drop entries that
+    /// have expired, then evict whatever is still over `MAX_GLOBAL_ENTRIES`.
     ///
     /// The key bound and the clamp apply to `global_frequency` alone,
     /// because it is the only half of a [`Learning`] a load populates:
@@ -988,6 +1352,31 @@ impl Learning {
     /// key may *contain*. The id-scrubbing rule is the latter, is a separate
     /// issue, and is deliberately not applied here; the two are easy to
     /// mistake for one another because both look like "checking the id".
+    ///
+    /// # Why re-keying happens immediately after the bound, and not before it
+    ///
+    /// [`rekeyed_global_frequency`] maps every surviving key through
+    /// [`persistence_key`] — the load-path half of issue #39's rule, whose
+    /// module docs are on [`persistence_key`] itself. It runs second,
+    /// straight after the length check above and nowhere else, for a reason
+    /// that is really the same reason the length check exists at all: a key
+    /// [`persistence_key`] hashes always comes out at a fixed, short length,
+    /// whatever the raw key's length was. Checking the bound *after*
+    /// re-keying would check that fixed-length output instead of the raw
+    /// key a store actually claimed, and every over-long key — the exact
+    /// garbage this bound exists to catch — would launder itself into a
+    /// legitimate-looking short entry rather than being dropped. Checking
+    /// first, against the raw key as the file wrote it, is what keeps the
+    /// bound a bound on what a store *claims*, not on what re-keying is
+    /// willing to produce from it.
+    ///
+    /// Re-keying can turn two distinct surviving keys into one — a raw id
+    /// and an already-canonical form of it, say — and [`rekeyed_global_frequency`]
+    /// merges rather than lets the second overwrite the first: counts sum
+    /// (saturating) and `last_ms` takes the later of the two. Overwriting
+    /// would discard real learning one of the two source entries recorded;
+    /// see [`rekeyed_global_frequency`]'s own doc comment for why summing
+    /// and taking the later stamp are each the right merge for their field.
     ///
     /// # Why the future stamps are clamped rather than trusted or dropped
     ///
@@ -1038,12 +1427,25 @@ impl Learning {
     /// # Why this order
     ///
     /// Each step hands the next a smaller or saner map, and each is about
-    /// something different: what is not learning at all, what cannot be
-    /// true, what is too old to count, and what is simply too much. The key
-    /// bound goes first so eviction never spends a slot deciding between a
-    /// genuine entry and one that was never admissible — an over-long key
-    /// stamped in the future would otherwise win that comparison against
-    /// every entry that was really learned, clamped or not.
+    /// something different: what is not learning at all, what an honest key
+    /// looks like once persisted, what cannot be true, what is too old to
+    /// count, and what is simply too much. The key bound goes first so
+    /// neither re-keying nor eviction ever has to treat an inadmissible key
+    /// as a real one — re-keying would otherwise turn an over-long key into
+    /// a short, legitimate-looking hash (the paragraph above works through
+    /// why), and eviction would otherwise spend a slot deciding between a
+    /// genuine entry and one that was never admissible, exactly the future-
+    /// dated-key hazard the paragraph below describes for the clamp.
+    ///
+    /// Re-keying goes second, before the clamp, though the two turn out not
+    /// to interact: [`rekeyed_global_frequency`]'s merge takes the later of
+    /// two `last_ms` values, and `min(a, now)` against `max(a, b)` commutes
+    /// with `min(b, now)` against the same `now` — clamping each source
+    /// entry first and then taking the later of the two clamped stamps gives
+    /// the same result as merging first and clamping the merged stamp
+    /// after. Placed before the clamp anyway, because a step that decides
+    /// *which* entries exist reads better ahead of a step that only
+    /// corrects a field on the entries re-keying already settled.
     ///
     /// The clamp's position, by contrast, is free against *both* of the
     /// steps that follow it, and saying so is better than implying an order
@@ -1082,6 +1484,7 @@ impl Learning {
     fn purge_and_bound(&mut self) {
         self.global_frequency
             .retain(|id, _| id.len() <= MAX_ITEM_ID);
+        self.global_frequency = rekeyed_global_frequency(&self.global_frequency);
         let now = now_ms();
         for entry in self.global_frequency.values_mut() {
             entry.last_ms = entry.last_ms.min(now);
@@ -1097,8 +1500,23 @@ impl Learning {
     /// its mode. `persist_atomically`'s `DirBuilder` block says why that
     /// asymmetry is load-bearing.
     ///
-    /// Per-query selections are never written — only the canonicalized,
-    /// retention-purged global frequency table is.
+    /// Per-query selections are never written — only the retention-purged
+    /// global frequency table is.
+    ///
+    /// The keys written are exactly the keys `global_frequency` holds in
+    /// memory, unmodified. That is not an oversight: every entry reached
+    /// this table either through [`Learning::record`], which inserts under
+    /// [`persistence_key`] rather than the raw id, or through a load, which
+    /// re-keys through the same function in [`Learning::purge_and_bound`] —
+    /// see [`rekeyed_global_frequency`] for why that has to happen on the
+    /// way in rather than here on the way out. So by the time any caller
+    /// reaches this function, the map is already keyed the way it will be
+    /// written; a canonicalizing pass here would either repeat work
+    /// [`Learning::record`] and [`Learning::load`] already did or, for an
+    /// id neither of those built this value from — a `Learning` an outside
+    /// caller deserialized straight from JSON and never loaded (see
+    /// `MAX_STORE_BYTES`'s doc comment on that route) — silently launder an
+    /// out-of-bound key this function has no bound to check it against.
     ///
     /// The version written is `STORE_VERSION`, never `self.version`: these
     /// bytes are in the format this function serializes, whatever version
@@ -1144,7 +1562,7 @@ impl Learning {
             path,
             &PersistedLearningStore {
                 version: STORE_VERSION,
-                global_frequency: canonicalized_global_frequency(&purged_global),
+                global_frequency: purged_global,
             },
         )
     }
@@ -1195,6 +1613,22 @@ impl Learning {
     }
 
     /// Record a selection: the user chose `result_id` while typing `query`.
+    ///
+    /// `selections` and `global_frequency` key `result_id` differently, and
+    /// that split is deliberate rather than an inconsistency to fix.
+    /// `selections` is in-memory only — `save` never writes it — so nothing
+    /// about issue #39's persistence-key rule applies to it, and it keeps
+    /// the raw `result_id` [`Learning::query_boost`] already looked it up
+    /// by. `global_frequency` is exactly what does get written, so it is
+    /// inserted under [`persistence_key`] here rather than under
+    /// `result_id` itself — the entry point where an id enters the store,
+    /// which is what [`Learning::frequency_boost`] has to compute the same
+    /// key at on the way back out. Hashing only where `save` writes, and
+    /// leaving `global_frequency` keyed by raw id in memory, was the
+    /// alternative rejected: a reload would then key the map by hash while
+    /// every lookup still keyed by raw id, silently breaking a hashed
+    /// provider's learning across a restart. See [`persistence_key`] for the
+    /// rule itself.
     fn record(&mut self, query: &str, result_id: &str) {
         self.purge_expired();
         let ts = now_ms();
@@ -1221,10 +1655,12 @@ impl Learning {
             evict_lru_outer(&mut self.selections, MAX_QUERIES);
         }
 
-        // Update global frequency
+        // Update global frequency, keyed by the persistence key rather than
+        // the raw id — see this function's doc comment for why here rather
+        // than at `save`.
         let global = self
             .global_frequency
-            .entry(result_id.to_string())
+            .entry(persistence_key(result_id))
             .or_insert(LearningEntry {
                 count: 0,
                 last_ms: 0,
@@ -1286,9 +1722,18 @@ impl Learning {
     /// clamped to `0..=FREQ_BOOST_CAP` — the same non-negative-and-capped
     /// property as [`Learning::query_boost`], for the same reason; see its
     /// doc comment.
+    ///
+    /// `result_id` is the raw id — the same one a caller would pass to
+    /// [`Learning::query_boost`] — and not `global_frequency`'s own key
+    /// space. This function computes [`persistence_key`] over it before
+    /// looking up, the read-side half of the same rule
+    /// [`Learning::record`]'s doc comment explains from the write side: the
+    /// map is keyed by persistence key in memory as well as on disk, so a
+    /// lookup that skipped this step would silently miss every entry whose
+    /// raw id and persistence key differ — everything this rule hashes.
     fn frequency_boost(&self, result_id: &str) -> i32 {
         let now = now_ms();
-        if let Some(entry) = self.global_frequency.get(result_id) {
+        if let Some(entry) = self.global_frequency.get(&persistence_key(result_id)) {
             let raw = saturating_count_i32(entry.count).saturating_mul(FREQ_BOOST_PER_COUNT);
             apply_decay(raw, entry.last_ms, now).clamp(0, FREQ_BOOST_CAP)
         } else {
@@ -1855,14 +2300,18 @@ mod tests {
         let path = dir.path().join("learning.json");
         let mut store = Learning::load(&path);
 
-        store.record("a", "first.desktop");
+        // `app:`-shaped ids, not the salvage's bare `.desktop` strings: issue
+        // #39 persists a non-`app:`/`utility:`/`web-search:` id under its
+        // hash, and this test is about `recent_launches`' sort order, not
+        // about that keying, so it needs ids `persistence_key` leaves alone.
+        store.record("a", "app:first");
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.record("b", "second.desktop");
+        store.record("b", "app:second");
 
         let recent = store.recent_launches(10);
         assert_eq!(recent.len(), 2);
-        assert_eq!(recent[0].0, "second.desktop", "most recent should be first");
-        assert_eq!(recent[1].0, "first.desktop");
+        assert_eq!(recent[0].0, "app:second", "most recent should be first");
+        assert_eq!(recent[1].0, "app:first");
     }
 
     #[test]
@@ -1871,16 +2320,19 @@ mod tests {
         let path = dir.path().join("learning.json");
         let mut store = Learning::load(&path);
 
+        // `app:`-shaped ids for the same reason as `recent_launches_sorted_by_time`
+        // above: this test is about exclusion, which needs the id it excludes
+        // by to be the id `global_frequency` is actually keyed by.
         for _ in 0..5 {
-            store.record("a", "popular.desktop");
+            store.record("a", "app:popular");
         }
         for _ in 0..2 {
-            store.record("b", "other.desktop");
+            store.record("b", "app:other");
         }
 
-        let frequent = store.frequent_launches(10, &["popular.desktop".to_string()]);
+        let frequent = store.frequent_launches(10, &["app:popular".to_string()]);
         assert!(
-            frequent.iter().all(|(id, _)| id != "popular.desktop"),
+            frequent.iter().all(|(id, _)| id != "app:popular"),
             "excluded IDs should not appear"
         );
         assert!(!frequent.is_empty(), "should still have other entries");
@@ -2023,12 +2475,12 @@ mod tests {
     //
     // `query_boost` and `frequency_boost` each convert `entry.count`
     // through `saturating_count_i32` — see its doc comment for why, and for
-    // the `i32::MAX` ceiling `canonicalized_global_frequency` shares. The
-    // tests below pin three independent properties: a deserialization
-    // boundary that saturates a persisted count on the way in, each boost
-    // function staying correct on its own for *any* `LearningEntry`
-    // (including one built in memory that never touched the boundary at
-    // all), and that same ceiling holding on the way back out to disk.
+    // the `i32::MAX` ceiling `rekeyed_global_frequency` shares. The tests
+    // below pin three independent properties: a deserialization boundary
+    // that saturates a persisted count on the way in, each boost function
+    // staying correct on its own for *any* `LearningEntry` (including one
+    // built in memory that never touched the boundary at all), and that
+    // same ceiling holding when a load merges two colliding entries.
 
     // Pins the deserialization boundary itself: if
     // `#[serde(deserialize_with = "deserialize_saturating_count")]` were
@@ -2129,15 +2581,15 @@ mod tests {
         assert_eq!(boost, FREQ_BOOST_CAP);
     }
 
-    // The ceiling has to hold on the way back out too: two ids that
-    // canonicalize to the same key (see `canonicalize_result_id`), each
-    // already at `i32::MAX`, must not sum past it when `save` merges them.
-    // `canonicalized_global_frequency` is what `save` calls to do that
-    // merge — entered directly here, since going through a real `save`
-    // would only add a filesystem round trip without changing what this
-    // pins.
+    // The ceiling has to hold on the way in from a load too: two ids that
+    // key to the same persistence key (see `persistence_key`), each already
+    // at `i32::MAX`, must not sum past it when a load merges them.
+    // `rekeyed_global_frequency` is what `Learning::purge_and_bound` calls
+    // to do that merge — entered directly here, since going through a real
+    // `Learning::load` would only add a filesystem round trip without
+    // changing what this pins.
     #[test]
-    fn canonicalizing_global_frequency_saturates_a_merged_count_at_i32_max() {
+    fn rekeying_global_frequency_saturates_a_merged_count_at_i32_max() {
         let mut input: HashMap<String, LearningEntry> = HashMap::new();
         input.insert(
             "utility:calculator:1+1".to_string(),
@@ -2154,7 +2606,7 @@ mod tests {
             },
         );
 
-        let merged = canonicalized_global_frequency(&input);
+        let merged = rekeyed_global_frequency(&input);
         let entry = merged.get("utility:calculator").unwrap();
         assert_eq!(
             entry.count,
@@ -2747,6 +3199,13 @@ mod tests {
     // `save` with `to_string_pretty`'s indentation on top — over the
     // ceiling, unreadable by the very next load. `record_launch` takes an
     // `ItemId`, so no key this long can be real learning.
+    //
+    // The bound is checked against `over_long` as the file wrote it, before
+    // `rekeyed_global_frequency` ever runs — `Learning::purge_and_bound`'s
+    // doc comment says why that order matters as of issue #39: re-keying
+    // first would hash this into a short, legitimate-looking entry instead
+    // of dropping it, laundering exactly the garbage this bound exists to
+    // catch.
     #[test]
     fn a_persisted_key_over_the_item_id_bound_is_dropped_on_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -2775,11 +3234,20 @@ mod tests {
 
     // The other side of that bound: a key of exactly `MAX_ITEM_ID` bytes is
     // one `ItemId::new` accepts, so it is real learning and must survive.
+    //
+    // `app:`-shaped, not the plain "a" repeat this test used before issue
+    // #39: a bare id that long is not a known-safe shape and would be
+    // hashed to a short `sha256:` key regardless of this bound, which would
+    // make `contains_key(&key)` below fail for a reason unrelated to what
+    // this test pins. `app:` is the one shape `persistence_key` never
+    // rewrites, so it is the shape whose survival at the bound is worth
+    // asserting on the literal key.
     #[test]
     fn a_persisted_key_exactly_on_the_item_id_bound_survives_a_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        let key = "a".repeat(MAX_ITEM_ID);
+        let key = format!("app:{}", "a".repeat(MAX_ITEM_ID - 4));
+        assert_eq!(key.len(), MAX_ITEM_ID);
         assert!(ItemId::new(key.clone()).is_ok(), "an id this long is legal");
         let now = now_ms();
         std::fs::write(
@@ -3460,5 +3928,414 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    // --- Unknown ids hash before persistence (issue #39, Decision 2's shape
+    // half). ---
+    //
+    // `persistence_key` is the one function deciding what an id looks like
+    // once it can reach disk; these pin its rule directly, then pin the two
+    // things that rule is worthless without: the same key on both sides of a
+    // restart, and a legacy store's plaintext migrating in place rather than
+    // going unmatched forever.
+
+    // The rule itself, and the partition it claims to guarantee: every
+    // known-safe shape persists unchanged, and everything else — `calc:`,
+    // an id from a provider this module has never heard of, and an id that
+    // already looks hashed — is hashed under the *raw* id, landing in a key
+    // space the plaintext one can never collide with by construction.
+    #[test]
+    fn persistence_key_partitions_known_safe_shapes_from_hashed_ids() {
+        assert_eq!(
+            persistence_key("app:firefox.desktop"),
+            "app:firefox.desktop"
+        );
+        assert_eq!(
+            persistence_key("utility:calculator:2+2"),
+            "utility:calculator"
+        );
+        assert_eq!(
+            persistence_key("web-search:duckduckgo:https%3A%2F%2Fexample"),
+            "web-search:duckduckgo"
+        );
+
+        for raw in [
+            "calc:2+2",
+            "some-future-provider:opaque-payload",
+            "sha256:not-a-real-hash",
+        ] {
+            let key = persistence_key(raw);
+            assert_eq!(
+                key,
+                format!("sha256:{:x}", Sha256::digest(raw.as_bytes())),
+                "unrecognized id {raw:?} must be hashed under the raw id"
+            );
+            assert_ne!(
+                key, raw,
+                "a hashed key must never equal its raw input verbatim, or an id \
+                 already claiming to be one would be written through unhashed"
+            );
+            assert!(
+                !key.starts_with("app:")
+                    && !key.starts_with("utility:")
+                    && !key.starts_with("web-search:"),
+                "a hashed key must never fall into the plaintext partition: got {key:?}"
+            );
+        }
+    }
+
+    // Whole-branch review finding: `canonicalize_result_id` only strips a
+    // payload when a *second* colon is present. For a single-segment
+    // `utility:2+2` or `web-search:secretquery`, the kind and the payload
+    // collapse into one field, nothing is stripped, and a bare prefix check
+    // would have accepted the unstripped id as "already safe" — persisting
+    // exactly the payload Decision 2 exists to hash. Both shapes must hash
+    // instead, fail-closed, and — the point of the pin — must not appear
+    // verbatim in the written file's bytes. Contrast
+    // `canonicalizes_dynamic_result_ids_for_persistence` below, where a
+    // genuine second colon *does* prove a payload was stripped and the
+    // `utility:<kind>`/`web-search:<service>` form persists in the clear.
+    #[test]
+    fn a_single_segment_utility_or_web_search_id_hashes_rather_than_persisting_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let mut store = Learning::load(&path);
+
+        store.record_launch("2+2", &ItemId::new("utility:2+2").unwrap());
+        store.record_launch(
+            "secretquery",
+            &ItemId::new("web-search:secretquery").unwrap(),
+        );
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains("utility:2+2"),
+            "a single-segment utility: id has no proven kind and must not persist \
+             verbatim, got: {saved}"
+        );
+        assert!(
+            !saved.contains("web-search:secretquery"),
+            "a single-segment web-search: id has no proven service and must not persist \
+             verbatim, got: {saved}"
+        );
+        assert_eq!(
+            saved.matches("sha256:").count(),
+            2,
+            "both ids must be hashed instead, got: {saved}"
+        );
+    }
+
+    // The persisted bytes, not the in-memory map: a `calc:` id carries the
+    // raw expression the user typed, and this is the leak issue #39 exists
+    // to close (`crates/hopd/src/calculator.rs` mints these ids from routed
+    // query text).
+    #[test]
+    fn a_calc_id_with_an_embedded_expression_never_appears_verbatim_in_the_persisted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let mut store = Learning::load(&path);
+
+        store.record_launch("2+2", &ItemId::new("calc:2+2").unwrap());
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains("calc:2+2"),
+            "a calc: id's raw expression must not be persisted verbatim, got: {saved}"
+        );
+        assert!(
+            saved.contains("sha256:"),
+            "the hashed form should be what was written instead, got: {saved}"
+        );
+    }
+
+    // Issue #39's acceptance criterion, in its own literal words: "An id
+    // with an embedded path never appears verbatim on disk." Every other
+    // test in this section exercises that through a `calc:`/`utility:`/
+    // `sha256:`-shaped id; none used a path-shaped one, which is the exact
+    // scenario the criterion names — a file-provider id is not a shape this
+    // module's structural argument treats specially, but the brief's own
+    // example is worth pinning directly rather than trusting the general
+    // case to cover it.
+    #[test]
+    fn a_file_path_id_never_appears_verbatim_in_the_persisted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let raw = "file:/home/user/Documents/medical-results.pdf";
+        let mut store = Learning::load(&path);
+
+        store.record_launch("medical", &ItemId::new(raw).unwrap());
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains("medical-results")
+                && !saved.contains("/home/user")
+                && !saved.contains(raw),
+            "a file: id's embedded path must not be persisted verbatim, got: {saved}"
+        );
+        let expected_key = format!("sha256:{:x}", Sha256::digest(raw.as_bytes()));
+        assert!(
+            saved.contains(&expected_key),
+            "the stored key should be the hash of the raw path, got: {saved}"
+        );
+    }
+
+    // The restart-survival constraint from the brief, and the one that fails
+    // if the key is ever applied only at save time: `record` and
+    // `frequency_boost` have to compute the *same* key from the *same* raw
+    // id, or a reload keys the map by hash while a lookup still keys by the
+    // id it was given, and a hashed provider's learning silently stops
+    // applying the moment hopd restarts.
+    #[test]
+    fn a_hashed_ids_learning_survives_a_save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let item_id = ItemId::new("calc:2+2").unwrap();
+
+        let mut store = Learning::load(&path);
+        store.record_launch("2+2", &item_id);
+        store.save(&path).unwrap();
+
+        let reloaded = Learning::load(&path);
+        assert!(
+            reloaded.boost_for("2+2", &item_id) > 0.0,
+            "the same raw id must still receive its boost after a restart"
+        );
+    }
+
+    // A known-safe shape is the one case where the persisted bytes should
+    // name the id in the clear — the opposite assertion from the two tests
+    // above, and both are needed to pin the partition on the disk-writing
+    // side rather than only inside `persistence_key`.
+    #[test]
+    fn an_app_id_round_trips_as_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let item_id = ItemId::new("app:firefox").unwrap();
+
+        let mut store = Learning::load(&path);
+        store.record_launch("firefox", &item_id);
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            saved.contains("\"app:firefox\""),
+            "a known-safe app: id should persist in the clear, got: {saved}"
+        );
+
+        let reloaded = Learning::load(&path);
+        assert!(reloaded.boost_for("firefox", &item_id) > 0.0);
+    }
+
+    // The partition's own edge case: an id that already begins `sha256:` is
+    // not one of the three known-safe prefixes, so it is hashed like any
+    // other unrecognized id rather than being written through as though it
+    // already were a persistence key — see `persistence_key`'s doc comment
+    // for why that matters for the partition being provable at all. This is
+    // the short, non-hash-shaped case; the full 64-hex-character case below
+    // is the exposing shape the brief specifically asks for.
+    #[test]
+    fn an_id_beginning_sha256_is_hashed_rather_than_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let raw = "sha256:not-a-real-hash";
+        let item_id = ItemId::new(raw).unwrap();
+
+        let mut store = Learning::load(&path);
+        store.record_launch("q", &item_id);
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains(raw),
+            "an id that already looks hashed must not be written through verbatim, got: {saved}"
+        );
+        let expected = format!("sha256:{:x}", Sha256::digest(raw.as_bytes()));
+        assert!(
+            saved.contains(&expected),
+            "it should be hashed again, under sha256(raw_id) and not raw_id itself, got: {saved}"
+        );
+    }
+
+    /// A raw id shaped *exactly* like this module's own persistence-hash
+    /// output: `sha256:` followed by 64 lowercase hex characters, not a
+    /// short look-alike. `is_already_a_persistence_hash` is what would
+    /// mistake this for an already-computed key if `persistence_key` used it
+    /// on the record path — it does not (see `rekeyed_global_frequency`'s
+    /// doc comment for why that guard lives on the load path only) — so
+    /// this must still be hashed like any other unrecognized raw id.
+    fn hash_shaped_raw_id() -> String {
+        format!("sha256:{}", "deadbeef".repeat(8))
+    }
+
+    // The brief's own required pin, with the exact exposing shape: a raw id
+    // that is a syntactically valid 64-character hex digest must still be
+    // hashed on the record path, and must not appear verbatim in the
+    // written file's bytes.
+    #[test]
+    fn a_raw_id_shaped_exactly_like_a_persistence_hash_is_hashed_rather_than_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let raw = hash_shaped_raw_id();
+        assert_eq!(
+            raw.len(),
+            "sha256:".len() + 64,
+            "must be the exact hash shape, not a short look-alike"
+        );
+        let item_id = ItemId::new(raw.clone()).unwrap();
+
+        let mut store = Learning::load(&path);
+        store.record_launch("q", &item_id);
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains(&raw),
+            "a raw id already shaped like a persistence hash must still be hashed on the \
+             record path rather than written through verbatim, got: {saved}"
+        );
+        let expected = format!("sha256:{:x}", Sha256::digest(raw.as_bytes()));
+        assert!(
+            saved.contains(&expected),
+            "it should be hashed under sha256(raw_id), not passed through as raw_id \
+             itself, got: {saved}"
+        );
+    }
+
+    // The end-to-end consistency this fix depends on: record stores this
+    // shape under sha256(raw_id) (the test above), load's re-keying pass
+    // recognizes the stored key as already a persistence hash and leaves it
+    // alone (`rekeyed_global_frequency`), and `frequency_boost`'s lookup
+    // recomputes sha256(raw_id) fresh from the same raw id — so the boost
+    // must still apply after a restart, exactly as for any other hashed id.
+    // A regression that put the idempotency guard back inside
+    // `persistence_key` itself would still pass this test (both record and
+    // lookup would agree on leaving the id alone) but would fail the test
+    // above; a regression that dropped the guard entirely would fail this
+    // one instead, by double-hashing on load. Both tests are needed.
+    #[test]
+    fn a_raw_id_shaped_like_a_persistence_hash_still_receives_its_boost_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let raw = hash_shaped_raw_id();
+        let item_id = ItemId::new(raw).unwrap();
+
+        let mut store = Learning::load(&path);
+        store.record_launch("q", &item_id);
+        store.save(&path).unwrap();
+
+        let reloaded = Learning::load(&path);
+        assert!(
+            reloaded.boost_for("q", &item_id) > 0.0,
+            "a raw id shaped like a persistence hash must still receive its boost after \
+             a restart"
+        );
+    }
+
+    // Migration in place, for a v1 store written before issue #39: a
+    // plaintext `calc:` key loads, re-keys to its hash, and a re-save no
+    // longer carries the plaintext — the count is what proves the entry
+    // survived re-keying rather than having been silently dropped.
+    #[test]
+    fn a_legacy_stores_plaintext_calc_key_no_longer_persists_after_a_load_and_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let now = now_ms();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{STORE_VERSION},"global_frequency":{{"calc:2+2":{{"count":7,"last_ms":{now}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = Learning::load(&path);
+        let expected_key = format!("sha256:{:x}", Sha256::digest(b"calc:2+2"));
+        assert_eq!(
+            loaded.global_frequency.get(&expected_key).map(|e| e.count),
+            Some(7),
+            "the count must survive re-keying on load"
+        );
+
+        loaded.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains("calc:2+2"),
+            "the legacy plaintext key must not be re-persisted verbatim, got: {saved}"
+        );
+    }
+
+    // Review coverage gap: a legacy plaintext entry re-keyed on load, and
+    // then the *same* raw id launched again in the new session, must land on
+    // the one entry `record`'s own persistence-key insert already re-keyed
+    // it to — not a second, parallel entry that only merges on some later
+    // load. Both paths (load's `rekeyed_global_frequency` and `record`'s
+    // `persistence_key` insert) are guaranteed to compute the same key by
+    // construction, since both call `persistence_key` over the same raw id,
+    // but nothing before this exercised a load immediately followed by new
+    // activity on the same id in one running process.
+    #[test]
+    fn a_legacy_entry_rekeyed_on_load_and_relaunched_in_the_same_session_is_one_entry_not_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let now = now_ms();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{STORE_VERSION},"global_frequency":{{"calc:2+2":{{"count":7,"last_ms":{now}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let mut loaded = Learning::load(&path);
+        loaded.record_launch("2+2", &ItemId::new("calc:2+2").unwrap());
+
+        assert_eq!(
+            loaded.global_frequency.len(),
+            1,
+            "the re-keyed legacy entry and the freshly recorded launch of the same raw \
+             id must be one entry, not two"
+        );
+        let key = format!("sha256:{:x}", Sha256::digest(b"calc:2+2"));
+        assert_eq!(
+            loaded.global_frequency.get(&key).map(|e| e.count),
+            Some(8),
+            "the count must reflect both the migrated legacy launch and the new one"
+        );
+    }
+
+    // Two legacy entries that land on one persistence key must merge, not
+    // let the second silently overwrite the first — `rekeyed_global_frequency`'s
+    // doc comment says why summing the count and keeping the later stamp are
+    // each the right merge. Both source timestamps are kept safely in the
+    // past so `purge_and_bound`'s future-stamp clamp cannot interfere with
+    // which one this test expects to survive.
+    #[test]
+    fn two_legacy_entries_that_rekey_onto_one_key_merge_by_summing_count_and_taking_the_later_timestamp()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let earlier = now_ms() - 2_000;
+        let later = now_ms() - 1_000;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{STORE_VERSION},"global_frequency":{{"utility:calculator:2+2":{{"count":3,"last_ms":{earlier}}},"utility:calculator:9+9":{{"count":5,"last_ms":{later}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = Learning::load(&path);
+        let entry = loaded
+            .global_frequency
+            .get("utility:calculator")
+            .expect("both source entries re-key onto this one persistence key");
+        assert_eq!(entry.count, 8, "counts from both legacy entries must sum");
+        assert_eq!(
+            entry.last_ms, later,
+            "the later of the two source timestamps must survive the merge"
+        );
     }
 }
