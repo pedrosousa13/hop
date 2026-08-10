@@ -19,9 +19,16 @@
 //! rule of its own, without which it would be a second way to send a path.
 //!
 //! [`Item`](crate::item::Item)'s `copy_text` reaches the same clipboard by a
-//! different route, and it is still a plain bounded `String`. It wants
-//! [`CopyText`] too, and giving it one changes the item model rather than the
-//! outcome, so it is deliberately left for its own change.
+//! different route, and it carries [`CopyText`] too: its field is
+//! `Option<CopyText>`, gated the same way. What differs is the field name a
+//! refusal names. [`CopyText::FIELD`] is `"ExecOutcome::CopyText"` — the wire
+//! field a value travels in when it arrives through an outcome — and an
+//! item's `copy_text` is a different field, so naming that constant on its
+//! refusal would be wrong in exactly the way issue #82 is about. Rather than
+//! let that drift in, `crate::item`'s `de_item_copy_text` calls
+//! [`CopyText::new_named`], the same rules as [`CopyText::new`] behind a
+//! `field` the caller supplies, so an item's refusal names `Item.copy_text`
+//! and an outcome's still names [`CopyText::FIELD`].
 //!
 //! [`limits`] says how *long* these values may be; this module
 //! says what they may *contain*. The two compose rather than replace one
@@ -491,8 +498,14 @@ impl<'de> Deserialize<'de> for CopyText {
 }
 
 impl CopyText {
-    /// The wire field this value travels in, named by every refusal of one, for
-    /// the reason given on [`OpenUrl`]'s constant of the same name.
+    /// The wire field this value travels in when it arrives through an
+    /// outcome, named by every such refusal, for the reason given on
+    /// [`OpenUrl`]'s constant of the same name. Unlike [`OpenUrl::FIELD`],
+    /// this is not named by *every* refusal of a [`CopyText`]: an item's
+    /// `copy_text` reaches this type through [`CopyText::new_named`]
+    /// instead, which names `Item.copy_text` on refusal rather than this
+    /// constant — see this module's docs for why the two routes disagree on
+    /// the name.
     pub(crate) const FIELD: &'static str = "ExecOutcome::CopyText";
 
     /// Builds copy text, refusing a value that breaks any rule on [`CopyText`].
@@ -503,14 +516,31 @@ impl CopyText {
     /// [`ContentError::ForbiddenChar`] naming the first refused control
     /// character in the value.
     pub fn new(value: impl Into<String>) -> Result<Self, ContentError> {
+        Self::new_named(Self::FIELD, value)
+    }
+
+    /// [`CopyText::new`], but a refusal names `field` rather than
+    /// [`CopyText::FIELD`].
+    ///
+    /// The rules are identical either way — this is the one gate both
+    /// [`CopyText::new`] and this function route through, so a rule added
+    /// here governs both callers without being repeated. What differs is
+    /// only which wire field the value actually travelled in: `crate::item`
+    /// uses this, naming `Item.copy_text`, for the same content rules
+    /// reached by a different route than [`CopyText::FIELD`]'s. See this
+    /// module's docs for why that distinction matters.
+    pub(crate) fn new_named(
+        field: &'static str,
+        value: impl Into<String>,
+    ) -> Result<Self, ContentError> {
         let value = value.into();
-        check_len(Self::FIELD, MAX_COPY_TEXT, value.len())?;
+        check_len(field, MAX_COPY_TEXT, value.len())?;
         if let Some(refused) = value
             .chars()
             .find(|c| c.is_control() && !ALLOWED_COPY_TEXT_CONTROLS.contains(c))
         {
             return Err(ContentError::ForbiddenChar {
-                field: Self::FIELD,
+                field,
                 codepoint: refused as u32,
             });
         }

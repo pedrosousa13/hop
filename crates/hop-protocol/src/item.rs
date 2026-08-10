@@ -4,8 +4,8 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::content::{IconName, IconPath};
-use crate::limits::{self, BoundError, MAX_ACTION_ID, MAX_ITEM_ID, check_len};
+use crate::content::{CopyText, IconName, IconPath};
+use crate::limits::{self, BoundError, MAX_ACTION_ID, MAX_COPY_TEXT, MAX_ITEM_ID, check_len};
 
 /// The stable identifier of an [`Item`], opaque to clients.
 ///
@@ -255,9 +255,17 @@ pub struct Item {
     #[serde(deserialize_with = "limits::de_item_actions")]
     pub actions: Vec<Action>,
     pub default_action: ActionId,
-    /// Bounded at [`MAX_COPY_TEXT`](crate::limits::MAX_COPY_TEXT) bytes on the way in.
-    #[serde(default, deserialize_with = "limits::de_item_copy_text")]
-    pub copy_text: Option<String>,
+    /// Text a client may put on the clipboard for this item, carrying the
+    /// same rules as [`CopyText`]: bounded at
+    /// [`MAX_COPY_TEXT`](crate::limits::MAX_COPY_TEXT) bytes and free of every
+    /// control character outside [`ALLOWED_COPY_TEXT_CONTROLS`](crate::content::ALLOWED_COPY_TEXT_CONTROLS),
+    /// checked in that order. This is the same clipboard
+    /// [`ExecOutcome::CopyText`](crate::wire::ExecOutcome::CopyText) reaches,
+    /// by a different route — see [`crate::content`]'s module docs for why
+    /// the two are gated identically but a refusal here names
+    /// `Item.copy_text` rather than [`CopyText::FIELD`].
+    #[serde(default, deserialize_with = "de_item_copy_text")]
+    pub copy_text: Option<CopyText>,
     /// Asks for this item to be pinned after the ranked results, rather than
     /// ranked among them. The pinned web-search row is the motivating case.
     ///
@@ -299,6 +307,23 @@ pub struct Item {
     /// Bounded at [`MAX_PROVIDER_ID`](crate::limits::MAX_PROVIDER_ID) bytes on the way in.
     #[serde(deserialize_with = "limits::de_provider")]
     pub provider: String,
+}
+
+/// The `deserialize_with` for [`Item::copy_text`].
+///
+/// Not [`CopyText`]'s own `Deserialize` — that would name a refusal
+/// [`CopyText::FIELD`], `"ExecOutcome::CopyText"`, which is the wire field a
+/// value travels in when it arrives through an outcome, and this field is a
+/// different one. This calls [`limits::validated_opt`] with
+/// [`CopyText::new_named`] instead, the same rules as [`CopyText::new`]
+/// behind a `field` argument, so the length pre-filter and the content check
+/// both name `Item.copy_text` — see [`crate::content`]'s module docs for the
+/// full reasoning, and issue #82 for what happens when a refusal names a
+/// field the value did not travel in.
+fn de_item_copy_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<CopyText>, D::Error> {
+    limits::validated_opt(d, "Item.copy_text", MAX_COPY_TEXT, |v| {
+        CopyText::new_named("Item.copy_text", v)
+    })
 }
 
 #[cfg(test)]
@@ -620,7 +645,7 @@ mod tests {
     #[test]
     fn item_round_trips_with_copy_text_and_append_to_end() {
         let item = Item {
-            copy_text: Some("https://example.com".into()),
+            copy_text: Some(CopyText::new("https://example.com").unwrap()),
             append_to_end: true,
             ..sample_item()
         };
@@ -628,6 +653,105 @@ mod tests {
         assert!(json.contains(r#""copy_text":"https://example.com""#));
         assert!(json.contains(r#""append_to_end":true"#));
         assert_eq!(serde_json::from_str::<Item>(&json).unwrap(), item);
+    }
+
+    // --- Item.copy_text: CopyText's rules, at Item's own field name --------
+
+    #[test]
+    fn item_copy_text_is_none_when_explicit_null() {
+        let mut json = full_item_json();
+        json["copy_text"] = serde_json::Value::Null;
+        let item: Item = serde_json::from_str(&json.to_string()).unwrap();
+        assert_eq!(item.copy_text, None);
+    }
+
+    #[test]
+    fn item_copy_text_carrying_esc_is_refused() {
+        let mut json = full_item_json();
+        json["copy_text"] = json!(format!("before{}after", '\u{1B}'));
+        let err = serde_json::from_str::<Item>(&json.to_string())
+            .expect_err("an item copy_text carrying ESC must not parse");
+        assert!(
+            err.to_string().contains("U+001B"),
+            "the refusal must name the offending code point, got: {err}"
+        );
+    }
+
+    #[test]
+    fn item_copy_text_carrying_tab_and_newline_is_accepted() {
+        let mut json = full_item_json();
+        json["copy_text"] = json!("line one\tindented\nline two");
+        let item: Item = serde_json::from_str(&json.to_string())
+            .expect("tab and newline are the allowed exceptions");
+        assert_eq!(
+            item.copy_text.unwrap().as_str(),
+            "line one\tindented\nline two"
+        );
+    }
+
+    #[test]
+    fn item_copy_text_carrying_a_carriage_return_is_refused() {
+        // CopyText deliberately refuses CR even though it is common in
+        // Windows-origin and CRLF text — see CopyText's own doc comment,
+        // "What refusing a carriage return costs", for what that costs and
+        // why it is paid anyway.
+        let mut json = full_item_json();
+        json["copy_text"] = json!("line one\rline two");
+        assert!(
+            serde_json::from_str::<Item>(&json.to_string()).is_err(),
+            "a carriage return must be refused in an item's copy_text, same as in CopyText's own rules"
+        );
+    }
+
+    #[test]
+    fn item_copy_text_refusal_names_the_item_field_not_the_outcome_field() {
+        // The whole point of routing an item's copy_text through
+        // `CopyText::new_named` rather than `CopyText`'s own `Deserialize`:
+        // the value never travelled in `ExecOutcome::CopyText`'s wire field,
+        // so a refusal must not claim that it did.
+        let mut json = full_item_json();
+        json["copy_text"] = json!(format!("{}", '\u{1B}'));
+        let err = serde_json::from_str::<Item>(&json.to_string()).expect_err("ESC must be refused");
+        let text = err.to_string();
+        assert!(text.contains("Item.copy_text"), "got: {text}");
+        assert!(
+            !text.contains(CopyText::FIELD),
+            "the refusal must not name the outcome's field {}, got: {text}",
+            CopyText::FIELD
+        );
+    }
+
+    #[test]
+    fn item_copy_text_wrong_type_names_its_field() {
+        // A number where a string is wanted is refused before
+        // `CopyText::new_named` ever runs — by serde's own `invalid_type`,
+        // formatted from `ValidatedOpt::expecting` or `Validated::expecting`
+        // depending on which one actually judges it (see the doc comment on
+        // `limits::ValidatedOpt` for why it is `Validated`'s `expecting` that
+        // fires here, not `ValidatedOpt`'s own). This pins the observable
+        // behavior, not which visitor produces it: either way, the refusal
+        // must name `Item.copy_text`.
+        let mut json = full_item_json();
+        json["copy_text"] = json!(42);
+        let err =
+            serde_json::from_str::<Item>(&json.to_string()).expect_err("a number is not a string");
+        assert!(err.to_string().contains("Item.copy_text"), "got: {err}");
+    }
+
+    #[test]
+    fn item_copy_text_over_long_and_control_bearing_is_reported_as_over_long() {
+        // Length is checked before content, so a value breaking both rules is
+        // reported as over-long rather than as a forbidden character — the
+        // same ordering CopyText's own doc comment documents and tests.
+        let value = format!("{}{}", "a".repeat(MAX_COPY_TEXT), '\u{1B}');
+        let mut json = full_item_json();
+        json["copy_text"] = json!(value);
+        let err = serde_json::from_str::<Item>(&json.to_string())
+            .expect_err("a value breaking both rules must still be refused");
+        assert!(
+            err.to_string().contains("over its maximum of"),
+            "got: {err}"
+        );
     }
 
     #[test]
