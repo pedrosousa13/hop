@@ -275,13 +275,10 @@ fn run_exec_against_reply(
     output
 }
 
-fn query_scoped_error(id: u64, code: hop_protocol::ErrorCode, message: &str) -> DaemonMsg {
+fn query_scoped_error(id: u64, code: hop_protocol::ErrorCode, message: &'static str) -> DaemonMsg {
     DaemonMsg::Error {
         query_id: Some(id),
-        error: hop_protocol::ProtoError {
-            code,
-            message: message.to_string(),
-        },
+        error: hop_protocol::ProtoError::new(code, hop_protocol::ErrorDetail::Fixed(message)),
     }
 }
 
@@ -548,10 +545,10 @@ fn the_cli_drops_an_error_frame_scoped_to_another_query() {
             stream,
             &DaemonMsg::Error {
                 query_id: Some(id + 1),
-                error: hop_protocol::ProtoError {
-                    code: hop_protocol::ErrorCode::UnknownItem,
-                    message: "stale query's problem, not this one's".to_string(),
-                },
+                error: hop_protocol::ProtoError::new(
+                    hop_protocol::ErrorCode::UnknownItem,
+                    hop_protocol::ErrorDetail::Fixed("stale query's problem, not this one's"),
+                ),
             },
         );
         write_daemon_frame(
@@ -605,10 +602,10 @@ fn the_cli_fails_on_an_error_frame_scoped_to_its_own_query() {
             stream,
             &DaemonMsg::Error {
                 query_id: Some(id),
-                error: hop_protocol::ProtoError {
-                    code: hop_protocol::ErrorCode::ProviderFailed,
-                    message: "this exchange is over".to_string(),
-                },
+                error: hop_protocol::ProtoError::new(
+                    hop_protocol::ErrorCode::ProviderFailed,
+                    hop_protocol::ErrorDetail::Fixed("this exchange is over"),
+                ),
             },
         );
     });

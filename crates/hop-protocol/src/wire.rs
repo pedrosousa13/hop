@@ -328,13 +328,255 @@ pub enum ExecOutcome {
 }
 
 /// A protocol-level error reported by the daemon.
+///
+/// # What `message` may contain (issue #84)
+///
+/// #74 bounded this field's *length* (see [`MAX_ERROR_MESSAGE`]); nothing
+/// bounded its *kind*. `message` was a bare `String`, so any `hopd` error
+/// site could `format!` a filesystem path, a provider's own words, or a raw
+/// `serde_json::Error`'s `Display` straight into a frame this daemon sends
+/// to every client that asks — the same disclosure #27 closed for the
+/// client-to-daemon direction (`QueryText`) but explicitly scoped out for
+/// this one, because a redacting newtype fixes the wrong half of the
+/// problem here: see "Rejected: a redacting newtype" below.
+///
+/// The decision: `message` is never typed in at a `hopd` error site. It is
+/// **derived**, by [`ProtoError::new`], from an [`ErrorCode`] and an
+/// [`ErrorDetail`] — a closed set of already-bounded, already-typed values
+/// ([`ItemId`], [`ActionId`], a provider id, a `u32` version, a `usize`
+/// length) or a `&'static str` chosen at the call site. A `String` computed
+/// at runtime — a path, a caught error's `Display`, anything a future error
+/// site might be tempted to interpolate — has no route into `message` at
+/// all: there is no `ErrorDetail` variant that takes one. That is what
+/// "enforced by something other than a reviewer's memory" (criterion 1)
+/// means concretely: the daemon does not merely avoid disclosure by
+/// discipline, it cannot express it, because `message` itself — the private
+/// field below — is not constructible outside [`ProtoError::new`].
+///
+/// # What structuring the message costs
+///
+/// Three costs, all accepted:
+///
+/// - **`ErrorDetail::Item` can render a message over [`MAX_ERROR_MESSAGE`].**
+///   [`ProtoError::new`] applies no length check of its own — see
+///   [`MAX_ERROR_MESSAGE`]'s own docs for where the bound is actually
+///   enforced (the receiving peer's parse, nowhere else) — and it does not
+///   need to for five of `ErrorDetail`'s six variants, because what each one
+///   interpolates is already small: [`MAX_ACTION_ID`](crate::limits::MAX_ACTION_ID),
+///   [`MAX_PROVIDER_ID`](crate::limits::MAX_PROVIDER_ID), a fixed-width
+///   integer, or a `&'static str` chosen at a call site. `Item` is the
+///   exception: [`ItemId`]'s own bound is
+///   [`MAX_ITEM_ID`](crate::limits::MAX_ITEM_ID), nearly 4× this struct's
+///   message bound, so a legitimate, in-bound `ItemId` can make
+///   `ProtoError::new` build a `message` a client's own
+///   [`limits::de_error_message`] would refuse to parse. This is not new to
+///   #84 — the pre-#84 `format!("unknown item {item_id}")` had the identical
+///   overflow, just never pinned by a test — and it is not fixed here:
+///   `ProtoError::new` stays infallible on purpose (making it fallible would
+///   ripple a `Result` across every one of `hopd`'s nine call sites for a
+///   hazard this one variant creates), so this is named and pinned rather
+///   than silently carried forward. Pinned by
+///   `tests::unknown_item_message_can_exceed_max_error_message_at_max_item_id`;
+///   the other five variants staying in bound is pinned by
+///   `tests::error_detail_length_stays_within_max_error_message_for_the_other_variants`.
+/// - **`ErrorDetail::Fixed` still takes a string.** A `&'static str` is a
+///   compile-time literal, not a runtime value, so nothing this daemon
+///   *computes* — a path it opened, a peer's own bytes, an error it
+///   caught — can reach it without either being typed into this crate's
+///   source (reviewable, and immediately visible in a diff) or being
+///   deliberately leaked to `'static` first (`Box::leak`, `String::leak`),
+///   which is conspicuous safe-Rust ceremony no accidental call site
+///   reaches for. This closes the *accidental* path — `format!("{err}")`,
+///   `.to_string()` on a caught error, a `PathBuf` interpolated without a
+///   thought — which is the path every real call site in this daemon
+///   actually took before this change. It is not an absolute guarantee
+///   against a determined author, the same honest limit `RoutedText` and
+///   `QueryText` accept about their own callers.
+/// - **`ErrorDetail::Provider` carries a plain `String`, not a validating
+///   newtype.** This crate has no `ProviderId` type — `Item.provider` is a
+///   plain, wire-bounded `String` everywhere else in this protocol too (see
+///   [`limits::MAX_PROVIDER_ID`]) — so `ErrorDetail::Provider` matches that
+///   existing shape rather than inventing a stronger one this issue did not
+///   ask for. The guarantee that a `hopd` call site passes a real,
+///   manifest-checked provider id and not arbitrary text is therefore a
+///   caller invariant, the same trust this codebase already places in
+///   `Item.provider` at the pipeline's checked-items boundary — not
+///   something the type of this one field enforces. It is the weakest of
+///   `ErrorDetail`'s variants against criterion 1, named here rather than
+///   left to look like an oversight.
+///
+/// # Rejected: a redacting newtype
+///
+/// A `QueryText`/`RoutedText`-shaped type — its own `Debug` printing a
+/// marker instead of the text — was considered and declined. That pattern
+/// fixes disclosure into a *log*: a value with a redacting `Debug` still
+/// carries the real text everywhere else, `Display`, `as_str`,
+/// serialization, and gets to the party that logs a whole frame only
+/// because logging is the one path its `Debug` intercepts. `ProtoError`
+/// does not have that shape of problem — it is not logged and then
+/// separately serialized, it *is* serialized, straight to the client that
+/// is the one asking to see it — so a redacting `Debug` would protect
+/// nothing: the internals it hid from a log line would still be sitting in
+/// `message` when this struct is serialized onto the wire moments later.
+/// Structuring what `message` may contain closes the disclosure at its
+/// only real crossing; redacting `Debug` would have been theater over it.
+///
+/// # Rejected: discipline at construction sites
+///
+/// Leaving `message: String` public and relying on each of `hopd`'s error
+/// sites to compose safe text by convention was the weakest option against
+/// criterion 1 by construction: a reviewer's memory is exactly what it
+/// would have rested on, and the issue's own motivation — the count was
+/// nine sites and climbing — is the argument that a discipline which has to
+/// be re-remembered at every new one does not scale. See this struct's
+/// `message` field for the mechanism that replaces it.
+///
+/// # The asymmetry with a client's `Deserialize`
+///
+/// [`ProtoError::new`] is the *daemon's* construction path — the only one,
+/// once `message` is private — but [`Deserialize`] on this struct stays as
+/// permissive as before: any string up to [`MAX_ERROR_MESSAGE`] bytes
+/// parses, including one no call to [`ProtoError::new`] could ever have
+/// produced. A client reading a frame it *received* cannot check who built
+/// it or retroactively restrict what shipped on the wire — the wire form is
+/// unchanged, still a bare JSON string — so the parse stays permissive by
+/// necessity. This is not an oversight; it is the identical split #83 draws
+/// between `QueryText::new` (fallible, a client's own construction path)
+/// and `RoutedText`'s infallible constructor (a value built from data this
+/// crate does not control the shape of). Pinned by
+/// `tests::a_client_deserializes_an_error_message_no_local_constructor_could_produce`.
+///
+/// # A gap this decision does not close (criterion 3)
+///
+/// `message` is not the only free-form text a `DaemonMsg` frame carries.
+/// [`Item`]'s `title` and `subtitle`, its `copy_text`, and — walking one
+/// level further, into `items`' own `actions` —
+/// [`Action`](crate::item::Action)'s `label`
+/// ([`limits::MAX_TITLE`], [`limits::MAX_SUBTITLE`],
+/// [`limits::MAX_COPY_TEXT`], [`limits::MAX_ACTION_LABEL`]), all travel
+/// inside every [`DaemonMsg::Results`] frame as provider-authored,
+/// bounded-in-length-only strings — the exact same shape of problem this
+/// issue closes for `ProtoError.message`, just authored by a provider
+/// rather than by a `hopd` error site. This issue does not fix that: an
+/// item's display fields are free text *by design* — that is what a title
+/// or a context-menu label is — so "derive it from a closed set of typed
+/// values" is not a fit the way it is here, and a misbehaving provider
+/// putting a path or an internal detail into any of the four is a real,
+/// un-closed instance of the same class of risk this issue's own body
+/// describes. Named rather than silently left implied-closed.
+///
+/// `Item`'s other string-shaped fields — `id`, `default_action`, `provider`,
+/// and each action's own `id` — are deliberately not on this list: they are
+/// opaque identifiers, not display prose, and `provider` in particular is
+/// already checked against its producer's manifest id at the pipeline's
+/// checked-items boundary (`hop-core`'s `CheckedItems::check`) rather than
+/// carried verbatim from whatever a provider claims. `icon` is not on this
+/// list either: both its arms, `IconName` and `IconPath`, are already
+/// validating newtypes, not bare `String`s.
+///
+/// [`DaemonMsg::Executed`]'s [`ExecOutcome::CopyText`] and
+/// [`ExecOutcome::OpenUrl`] are, by contrast, *not* a gap: both already
+/// carry a validating newtype (see [`ExecOutcome`]'s own docs) rather than
+/// a bare `String`, landed before this issue. Nor is the provider-authored
+/// text behind [`ErrorCode::ProviderFailed`] — a `ProviderError::Failed`'s
+/// own message — a gap in this field: `hopd`'s connection driver already
+/// declines to forward it verbatim (see `crates/hopd/src/connection.rs`),
+/// which is exactly why [`ErrorDetail::Provider`] carries only a provider
+/// *id*, never a provider's own words. `HelloAck`, `QueryRouted`,
+/// `QueryDone` and `Executed`'s own scalar/enum fields carry no free text at
+/// all — `api_version`, `query_id`, [`Mode`], and `exclusive`/`partial` are
+/// all closed or numeric.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProtoError {
     pub code: ErrorCode,
     /// Bounded at [`MAX_ERROR_MESSAGE`](crate::limits::MAX_ERROR_MESSAGE) bytes
     /// on the way in — an error headed for a UI is not a payload channel.
+    ///
+    /// Private on the construction side by design — see this struct's own
+    /// docs. [`ProtoError::new`] is the only way to build one outside this
+    /// module; [`ProtoError::message`] is how any caller, in any crate,
+    /// reads one back.
     #[serde(deserialize_with = "limits::de_error_message")]
-    pub message: String,
+    message: String,
+}
+
+impl ProtoError {
+    /// Builds a protocol error whose `message` is derived entirely from
+    /// `code` and `detail` — see this struct's own docs for why that is the
+    /// only construction path.
+    pub fn new(code: ErrorCode, detail: ErrorDetail) -> Self {
+        Self {
+            code,
+            message: detail.render(),
+        }
+    }
+
+    /// The message text, however it was constructed — derived by
+    /// [`ProtoError::new`] on the daemon's side, or whatever a peer's frame
+    /// carried on a client's side. See this struct's "The asymmetry with a
+    /// client's `Deserialize`" for why those are not the same guarantee.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// The bounded, typed data a [`ProtoError`] message may be derived from.
+///
+/// Never serialized: this type exists purely on the daemon's construction
+/// path, discarded the moment [`ProtoError::new`] renders it to a `String`.
+/// It carries no `code` of its own — `ProtoError::new` takes `code`
+/// separately, since [`ErrorCode`] is the wire-stable classification a
+/// client dispatches on and a detail is only ever the human text alongside
+/// it — so pairing a variant here with an unrelated `code` is a call-site
+/// mistake this type does not prevent, the same way passing the wrong
+/// `ErrorCode` to `hopd`'s pre-#84 `send_error` never was prevented either.
+/// What this type *does* prevent is the disclosure this issue is about: no
+/// variant below accepts a `String` a `hopd` error site did not already
+/// have bounded and typed for an unrelated reason.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ErrorDetail {
+    /// A message with no interpolated data at all: `message` becomes
+    /// exactly `text`. `text` must be `&'static str` — see this struct's own
+    /// "What structuring the message costs" for what that buys and what it
+    /// does not.
+    Fixed(&'static str),
+    /// `message` names the item that was not found. Pairs with
+    /// [`ErrorCode::UnknownItem`].
+    Item(ItemId),
+    /// `message` names the action that was not found or not offered.
+    /// Pairs with [`ErrorCode::UnknownAction`].
+    Action(ActionId),
+    /// `message` names the provider whose execute failed. See this type's
+    /// own docs for why this is a plain `String` rather than a validating
+    /// newtype. Pairs with [`ErrorCode::ProviderFailed`].
+    Provider(String),
+    /// `message` reports a handshake's mismatched `api_version`s. Pairs
+    /// with [`ErrorCode::VersionMismatch`].
+    Version { expected: u32, actual: u32 },
+    /// `message` reports a frame's length prefix having named more than
+    /// [`MAX_FRAME_BYTES`](crate::limits::MAX_FRAME_BYTES) bytes. Pairs with
+    /// [`ErrorCode::FrameTooLarge`].
+    FrameTooLarge { len: usize },
+}
+
+impl ErrorDetail {
+    fn render(&self) -> String {
+        match self {
+            ErrorDetail::Fixed(text) => (*text).to_string(),
+            ErrorDetail::Item(id) => format!("unknown item {id}"),
+            ErrorDetail::Action(id) => format!("unknown action {id}"),
+            ErrorDetail::Provider(id) => format!("provider `{id}` failed to execute the action"),
+            ErrorDetail::Version { expected, actual } => {
+                format!("hopd speaks api_version {expected}, client sent {actual}")
+            }
+            ErrorDetail::FrameTooLarge { len } => {
+                format!(
+                    "frame of {len} bytes is over the {}-byte cap",
+                    crate::limits::MAX_FRAME_BYTES
+                )
+            }
+        }
+    }
 }
 
 /// The category of a protocol-level error.
@@ -598,6 +840,172 @@ mod tests {
             let json = serde_json::to_string(&err).unwrap();
             assert_eq!(serde_json::from_str::<ProtoError>(&json).unwrap(), err);
         }
+    }
+
+    #[test]
+    fn proto_error_new_derives_a_fixed_message_from_a_static_str() {
+        let err = ProtoError::new(
+            ErrorCode::HandshakeRequired,
+            ErrorDetail::Fixed("the first frame on a connection must be hello"),
+        );
+        assert_eq!(err.code, ErrorCode::HandshakeRequired);
+        assert_eq!(
+            err.message(),
+            "the first frame on a connection must be hello"
+        );
+    }
+
+    #[test]
+    fn proto_error_new_derives_message_from_each_typed_detail() {
+        let item = ProtoError::new(
+            ErrorCode::UnknownItem,
+            ErrorDetail::Item(ItemId::new("app:1").unwrap()),
+        );
+        assert_eq!(item.message(), "unknown item app:1");
+
+        let action = ProtoError::new(
+            ErrorCode::UnknownAction,
+            ErrorDetail::Action(ActionId::new("open").unwrap()),
+        );
+        assert_eq!(action.message(), "unknown action open");
+
+        let provider = ProtoError::new(
+            ErrorCode::ProviderFailed,
+            ErrorDetail::Provider("apps".to_string()),
+        );
+        assert_eq!(
+            provider.message(),
+            "provider `apps` failed to execute the action"
+        );
+
+        let version = ProtoError::new(
+            ErrorCode::VersionMismatch,
+            ErrorDetail::Version {
+                expected: 1,
+                actual: 999,
+            },
+        );
+        assert_eq!(
+            version.message(),
+            "hopd speaks api_version 1, client sent 999"
+        );
+
+        let too_large = ProtoError::new(
+            ErrorCode::FrameTooLarge,
+            ErrorDetail::FrameTooLarge { len: 99_999_999 },
+        );
+        assert_eq!(
+            too_large.message(),
+            format!(
+                "frame of 99999999 bytes is over the {}-byte cap",
+                crate::limits::MAX_FRAME_BYTES
+            )
+        );
+    }
+
+    /// Pins the claim `MAX_ERROR_MESSAGE`'s doc makes: five of `ErrorDetail`'s
+    /// six variants render a message that stays within
+    /// [`crate::limits::MAX_ERROR_MESSAGE`] even at their own maximum
+    /// plausible input — `ActionId` and the provider string at their own
+    /// wire bounds, the numeric fields at their type's maximum, and the
+    /// longest `Fixed` literal any real `hopd` call site uses today. This is
+    /// not a guarantee `ProtoError::new` enforces — it applies no length
+    /// check of its own, see `MAX_ERROR_MESSAGE`'s docs — so this test is
+    /// what stands behind the claim instead: add a variant, or grow one of
+    /// these bounds, in a way that pushes a rendered message over the limit,
+    /// and this fails rather than the overflow going unnoticed until a
+    /// client refuses to parse it. `ErrorDetail::Item` is the sixth
+    /// variant and is deliberately not asserted here — see
+    /// `unknown_item_message_can_exceed_max_error_message_at_max_item_id`
+    /// just below, which pins the opposite fact about it.
+    #[test]
+    fn error_detail_length_stays_within_max_error_message_for_the_other_variants() {
+        use crate::limits::{MAX_ACTION_ID, MAX_ERROR_MESSAGE, MAX_PROVIDER_ID};
+
+        let cases = [
+            ProtoError::new(
+                ErrorCode::UnknownAction,
+                ErrorDetail::Action(ActionId::new("a".repeat(MAX_ACTION_ID)).unwrap()),
+            ),
+            ProtoError::new(
+                ErrorCode::ProviderFailed,
+                ErrorDetail::Provider("p".repeat(MAX_PROVIDER_ID)),
+            ),
+            ProtoError::new(
+                ErrorCode::VersionMismatch,
+                ErrorDetail::Version {
+                    expected: u32::MAX,
+                    actual: u32::MAX,
+                },
+            ),
+            ProtoError::new(
+                ErrorCode::FrameTooLarge,
+                ErrorDetail::FrameTooLarge { len: usize::MAX },
+            ),
+            // The longest `ErrorDetail::Fixed` literal any real `hopd` call
+            // site passes today (see `crates/hopd/src/connection.rs`).
+            ProtoError::new(
+                ErrorCode::Internal,
+                ErrorDetail::Fixed("a connection may complete its handshake only once"),
+            ),
+        ];
+
+        for err in cases {
+            assert!(
+                err.message().len() <= MAX_ERROR_MESSAGE,
+                "{:?}'s message is {} bytes, over MAX_ERROR_MESSAGE ({MAX_ERROR_MESSAGE}): {:?}",
+                err.code,
+                err.message().len(),
+                err.message(),
+            );
+        }
+    }
+
+    /// The documented exception to the claim the test above pins:
+    /// `ErrorDetail::Item`'s bound is `ItemId`'s own `MAX_ITEM_ID` (4096
+    /// bytes), nearly 4× `MAX_ERROR_MESSAGE` (1024) — so a legitimate,
+    /// in-bound `ItemId` makes `ProtoError::new` build a message a
+    /// receiving peer's own `de_error_message` would refuse to parse. Not
+    /// new to #84 (the pre-#84 `format!("unknown item {item_id}")` had the
+    /// identical overflow, just never pinned by a test) and not fixed here
+    /// — `ProtoError::new` stays infallible on purpose, and a fix (truncate
+    /// the interpolated id? shrink the bound used in this one message?
+    /// something else?) is a call for whoever owns this gap next, not a
+    /// silent change riding in on this pin. See `ProtoError`'s "What
+    /// structuring the message costs" for the same point made in prose.
+    /// If this assertion ever starts failing, `ErrorDetail::Item` has been
+    /// bounded — update this test and both doc comments it stands beside
+    /// together, rather than deleting it.
+    #[test]
+    fn unknown_item_message_can_exceed_max_error_message_at_max_item_id() {
+        let max_id = ItemId::new("a".repeat(crate::limits::MAX_ITEM_ID)).unwrap();
+        let err = ProtoError::new(ErrorCode::UnknownItem, ErrorDetail::Item(max_id));
+        assert!(
+            err.message().len() > crate::limits::MAX_ERROR_MESSAGE,
+            "expected a max-length ItemId to overflow MAX_ERROR_MESSAGE, got \
+             {} bytes — if ErrorDetail::Item has been bounded, update this \
+             test (and the doc comments pointing at it) rather than deleting it",
+            err.message().len()
+        );
+    }
+
+    /// The asymmetry constraint #84 settles: [`ProtoError::new`] can only ever
+    /// produce a message shaped by [`ErrorDetail`], but a client deserializing
+    /// a frame it *received* has no way to check who built it, and must still
+    /// accept any bounded string — the same split #83 draws between
+    /// `QueryText::new` and `RoutedText`'s infallible constructor. This parses
+    /// a message no call to [`ProtoError::new`] could ever produce (free text
+    /// with punctuation `ProtoError::new`'s templates never emit) and asserts
+    /// it survives the parse unchanged.
+    #[test]
+    fn a_client_deserializes_an_error_message_no_local_constructor_could_produce() {
+        let json =
+            r#"{"code":"internal","message":"free-form: whatever a daemon wrote, /any/path, 🔥"}"#;
+        let err: ProtoError = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            err.message(),
+            "free-form: whatever a daemon wrote, /any/path, 🔥"
+        );
     }
 
     #[test]
