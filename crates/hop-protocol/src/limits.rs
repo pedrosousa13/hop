@@ -381,7 +381,24 @@ pub enum BoundError {
 }
 
 /// Checks a byte length against a maximum, naming the field in the error.
-pub(crate) fn check_len(field: &'static str, max: usize, actual: usize) -> Result<(), BoundError> {
+///
+/// Public, unlike the rest of this module's parse-time machinery
+/// (`validated`, `BoundedString`, and friends, all `pub(crate)`), because
+/// bound-checking a value is a real need even for a caller that never
+/// deserializes a wire type at all. `hop-core`'s alias loader is the case
+/// that forced the question: a `window` alias's `app_id` and
+/// `title_contains` are bounded against [`MAX_ITEM_ID`] and [`MAX_TITLE`] at
+/// load time, long before either string becomes an
+/// [`ItemId`](crate::item::ItemId) or reaches the wire, if it ever does. That
+/// caller could have reimplemented this function's three-line body instead —
+/// nothing stopped it, since [`BoundError::TooLong`]'s fields are as public
+/// as the enum they're on — but a hand-copied bound check is a second
+/// definition of "what counts as exceeding a bound, and how that is
+/// reported," one a future change to either copy would not reach. Exporting
+/// this function keeps that definition singular; `validated` and
+/// `BoundedString` stay `pub(crate)` because nothing outside this crate's
+/// deserialization path has ever needed them.
+pub fn check_len(field: &'static str, max: usize, actual: usize) -> Result<(), BoundError> {
     if actual > max {
         return Err(BoundError::TooLong { field, max, actual });
     }
