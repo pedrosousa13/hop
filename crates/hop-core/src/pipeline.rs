@@ -21,9 +21,7 @@
 //! carries the [`FailedCheck`] that produced it precisely so the two are told
 //! apart.
 
-use hop_protocol::limits::{
-    MAX_ACTION_LABEL, MAX_ACTIONS_PER_ITEM, MAX_COPY_TEXT, MAX_SUBTITLE, MAX_TITLE,
-};
+use hop_protocol::limits::{MAX_ACTION_LABEL, MAX_ACTIONS_PER_ITEM, MAX_SUBTITLE, MAX_TITLE};
 use hop_protocol::{Item, ItemId, Kind};
 
 use crate::aliases::Aliases;
@@ -367,12 +365,21 @@ pub enum FailedCheck {
     /// One of the item's variable-length fields is over the bound
     /// `hop_protocol::limits` already applies to that same field when it
     /// arrives by socket — `title` ([`MAX_TITLE`]), `subtitle`
-    /// ([`MAX_SUBTITLE`]), `copy_text` ([`MAX_COPY_TEXT`]), an action's
-    /// `label` ([`MAX_ACTION_LABEL`]), or the number of `actions`
-    /// ([`MAX_ACTIONS_PER_ITEM`]). `field` names which one, as the same
-    /// `Type.field` spelling `hop_protocol::limits`'s own deserializers use
-    /// (e.g. `"Item.title"`, `"Action.label"`) — not a new naming scheme,
-    /// so grepping a field name finds both layers that bound it.
+    /// ([`MAX_SUBTITLE`]), an action's `label` ([`MAX_ACTION_LABEL`]), or the
+    /// number of `actions` ([`MAX_ACTIONS_PER_ITEM`]). `field` names which
+    /// one, as the same `Type.field` spelling `hop_protocol::limits`'s own
+    /// deserializers use (e.g. `"Item.title"`, `"Action.label"`) — not a new
+    /// naming scheme, so grepping a field name finds both layers that bound
+    /// it.
+    ///
+    /// `copy_text` is not on that list even though
+    /// [`hop_protocol::limits::MAX_COPY_TEXT`] still bounds it: since issue
+    /// #78, `Item.copy_text` is
+    /// `Option<hop_protocol::content::CopyText>`, a validating newtype whose
+    /// own constructor enforces the bound on every value that exists, so no
+    /// item this check inspects can ever carry one over it. See
+    /// [`hop_protocol::limits::MAX_ITEMS_PER_QUERY`]'s docs for the fuller
+    /// account.
     ///
     /// An item built in-process and never parsed off the wire had passed no
     /// length check at all until this variant existed — the gap
@@ -540,10 +547,11 @@ impl CheckedItems {
     ///
     /// An item is kept only if its `kind` is one its producer declared, its
     /// `provider` string equals its producer's manifest `id`, and none of its
-    /// variable-length fields (`title`, `subtitle`, `copy_text`, an action's
-    /// `label`, or the number of `actions`) is over the bound
-    /// `hop_protocol::limits` already applies to that same field on the wire
-    /// — see [`FailedCheck::FieldTooLong`]. Anything else becomes a
+    /// variable-length fields (`title`, `subtitle`, an action's `label`, or
+    /// the number of `actions`) is over the bound `hop_protocol::limits`
+    /// already applies to that same field on the wire — see
+    /// [`FailedCheck::FieldTooLong`]. `copy_text` needs no check of its own
+    /// here; see that variant's docs for why. Anything else becomes a
     /// [`Rejection`] and never reaches boosts, dedupe, filtering or ranking.
     ///
     /// The truncation runs *before* this loop even starts, not as one more
@@ -648,14 +656,18 @@ impl CheckedItems {
                     Some(FailedCheck::FieldTooLong {
                         field: "Item.subtitle",
                     })
-                } else if item
-                    .copy_text
-                    .as_ref()
-                    .is_some_and(|copy_text| copy_text.len() > MAX_COPY_TEXT)
-                {
-                    Some(FailedCheck::FieldTooLong {
-                        field: "Item.copy_text",
-                    })
+                // `copy_text` has no branch here. It did until issue #78 made
+                // `Item.copy_text` an `Option<hop_protocol::content::CopyText>`
+                // rather than an `Option<String>`: `CopyText`'s own
+                // constructor enforces MAX_COPY_TEXT on every value that
+                // exists, in-process or off the wire, so no `CopyText` this
+                // check could ever see is over the bound — a second check
+                // here would be the "two gates that happen to agree"
+                // `hop_protocol::limits::validated`'s docs argue against, not
+                // a real backstop. See
+                // `hop_protocol::limits::MAX_ITEMS_PER_QUERY`'s docs for the
+                // fuller account of why this field left the list.
+                //
                 // Count before labels, deliberately: `actions.len()` is O(1)
                 // (`Vec::len` is a stored field, not a scan), but the
                 // `.any(...)` label check below it is O(actions.len()) even
@@ -2732,37 +2744,6 @@ mod tests {
             over.rejections()[0].check,
             FailedCheck::FieldTooLong {
                 field: "Item.subtitle"
-            }
-        );
-    }
-
-    /// An item whose `copy_text` is exactly `len` bytes.
-    fn item_with_copy_text(len: usize) -> Item {
-        Item {
-            copy_text: Some("a".repeat(len)),
-            ..item(Kind::App, "app:copy", "Alpha")
-        }
-    }
-
-    #[test]
-    fn copy_text_at_the_bound_passes_one_over_is_rejected() {
-        let at_bound = checked(vec![item_with_copy_text(MAX_COPY_TEXT)]);
-        assert_eq!(
-            at_bound.items().len(),
-            1,
-            "exactly MAX_COPY_TEXT bytes must pass"
-        );
-
-        let over = CheckedItems::check(vec![output(
-            "test",
-            ALL_KINDS.to_vec(),
-            vec![item_with_copy_text(MAX_COPY_TEXT + 1)],
-        )]);
-        assert!(over.items().is_empty());
-        assert_eq!(
-            over.rejections()[0].check,
-            FailedCheck::FieldTooLong {
-                field: "Item.copy_text"
             }
         );
     }

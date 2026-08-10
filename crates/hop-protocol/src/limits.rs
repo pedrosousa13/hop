@@ -303,12 +303,21 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// provider's answer must cross: `hop-core`'s
 /// `pipeline::CheckedItems::check`, called once per provider by
 /// `ProviderHost::run_one` before an answer reaches assembly. It now rejects
-/// an item whose `title`, `subtitle`, `copy_text`, an action's `label`, or
-/// action count is over the same bound this module already applies to that
-/// same field on the wire (see `pipeline::FailedCheck::FieldTooLong`) — so
-/// the specific claim above, "documented, not enforced... wherever an item
-/// is built in-process," is no longer true of a provider's answer, which is
-/// where the overwhelming majority of in-process items originate.
+/// an item whose `title`, `subtitle`, an action's `label`, or action count is
+/// over the same bound this module already applies to that same field on the
+/// wire (see `pipeline::FailedCheck::FieldTooLong`) — so the specific claim
+/// above, "documented, not enforced... wherever an item is built in-process,"
+/// is no longer true of a provider's answer, which is where the overwhelming
+/// majority of in-process items originate.
+///
+/// `copy_text` used to be on that list and no longer is, not because its gap
+/// reopened but because issue #78 closed it a different way: `Item.copy_text`
+/// is now `Option<content::CopyText>`, and `CopyText`'s own constructor
+/// enforces `MAX_COPY_TEXT` — and its content rules — on every value that
+/// exists, in-process or off the wire. There is no longer a state
+/// `CheckedItems::check` could catch that construction had not already
+/// refused, so checking it there again would be the second gate this crate's
+/// docs on [`validated`] argue against.
 ///
 /// It narrows, though — it does not disappear. `CheckedItems::check` is a
 /// choke point only for callers that go through it: `hop-core`'s
@@ -532,6 +541,64 @@ where
     })
 }
 
+/// The `Option` counterpart of [`validated`]: deserializes `Option<T>` for a
+/// validating newtype, refusing a `Some` that breaks `build`'s rules exactly
+/// as [`validated`] would, and mapping absence and explicit `null` to `None`
+/// exactly as [`opt_string`] does for a plain bounded string.
+pub(crate) fn validated_opt<'de, D, T, B, F>(
+    deserializer: D,
+    field: &'static str,
+    max: usize,
+    build: F,
+) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    B: fmt::Display,
+    F: FnOnce(String) -> Result<T, B>,
+{
+    deserializer.deserialize_option(ValidatedOpt {
+        field,
+        max,
+        build,
+        marker: std::marker::PhantomData,
+    })
+}
+
+struct ValidatedOpt<T, F> {
+    field: &'static str,
+    max: usize,
+    build: F,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T, B, F> Visitor<'de> for ValidatedOpt<T, F>
+where
+    B: fmt::Display,
+    F: FnOnce(String) -> Result<T, B>,
+{
+    type Value = Option<T>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "null or a string of at most {} bytes that its type accepts",
+            self.max
+        )
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        validated(deserializer, self.field, self.max, self.build).map(Some)
+    }
+}
+
 struct Validated<T, F> {
     field: &'static str,
     max: usize,
@@ -706,6 +773,16 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
 // outcome half of `MAX_COPY_TEXT` by `crate::content`, and `MAX_QUERY_TEXT` by
 // `crate::redaction`. Grepping a constant still finds every field it governs; it
 // just finds some of them in the module that owns the type.
+//
+// `Item.copy_text` is the item half of `MAX_COPY_TEXT`, and it is a
+// validating newtype too — `Option<content::CopyText>` — so by that same rule
+// its bound is not here either. What is different about it is *where* its
+// `deserialize_with` lives: not on `CopyText`'s own `Deserialize`, which
+// `crate::content` owns and which names every refusal `CopyText::FIELD`, but
+// as `crate::item::de_item_copy_text`, which calls `validated_opt` above with
+// `content::CopyText::new_named` so the refusal names `Item.copy_text`
+// instead. See `crate::content`'s module docs for why that field name has to
+// differ from `CopyText::FIELD`'s.
 
 pub(crate) fn de_title<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string(d, "Item.title", MAX_TITLE)
@@ -721,12 +798,6 @@ pub(crate) fn de_provider<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::
 
 pub(crate) fn de_action_label<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string(d, "Action.label", MAX_ACTION_LABEL)
-}
-
-pub(crate) fn de_item_copy_text<'de, D: Deserializer<'de>>(
-    d: D,
-) -> Result<Option<String>, D::Error> {
-    opt_string(d, "Item.copy_text", MAX_COPY_TEXT)
 }
 
 pub(crate) fn de_error_message<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
