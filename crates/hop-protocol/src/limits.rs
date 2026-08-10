@@ -542,11 +542,21 @@ where
 {
     type Value = T;
 
+    /// Leads with the field, as [`BoundError::TooLong`] does, so an operator
+    /// scanning a refusal finds the name first rather than reading to the end
+    /// of a byte count to learn what broke. That is also why this writes a
+    /// sentence (`{field} to be …`) rather than an appositive (`{field}, …`):
+    /// serde's own `invalid_type` wraps whatever `expecting` returns in
+    /// `expected {…}`, and `expected Foo, a string of…` reads as two things
+    /// being expected — a literal `Foo` and a string — rather than one thing
+    /// said about `Foo`. `to be` is the connector that resolves correctly
+    /// under that prefix; the exact word matters less than the sentence
+    /// shape it produces.
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "a string of at most {} bytes that its type accepts",
-            self.max
+            "{} to be a string of at most {} bytes that its type accepts",
+            self.field, self.max
         )
     }
 
@@ -570,7 +580,11 @@ impl Visitor<'_> for BoundedString {
     type Value = String;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "a string of at most {} bytes", self.max)
+        write!(
+            f,
+            "{} to be a string of at most {} bytes",
+            self.field, self.max
+        )
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
@@ -584,6 +598,35 @@ impl Visitor<'_> for BoundedString {
     }
 }
 
+/// The visitor `opt_string` drives to deserialize an `Option<String>`.
+///
+/// # `expecting`'s field name is currently unreachable
+///
+/// `expecting` below writes `self.field`, matching every other visitor in
+/// this module, but no parse this crate exercises today can actually reach
+/// it: `deserialize_option` only ever calls one of this visitor's other three
+/// methods, never falls through to the default `invalid_type` that would
+/// format a message from `expecting` at all. `visit_none` and `visit_unit`
+/// answer `null` and absence, and `visit_some` hands anything else straight
+/// to [`string`], which drives `BoundedString` over the same `field` instead
+/// — so a present, wrong-typed value is judged (and named) there, not here.
+/// Both deserializers this crate drives an `Option<String>` field through —
+/// serde_json's own, and the internally-tagged `ContentDeserializer` that
+/// [`ClientMsg`](crate::wire::ClientMsg) and
+/// [`DaemonMsg`](crate::wire::DaemonMsg) buffer into — agree on that
+/// null-or-`visit_some` split, so there is no parse in this codebase today
+/// that would make `deserialize_option` reach for a fourth arm and fall back
+/// to `expecting`.
+///
+/// Leaving `expecting` fieldless anyway was considered, on the strength of
+/// that unreachability, and rejected: `field` is already in scope on this
+/// struct, matching it costs nothing here, and a future `Deserializer` — or a
+/// future serde version — is free to route `deserialize_option` differently
+/// for a type it cannot special-case. An `expecting` that stayed fieldless
+/// would then silently reopen the exact gap issue #82 closed elsewhere,
+/// discovered only if somebody thought to check this one arm again. Naming
+/// the field costs one comparison against a constant; leaving it unnamed bets
+/// against every future deserializer keeping today's shape.
 struct BoundedOptString {
     field: &'static str,
     max: usize,
@@ -593,7 +636,11 @@ impl<'de> Visitor<'de> for BoundedOptString {
     type Value = Option<String>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "null or a string of at most {} bytes", self.max)
+        write!(
+            f,
+            "{} to be null or a string of at most {} bytes",
+            self.field, self.max
+        )
     }
 
     fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
@@ -619,7 +666,11 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
     type Value = Vec<T>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "a sequence of at most {} elements", self.max)
+        write!(
+            f,
+            "{} to be a sequence of at most {} elements",
+            self.field, self.max
+        )
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
@@ -1007,6 +1058,74 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains(QueryText::FIELD), "got: {text}");
         assert!(text.contains(&MAX_QUERY_TEXT.to_string()), "got: {text}");
+    }
+
+    // --- A wrong-typed value names its field too (issue #82) ----------------
+    //
+    // The length refusal just above goes through `BoundError::TooLong`, which
+    // carries `field`. A value of the wrong JSON type never reaches that: it
+    // is refused earlier, by serde's own `invalid_type`, formatted from
+    // whichever `Visitor::expecting` was in play — `Validated::expecting` for
+    // a validating newtype, `BoundedString::expecting` for a plain bounded
+    // `String` field, `BoundedVec::expecting` for a bounded sequence. All
+    // three held `field` in their struct and never wrote it, so all three
+    // named nothing. These pin the fix across every shape this module hands
+    // to `deserialize_with`, not only the validating newtypes issue #82 named.
+
+    #[test]
+    fn a_type_mismatch_on_a_validated_newtype_names_its_field() {
+        // `Validated::expecting` backs every validating newtype that goes
+        // through `limits::validated`, not only the four `FIELD`-carrying
+        // types in `content` — `QueryText` is one too. A wrong-typed `text`
+        // and a `null` one both have to be refused by the same `expecting`,
+        // naming the field either way.
+        let wrong_type = json!({ "type": "query", "id": 1, "text": 42 });
+        let err = serde_json::from_str::<ClientMsg>(&wrong_type.to_string()).unwrap_err();
+        assert!(err.to_string().contains(QueryText::FIELD), "got: {err}");
+
+        let null = json!({ "type": "query", "id": 1, "text": null });
+        let err = serde_json::from_str::<ClientMsg>(&null.to_string()).unwrap_err();
+        assert!(err.to_string().contains(QueryText::FIELD), "got: {err}");
+    }
+
+    #[test]
+    fn a_type_mismatch_on_a_bounded_string_field_names_its_field() {
+        // `Item.title` has no `FIELD` constant of its own — `de_title` passes
+        // a literal to `string` — but `BoundedString::expecting` has the same
+        // defect `Validated::expecting` does, for the same reason: the
+        // struct holds `field`, and the old `expecting` never wrote it.
+        let mut item = item_json();
+        item["title"] = json!(42);
+        let err = serde_json::from_str::<Item>(&item.to_string()).unwrap_err();
+        assert!(err.to_string().contains("Item.title"), "got: {err}");
+    }
+
+    #[test]
+    fn a_type_mismatch_on_an_optional_bounded_string_field_names_its_field() {
+        // `subtitle` is `Option<String>`, deserialized through
+        // `BoundedOptString`. A JSON value that is present and non-null still
+        // routes through `visit_some` into the very same `BoundedString`
+        // `de_subtitle` hands off to for the inner value — so this exercises
+        // `BoundedString::expecting` again, under a different field name, not
+        // `BoundedOptString::expecting`. See that struct's own doc comment,
+        // above in this file, for why its `expecting` cannot be reached this
+        // way at all.
+        let mut item = item_json();
+        item["subtitle"] = json!(true);
+        let err = serde_json::from_str::<Item>(&item.to_string()).unwrap_err();
+        assert!(err.to_string().contains("Item.subtitle"), "got: {err}");
+    }
+
+    #[test]
+    fn a_type_mismatch_on_a_bounded_vec_field_names_its_field() {
+        // `Item.actions` is a bounded sequence, deserialized through
+        // `BoundedVec`. A number where an array is expected is refused by
+        // `deserialize_seq` before any element is read, through
+        // `BoundedVec::expecting`.
+        let mut item = item_json();
+        item["actions"] = json!(42);
+        let err = serde_json::from_str::<Item>(&item.to_string()).unwrap_err();
+        assert!(err.to_string().contains("Item.actions"), "got: {err}");
     }
 
     // The bounds on `Item`, `IconSpec`, `Action`, `ExecOutcome` and `ProtoError`

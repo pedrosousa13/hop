@@ -345,6 +345,18 @@ impl OpenUrl {
     /// [`ItemId`](crate::item::ItemId) is named for its type instead, because
     /// it travels in several fields and its type is the only stable name it
     /// has.
+    ///
+    /// "Every refusal" includes a value of the wrong JSON type. A number or a
+    /// `null` where a string is wanted never reaches [`OpenUrl::new`] at
+    /// all — it is refused earlier, by serde's own `invalid_type` error, whose
+    /// message is built from `limits`'s shared `expecting` for a validating
+    /// newtype. That `expecting` used to write only the byte maximum, naming
+    /// no field, which made this claim false for exactly that refusal (issue
+    /// #82); it now writes this constant too. Pinned by
+    /// `tests::a_wrong_typed_value_names_the_field_for_every_field_carrying_type`
+    /// and `tests::a_null_value_names_the_field_for_every_field_carrying_type`,
+    /// which cover all four `FIELD`-carrying types in this module, not only
+    /// this one and [`CopyText::FIELD`].
     pub(crate) const FIELD: &'static str = "ExecOutcome::OpenUrl";
 
     /// Builds a URL, refusing one that breaks any rule on [`OpenUrl`].
@@ -989,6 +1001,7 @@ mod tests {
         time::Duration,
     };
 
+    use crate::item::IconSpec;
     use crate::limits::{MAX_ICON_NAME, MAX_ICON_PATH};
     use crate::wire::{DaemonMsg, ExecOutcome};
 
@@ -1891,6 +1904,86 @@ mod tests {
         let err = serde_json::from_str::<DaemonMsg>(&executed_frame(json!({ "open_url": "-o" })))
             .unwrap_err();
         assert!(err.to_string().contains(OpenUrl::FIELD), "got: {err}");
+    }
+
+    // --- A wrong-typed value names its field too (issue #82) ----------------
+    //
+    // Every `FIELD` constant in this module is documented as "named by every
+    // refusal of one" — a universal. The length and content refusals above
+    // keep that promise through `BoundError` and `ContentError`, both of which
+    // carry `field`. A value of the *wrong JSON type* — a number or `null`
+    // where a string is wanted — never reaches either: serde refuses it
+    // through `invalid_type`, formatted from `Validated::expecting` in
+    // `limits`, before `OpenUrl::new`/`CopyText::new`/`IconName::new`/
+    // `IconPath::new` ever runs. That path used to build its message from the
+    // byte maximum alone, naming no field, which is exactly the gap issue #82
+    // found. These two tests are what would have caught it: one wrong-typed
+    // case and one `null` case, for all four `FIELD`-carrying types this
+    // module defines, not only the two the issue happened to name.
+
+    #[test]
+    fn a_wrong_typed_value_names_the_field_for_every_field_carrying_type() {
+        let open_url = serde_json::from_str::<ExecOutcome>(&json!({ "open_url": 42 }).to_string())
+            .expect_err("a number is not a string");
+        assert!(
+            open_url.to_string().contains(OpenUrl::FIELD),
+            "got: {open_url}"
+        );
+
+        let copy_text =
+            serde_json::from_str::<ExecOutcome>(&json!({ "copy_text": 42 }).to_string())
+                .expect_err("a number is not a string");
+        assert!(
+            copy_text.to_string().contains(CopyText::FIELD),
+            "got: {copy_text}"
+        );
+
+        let icon_name = serde_json::from_str::<IconSpec>(r#"{"name":42}"#)
+            .expect_err("a number is not a string");
+        assert!(
+            icon_name.to_string().contains(IconName::FIELD),
+            "got: {icon_name}"
+        );
+
+        let icon_path = serde_json::from_str::<IconSpec>(r#"{"path":42}"#)
+            .expect_err("a number is not a string");
+        assert!(
+            icon_path.to_string().contains(IconPath::FIELD),
+            "got: {icon_path}"
+        );
+    }
+
+    #[test]
+    fn a_null_value_names_the_field_for_every_field_carrying_type() {
+        let open_url =
+            serde_json::from_str::<ExecOutcome>(&json!({ "open_url": null }).to_string())
+                .expect_err("null is not a string");
+        assert!(
+            open_url.to_string().contains(OpenUrl::FIELD),
+            "got: {open_url}"
+        );
+
+        let copy_text =
+            serde_json::from_str::<ExecOutcome>(&json!({ "copy_text": null }).to_string())
+                .expect_err("null is not a string");
+        assert!(
+            copy_text.to_string().contains(CopyText::FIELD),
+            "got: {copy_text}"
+        );
+
+        let icon_name =
+            serde_json::from_str::<IconSpec>(r#"{"name":null}"#).expect_err("null is not a string");
+        assert!(
+            icon_name.to_string().contains(IconName::FIELD),
+            "got: {icon_name}"
+        );
+
+        let icon_path =
+            serde_json::from_str::<IconSpec>(r#"{"path":null}"#).expect_err("null is not a string");
+        assert!(
+            icon_path.to_string().contains(IconPath::FIELD),
+            "got: {icon_path}"
+        );
     }
 
     #[test]
