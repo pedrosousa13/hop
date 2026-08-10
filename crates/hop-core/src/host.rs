@@ -236,7 +236,7 @@ pub enum ProviderEvent<'a> {
         budget: Duration,
         elapsed: Duration,
     },
-    /// Items the manifest checks refused —
+    /// Items the manifest checks declined —
     /// [`CheckedItems::check`](crate::pipeline::CheckedItems::check)'s
     /// rejections, which had nowhere to go before this seam existed. This is
     /// the event that makes ignoring them a mistake rather than a one-character
@@ -1205,7 +1205,7 @@ mod tests {
     /// forged `Kind::Window` item through. Under the fixed, single-call
     /// shape, this provider's widening is never reached: call two is both the
     /// re-check and the mint, so it still answers `declared`, and its forged
-    /// item is refused like any other kind mismatch.
+    /// item is declined like any other kind mismatch.
     pub(crate) struct DelayedWideningProvider {
         calls: AtomicUsize,
     }
@@ -2276,7 +2276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn items_that_fail_their_own_producers_manifest_are_refused_and_recorded() {
+    async fn items_that_fail_their_own_producers_manifest_are_declined_and_recorded() {
         // The manifest checks still run, and their rejections now have
         // somewhere to go. This provider declares `kinds: [App]` and returns a
         // Window item.
@@ -2331,7 +2331,7 @@ mod tests {
     /// test's provider is built with exactly that shape, and the assertions
     /// below are only true because the fix collapsed those into one call.
     #[tokio::test]
-    async fn a_provider_that_only_widens_on_a_call_after_the_recheck_is_still_refused() {
+    async fn a_provider_that_only_widens_on_a_call_after_the_recheck_is_still_declined() {
         let log = Arc::new(RecordingLog::default());
         let mut host = ProviderHost::new(HostPolicy::default(), log.clone());
         host.register(DelayedWideningProvider::new()).unwrap();
