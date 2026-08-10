@@ -175,6 +175,24 @@ pub const MAX_OPEN_URL: usize = 8_192;
 ///
 /// An error string headed for a UI. 1 KiB matches [`MAX_TITLE`]: enough for a
 /// diagnostic sentence, not enough to be a payload.
+///
+/// This bound is enforced at exactly one place: [`de_error_message`], the
+/// receiving peer's parse. [`ProtoError::new`](crate::wire::ProtoError::new)
+/// applies **no** length check of its own — it is not a gate, it is a
+/// deterministic render over an [`ErrorDetail`](crate::wire::ErrorDetail).
+/// The sending side stays under this bound only because every
+/// `ErrorDetail` variant interpolates a value that is *itself* bounded well
+/// under it — [`MAX_ACTION_ID`], [`MAX_PROVIDER_ID`], a fixed-width integer,
+/// or a `&'static str` chosen at a call site — with one documented
+/// exception: `ErrorDetail::Item`'s bound is [`MAX_ITEM_ID`], which is
+/// nearly 4× this constant, so a legitimate, in-bound `ItemId` can make
+/// `ProtoError::new` build a message a receiving peer's own
+/// [`de_error_message`] would refuse. See `ProtoError`'s "A gap this
+/// decision does not close" for that case, named rather than fixed here, and
+/// `wire::tests::unknown_item_message_can_exceed_max_error_message_at_max_item_id`,
+/// which pins the current, overflowing behavior directly. What `message`
+/// may *contain* — as opposed to how long it is — is
+/// [`ErrorDetail`](crate::wire::ErrorDetail)'s decision (#84).
 pub const MAX_ERROR_MESSAGE: usize = 1_024;
 
 /// Maximum number of actions on a single [`Item`](crate::item::Item).

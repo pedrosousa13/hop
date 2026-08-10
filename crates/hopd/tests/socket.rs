@@ -291,6 +291,48 @@ fn a_payload_that_is_not_valid_json_is_refused_as_malformed_not_internal() {
     assert_eof(&mut stream);
 }
 
+/// Issue #84's flagged hazard: `decode_payload`'s failure path used to build
+/// `message` from `err.to_string()`, and a `serde_json` "unknown variant"
+/// error echoes back the exact text a peer sent for the tag it did not
+/// recognize — verified directly against `decode_payload` while designing
+/// this test: `{"type":"XYZZY..."}"` produces `unknown variant`
+/// `XYZZY...`, expected one of ...`. That distinctive text is peer input
+/// here, not a daemon secret, but it stands for the whole class of thing
+/// this issue closes: whatever a parse failure's `Display` happens to
+/// contain no longer has any path into a client-facing frame, because
+/// `message` is now derived from a fixed [`hop_protocol::ErrorDetail`]
+/// rather than from the error itself.
+#[test]
+fn a_distinctive_value_in_a_malformed_payload_does_not_survive_into_the_error_message() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = spawn_daemon(runtime_dir.path());
+    let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
+
+    hello(&mut stream);
+
+    let marker = "XYZZY_DISTINCTIVE_MARKER_998877";
+    let payload = format!(r#"{{"type":"{marker}"}}"#).into_bytes();
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .expect("writing the prefix must succeed");
+    stream
+        .write_all(&payload)
+        .expect("writing the malformed payload must succeed");
+
+    let reply = recv(&mut stream);
+    let DaemonMsg::Error { error, .. } = reply else {
+        panic!("expected an error frame, got {reply:?}");
+    };
+    assert_eq!(error.code, ErrorCode::MalformedFrame);
+    assert!(
+        !error.message().contains(marker),
+        "the malformed-frame message must not echo the peer's bytes, got: {:?}",
+        error.message()
+    );
+
+    assert_eof(&mut stream);
+}
+
 #[test]
 fn a_version_mismatch_is_an_explicit_error() {
     let runtime_dir = tempfile::tempdir().unwrap();

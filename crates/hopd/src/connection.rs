@@ -42,7 +42,7 @@ use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
 };
 use hop_protocol::limits::MAX_ITEMS_PER_RESULTS_FRAME;
-use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ErrorCode, Item, ProtoError};
+use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ErrorCode, ErrorDetail, Item, ProtoError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -68,7 +68,10 @@ enum ReadEvent {
     Message(ClientMsg),
     /// A frame this connection refuses, and why — the driver sends the error
     /// and closes.
-    Refused { code: ErrorCode, message: String },
+    Refused {
+        code: ErrorCode,
+        detail: ErrorDetail,
+    },
     /// The transport failed mid-read. The driver surfaces it to
     /// [`crate::server::serve_with`]'s log seam; there is no peer left worth
     /// answering.
@@ -168,9 +171,7 @@ async fn read_loop(mut read_half: OwnedReadHalf, events: mpsc::Sender<ReadEvent>
     loop {
         let event = match read_frame(&mut read_half).await {
             Ok(Some(ReadOutcome::Message(msg))) => ReadEvent::Message(msg),
-            Ok(Some(ReadOutcome::Refused { code, message })) => {
-                ReadEvent::Refused { code, message }
-            }
+            Ok(Some(ReadOutcome::Refused { code, detail })) => ReadEvent::Refused { code, detail },
             Ok(None) => return, // EOF: the peer closed its end.
             Err(err) => {
                 let _ = events.send(ReadEvent::Failed(err)).await;
@@ -222,8 +223,8 @@ async fn drive<S: ResultSource>(
         match step {
             Step::Peer(None) => return Ok(()), // EOF: the peer closed its end.
             Step::Peer(Some(ReadEvent::Failed(err))) => return Err(err),
-            Step::Peer(Some(ReadEvent::Refused { code, message })) => {
-                send_error(&mut write_half, None, code, message).await?;
+            Step::Peer(Some(ReadEvent::Refused { code, detail })) => {
+                send_error(&mut write_half, None, code, detail).await?;
                 return Ok(());
             }
             Step::Peer(Some(ReadEvent::Message(msg))) => {
@@ -264,7 +265,10 @@ async fn handle_message<S: ResultSource>(
                 write_half,
                 None,
                 ErrorCode::VersionMismatch,
-                format!("hopd speaks api_version {API_VERSION}, client sent {api_version}"),
+                ErrorDetail::Version {
+                    expected: API_VERSION,
+                    actual: api_version,
+                },
             )
             .await?;
             Ok(true)
@@ -274,7 +278,7 @@ async fn handle_message<S: ResultSource>(
                 write_half,
                 None,
                 ErrorCode::HandshakeRequired,
-                "the first frame on a connection must be hello".to_string(),
+                ErrorDetail::Fixed("the first frame on a connection must be hello"),
             )
             .await?;
             Ok(true)
@@ -379,7 +383,11 @@ async fn handle_message<S: ResultSource>(
                         &mut *write_half,
                         Some(query_id),
                         ErrorCode::UnknownItem,
-                        format!("no such query or stale query id {query_id}"),
+                        // `query_id` is not repeated here: the enclosing
+                        // frame's own `query_id` field already carries it
+                        // (see `DaemonMsg::Error`'s docs), so this message
+                        // has nothing left to interpolate.
+                        ErrorDetail::Fixed("no such query or stale query id"),
                     )
                     .await?;
                     return Ok(false);
@@ -391,7 +399,7 @@ async fn handle_message<S: ResultSource>(
                     &mut *write_half,
                     Some(query_id),
                     ErrorCode::UnknownItem,
-                    format!("unknown item {item_id}"),
+                    ErrorDetail::Item(item_id),
                 )
                 .await?;
                 return Ok(false);
@@ -402,7 +410,7 @@ async fn handle_message<S: ResultSource>(
                     &mut *write_half,
                     Some(query_id),
                     ErrorCode::UnknownAction,
-                    format!("unknown action {action_id}"),
+                    ErrorDetail::Action(action_id),
                 )
                 .await?;
                 return Ok(false);
@@ -430,7 +438,7 @@ async fn handle_message<S: ResultSource>(
                         &mut *write_half,
                         Some(query_id),
                         ErrorCode::ProviderFailed,
-                        format!("provider `{provider}` failed to execute the action"),
+                        ErrorDetail::Provider(provider),
                     )
                     .await?
                 }
@@ -455,7 +463,7 @@ async fn handle_message<S: ResultSource>(
                 write_half,
                 None,
                 ErrorCode::Internal,
-                "a connection may complete its handshake only once".to_string(),
+                ErrorDetail::Fixed("a connection may complete its handshake only once"),
             )
             .await?;
             Ok(false)
@@ -546,7 +554,10 @@ enum ReadOutcome {
     Message(ClientMsg),
     /// A frame this connection refuses, and why — the caller sends the error
     /// and closes.
-    Refused { code: ErrorCode, message: String },
+    Refused {
+        code: ErrorCode,
+        detail: ErrorDetail,
+    },
 }
 
 /// Reads one length-prefixed frame off `read_half`, or reports why it refuses
@@ -568,14 +579,17 @@ async fn read_frame(read_half: &mut OwnedReadHalf) -> io::Result<Option<ReadOutc
 
     let len = match payload_len(prefix) {
         Ok(len) => len,
-        Err(err @ FrameError::TooLarge { .. }) => {
+        Err(FrameError::TooLarge { len }) => {
             // The refusal happens here, on the prefix alone: nothing below
             // this arm reads or allocates a buffer sized by the peer's
             // claimed length, which is the whole point of `payload_len`
-            // being the pre-allocation gate.
+            // being the pre-allocation gate. `len` is the peer's own claimed
+            // prefix value — a bare number, not text — so it travels to the
+            // client as a typed `ErrorDetail::FrameTooLarge` rather than
+            // through `FrameError::TooLarge`'s own `Display`.
             return Ok(Some(ReadOutcome::Refused {
                 code: ErrorCode::FrameTooLarge,
-                message: err.to_string(),
+                detail: ErrorDetail::FrameTooLarge { len },
             }));
         }
         Err(other) => {
@@ -583,10 +597,13 @@ async fn read_frame(read_half: &mut OwnedReadHalf) -> io::Result<Option<ReadOutc
             // doc comment — so this arm exists as a compile-time reminder
             // rather than a case this server expects to hit: a future
             // variant added there is a match to update here, not a silent
-            // fallthrough.
+            // fallthrough. `other`'s `Display` is logged here, daemon-side,
+            // rather than reaching the client — the same split the
+            // `decode_payload` arm below makes, for the same reason.
+            eprintln!("hopd: unexpected error decoding a frame prefix: {other}");
             return Ok(Some(ReadOutcome::Refused {
                 code: ErrorCode::Internal,
-                message: other.to_string(),
+                detail: ErrorDetail::Fixed("an internal error occurred decoding a frame"),
             }));
         }
     };
@@ -604,15 +621,28 @@ async fn read_frame(read_half: &mut OwnedReadHalf) -> io::Result<Option<ReadOutc
 
     match decode_payload::<ClientMsg>(&payload) {
         Ok(msg) => Ok(Some(ReadOutcome::Message(msg))),
-        Err(err) => Ok(Some(ReadOutcome::Refused {
-            // A payload this connection read in full and still could not
-            // parse as a `ClientMsg` is bytes the peer sent, not a bug in
-            // this daemon — `ErrorCode::MalformedFrame`'s doc comment makes
-            // that split explicit. `ErrorCode::Internal` stays reserved for
-            // a failure this process caused itself.
-            code: ErrorCode::MalformedFrame,
-            message: err.to_string(),
-        })),
+        Err(err) => {
+            // `err` is a `serde_json::Error` and is daemon-internal by
+            // construction (issue #84): its `Display` can echo back
+            // whatever the peer's bytes happened to contain — an unknown
+            // `type` tag's exact text, for one — which is peer input, not a
+            // daemon secret, but is exactly the shape of thing a *future*
+            // parse failure could leak real internals through if this arm
+            // kept forwarding it verbatim. It is logged here, daemon-side,
+            // where it is actually useful for debugging a malformed peer,
+            // and never reaches `message`, which becomes a fixed,
+            // code-derived string instead.
+            eprintln!("hopd: refused a frame that failed to parse as a client message: {err}");
+            Ok(Some(ReadOutcome::Refused {
+                // A payload this connection read in full and still could not
+                // parse as a `ClientMsg` is bytes the peer sent, not a bug in
+                // this daemon — `ErrorCode::MalformedFrame`'s doc comment
+                // makes that split explicit. `ErrorCode::Internal` stays
+                // reserved for a failure this process caused itself.
+                code: ErrorCode::MalformedFrame,
+                detail: ErrorDetail::Fixed("the frame payload could not be parsed"),
+            }))
+        }
     }
 }
 
@@ -628,18 +658,20 @@ async fn send_msg(write_half: &mut OwnedWriteHalf, msg: &DaemonMsg) -> io::Resul
     write_half.write_all(&frame).await
 }
 
-/// Sends a [`DaemonMsg::Error`] built from `code` and `message`.
+/// Sends a [`DaemonMsg::Error`] whose message [`ProtoError::new`] derives
+/// from `code` and `detail` — see that constructor's docs for why this is
+/// the only way this daemon builds one.
 async fn send_error(
     write_half: &mut OwnedWriteHalf,
     query_id: Option<u64>,
     code: ErrorCode,
-    message: String,
+    detail: ErrorDetail,
 ) -> io::Result<()> {
     send_msg(
         write_half,
         &DaemonMsg::Error {
             query_id,
-            error: ProtoError { code, message },
+            error: ProtoError::new(code, detail),
         },
     )
     .await
@@ -909,10 +941,10 @@ mod tests {
             read_daemon_msg(&mut peer).await,
             DaemonMsg::Error {
                 query_id: Some(8),
-                error: ProtoError {
-                    code: ErrorCode::UnknownItem,
-                    message: "no such query or stale query id 8".to_string(),
-                },
+                error: ProtoError::new(
+                    ErrorCode::UnknownItem,
+                    ErrorDetail::Fixed("no such query or stale query id"),
+                ),
             }
         );
         assert!(
@@ -951,10 +983,10 @@ mod tests {
             read_daemon_msg(&mut peer).await,
             DaemonMsg::Error {
                 query_id: Some(1),
-                error: ProtoError {
-                    code: ErrorCode::UnknownItem,
-                    message: "no such query or stale query id 1".to_string(),
-                },
+                error: ProtoError::new(
+                    ErrorCode::UnknownItem,
+                    ErrorDetail::Fixed("no such query or stale query id"),
+                ),
             }
         );
     }
@@ -995,10 +1027,10 @@ mod tests {
             read_daemon_msg(&mut peer).await,
             DaemonMsg::Error {
                 query_id: Some(7),
-                error: ProtoError {
-                    code: ErrorCode::UnknownItem,
-                    message: "unknown item app:2".to_string(),
-                },
+                error: ProtoError::new(
+                    ErrorCode::UnknownItem,
+                    ErrorDetail::Item(ItemId::new("app:2").unwrap()),
+                ),
             }
         );
         assert!(source.calls.lock().expect("test lock").is_empty());
@@ -1040,10 +1072,10 @@ mod tests {
             read_daemon_msg(&mut peer).await,
             DaemonMsg::Error {
                 query_id: Some(7),
-                error: ProtoError {
-                    code: ErrorCode::UnknownAction,
-                    message: "unknown action delete".to_string(),
-                },
+                error: ProtoError::new(
+                    ErrorCode::UnknownAction,
+                    ErrorDetail::Action(ActionId::new("delete").unwrap()),
+                ),
             }
         );
         assert!(source.calls.lock().expect("test lock").is_empty());
@@ -1084,10 +1116,10 @@ mod tests {
             read_daemon_msg(&mut peer).await,
             DaemonMsg::Error {
                 query_id: Some(7),
-                error: ProtoError {
-                    code: ErrorCode::ProviderFailed,
-                    message: "provider `test` failed to execute the action".to_string(),
-                },
+                error: ProtoError::new(
+                    ErrorCode::ProviderFailed,
+                    ErrorDetail::Provider("test".to_string()),
+                ),
             }
         );
         assert_eq!(

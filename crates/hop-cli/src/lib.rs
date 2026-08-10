@@ -210,7 +210,9 @@ impl fmt::Display for ClientError {
             ClientError::UnexpectedHandshakeReply(msg) => {
                 write!(f, "hopd did not acknowledge the handshake, got {msg:?}")
             }
-            ClientError::Daemon(err) => write!(f, "hopd reported {:?}: {}", err.code, err.message),
+            ClientError::Daemon(err) => {
+                write!(f, "hopd reported {:?}: {}", err.code, err.message())
+            }
             ClientError::UnknownItem(id) => write!(f, "no such item: {id}"),
             ClientError::UnknownAction(id) => write!(f, "no such action: {id}"),
             ClientError::ProviderFailed(what) => write!(f, "provider failed to execute: {what}"),
@@ -344,9 +346,9 @@ fn try_run_query(text: &str) -> Result<(), ClientError> {
 /// right exit code off them. Anything else is an ordinary daemon error.
 fn map_daemon_error(error: ProtoError) -> ClientError {
     match error.code {
-        ErrorCode::UnknownItem => ClientError::UnknownItem(error.message),
-        ErrorCode::UnknownAction => ClientError::UnknownAction(error.message),
-        ErrorCode::ProviderFailed => ClientError::ProviderFailed(error.message),
+        ErrorCode::UnknownItem => ClientError::UnknownItem(error.message().to_string()),
+        ErrorCode::UnknownAction => ClientError::UnknownAction(error.message().to_string()),
+        ErrorCode::ProviderFailed => ClientError::ProviderFailed(error.message().to_string()),
         _ => ClientError::Daemon(error),
     }
 }
