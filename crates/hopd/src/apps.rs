@@ -2465,7 +2465,7 @@ impl Provider for AppsProvider {
         q: Arc<RoutedQuery>,
         _ctx: QueryCtx,
     ) -> Result<Vec<Item>, ProviderError> {
-        Ok(self.index.query(&q.term))
+        Ok(self.index.query(q.term.as_str()))
     }
 
     async fn execute(

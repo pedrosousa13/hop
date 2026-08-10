@@ -30,7 +30,7 @@ use crate::aliases::Aliases;
 use crate::learning::Learning;
 use crate::provider::{Provider, ProviderManifest};
 use crate::rank::{Boosts, Ranker, Weights};
-use crate::router::{Mode, RoutedQuery, route};
+use crate::router::{Mode, RoutedQuery, RoutedText, route};
 
 /// One provider's answer to one query, still attached to the manifest of the
 /// provider that produced it.
@@ -886,7 +886,7 @@ impl Pipeline {
         let routed = route(raw_query);
 
         // Step 2: apply aliases to the routed term.
-        let alias_effect = self.aliases.apply(&routed.term);
+        let alias_effect = self.aliases.apply(routed.term.as_str());
 
         // Step 3: collect boosts — alias boosts plus a learning boost per
         // candidate item. Where both apply to the same item, they add.
@@ -924,7 +924,7 @@ impl Pipeline {
         // migration to write. `selections` is deferred alongside it rather
         // than resolved on its own. Filed as issue #72.
         for item in &provider_items {
-            let learned = self.learning.boost_for(&routed.term, &item.id);
+            let learned = self.learning.boost_for(routed.term.as_str(), &item.id);
             if learned != 0.0 {
                 *boosts.by_item_id.entry(item.id.clone()).or_insert(0.0) += learned;
             }
@@ -1000,7 +1000,7 @@ impl Pipeline {
         // term. The routed query is otherwise unchanged — only `term`
         // differs from `routed`.
         let effective_query = RoutedQuery {
-            term: alias_effect.effective_term,
+            term: RoutedText::new(alias_effect.effective_term),
             ..routed.clone()
         };
         let ranked = self

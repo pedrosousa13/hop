@@ -345,7 +345,7 @@ pub fn should_query(m: &ProviderManifest, q: &RoutedQuery) -> bool {
     if !m.modes.contains(&q.mode) {
         return false;
     }
-    if q.term.chars().count() < m.min_term_len {
+    if q.term.as_str().chars().count() < m.min_term_len {
         return false;
     }
     true
@@ -379,7 +379,7 @@ mod tests {
 
         // Right mode, term shorter than min_term_len: false.
         let short_term = route("a hi");
-        assert_eq!(short_term.term, "hi");
+        assert_eq!(short_term.term.as_str(), "hi");
         assert!(!should_query(&m, &short_term));
 
         // Right mode, term at/above min_term_len: true.
@@ -391,7 +391,7 @@ mod tests {
     fn should_query_with_zero_min_term_len_runs_for_empty_term() {
         let m = manifest(vec![Mode::Apps], 0);
         let empty_term = route("a ");
-        assert_eq!(empty_term.term, "");
+        assert_eq!(empty_term.term.as_str(), "");
         assert!(should_query(&m, &empty_term));
     }
 
@@ -445,7 +445,7 @@ mod tests {
             Ok(vec![Item {
                 id: ItemId::new("app:fake").unwrap(),
                 kind: Kind::App,
-                title: q.term.clone(),
+                title: q.term.as_str().to_string(),
                 subtitle: None,
                 icon: None,
                 actions: vec![],

@@ -483,11 +483,17 @@ contain, and a redaction what formatting it discloses; the three live in
 fact costs is priced on the type that discloses it, under the `# What ... costs`
 heading in Conventions, never assumed to be free.
 
-**Redacting newtype** — a validating newtype that also carries its own `Debug`,
-so the redaction travels with the value: a field formatted on its own prints the
-same marker it prints inside its frame, and a field added to a frame later is
-redacted by having the type. `QueryText`, the type of `ClientMsg::Query.text`,
-which holds keystrokes typed into the launcher overlay.
+**Redacting newtype** — a newtype that carries its own `Debug`, so the
+redaction travels with the value: a field formatted on its own prints the same
+marker it prints inside its frame, and a field added to a frame later is
+redacted by having the type. Often *also* a validating newtype, but the two are
+independent and one instance of each exists. `QueryText`, the type of
+`ClientMsg::Query.text`, is both: it holds keystrokes typed into the launcher
+overlay and enforces `MAX_QUERY_TEXT`. `hop-core`'s `RoutedText`, the type of
+`RoutedQuery`'s `term` and `raw`, redacts without validating — it carries those
+same keystrokes past the wire and asserts no bound, because `Pipeline::assemble`
+builds one from an alias rewrite target, which is config-file text and not
+wire-bound (#83).
 
 ## Conventions
 
@@ -510,8 +516,12 @@ disclosure is one grep away; anything else that gives something up **may**.
 `content`'s `# What refusing a carriage return costs` is the permission taken
 up — the same heading spent on a rule's cost rather than a disclosure's.
 
-The form prices what a gate on a wire value gives up, so it is scoped to
-`hop-protocol`'s `limits`, `content` and `redaction`. Prose that prices
+The form prices what a gate or a redaction gives up. That is mostly wire values,
+so it is mostly `hop-protocol`'s `limits`, `content` and `redaction` — plus
+`hop-core`'s `router`, where `RoutedText`'s `# What reporting the length costs`
+prices what its redacted `Debug` discloses (#83). A redaction that discloses a
+fact about the value carries the heading wherever the type lives; that module
+list is where such types happen to sit, not a boundary. Prose that prices
 something else is outside the form rather than missing it: `hop-core`'s
 `pipeline` heading `## When the manifest is read, and what that costs` prices
 when a check runs, not what a gate discloses or refuses, and the grep above does

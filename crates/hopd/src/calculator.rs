@@ -256,7 +256,7 @@ impl Provider for CalculatorProvider {
         q: Arc<RoutedQuery>,
         _ctx: QueryCtx,
     ) -> Result<Vec<Item>, ProviderError> {
-        Ok(build_item(&q.term).into_iter().collect())
+        Ok(build_item(q.term.as_str()).into_iter().collect())
     }
 
     /// Ignores `_action_id` — safe today, for a reason worth writing down
