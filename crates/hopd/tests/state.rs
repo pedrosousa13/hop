@@ -209,11 +209,18 @@ fn a_launch_recorded_in_one_daemon_lifetime_survives_a_restart_into_a_second() {
     // The load/save boundary itself: a fresh `Learning::load`, from a
     // process state that never touched lifetime 1's in-memory `Pipeline`.
     let reloaded_directly = Learning::load(&store_path);
+    // `hop-core`'s learning store persists a provider-scoped key (issue #72),
+    // not the bare item id — `<provider-len>:<provider>:<id>`. `"restartable"`
+    // is `RestartableProvider`'s manifest id, and `app:restartable:1` is a
+    // known-safe shape that persists in the clear, so the persisted key is
+    // exactly this composition; see `hop-core::learning`'s own tests for the
+    // key rule itself.
+    let expected_key = format!("{}:restartable:app:restartable:1", "restartable".len());
     assert!(
         reloaded_directly
             .recent_launches(10)
             .iter()
-            .any(|(id, _)| id == "app:restartable:1"),
+            .any(|(id, _)| *id == expected_key),
         "the launch recorded in lifetime 1 must survive a fresh \
          Learning::load in lifetime 2, got {:?}",
         reloaded_directly.recent_launches(10)
@@ -247,9 +254,12 @@ fn a_launch_recorded_in_one_daemon_lifetime_survives_a_restart_into_a_second() {
     // 2's save clobbered lifetime 1's instead of building on it).
     let final_store = Learning::load(&store_path);
     let frequent = final_store.frequent_launches(1, &[]);
+    // See the load/save-boundary assertion above for why the persisted key
+    // is provider-scoped rather than the bare item id.
+    let expected_key = format!("{}:restartable:app:restartable:1", "restartable".len());
     assert_eq!(
         frequent,
-        vec![("app:restartable:1".to_string(), 2)],
+        vec![(expected_key, 2)],
         "both the lifetime-1 launch and the lifetime-2 launch, recorded \
          across two independent daemon lifetimes sharing one store file, \
          must both be present, got {frequent:?}"

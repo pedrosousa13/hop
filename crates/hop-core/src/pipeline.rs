@@ -924,7 +924,9 @@ impl Pipeline {
         // migration to write. `selections` is deferred alongside it rather
         // than resolved on its own. Filed as issue #72.
         for item in &provider_items {
-            let learned = self.learning.boost_for(routed.term.as_str(), &item.id);
+            let learned = self
+                .learning
+                .boost_for(&item.provider, routed.term.as_str(), &item.id);
             if learned != 0.0 {
                 *boosts.by_item_id.entry(item.id.clone()).or_insert(0.0) += learned;
             }
@@ -1311,7 +1313,7 @@ mod tests {
         for _ in 0..10 {
             pipeline
                 .learning
-                .record_launch("fire", &ItemId::new("app:learned").unwrap());
+                .record_launch("test", "fire", &ItemId::new("app:learned").unwrap());
         }
         let items = vec![
             item(Kind::App, "app:learned", "Fireplace"),
@@ -1322,9 +1324,11 @@ mod tests {
         // otherwise-equal competitor.
         let mut unaliased_pipeline = Pipeline::default();
         for _ in 0..10 {
-            unaliased_pipeline
-                .learning
-                .record_launch("fire", &ItemId::new("app:learned").unwrap());
+            unaliased_pipeline.learning.record_launch(
+                "test",
+                "fire",
+                &ItemId::new("app:learned").unwrap(),
+            );
         }
         let sanity = unaliased_pipeline
             .assemble("fire", checked(items.clone()), 10)
@@ -2107,9 +2111,11 @@ mod tests {
     fn a_rejected_item_cannot_evict_a_genuine_item_through_dedupe() {
         let mut pipeline = Pipeline::default();
         for _ in 0..10 {
-            pipeline
-                .learning
-                .record_launch("firefox", &ItemId::new("app:evil").unwrap());
+            pipeline.learning.record_launch(
+                APPS_PROVIDER_ID,
+                "firefox",
+                &ItemId::new("app:evil").unwrap(),
+            );
         }
         let out = pipeline.assemble(
             "firefox",

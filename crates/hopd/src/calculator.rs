@@ -126,11 +126,13 @@ fn trim_trailing_zeros(s: &str) -> String {
 /// result instead):
 ///
 /// - [`hop_core::learning::Learning::record_launch`] and
-///   [`hop_core::learning::Learning::boost_for`] both key **only** on the
-///   bare item id string — `crates/hop-core/src/learning.rs`'s `record`
-///   and `boost_for` never look past `item_id.as_str()`. If the id encoded
-///   the result, `2+2` and `1+3` — two different expressions that happen
-///   to land on the same number — would share one learning key, and
+///   [`hop_core::learning::Learning::boost_for`] key on the provider and the
+///   item id together (issue #72), never on anything past
+///   `item_id.as_str()` for the id half. Every calculator item shares the
+///   same provider, so the id string is still what has to distinguish one
+///   expression's learning from another's within it: if the id encoded the
+///   result instead, `2+2` and `1+3` — two different expressions that
+///   happen to land on the same number — would share one learning key, and
 ///   launching one would boost the other. Encoding the expression keeps
 ///   every distinct query its own row.
 /// - This is already the shape the rest of the tree assumes:

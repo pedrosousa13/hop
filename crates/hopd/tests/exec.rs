@@ -73,15 +73,16 @@ enum ExecBehavior {
 /// refusal — proving the daemon never dispatched to the source on a refusal.
 ///
 /// `launches` records every `record_launch` call the same way, as
-/// `(query, item_id)` pairs — the genuine observation issue #60's Task 4 owes:
-/// that a successful execute records one, and a failed or refused one records
-/// none, rather than an assertion that would hold either way.
+/// `(provider, query, item_id)` triples — the genuine observation issue
+/// #60's Task 4 owes: that a successful execute records one, and a failed or
+/// refused one records none, rather than an assertion that would hold either
+/// way. `provider` is issue #72's addition to the triple.
 #[derive(Clone)]
 struct ExecSource {
     item: Option<Item>,
     behavior: ExecBehavior,
     calls: Arc<Mutex<Vec<(String, String, String)>>>,
-    launches: Arc<Mutex<Vec<(String, String)>>>,
+    launches: Arc<Mutex<Vec<(String, String, String)>>>,
 }
 
 impl ResultSource for ExecSource {
@@ -116,9 +117,18 @@ impl ResultSource for ExecSource {
         }
     }
 
-    fn record_launch(&self, query: &str, item_id: &ItemId) -> impl Future<Output = ()> + Send {
+    fn record_launch(
+        &self,
+        provider: &str,
+        query: &str,
+        item_id: &ItemId,
+    ) -> impl Future<Output = ()> + Send {
         let launches = self.launches.clone();
-        let entry = (query.to_string(), item_id.as_str().to_string());
+        let entry = (
+            provider.to_string(),
+            query.to_string(),
+            item_id.as_str().to_string(),
+        );
         async move {
             launches
                 .lock()
@@ -206,9 +216,9 @@ fn a_successful_execute_round_trips_and_reaches_the_source() {
     );
     assert_eq!(
         source.launches.lock().unwrap().as_slice(),
-        &[("q".to_string(), "app:1".to_string())],
-        "a successful execute must record a launch keyed on the accepted \
-         query text and the resolved item id"
+        &[("script".to_string(), "q".to_string(), "app:1".to_string())],
+        "a successful execute must record a launch keyed on the item's \
+         provider, the accepted query text and the resolved item id"
     );
 }
 
@@ -645,8 +655,15 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
 
     let reloaded = Learning::load(&store_path);
     let recent = reloaded.recent_launches(10);
+    // `hop-core`'s learning store persists a provider-scoped key (issue #72),
+    // not the bare item id — `<provider-len>:<provider>:<id>`. `"launchable"`
+    // is `LaunchableProvider`'s manifest id, and `app:launchable:1` is a
+    // known-safe shape that persists in the clear, so the persisted key is
+    // exactly this composition; see `hop-core::learning`'s own tests for the
+    // key rule itself.
+    let expected_key = format!("{}:launchable:app:launchable:1", "launchable".len());
     assert!(
-        recent.iter().any(|(id, _)| id == "app:launchable:1"),
+        recent.iter().any(|(id, _)| *id == expected_key),
         "the launch recorded through the socket must be the one that landed \
          on disk, got {recent:?}"
     );
@@ -710,9 +727,12 @@ fn two_sequential_launches_both_land_in_the_learning_store() {
 
     let reloaded = Learning::load(&store_path);
     let frequent = reloaded.frequent_launches(1, &[]);
+    // See `a_successful_execute_persists_a_launch_to_the_learning_store` for
+    // why the persisted key is provider-scoped rather than the bare item id.
+    let expected_key = format!("{}:launchable:app:launchable:1", "launchable".len());
     assert_eq!(
         frequent,
-        vec![("app:launchable:1".to_string(), 2)],
+        vec![(expected_key, 2)],
         "both launches must have reached the file that made it to disk \
          last, not just the first or the second, got {frequent:?}"
     );

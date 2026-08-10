@@ -115,7 +115,7 @@ impl ResultSource for ScriptedSource {
     // Execute arm only calls on `Ok` — can never be reached by any lifecycle
     // test. The seam driving learning off a successful execute is pinned in
     // hopd/tests/exec.rs and src/connection.rs's own tests instead.
-    async fn record_launch(&self, _query: &str, _item_id: &ItemId) {}
+    async fn record_launch(&self, _provider: &str, _query: &str, _item_id: &ItemId) {}
 }
 
 #[test]
@@ -266,7 +266,7 @@ impl ResultSource for EndlessSource {
 
     // No-op, for the same reason as `ScriptedSource` above: `execute` always
     // fails, so this is never reached.
-    async fn record_launch(&self, _query: &str, _item_id: &ItemId) {}
+    async fn record_launch(&self, _provider: &str, _query: &str, _item_id: &ItemId) {}
 }
 
 #[test]
@@ -509,7 +509,7 @@ impl ResultSource for FirstEndlessThenBoundedSource {
 
     // No-op, for the same reason as the other scripted sources above:
     // `execute` always fails, so this is never reached.
-    async fn record_launch(&self, _query: &str, _item_id: &ItemId) {}
+    async fn record_launch(&self, _provider: &str, _query: &str, _item_id: &ItemId) {}
 }
 
 #[test]

@@ -157,9 +157,11 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
         action_id: ActionId,
     ) -> impl Future<Output = Result<ExecOutcome, ProviderError>> + Send;
 
-    /// Records that the user reached `item_id` while typing `query` — a
-    /// launch, in `hop-core`'s [`Learning`](hop_core::learning::Learning)
-    /// vocabulary.
+    /// Records that the user reached `item_id`, produced by `provider`,
+    /// while typing `query` — a launch, in `hop-core`'s
+    /// [`Learning`](hop_core::learning::Learning) vocabulary. `provider`
+    /// matches [`execute`](Self::execute)'s parameter order and naming
+    /// rather than a new convention of its own.
     ///
     /// This is issue #60's seam for turning a successful [`execute`](Self::execute)
     /// into learning: `crates/hopd/src/connection.rs`'s Execute arm calls this
@@ -167,10 +169,16 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
     /// `Executed` back to the peer — a launch is a successful action, not an
     /// attempted one, so a refused or failed execute never reaches this
     /// method. `query` is the accepted text of the query the item was
-    /// resolved under (`Exchange::text`), and `item_id` is the same id
-    /// `execute` was just called with; the connection is the only place that
-    /// holds both, which is why this seam is driven from there rather than
-    /// folded into `execute` itself.
+    /// resolved under (`Exchange::text`), and `item_id` and `provider` are
+    /// the same ids `execute` was just called with; the connection is the
+    /// only place that holds all three, which is why this seam is driven
+    /// from there rather than folded into `execute` itself.
+    ///
+    /// `provider` is issue #72's addition, forwarded to
+    /// [`Learning::record_launch`](hop_core::learning::Learning::record_launch)
+    /// so that a launch is recorded, and later looked up, under the provider
+    /// that actually produced the item — not the bare item id alone, which
+    /// let one provider collect boosts another had earned.
     ///
     /// [`HostSource`] records the launch against its `Pipeline`'s
     /// [`Learning`](hop_core::learning::Learning) store and, when it was
@@ -179,7 +187,12 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
     /// a no-op where its scenario does not care about learning, the same way
     /// most of this crate's scripted sources already treat `execute`'s
     /// outcome as the only thing worth scripting.
-    fn record_launch(&self, query: &str, item_id: &ItemId) -> impl Future<Output = ()> + Send;
+    fn record_launch(
+        &self,
+        provider: &str,
+        query: &str,
+        item_id: &ItemId,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 /// The walking skeleton's item, as a real [`Provider`].
@@ -499,10 +512,10 @@ impl ResultSource for HostSource {
     /// already-successful execute into a client-visible error, and the
     /// in-memory record above still took, so the next launch (or the next
     /// successful save) still has it.
-    async fn record_launch(&self, query: &str, item_id: &ItemId) {
+    async fn record_launch(&self, provider: &str, query: &str, item_id: &ItemId) {
         {
             let mut pipeline = self.pipeline.lock().await;
-            pipeline.learning.record_launch(query, item_id);
+            pipeline.learning.record_launch(provider, query, item_id);
         }
 
         let Some(path) = self.learning_path.as_ref() else {

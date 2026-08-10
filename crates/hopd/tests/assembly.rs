@@ -306,17 +306,19 @@ fn an_alias_boost_takes_effect_through_the_daemon() {
 /// Acceptance 5 (learning boost): a seeded launch count outranks an
 /// otherwise-equal sibling, observed over the socket.
 ///
-/// `record_launch("fire", "app:learned")` seeds a learning boost keyed on the
-/// bare item id (no provider dimension). Without it the two app items match
-/// at equal weight and the tie-break (title ascending) puts "Fire Alarm"
-/// first; the learned boost moves "Fireplace" ahead.
+/// `record_launch("apps", "fire", "app:learned")` seeds a learning boost
+/// keyed on the id and the provider that produced it (issue #72). Without it
+/// the two app items match at equal weight and the tie-break (title
+/// ascending) puts "Fire Alarm" first; the learned boost moves "Fireplace"
+/// ahead. The provider passed here must match the item's own `provider`
+/// field (`"apps"`, below) or the boost would not apply at all.
 #[test]
 fn a_learning_boost_takes_effect_through_the_daemon() {
     let mut pipeline = Pipeline::default();
     for _ in 0..10 {
         pipeline
             .learning
-            .record_launch("fire", &ItemId::new("app:learned").unwrap());
+            .record_launch("apps", "fire", &ItemId::new("app:learned").unwrap());
     }
     let log = Arc::new(RecordingLog::default());
     let daemon = daemon(HostPolicy::default(), pipeline, log, |host| {
