@@ -160,8 +160,8 @@ opt in, still M3's.
 Fourth, one accepted residual this landing introduces and documents rather
 than closes: a legacy store already holding a plaintext key shaped exactly
 like `sha256:` plus 64 lowercase hex digits cannot be told apart, on load,
-from a key this module hashed itself — `rekeyed_global_frequency`'s own doc
-comment (`learning.rs`) states why nothing in the v1 format distinguishes
+from a key this module hashed itself — `stored_key_needs_no_rekeying`'s own
+doc comment (`learning.rs`) states why nothing in the v1 format distinguishes
 the two. No passage in this document claimed otherwise, so nothing needed
 annotating for it; it is recorded here so a reader of Decision 2 knows it
 exists.
@@ -1136,8 +1136,8 @@ Two facts about that worth carrying into the implementing slice:
   documented rather than closed: a legacy store already holding a plaintext
   key shaped exactly like this module's own hash output cannot be told apart,
   on load, from a key this module hashed itself —
-  `rekeyed_global_frequency`'s own doc comment states why nothing in the v1
-  format distinguishes the two.
+  `stored_key_needs_no_rekeying`'s own doc comment states why nothing in the
+  v1 format distinguishes the two.
 - **How the empty-query view behaves for a provider that did not opt in.** The
   consequence above settles the rule — those items are learned and not
   renderable there — but not what the view *shows* in their place: a gap, a
