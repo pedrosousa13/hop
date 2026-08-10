@@ -32,6 +32,7 @@ pub mod server;
 pub mod source;
 pub mod state_dir;
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -41,13 +42,77 @@ use tokio::sync::Mutex;
 
 use crate::source::HostSource;
 
+/// What `hopd`'s argument list resolved to.
+///
+/// hopd's contract is "no arguments", and this type exists so that contract
+/// is *enforced* rather than merely undocumented. Before issue #122 the
+/// binary read `argv` not at all: every argument was discarded in silence
+/// and the daemon started and served regardless, so
+/// `hopd --socket /some/where` bound the default path and reported success.
+/// Under systemd that is the worst shape a misconfiguration can take — the
+/// unit is green, the daemon is listening, and it is listening somewhere no
+/// client looks, because `hop` resolves only
+/// `$XDG_RUNTIME_DIR/hop/hopd.sock` (`hop_cli`'s `socket_path`).
+///
+/// Kept separate from the code that acts on it — [`parse`] never touches a
+/// socket or prints anything — so the tests at the bottom of this module
+/// exercise the rule alone, without starting a daemon. This mirrors
+/// `hop_cli`'s `parse`/`Command` split deliberately: the client half of this
+/// workspace already treats unrecognized input as a usage error rather than
+/// a default, and the daemon half is the odd one out until it does too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invocation {
+    /// No arguments: run the daemon. [`run`] is the whole of it.
+    Serve,
+    /// One or more arguments, whatever they were. hopd accepts none, so
+    /// there is nothing to distinguish here — a plausible-looking flag, a
+    /// typo and a bare word are the same refusal.
+    Usage,
+}
+
+/// The line `main` prints to stderr for [`Invocation::Usage`].
+///
+/// Phrased as a statement rather than a synopsis (`usage: hopd`) because a
+/// synopsis listing no arguments reads like a truncated message. An operator
+/// who just passed `--socket` needs to be told the flag does not exist, not
+/// shown an empty grammar.
+pub const USAGE: &str = "hopd takes no arguments";
+
+/// Parses `args` — the process's arguments with `argv[0]` already stripped —
+/// into an [`Invocation`].
+///
+/// Any argument at all is [`Invocation::Usage`]. That is the entire rule, and
+/// it is deliberately total: hopd has no flags today, so there is no
+/// arm here that could silently accept one. If a real `--socket` override is
+/// ever wanted (the standalone-run gap issue #122 names and leaves open —
+/// `contrib/systemd/hopd.socket` already covers the activated case via
+/// `ListenStream`), it becomes a new arm of this function, and the failure
+/// mode it replaces is the silence this function exists to end.
+///
+/// # `OsString`, not `String`
+///
+/// Takes `OsString` so `main` can call `std::env::args_os()` rather than
+/// `std::env::args()`, which *panics* on an argument that is not valid
+/// Unicode. Nothing here inspects an argument's contents — the count is the
+/// whole decision — so requiring UTF-8 would buy nothing and add a panic
+/// path reachable from `argv`. `hop_cli::parse` does take `String`, because
+/// a query's text is its payload; hopd has no payload.
+pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Invocation {
+    if args.into_iter().next().is_some() {
+        Invocation::Usage
+    } else {
+        Invocation::Serve
+    }
+}
+
 /// Resolves the runtime directory, binds the socket inside it, and serves
 /// connections until an unrecoverable error occurs or the process is
 /// killed.
 ///
-/// `main.rs` calls this and nothing else — it parses no arguments, because
-/// this slice has none to parse — so every behavior described here is the
-/// whole of what running the `hopd` binary does.
+/// `main.rs` calls this once [`parse`] has confirmed the invocation carried
+/// no arguments, so every behavior described here is the whole of what
+/// running the `hopd` binary *successfully* does; the one other outcome is
+/// the [`USAGE`] refusal.
 ///
 /// # The runtime is built here, not on `main`
 ///
@@ -142,5 +207,73 @@ pub fn run() -> ExitCode {
             eprintln!("hopd: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds an argument list the way `main` hands one over: `argv[0]`
+    /// already stripped, each remaining argument an `OsString`.
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn no_arguments_serves() {
+        assert_eq!(parse(args(&[])), Invocation::Serve);
+    }
+
+    #[test]
+    fn a_single_argument_is_usage() {
+        assert_eq!(parse(args(&["serve"])), Invocation::Usage);
+    }
+
+    /// The regression issue #122 was actually filed for. This flag does not
+    /// exist, and before #122 hopd discarded it and bound its default socket
+    /// path anyway — a green systemd unit listening where no client looks.
+    #[test]
+    fn a_plausible_but_nonexistent_socket_flag_is_usage() {
+        assert_eq!(
+            parse(args(&["--socket", "/run/user/1000/hopd.sock"])),
+            Invocation::Usage
+        );
+    }
+
+    /// A near-miss of a flag hopd might one day have is still a refusal
+    /// today. Nothing in [`parse`] pattern-matches an argument's spelling,
+    /// so a typo cannot land in an accepting arm by accident.
+    #[test]
+    fn a_typo_of_a_future_flag_is_usage() {
+        assert_eq!(parse(args(&["--socket-path"])), Invocation::Usage);
+        assert_eq!(parse(args(&["-socket"])), Invocation::Usage);
+    }
+
+    #[test]
+    fn several_arguments_are_usage() {
+        assert_eq!(parse(args(&["--one", "--two", "three"])), Invocation::Usage);
+    }
+
+    /// `hopd ""` passed one argument, even though it carries no text. The
+    /// count is the decision, not the content, so an empty argument is as
+    /// much a refusal as any other — and notably not the same as no
+    /// argument at all.
+    #[test]
+    fn an_empty_string_argument_is_usage() {
+        assert_eq!(parse(args(&[""])), Invocation::Usage);
+    }
+
+    /// `std::env::args()` panics on an argument that is not valid Unicode,
+    /// which is why [`parse`] takes `OsString` and `main` calls
+    /// `args_os()`. This pins that a non-UTF-8 `argv` entry reaches a plain
+    /// refusal rather than a panic.
+    #[test]
+    fn a_non_utf8_argument_is_usage_not_a_panic() {
+        use std::os::unix::ffi::OsStringExt;
+
+        // 0x80 is a continuation byte with no lead byte: never valid UTF-8.
+        let invalid = OsString::from_vec(vec![b'-', b'-', 0x80]);
+        assert_eq!(parse(vec![invalid]), Invocation::Usage);
     }
 }
