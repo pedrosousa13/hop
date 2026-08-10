@@ -374,6 +374,11 @@ impl Ranker {
         boosts: &Boosts,
     ) -> Vec<Ranked> {
         let mut buf = Vec::new();
+        // Reused across every item's `haystack_of` call below (only actually
+        // written to for items that carry a subtitle — see that function's
+        // doc comment) so a files-shaped fixture's long, path-like titles
+        // cost at most one allocation total for this call, not one per item.
+        let mut haystack_buf = String::new();
         let mut ranked: Vec<Ranked> = items
             .into_iter()
             .filter(|item| !item.append_to_end)
@@ -388,9 +393,9 @@ impl Ranker {
                         pattern,
                         term_chars,
                     } => {
-                        let haystack = haystack_of(&item);
+                        let haystack = haystack_of(&item, &mut haystack_buf);
                         let raw =
-                            pattern.score(Utf32Str::new(&haystack, &mut buf), &mut self.matcher)?;
+                            pattern.score(Utf32Str::new(haystack, &mut buf), &mut self.matcher)?;
                         let normalized = raw as f32 / *term_chars as f32;
                         if normalized < weights.min_score {
                             return None;
@@ -534,10 +539,44 @@ fn kind_weight(weights: &Weights, kind: &Kind) -> f32 {
 
 /// `title`, then a space, then `subtitle` if present, trimmed — matches
 /// the previous extension's `primaryText + ' ' + secondaryText`.
-fn haystack_of(item: &Item) -> String {
+///
+/// Takes a `scratch` buffer, the same reuse precedent as the `buf`
+/// [`Ranker::rank_matching`] already keeps for the same reason — a local
+/// reused across that call's items, not a field on the `Ranker` — and
+/// returns a borrow rather than an owned `String`. The two
+/// branches differ in whether that borrow comes from `item` or from
+/// `scratch`:
+///
+/// - No subtitle: the trimmed title *is* the haystack, already sitting in
+///   `item.title` — returning `item.title.trim()` borrows it directly, no
+///   write and no allocation at all.
+/// - A subtitle: `scratch` is cleared and refilled with `title` + `' '` +
+///   `subtitle`, byte-for-byte what `format!("{} {subtitle}", item.title)`
+///   used to produce, then trimmed the same way (`str::trim`, on the
+///   *joined* string, exactly as before — it can still leave internal
+///   whitespace from either piece untouched if the two already abutted
+///   irregularly; only the ends are trimmed). Reusing `scratch` across
+///   calls turns a heap allocation *per subtitled item* into a handful for
+///   the whole call — the buffer reallocates only while growing to the
+///   longest haystack it sees, on `String`'s own doubling schedule, rather
+///   than once per item. Same trade `Ranker::new`'s doc comment describes
+///   for the matcher's own scratch memory, one granularity down.
+///
+/// Behavior-preserving by construction: both branches produce exactly the
+/// characters the old `String`-returning version did, just borrowed
+/// instead of owned. Callers that need the borrow to outlive `item` or
+/// `scratch` can't get one — that's the compiler enforcing that this
+/// buffer is scratch space, not a cache.
+fn haystack_of<'a>(item: &'a Item, scratch: &'a mut String) -> &'a str {
     match &item.subtitle {
-        Some(subtitle) => format!("{} {subtitle}", item.title).trim().to_string(),
-        None => item.title.trim().to_string(),
+        Some(subtitle) => {
+            scratch.clear();
+            scratch.push_str(&item.title);
+            scratch.push(' ');
+            scratch.push_str(subtitle);
+            scratch.trim()
+        }
+        None => item.title.trim(),
     }
 }
 
