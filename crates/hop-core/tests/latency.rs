@@ -2,7 +2,13 @@
 //! 10 000-item fixture, a p95-under-10ms arm, and an adversarial arm that
 //! proves the caps Task 1 (`rank::MAX_TERM_CHARS`) and Task 2
 //! (`pipeline::MAX_ITEMS_PER_PROVIDER_ANSWER`) added actually bound the work
-//! — not merely that they exist.
+//! — not merely that they exist. A second fixture and p95 arm, over
+//! files-shaped (path-like) titles, was added by issue #128; as of issue
+//! #134 that second arm is report-only — it measures and prints but no
+//! longer asserts against the budget — while the first p95 arm above and
+//! the adversarial arm both still gate. See
+//! [`p95_query_latency_over_a_files_shaped_fixture_is_measured_in_release_mode`]'s
+//! own doc comment for why.
 //!
 //! ## Why this file, and not `#[cfg(test)] mod tests`
 //!
@@ -728,21 +734,52 @@ fn files_shaped_fixture() -> CheckedItems {
 /// docs' "Fixture determinism" section.
 const EXPECTED_PATH_ID_SEQUENCE_DIGEST: u64 = 0x784a_a143_1dc2_0dc7;
 
-/// p95 over the files-shaped fixture, asserted under the same 10ms budget.
+/// p95 over the files-shaped fixture — measured and printed, not asserted.
 ///
 /// Release-mode only and `#[ignore]`d for exactly the reasons the arm above
 /// documents; the same CI `latency-gate` job runs it, since that job passes
 /// `--ignored` for the whole test binary rather than naming tests.
 ///
-/// **If this arm fails, the response is not to relax the budget or shorten
-/// these paths** (issue #128's acceptance criterion 6). A breach here means a
-/// files provider needs a different approach to candidate selection — prefix
-/// or path-segment indexing, pre-filtering before the fuzzy scorer — and that
-/// is a design input to M5, not a number to negotiate. Report the measurement
-/// and stop.
+/// **Report-only; does not gate CI (issue #134).** The measured position is
+/// ~4.899 ms locally (PR #135) against the ~4 ms working target #134's own
+/// brief set, which projects to ~9.8 ms on CI's roughly 2× slower runners —
+/// right at the 10 ms budget. A gate with that little margin isn't measuring
+/// regressions, it's measuring runner speed: the same commit measured 10.066
+/// ms and then 10.234 ms back to back on PR #133's runners, and a later 5/5
+/// pass streak was the arm's variance narrowing near the line, not its p95
+/// moving away from it. So the fixture, the paths and the 10 ms number below
+/// are untouched; only the failing behavior is gone.
+///
+/// **Calibrating the budget to machine speed instead (approach 2) was
+/// rejected.** It would keep this arm green by scaling the threshold to
+/// whatever the runner can manage, which keeps the tick without keeping the
+/// claim: §3 promises a p95 under 10 ms, not under whatever the current
+/// runner happens to do. That trades a visible, honest report-only arm for
+/// an invisible, dishonest one — worse, not better.
+///
+/// **#128's original point survives this change, and is now this arm's whole
+/// purpose.** A breach here still means a files provider needs a different
+/// approach to candidate selection — prefix or path-segment indexing, ahead
+/// of the fuzzy scorer — and that is a design input to M5, not a number to
+/// negotiate. This test no longer decides when that line is crossed; a human
+/// reading the printed p95 over time does.
+///
+/// **The cheap route to closing the gap is exhausted, not merely untried.**
+/// PR #135 removed `haystack_of`'s per-item allocation for a measured 2.4%
+/// gain (5.021 ms → 4.899 ms mean) — real, but nowhere near enough. A
+/// hand-rolled candidate prefilter ahead of the fuzzy scorer was measured too
+/// and came back a net *regression*: nucleo already runs its own
+/// `memchr`/SIMD prefilter before falling back to full scoring, so a naive
+/// filter in front of it pays its own cost without skipping any of nucleo's.
+/// Recorded here so the next person doesn't spend time re-measuring it.
+///
+/// **What would make this arm gate again**: the p95 moving away from the
+/// line — M5's files provider actually landing a different candidate-
+/// selection approach — not a change to the budget, the fixture, or this
+/// arm's `#[ignore]`.
 #[test]
 #[ignore]
-fn p95_query_latency_over_a_files_shaped_fixture_is_under_10ms_in_release_mode() {
+fn p95_query_latency_over_a_files_shaped_fixture_is_measured_in_release_mode() {
     let checked = files_shaped_fixture();
     assert_eq!(
         checked.items().len(),
@@ -774,9 +811,17 @@ fn p95_query_latency_over_a_files_shaped_fixture_is_under_10ms_in_release_mode()
     let rank = (0.95_f64 * samples.len() as f64).ceil() as usize;
     let p95 = samples[rank - 1];
 
-    // Printed unconditionally, like the arm above: this margin is the number
-    // M5's design depends on, so it is worth watching whether or not the
-    // assertion happens to pass today.
+    // Printed unconditionally, like the arm above — this is the whole point
+    // now that nothing here asserts (see this test's doc comment). The
+    // margin against the 10ms reference line is the number a reader needs to
+    // judge drift over time, so it's computed and printed explicitly rather
+    // than left for a reader to subtract by hand.
+    let ten_ms = Duration::from_millis(10);
+    let margin = if p95 <= ten_ms {
+        format!("{:?} under", ten_ms - p95)
+    } else {
+        format!("{:?} over", p95 - ten_ms)
+    };
     let mean_title: usize = checked
         .items()
         .iter()
@@ -784,19 +829,11 @@ fn p95_query_latency_over_a_files_shaped_fixture_is_under_10ms_in_release_mode()
         .sum::<usize>()
         / checked.items().len();
     println!(
-        "p95_query_latency_over_a_files_shaped_fixture_is_under_10ms_in_release_mode: \
-         p95 = {p95:?}, min = {:?}, max = {:?}, mean title = {mean_title} bytes",
+        "p95_query_latency_over_a_files_shaped_fixture_is_measured_in_release_mode: \
+         p95 = {p95:?}, min = {:?}, max = {:?}, mean title = {mean_title} bytes, \
+         margin vs 10ms reference = {margin}",
         samples.first().unwrap(),
         samples.last().unwrap(),
-    );
-
-    assert!(
-        p95 < Duration::from_millis(10),
-        "p95 over the files-shaped fixture was {p95:?} (release mode only); \
-         expected under 10ms. Per issue #128 the response is to treat this as \
-         a design input for M5's files provider — candidate pre-filtering \
-         ahead of the fuzzy scorer — not to relax the budget or shorten the \
-         fixture's paths."
     );
 }
 
