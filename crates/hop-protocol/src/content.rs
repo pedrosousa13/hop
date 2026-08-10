@@ -498,8 +498,14 @@ impl<'de> Deserialize<'de> for CopyText {
 }
 
 impl CopyText {
-    /// The wire field this value travels in, named by every refusal of one, for
-    /// the reason given on [`OpenUrl`]'s constant of the same name.
+    /// The wire field this value travels in when it arrives through an
+    /// outcome, named by every such refusal, for the reason given on
+    /// [`OpenUrl`]'s constant of the same name. Unlike [`OpenUrl::FIELD`],
+    /// this is not named by *every* refusal of a [`CopyText`]: an item's
+    /// `copy_text` reaches this type through [`CopyText::new_named`]
+    /// instead, which names `Item.copy_text` on refusal rather than this
+    /// constant — see this module's docs for why the two routes disagree on
+    /// the name.
     pub(crate) const FIELD: &'static str = "ExecOutcome::CopyText";
 
     /// Builds copy text, refusing a value that breaks any rule on [`CopyText`].

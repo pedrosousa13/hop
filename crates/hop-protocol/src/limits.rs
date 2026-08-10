@@ -279,14 +279,15 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// multiplied by bounds this module applies *at the parse*
 /// (`#[serde(deserialize_with = …)]`), so they hold for every item that
 /// arrived over a socket and for no item that did not. [`Item`](crate::item::Item)'s
-/// `title`, `subtitle`, `copy_text`, `provider` and `actions` fields are
-/// plain `String`s and `Vec`s with no bound outside the parse — `id` and
-/// `default_action` are validated newtypes (`ItemId`/`ActionId`) bounded at
-/// construction regardless of origin, but that leaves every other
-/// variable-length field uncovered. An item a daemon builds in-process — or
-/// takes from a result source in-process — has passed no *length* check on
-/// those: 5 000 items with a 100 MB title each are 5 000 items, and
-/// this cap admits them. The only backstop below that is [`MAX_FRAME_BYTES`]
+/// `title`, `subtitle`, `provider` and `actions` fields are plain `String`s
+/// and `Vec`s with no bound outside the parse — `id` and `default_action`
+/// are validated newtypes (`ItemId`/`ActionId`) bounded at construction
+/// regardless of origin, and `copy_text` joins them as of issue #78 (see
+/// below), but that leaves every other variable-length field uncovered. An
+/// item a daemon builds in-process — or takes from a result source
+/// in-process — has passed no *length* check on those: 5 000 items with a
+/// 100 MB title each are 5 000 items, and this cap admits them. The only
+/// backstop below that is [`MAX_FRAME_BYTES`]
 /// at encode time, which refuses the frame as an error rather than reporting
 /// an over-sized item.
 ///
