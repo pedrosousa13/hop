@@ -1,7 +1,7 @@
 # Hop Launcher v1 — Design Spec
 
 Date: 2026-07-30
-Status: Approved; amended 2026-07-31, 2026-08-03, 2026-08-04
+Status: Approved; amended 2026-07-31, 2026-08-03, 2026-08-04, 2026-08-10
 Decisions by: Pedro Sousa
 
 **Amendment, 2026-07-31.** Amended after a grilling session over the milestone
@@ -24,6 +24,13 @@ shows the `Send + Sync + 'static`, `Arc`-argument signature #56 actually
 landed, in place of the borrowed signature it replaced) and §6 (the
 amendment note now says #29 is closed by #56, and that #21 landed earlier,
 with #54). Each change is marked **[Amended 2026-08-04]** in place.
+
+**Amendment, 2026-08-10.** Amended by the #80 design grill, whose own output is
+`docs/superpowers/specs/2026-08-10-hop-m3-frontend-design.md`. One section
+changed: §3 (the latency contract now says what the 10 ms is measured over, and
+what it is not — decision D1). The change is marked **[Amended 2026-08-10]** in
+place. Nothing else in this document was re-opened: the grill found five of its
+eight questions already answered here, and treated them as settled.
 
 ## 1. What this is
 
@@ -97,6 +104,7 @@ Three processes at runtime, all salvage-validated as the right shape:
 ### The latency contract (fixes the Rust branch's fatal flaw)
 
 - Tier-0 keystroke → ranked results: **< 10 ms**. Toggle → visible overlay: **< 100 ms perceived**.
+- **[Amended 2026-08-10] What the 10 ms is measured over, and what it is not.** The gate that enforces it (`crates/hop-core/tests/latency.rs`, issue #61, run in CI per PR) times **`Pipeline::assemble` alone** — the pure ranking-and-assembly function — over a 10 000-item fixture, and currently reports p95 2.29 ms (min 2.08, max 4.76). Provider execution, IPC, serialization and render are **outside** that measurement. So "keystroke → ranked results" states the *intent*; the **proven** claim is the ranking path, and the remaining segments are bounded by other means (per-provider budgets, the frame cap, §8's off-main-thread IPC rule) rather than by this number. Narrowed deliberately rather than widened: an honest scope beats a claim no arm covers, and the #80 grill (decision D1) chose to keep the number and fix what proves it. The fixture's own sensitivity is the reason this matters — its titles are deliberately short, and `formulaic_title`'s comment records that ~45-byte titles pushed p95 to 11.8 ms, over budget. A files-shaped arm at realistic path lengths and counts is issue #128, required before M5 slices its files provider.
 - On the query path: **no disk reads, no subprocess spawns, no HTTP, ever.** Only in-memory index lookups.
 - Indexes are maintained by events, not queries: apps via inotify on XDG `.desktop` dirs; files via notify watcher + periodic rescan of configured roots (with default excludes: dotfiles, `.git`, `node_modules`, caches); windows via compositor event subscriptions (foreign-toplevel events, i3/Hyprland IPC events, EWMH property events, shim signals) into a cached list.
 - Network providers (weather, currency geocode/rates) return a cached-or-pending row synchronously and push an update frame when the fetch lands; fetches have timeouts *and* cancellation (`tokio::time::timeout` around abortable futures — real cancellation, not the branch's discard-after-completion).
