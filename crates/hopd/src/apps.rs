@@ -2462,7 +2462,7 @@ impl Provider for AppsProvider {
             // `<desktop-entry-id>` names which installed `.desktop` file
             // matched — enumerable from what is installed on the system, and
             // never anything the user typed. Contrast `CalculatorProvider`,
-            // whose ids embed the raw query text and does not opt in.
+            // which embeds the raw query text in its ids and does not opt in.
             ids_are_safe_to_persist_in_the_clear: true,
         }
     }

@@ -30,8 +30,8 @@ one Enter runs.
 
 **Provider** — a source of items. Describes itself with a **manifest** (its id,
 the kinds it produces, the modes it serves, a minimum term length, a per-query
-budget) and answers queries. This is the plugin seam; every later extension
-tier adapts to it.
+budget, and whether its ids are safe to persist in the clear) and answers
+queries. This is the plugin seam; every later extension tier adapts to it.
 
 ## Queries
 
@@ -160,6 +160,14 @@ disclosure — a backup, a synced folder, a support bundle — where a plaintext
 `calc:2+2` is legible on sight and a hex digest is not. See the threat model's
 Decision 2 (`docs/security/2026-08-02-m2-socket-boundary-threat-model.md`) for
 the full reasoning.
+
+**Revocation** — a provider leaving the opted-in set, whether by flipping its
+manifest flag off or by dropping out of the registry entirely. The store
+reacts on its next sync, not on retention's schedule: a revoked provider's
+plaintext entries are hashed immediately rather than waiting to age out. The
+reaction is one-directional — a hash, once written, cannot become plaintext
+again if the provider opts in later, since the hash cannot be reversed to
+recover the id it was computed over.
 
 **Load report** — what one load of the learning store noticed: that it loaded,
 or which single fallback it took instead — absent, not a regular file,
