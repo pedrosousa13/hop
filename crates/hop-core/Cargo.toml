@@ -26,6 +26,7 @@ thiserror.workspace = true
 nucleo-matcher.workspace = true
 tokio.workspace = true
 regex.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile.workspace = true
