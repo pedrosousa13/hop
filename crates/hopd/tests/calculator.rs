@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use common::{Script, ScriptedProvider, hello, recv, scripted_item, send, start_daemon};
 use hop_core::host::{NoopLog, ProviderHost};
-use hop_protocol::{ClientMsg, CopyText, DaemonMsg, ExecOutcome, Item, Kind, QueryText};
+use hop_protocol::{ClientMsg, CopyText, DaemonMsg, ExecOutcome, Item, Kind, Mode, QueryText};
 use hopd::calculator::CalculatorProvider;
 use hopd::source::HostSource;
 
@@ -63,6 +63,11 @@ fn run_query(stream: &mut UnixStream, id: u64, text: &str) -> Vec<Item> {
                 items: batch,
                 ..
             } if query_id == id => items = batch,
+            // #127's routed frame leads every exchange. This helper exists to
+            // return items, so the frame is tolerated here; the mode it
+            // reports for a math query is asserted in
+            // `an_inferred_math_query_reports_calculator_without_exclusivity`.
+            DaemonMsg::QueryRouted { query_id, .. } if query_id == id => {}
             DaemonMsg::QueryDone { query_id } if query_id == id => break,
             other => panic!("unexpected frame: {other:?}"),
         }
@@ -141,8 +146,50 @@ fn input_that_is_not_an_expression_yields_a_clean_query_done_with_no_items() {
 
     // No Results frame at all: the manifest's Mode::Calculator-only
     // declaration (Design decision 1) means this provider is never even
-    // selected for a non-math query, so QueryDone is the very first frame.
+    // selected for a non-math query, so nothing produces items.
+    //
+    // The exchange is therefore `QueryRouted` then `QueryDone`, which is #127's
+    // whole reason for being a separate frame: had the mode ridden on
+    // `Results`, this query would report none at all. `Mode::All` here —
+    // ordinary prose names no mode and reaches the routing fallback, which is
+    // never exclusive, so a frontend shows no mode label and the user sees a
+    // plain "no results" rather than a false claim about a mode.
+    assert_eq!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted {
+            query_id: 1,
+            mode: Mode::All,
+            exclusive: false,
+        }
+    );
     assert_eq!(recv(&mut stream), DaemonMsg::QueryDone { query_id: 1 });
+}
+
+/// #127 acceptance criterion 5, inferred half, over the socket: a bare sum is
+/// *inferred* `Calculator`, so the frame names that mode with `exclusive:
+/// false`. The `=` sigil would be the exclusive counterpart — asserted in
+/// `assembly.rs` for the `a ` prefix rather than duplicated here.
+#[test]
+fn an_inferred_math_query_reports_calculator_without_exclusivity() {
+    let daemon = calculator_daemon();
+    let mut stream = connect(&daemon);
+
+    send(
+        &mut stream,
+        &ClientMsg::Query {
+            id: 1,
+            text: QueryText::new("2+2").unwrap(),
+        },
+    );
+
+    assert_eq!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted {
+            query_id: 1,
+            mode: Mode::Calculator,
+            exclusive: false,
+        }
+    );
 }
 
 /// A second provider standing in for "some other, unrelated provider" —

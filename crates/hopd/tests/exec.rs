@@ -437,6 +437,10 @@ fn a_hanging_execute_is_bounded_and_the_connection_stays_responsive() {
                 query_id: 7, items, ..
             } => delivered = items,
             DaemonMsg::QueryDone { query_id: 7 } => break,
+            // #127's routed frame leads every exchange. These tests are about
+            // execute dispatch, not routing, so it is tolerated here; the
+            // modes it reports are asserted in assembly.rs and calculator.rs.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame during first query: {other:?}"),
         }
     }
@@ -590,6 +594,10 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
                 query_id: 1, items, ..
             } => delivered = items,
             DaemonMsg::QueryDone { query_id: 1 } => break,
+            // #127's routed frame leads every exchange. These tests are about
+            // execute dispatch, not routing, so it is tolerated here; the
+            // modes it reports are asserted in assembly.rs and calculator.rs.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame during query: {other:?}"),
         }
     }
@@ -671,6 +679,10 @@ fn two_sequential_launches_both_land_in_the_learning_store() {
             match recv(&mut stream) {
                 DaemonMsg::Results { .. } => {}
                 DaemonMsg::QueryDone { query_id: id } if id == query_id => break,
+                // #127's routed frame leads every exchange. These tests are about
+                // execute dispatch, not routing, so it is tolerated here; the
+                // modes it reports are asserted in assembly.rs and calculator.rs.
+                DaemonMsg::QueryRouted { .. } => {}
                 other => panic!("unexpected frame during query {query_id}: {other:?}"),
             }
         }

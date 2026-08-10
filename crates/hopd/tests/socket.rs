@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use hop_protocol::limits::MAX_FRAME_BYTES;
-use hop_protocol::{ClientMsg, DaemonMsg, ErrorCode, Kind, QueryText};
+use hop_protocol::{ClientMsg, DaemonMsg, ErrorCode, Kind, Mode, QueryText};
 
 /// A spawned `hopd`, and the path its socket should appear at.
 ///
@@ -165,6 +165,20 @@ fn the_round_trip_returns_one_item_end_to_end() {
             id: 7,
             text: QueryText::new("walking skeleton").unwrap(),
         },
+    );
+
+    // #127: the routed frame opens every exchange, ahead of results. This is
+    // the walking skeleton's end-to-end round trip, so pinning it here means
+    // the very first test anyone reads about this protocol shows the real frame
+    // order. "walking skeleton" names no mode, so it reaches the `All`
+    // fallback, which is never exclusive.
+    assert_eq!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted {
+            query_id: 7,
+            mode: Mode::All,
+            exclusive: false,
+        }
     );
 
     let results = recv(&mut stream);

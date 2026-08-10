@@ -123,6 +123,40 @@ fn connect(daemon: &TestDaemon) -> UnixStream {
 /// (as `host.rs` does for its count-only assertions) would lose exactly the
 /// *ordering* this file exists to pin, so this returns the frames whole.
 fn frames_for(stream: &mut UnixStream, query_id: u64) -> Vec<Vec<Item>> {
+    routed_and_frames_for(stream, query_id).1
+}
+
+/// The exchange's `QueryRouted` frame (#127) alongside every `Results` batch.
+///
+/// Reading the routed frame here rather than in each caller means the ordering
+/// rule — exactly one `QueryRouted`, **before** any `Results` or `QueryDone`
+/// for the id — is asserted once for every test in this file that drives a
+/// query, rather than once wherever someone remembered to. A second
+/// `QueryRouted`, or one arriving after a `Results`, lands in the `other`
+/// arm's panic below.
+fn routed_and_frames_for(stream: &mut UnixStream, query_id: u64) -> ((Mode, bool), Vec<Vec<Item>>) {
+    let routed = match recv(stream) {
+        DaemonMsg::QueryRouted {
+            query_id: got,
+            mode,
+            exclusive,
+        } => {
+            assert_eq!(got, query_id, "the routed frame must name this query");
+            (mode, exclusive)
+        }
+        other => panic!("the first frame of a query must be QueryRouted, got {other:?}"),
+    };
+    (routed, results_until_done(stream, query_id))
+}
+
+/// Every remaining `Results` batch for `query_id`, up to `QueryDone`.
+///
+/// Separate from [`routed_and_frames_for`] because an exchange carries exactly
+/// **one** `QueryRouted` (#127), so a caller that has already consumed it — a
+/// test timing the first results frame by hand, then draining the rest — must
+/// not expect a second. Calling `frames_for` mid-exchange would demand one and
+/// fail on the next `Results`.
+fn results_until_done(stream: &mut UnixStream, query_id: u64) -> Vec<Vec<Item>> {
     let mut frames = Vec::new();
     loop {
         match recv(stream) {
@@ -383,7 +417,16 @@ fn an_exclusive_route_filters_to_that_modes_kinds() {
         },
     );
 
-    let frames = frames_for(&mut stream, 4);
+    // #127, and acceptance criterion 5's exclusive half: this is an `a `
+    // prefix route, so the frame must report the mode that *filtered* and say
+    // so. Asserted right where the filtering behaviour below is asserted, so
+    // the wire's claim and the daemon's behaviour cannot drift apart.
+    let ((mode, exclusive), frames) = routed_and_frames_for(&mut stream, 4);
+    assert_eq!(mode, Mode::Apps);
+    assert!(
+        exclusive,
+        "an explicit prefix is an exclusive route, and the client is told so"
+    );
     let items = frames.last().unwrap();
     assert_eq!(
         items.len(),
@@ -443,7 +486,17 @@ fn an_inferred_route_promotes_without_removing() {
         },
     );
 
-    let frames = frames_for(&mut stream, 5);
+    // Criterion 5's inferred half, and the distinction the whole frame exists
+    // for: a bare sum is *inferred* Calculator, so results were promoted and
+    // nothing was removed. `exclusive` is therefore false — which is what
+    // tells a frontend to show no mode label at all, because claiming a mode
+    // over an unfiltered list would misdescribe what the window contains.
+    let ((mode, exclusive), frames) = routed_and_frames_for(&mut stream, 5);
+    assert_eq!(mode, Mode::Calculator);
+    assert!(
+        !exclusive,
+        "an inferred route filters nothing, so augment-not-hijack holds"
+    );
     let items = frames.last().unwrap();
     assert_eq!(
         items.len(),
@@ -512,6 +565,22 @@ fn the_first_frame_arrives_before_the_slow_provider_finishes() {
         },
     );
 
+    // `QueryRouted` (#127) is consumed *before* the clock starts, and that is
+    // deliberate: this test's claim is about how long the fast provider's
+    // *results* wait on the slow one, so the routed frame must not be inside
+    // the measured window. It cannot distort the claim either way — the daemon
+    // sends it from the query arm before the source is even started, so it is
+    // already on the wire — but timing it would mean this test silently
+    // measured two things.
+    assert_eq!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted {
+            query_id: 6,
+            mode: Mode::All,
+            exclusive: false,
+        }
+    );
+
     let started = Instant::now();
     let first = match recv(&mut stream) {
         DaemonMsg::Results {
@@ -531,8 +600,10 @@ fn the_first_frame_arrives_before_the_slow_provider_finishes() {
     );
     assert_eq!(first.len(), 1, "only the fast provider answered so far");
 
-    // Drain to completion so the daemon is not left mid-query.
-    let frames = frames_for(&mut stream, 6);
+    // Drain to completion so the daemon is not left mid-query. This
+    // exchange's one `QueryRouted` was consumed above, so this reads only the
+    // remaining results frames.
+    let frames = results_until_done(&mut stream, 6);
     assert_eq!(
         frames.last().unwrap().len(),
         2,

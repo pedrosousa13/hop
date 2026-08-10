@@ -86,22 +86,18 @@ use regex::Regex;
 /// any to carry. Which routes do carry a shape guarantee, and why the sigil
 /// path deliberately carries none, is on [`RoutedQuery`] under "An exclusive
 /// mode filters results; it never checks the term's shape".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    All,
-    Windows,
-    Apps,
-    Files,
-    Emoji,
-    Timezone,
-    Currency,
-    Calculator,
-    Weather,
-    Actions,
-    /// Part of the routing vocabulary, but `route()` never returns it yet —
-    /// no explicit prefix or inference rule targets it in this milestone.
-    WebSearch,
-}
+/// # Defined in `hop-protocol`, documented here
+///
+/// The type itself moved to [`hop_protocol::mode`] when
+/// [`DaemonMsg::QueryRouted`](hop_protocol::DaemonMsg::QueryRouted) began
+/// carrying it: a mode now crosses a process boundary, and every type that
+/// does is that crate's business — the same treatment
+/// [`Kind`](hop_protocol::Kind) already gets. Everything above stays here
+/// because it is about what [`route`] does and does not establish, which is a
+/// property of this module rather than of the wire. `hop-protocol`'s copy
+/// documents the two warnings a client needs when it reads the value out of a
+/// frame with none of this context.
+pub use hop_protocol::Mode;
 
 /// The result of routing a raw query string.
 ///

@@ -37,6 +37,7 @@
 
 use std::io;
 
+use hop_core::router::route;
 use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
 };
@@ -287,6 +288,35 @@ async fn handle_message<S: ResultSource>(
             // is replaced along with it, because what the client is looking
             // at is now this query's results and nothing else.
             let text_owned = text.clone().into_string();
+
+            // `QueryRouted` goes out before the source is even started, which
+            // is what makes its ordering guarantee hold trivially: no
+            // `Results` or `QueryDone` for this id can be written until this
+            // function returns to the driver's poll loop, so nothing can
+            // overtake it. Issue #127.
+            //
+            // Routing here is a *third* call on the same text — `HostSource`
+            // routes once for the host's `RoutedQuery` and `Pipeline::assemble`
+            // routes again per arrival, a tradeoff `source`'s own docs weigh
+            // and accept because `route` is pure and cheap enough to run on
+            // every keystroke. The same purity is what makes this call safe to
+            // add rather than threading a value out through `ResultSource`,
+            // whose `start` returns only a receiver: identical input, identical
+            // answer, so the mode the client is told is necessarily the mode
+            // the providers were asked under.
+            let routed = route(&text_owned);
+            send_msg(
+                write_half,
+                &DaemonMsg::QueryRouted {
+                    query_id: id,
+                    mode: routed.mode,
+                    exclusive: routed.exclusive,
+                },
+            )
+            .await?;
+
+            // Replacing the exchange drops the previous query's receiver, and
+            // that *is* the server-side cancellation — see the comment above.
             *exchange = Some(Exchange {
                 id,
                 text: text_owned,

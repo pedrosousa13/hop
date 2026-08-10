@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::content::{CopyText, OpenUrl};
 use crate::item::{ActionId, Item, ItemId};
 use crate::limits;
+use crate::mode::Mode;
 use crate::redaction::QueryText;
 
 /// Messages sent from a client to the daemon.
@@ -157,6 +158,46 @@ pub enum DaemonMsg {
     /// it, the same distinction [`ErrorCode`]'s docs draw for a new variant.
     HelloAck {
         api_version: u32,
+    },
+    /// How the daemon routed an accepted [`ClientMsg::Query`]: which
+    /// [`Mode`] it was interpreted as, and whether that route **filtered**
+    /// results to that mode's kinds.
+    ///
+    /// # Why this is its own frame rather than a field on `Results`
+    ///
+    /// Because a query that matches nothing sends no `Results` frame at all.
+    /// The daemon's terminal frame is [`DaemonMsg::QueryDone`], and it is sent
+    /// alone when a source finishes empty — so a mode carried on `Results`
+    /// would be absent precisely when it matters most. An exclusive route that
+    /// filtered everything away is the case a user most needs explained: the
+    /// difference between "Windows — no matches" and a bare "no results" is
+    /// the whole reason a client is told the mode.
+    ///
+    /// Putting it on `QueryDone` instead was rejected for the opposite
+    /// reason — it arrives after results have rendered, so a mode label would
+    /// appear late, while the user is still typing.
+    ///
+    /// # Ordering
+    ///
+    /// Exactly one `QueryRouted` per accepted query, sent **before** any
+    /// `Results` or `QueryDone` bearing the same `query_id`. A client may
+    /// therefore render a mode label before the first item arrives, and the
+    /// stale-frame rule governs this frame exactly as it governs `Results`: a
+    /// `QueryRouted` for a superseded id is dropped like any other stale
+    /// frame.
+    ///
+    /// # `exclusive` is not derivable from `mode`
+    ///
+    /// The same [`Mode`] is reachable both ways — `route("$100 usd")` and
+    /// `route("100 usd to eur")` are both [`Mode::Currency`], one exclusive
+    /// and one inferred — so the flag is a separate field rather than
+    /// something a client could infer. It is also the half that carries the
+    /// user-facing meaning: `exclusive` is true exactly when results the user
+    /// cannot see were withheld.
+    QueryRouted {
+        query_id: u64,
+        mode: Mode,
+        exclusive: bool,
     },
     /// One frame of a query's results.
     ///

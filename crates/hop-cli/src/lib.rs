@@ -310,7 +310,16 @@ fn connect_and_query(text: &str) -> Result<(UnixStream, Vec<Item>), ClientError>
                 query_id: Some(id),
                 error,
             } if id == QUERY_ID => return Err(ClientError::Daemon(error)),
-            // Any other id is a stale frame — a `results`, `query_done` or
+            // `QueryRouted` (#127) tells a client which mode answered and
+            // whether that route filtered results away. This CLI has no use
+            // for it: it renders one JSON object per item and draws no mode
+            // label, which is the frontend's job. Matched explicitly rather
+            // than left to the catch-all below so that "the CLI ignores this
+            // deliberately" is recorded, not inferred from an absence — and so
+            // that adding a *third* frame later cannot be silently swallowed
+            // by an arm whose comment claims to be about stale ids.
+            DaemonMsg::QueryRouted { .. } => continue,
+            // Any other frame is a stale one — a `results`, `query_done` or
             // `error` for a query this process is no longer (or was never)
             // waiting on. This CLI only ever has one query in flight and
             // never sends `Cancel`, so it should never see one in practice.

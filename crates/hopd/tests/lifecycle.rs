@@ -155,6 +155,10 @@ fn a_query_streams_several_results_frames_before_its_done_frame() {
                 assert_eq!(query_id, 7);
                 break;
             }
+            // #127's routed frame leads every exchange. These tests are about
+            // the query lifecycle — streaming, supersession, cancellation,
+            // truncation — so it is tolerated rather than asserted here.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame: {other:?}"),
         }
     }
@@ -204,6 +208,10 @@ fn a_re_sent_item_is_not_charged_twice() {
         match recv(&mut stream) {
             DaemonMsg::Results { query_id: 5, .. } => frames += 1,
             DaemonMsg::QueryDone { query_id: 5 } => break,
+            // #127's routed frame leads every exchange. These tests are about
+            // the query lifecycle — streaming, supersession, cancellation,
+            // truncation — so it is tolerated rather than asserted here.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame: {other:?}"),
         }
     }
@@ -279,6 +287,11 @@ fn a_second_query_cancels_the_first_observably() {
         },
     );
     // At least one frame of query 1 arrives, proving it was running.
+    // #127: the routed frame precedes this query's first results frame.
+    assert!(matches!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted { query_id: 1, .. }
+    ));
     let DaemonMsg::Results { query_id: 1, .. } = recv(&mut stream) else {
         panic!("query 1 must stream before being cancelled");
     };
@@ -306,6 +319,10 @@ fn a_second_query_cancels_the_first_observably() {
         match recv(&mut stream) {
             DaemonMsg::Results { query_id: 2, .. } => break,
             DaemonMsg::Results { query_id: 1, .. } => continue,
+            // #127's routed frame leads every exchange. These tests are about
+            // the query lifecycle — streaming, supersession, cancellation,
+            // truncation — so it is tolerated rather than asserted here.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame: {other:?}"),
         }
     }
@@ -328,6 +345,11 @@ fn a_cancel_frame_stops_the_active_query_and_answers_query_done() {
             text: QueryText::new("q").unwrap(),
         },
     );
+    // #127: the routed frame precedes this query's first results frame.
+    assert!(matches!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted { query_id: 9, .. }
+    ));
     let DaemonMsg::Results { query_id: 9, .. } = recv(&mut stream) else {
         panic!("the query must stream before the cancel");
     };
@@ -395,6 +417,10 @@ fn a_list_over_the_frame_bound_is_truncated_and_terminates() {
                 total += items.len();
             }
             DaemonMsg::QueryDone { query_id: 3 } => break,
+            // #127's routed frame leads every exchange. These tests are about
+            // the query lifecycle — streaming, supersession, cancellation,
+            // truncation — so it is tolerated rather than asserted here.
+            DaemonMsg::QueryRouted { .. } => {}
             other => panic!("unexpected frame: {other:?}"),
         }
     }
@@ -503,6 +529,11 @@ fn a_superseded_query_never_emits_query_done_for_its_old_id() {
     );
     // At least one frame of query 1 arrives, proving it was actually running
     // (and not, say, already finished) at the moment it gets superseded.
+    // #127: the routed frame precedes this query's first results frame.
+    assert!(matches!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted { query_id: 1, .. }
+    ));
     let DaemonMsg::Results { query_id: 1, .. } = recv(&mut stream) else {
         panic!("query 1 must stream before being superseded");
     };
@@ -528,6 +559,18 @@ fn a_superseded_query_never_emits_query_done_for_its_old_id() {
             DaemonMsg::QueryDone { query_id: 2 } => break,
             DaemonMsg::QueryDone { query_id: 1 } => {
                 panic!("a superseded query must never receive QueryDone for its old id")
+            }
+            // #127 acceptance criterion 6, and the reason this arm is not the
+            // blanket `QueryRouted { .. } => {}` used elsewhere in this file:
+            // the routed frame is subject to the same rule as every other
+            // frame. Exactly one may appear here, for id 2 — query 1's own was
+            // consumed above, before the supersession. A *second* one naming
+            // id 1 would be the daemon reopening an exchange the client has
+            // moved on from, the same defect this test's `QueryDone` arm
+            // guards against.
+            DaemonMsg::QueryRouted { query_id: 2, .. } => continue,
+            DaemonMsg::QueryRouted { query_id: 1, .. } => {
+                panic!("a superseded query must never receive a second QueryRouted for its old id")
             }
             other => panic!("unexpected frame: {other:?}"),
         }
@@ -560,6 +603,11 @@ fn a_non_matching_cancel_is_dropped_silently() {
     // Query 7 must actually be streaming when the mismatched cancel lands —
     // otherwise this test could pass for the wrong reason (nothing active to
     // disturb in the first place).
+    // #127: the routed frame precedes this query's first results frame.
+    assert!(matches!(
+        recv(&mut stream),
+        DaemonMsg::QueryRouted { query_id: 7, .. }
+    ));
     let DaemonMsg::Results { query_id: 7, .. } = recv(&mut stream) else {
         panic!("query 7 must stream before the non-matching cancel");
     };
