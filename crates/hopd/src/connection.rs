@@ -430,7 +430,9 @@ async fn handle_message<S: ResultSource>(
                     // `ResultSource::record_launch`'s docs for why the
                     // connection is what drives this rather than `execute`
                     // itself.
-                    source.record_launch(&active.text, &item_id).await;
+                    source
+                        .record_launch(&provider, &active.text, &item_id)
+                        .await;
                     send_msg(write_half, &DaemonMsg::Executed { query_id, outcome }).await?
                 }
                 Err(_) => {
@@ -830,9 +832,14 @@ mod tests {
             }
         }
 
-        fn record_launch(&self, query: &str, item_id: &ItemId) -> impl Future<Output = ()> + Send {
+        fn record_launch(
+            &self,
+            provider: &str,
+            query: &str,
+            item_id: &ItemId,
+        ) -> impl Future<Output = ()> + Send {
             let launches = self.launches.clone();
-            let entry = format!("{query}|{item_id}");
+            let entry = format!("{provider}|{query}|{item_id}");
             async move {
                 launches
                     .lock()
@@ -899,9 +906,10 @@ mod tests {
         );
         assert_eq!(
             source.launches.lock().expect("test lock").as_slice(),
-            &["hello world|app:1".to_string()],
-            "a successful execute must record a launch keyed on the \
-             exchange's accepted query text and the resolved item id"
+            &["test|hello world|app:1".to_string()],
+            "a successful execute must record a launch keyed on the item's \
+             provider, the exchange's accepted query text and the resolved \
+             item id"
         );
     }
 

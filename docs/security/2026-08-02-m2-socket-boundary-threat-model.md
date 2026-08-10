@@ -169,6 +169,74 @@ exists.
 Each changed passage below is marked **[Amended 2026-08-10]** in place, the
 same shape this document's other amendments already use.
 
+**Amendment, 2026-08-10.** A third amendment sharing this document's date
+with the two above — issue #72's own implementation landing (`4f5acf9`,
+`0c50a98`, `9a595bb`), the provider dimension in the store key and the
+manifest half of Decision 2's consequence. Unlike the two amendments above,
+this one does not merely correct pointers or note landings elsewhere: it
+supersedes part of what the second 2026-08-10 amendment recorded, because
+#72's landing did not simply add to #39's shape half — it retired it. Four
+things follow.
+
+First, `persistence_key` no longer looks at a raw id's shape at all.
+`is_known_safe_shape` and `canonicalize_result_id`'s known-safe machinery
+(`learning.rs`) are deleted, not merely bypassed, and `ProviderManifest`
+gained `ids_are_safe_to_persist_in_the_clear` (`provider.rs`) — a required
+field with no default, so a manifest literal that omits it does not compile.
+That flag, read at `Learning::record` and every `global_frequency` lookup via
+`Learning::sync_plaintext_providers`, is now the sole authority deciding
+plaintext versus hash; no shape, built-in or otherwise, is special-cased. A
+provider absent from the synced set — one that never registered, or one this
+process has not learned about yet — hashes by the same default, meeting
+issue #72's fail-closed requirement. The second amendment's claim that "which
+shapes count as known-safe" was settled by #39's landing was true of what
+#39 shipped; it is not rewritten, per this document's rule, and is annotated
+in place below, at Decision 2's "Where today's code stands" and "What the
+implementing slice must still settle," and at T11.
+
+Second, the store key gained a provider dimension. `persistence_key` now
+takes the producing provider alongside the raw id, and folds both into one
+key by a composition proven injective in `provider_scoped_key`'s own doc
+comment (`learning.rs`): no two distinct `(provider, id)` pairs can ever
+produce the same key, so a provider cannot forge another provider's
+persisted key merely by choosing what it puts in its own id or provider
+string. This closes T12, "cross-provider boost theft," and the residual
+named under "Trust directions, stated" — both annotated in place below. The
+identical dimension was added to `rank.rs`'s `Boosts::by_item_id`, closing
+the same gap one layer up: before that fix, an honestly-declared hostile
+provider whose item shared a genuine provider's id inherited whatever the
+genuine item had already added to a bare-`ItemId`-keyed slot, even though the
+persisted side was by then already provider-scoped. Both fixes together are
+what issue #31 asked for and left half met — see the plan
+(`docs/superpowers/plans/2026-08-10-issue-72-provider-dimension.md`) and
+`provider.rs`'s own doc comment on `APPS_PROVIDER_ID` for that history.
+
+Third, the legacy-store migration this document already described changed
+again. The second amendment recorded `rekeyed_global_frequency` as migrating
+"a legacy entry to its persistence key as the store loads." Under #72's
+landing it does something narrower: a legacy `app:`-prefixed key is
+re-attributed to `APPS_PROVIDER_ID` — the one legacy shape with a single
+honest owner, since no other provider has ever minted an `app:` id — and
+every other legacy shape, including the `sha256:`-shaped entry the second
+amendment's own residual paragraph named, is dropped rather than carried
+forward: a hash taken without the provider that earned it can never match a
+fresh, provider-scoped lookup regardless of what this pass did with it.
+`STORE_VERSION` still does not bump. The residual the second amendment
+recorded — a legacy plaintext key indistinguishable, on load, from this
+module's own hash output — no longer needs distinguishing, since both are
+dropped now along with every other unrecognized legacy shape.
+
+Fourth, two of the six questions "What the implementing slice must still
+settle" posed are now answered and marked so below: the manifest field's
+name and default (`ids_are_safe_to_persist_in_the_clear`, required, no
+default), and which shapes count as known-safe (none — there is no shape
+list left to relate the opt-in to). The salt question and the empty-query
+view's behaviour are unchanged by this landing and remain open, exactly as
+the second amendment left them.
+
+Each changed passage is marked **[Amended 2026-08-10]** in place below, the
+same shape the two amendments above already use.
+
 ---
 
 ## What this is
@@ -445,6 +513,11 @@ is what puts the sentence above where a plugin-tier implementer will read it.
   [#72](https://github.com/pedrosousa13/hop/issues/72) — the learning store
   keys on a bare item id, so an honestly-declared hostile provider can still
   collect another provider's learned boosts.
+  **[Amended 2026-08-10]** #72 (`4f5acf9`, `0c50a98`, `9a595bb`) is now
+  **closed**: the learning store and the ranker's in-memory boost maps both
+  key on `(provider, id)`, so an honestly-declared hostile provider collects
+  nothing from an id it did not itself earn a boost on — see T12 and
+  Decision 2, "Where today's code stands."
 
 ---
 
@@ -640,11 +713,11 @@ exists yet.
 | T7 | Query-path cost amplification | `query` | `MAX_QUERY_TEXT` bounds one query's bytes; ranking is `O(atoms × items)` with 4.09 s measured (#46), and `boost_for` lowercases per candidate item (#75) | Input caps decided in M2, gated by #61's adversarial arm. **[Amended 2026-08-10]** #61 is now **closed** (`80b7ffd`), whose PR introduced `rank.rs`'s `MAX_TERM_CHARS` (256), truncating the term before `Pattern::new` is built. #46 is closed separately, by `85b4c2f`, which turned that fixed truncation into a configurable knob and added `hopd`'s loader enforcement (`config.rs`'s `validate_max_term_chars`). `boost_for`'s per-candidate lowercasing (#75) remains open |
 | T8 | A provider aiming a command-shaped outcome at a client | `executed`, and `Item.icon` on `results` | Content rules on `CopyText`/`OpenUrl` (#23, closed) and on `IconName`/`IconPath` (#24, closed) | Residual on both halves, and an **open** issue owns each: `Item.copy_text` still reaches the clipboard as a bare bounded string ([#78](https://github.com/pedrosousa13/hop/issues/78), open), and an icon path is validated but not contained — the roots are documented, not enforced, so a regular file outside them still opens ([#93](https://github.com/pedrosousa13/hop/issues/93), open, split out of #24 for this half) |
 | T9 | Keystrokes reaching the journal, then a shared bundle | Logging | No logging dependency. `QueryText` redacts (#27, closed) — **in `hop-protocol` only**. `route` takes a `&str` and `RoutedQuery` (`router.rs`:257–258) derives `Debug` over a plain `String` term, so the same text formats verbatim in `hop-core`; `router.rs`:249–256 says not to treat one as safe to log ([#83](https://github.com/pedrosousa13/hop/issues/83), open). **[Amended 2026-08-10]** #83 is now **closed** (`8bd6550`): `RoutedQuery` (`router.rs`:378–393) carries `term` and `raw` as `RoutedText`, which redacts under `Debug` the same way `QueryText` does, so the same text no longer formats verbatim in `hop-core`; `router.rs`:363–377 states the change in place | Any added logging keeps the redacting type at the field, and #83 carries the redaction across the crate boundary rather than stopping at `route`. **[Amended 2026-08-10]** Landed — see the Today column |
-| T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the `version` is refused on mismatch and a future-dated timestamp clamped (#38, closed by `59fd5fe`); the version probe and the per-condition `LoadReport` are #43's (closed by `056893e`, which replaced #38's two per-branch checks); a persisted `count` is saturated at the boundary (#44, closed by `edb8258`). **Two residuals, one owner**: still no integrity check, so a plausible forged store passes all of it — and eviction still prefers a clamped future-dated entry, which `96d5713` left open and `59fd5fe` explicitly did not close (#88, open) | #88's integrity check, which is what lets a forged entry be *refused* rather than clamped, sequenced with #72 and with Decision 2 on the same load path |
-| T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:737–751 [Amended 2026-08-10]). **[Amended 2026-08-10]** Decision 2's shape half has landed (#39, `193dc4d`, `e83c373`): `persistence_key` (`learning.rs`) now sits between that scrubbing and disk — an id outside the three known-safe shapes persists as `sha256:<hex>` rather than unchanged. | Decision 2. **[Amended 2026-08-10]** Shape half done; the manifest opt-in half is still open, riding with #72 |
-| T12 | Cross-provider boost theft | Provider seam | `CheckedItems::check` closes provenance forgery; the store keys on a bare id (#72) | A provider dimension in the store key |
+| T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the `version` is refused on mismatch and a future-dated timestamp clamped (#38, closed by `59fd5fe`); the version probe and the per-condition `LoadReport` are #43's (closed by `056893e`, which replaced #38's two per-branch checks); a persisted `count` is saturated at the boundary (#44, closed by `edb8258`). **Two residuals, one owner**: still no integrity check, so a plausible forged store passes all of it — and eviction still prefers a clamped future-dated entry, which `96d5713` left open and `59fd5fe` explicitly did not close (#88, open) **[Amended 2026-08-10]** #72 (`4f5acf9`, `0c50a98`, `9a595bb`) has since landed on this same load path — provider-scoped keys, manifest-gated plaintext — without touching either residual named here | #88's integrity check, which is what lets a forged entry be *refused* rather than clamped, sequenced with #72 and with Decision 2 on the same load path. **[Amended 2026-08-10]** #72 has landed; #88's integrity check is still what's needed for either residual |
+| T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:737–751 [Amended 2026-08-10]). **[Amended 2026-08-10]** Decision 2's shape half has landed (#39, `193dc4d`, `e83c373`): `persistence_key` (`learning.rs`) now sits between that scrubbing and disk — an id outside the three known-safe shapes persists as `sha256:<hex>` rather than unchanged. **[Amended 2026-08-10]** The shape half described above is retired, not merely extended: issue #72 (`4f5acf9`, `0c50a98`, `9a595bb`) deleted the known-safe-shape check outright and made `ProviderManifest::ids_are_safe_to_persist_in_the_clear` the sole authority — an id from an opted-in provider persists in the clear regardless of its shape, and an id from any other provider, including one presenting an `app:`-shaped id, hashes. | Decision 2. **[Amended 2026-08-10]** Shape half done; the manifest opt-in half is still open, riding with #72 **[Amended 2026-08-10]** Landed: the field exists, required with no default, and every production manifest (`apps.rs`, `calculator.rs`, `hopd::source::SkeletonProvider`) states it explicitly |
+| T12 | Cross-provider boost theft | Provider seam | `CheckedItems::check` closes provenance forgery; the store keys on a bare id (#72) **[Amended 2026-08-10]** #72 (`4f5acf9`, `0c50a98`, `9a595bb`) is now **closed**: the store keys on `(provider, id)`, folded by `provider_scoped_key` into a composition proven injective in its own doc comment, so a provider cannot forge another provider's persisted key by choosing its own id or provider string; and `rank.rs`'s `Boosts::by_item_id` gained the identical provider dimension, closing the in-memory half of the same gap for a query where the genuine and impostor items both appear before anything is ever persisted | A provider dimension in the store key. **[Amended 2026-08-10]** Landed — see the Today column |
 | T13 | Connection flood / socket occupancy | Accept loop | An accept loop exists (#54) and spawns one unbounded task per peer (`server.rs`, `serve_with`); nothing caps concurrent connections, aggregate memory across them, or the accept rate, and `read_frame` has no read timeout, so a peer that sends a valid length prefix and then stalls holds a task and its payload buffer open indefinitely (`connection.rs` says so in place) | Belongs to [#98](https://github.com/pedrosousa13/hop/issues/98); this document does not settle it. #54 and #55 have both landed and neither took it: #55 bounded per-*query* retained state (T3) and deliberately left every connection-level bound to #98 |
-| T14 | A provider opts in to plaintext persistence for ids that carry user content | Manifest, under Decision 2's consequence | The opt-in field does not exist yet (`provider.rs`:85–121 [Amended 2026-08-10]). `CheckedItems::check` verifies an item's kind and provider id, and inspects nothing about what the id *contains* | Documentation a provider author reads before setting the field, and the extension store's PR review (spec §6) as the gate. No code check can verify the claim |
+| T14 | A provider opts in to plaintext persistence for ids that carry user content | Manifest, under Decision 2's consequence | The opt-in field does not exist yet (`provider.rs`:85–121 [Amended 2026-08-10]). `CheckedItems::check` verifies an item's kind and provider id, and inspects nothing about what the id *contains* **[Amended 2026-08-10]** The field exists now: `ProviderManifest::ids_are_safe_to_persist_in_the_clear` (#72, `4f5acf9`, `0c50a98`, `9a595bb`), required with no default. `CheckedItems::check` still verifies only kind and provider id — the claim itself remains unverified, exactly as this row already said | Documentation a provider author reads before setting the field, and the extension store's PR review (spec §6) as the gate. No code check can verify the claim. **[Amended 2026-08-10]** Still true: the field's own doc comment (`provider.rs`) is that documentation, but nothing checks the claim it asks a provider author to make |
 
 ---
 
@@ -888,6 +961,13 @@ landing (`193dc4d`, `e83c373`) added `persistence_key` (`hop-core`'s
 now go through — see `CONTEXT.md`'s **Persistence key** entry for the term,
 and "Where today's code stands" and "What the implementing slice must still
 settle" below for what changed and what is still open.
+**[Amended 2026-08-10]** The manifest half has since landed too, and it did
+not merely complement the shape half — it replaced it: issue #72
+(`4f5acf9`, `0c50a98`, `9a595bb`) deleted the known-safe-shape check and made
+`ProviderManifest::ids_are_safe_to_persist_in_the_clear` the sole authority
+`persistence_key` consults. "The rule" above, as originally stated, no
+longer describes how the code decides — see the third 2026-08-10 amendment
+at the top of this document for the full account.
 
 ### Why
 
@@ -974,6 +1054,14 @@ open to change rather than after the extension store ships. It also interacts
 with [#72](https://github.com/pedrosousa13/hop/issues/72), which wants a
 provider dimension in the store key: both add a provider-shaped fact to how
 learning is stored, and they should be designed together.
+**[Amended 2026-08-10]** It exists now: issue #72's landing (`4f5acf9`,
+`0c50a98`, `9a595bb`) added `ProviderManifest::ids_are_safe_to_persist_in_the_clear`
+(`provider.rs`), designed together with the store's provider dimension exactly
+as this paragraph anticipated. It is required, with no default — the struct
+derives no `Default`, so a manifest literal that omits the field does not
+compile, rather than silently inheriting `true` or `false`. See "What the
+implementing slice must still settle" below for how this answers that
+bullet's open questions.
 
 #### Rejected alternative — accepting the gap
 
@@ -1018,6 +1106,17 @@ has never heard of — but `persistence_key` is what that fallen-through
 string reaches next, and it replaces it with `sha256:<hex>` of the raw id
 before anything is written to disk, rather than the plaintext this paragraph
 describes.
+**[Amended 2026-08-10]** `canonicalize_result_id` itself is gone now, not
+merely bypassed: issue #72's landing (`4f5acf9`, `0c50a98`, `9a595bb`)
+deleted it along with `raw_id_proves_a_known_safe_shape` (`learning.rs`),
+since the shape check they implemented no longer decides anything.
+`persistence_key` no longer inspects `raw_id`'s shape at all — it takes a
+plain `persist_plaintext: bool`, computed by its caller
+(`Learning::record`/`Learning::frequency_boost`) from the provider's own
+manifest flag via `Learning::sync_plaintext_providers`. A provider absent
+from the synced set — one that never registered, or one whose registration
+this process has not learned about yet — hashes by the same default, which
+is issue #72's fail-closed requirement.
 
 Two facts about that worth carrying into the implementing slice:
 
@@ -1055,6 +1154,13 @@ Two facts about that worth carrying into the implementing slice:
   `e83c373`) implemented Decision 2's shape half only. `ProviderManifest`
   (`provider.rs`) carries no such field today, and every question this
   bullet poses is unchanged — it rides with #72.
+  **[Amended 2026-08-10]** Settled by issue #72's landing (`4f5acf9`,
+  `0c50a98`, `9a595bb`): the field is
+  `ProviderManifest::ids_are_safe_to_persist_in_the_clear`, and the third
+  answer this bullet named — no default, required — is the one the
+  maintainer took: the struct derives no `Default`, so a manifest literal
+  omitting the field does not compile. `provider.rs`'s doc comment on the
+  field states what setting it wrongly costs in each direction.
 - **Which shapes count as known-safe**, and how that list relates to the opt-in
   — whether a built-in provider is covered by a shape, by the manifest flag, or
   by both.
@@ -1064,6 +1170,15 @@ Two facts about that worth carrying into the implementing slice:
   independently of any manifest flag. The opt-in half of this bullet's
   question is unanswered, since the field itself still does not exist — see
   the manifest-field bullet above.
+  **[Amended 2026-08-10]** Superseded, not merely completed: issue #72's
+  landing (`4f5acf9`, `0c50a98`, `9a595bb`) removed the shape check outright
+  — `is_known_safe_shape` and `canonicalize_result_id`'s known-safe machinery
+  no longer exist in `learning.rs` — rather than layering the opt-in on top
+  of it. `persistence_key` now decides plaintext-versus-hash purely from
+  `ProviderManifest::ids_are_safe_to_persist_in_the_clear`; no shape,
+  built-in or otherwise, is special-cased. This bullet's question, how the
+  shape list relates to the opt-in, is answered by there being no shape list
+  left to relate anything to.
 - **The hash function, and the dependency it brings.** Neither crate lists a
   hashing or cryptographic dependency today (`crates/*/Cargo.toml`), so this
   adds one. The gate it will meet now exists:
@@ -1138,6 +1253,18 @@ Two facts about that worth carrying into the implementing slice:
   on load, from a key this module hashed itself —
   `stored_key_needs_no_rekeying`'s own doc comment states why nothing in the
   v1 format distinguishes the two.
+  **[Amended 2026-08-10]** Issue #72's landing (`4f5acf9`, `0c50a98`,
+  `9a595bb`) changed the migration rule again, this time by provider rather
+  than by shape: a legacy `app:`-prefixed key is re-attributed to
+  `APPS_PROVIDER_ID` — the one legacy shape with a single honest owner, since
+  no other provider has ever minted an `app:` id — and every other legacy
+  shape, including the `sha256:`-shaped entry the residual above describes,
+  is dropped rather than carried forward: a hash taken without the provider
+  that earned it can never match a fresh, provider-scoped lookup regardless.
+  `STORE_VERSION` still does not bump. The residual above no longer needs
+  distinguishing, since both the ambiguous plaintext key and this module's
+  own hash output are dropped now, along with every other unrecognized
+  legacy shape.
 - **How the empty-query view behaves for a provider that did not opt in.** The
   consequence above settles the rule — those items are learned and not
   renderable there — but not what the view *shows* in their place: a gap, a
@@ -1162,6 +1289,9 @@ Two facts about that worth carrying into the implementing slice:
   ([#28](https://github.com/pedrosousa13/hop/issues/28)) and the boost-theft
   residual ([#72](https://github.com/pedrosousa13/hop/issues/72)) are in-process
   concerns that the M2 sweep covers.
+  **[Amended 2026-08-10]** #72's boost-theft residual is closed — see T12;
+  panic isolation and budget enforcement remain the M2 sweep's, as this
+  bullet already said.
 - **Network providers.** None exist. A10 (SSRF) was recorded not-applicable by
   the M1 sweep for that reason and re-runs at M5 against real providers.
 - **Connection-level denial of service.** An accept loop exists now (#54), but
@@ -1184,8 +1314,9 @@ What has to be true for this model to describe reality rather than intent:
 | [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation. #55 answered the first two — 5 000, item count only, reasoning in `hop_protocol::limits` — and left the third half-answered: the daemon truncates the undelivered remainder rather than evicting what it delivered, but says nothing on the wire that lets a client tell a capped exchange from a completed one, so its half is still a truncation and not a refusal. **[Amended 2026-08-10]** #59 (`4c1aff4`) has since landed and settled the sub-question this row used to pose to it — a cap-truncated id and a never-emitted one are deliberately not distinguished — without touching this remaining half: no wire signal for a capped exchange exists yet, and none of the closed M2 slices added one. See Decision 1's settled answers |
 | [#60](https://github.com/pedrosousa13/hop/issues/60) | **[Amended 2026-08-10] Landed.** A real state directory, which is where `learning.json`'s path stops being hypothetical |
 | [#62](https://github.com/pedrosousa13/hop/issues/62) | **[Amended 2026-08-10] Landed.** Socket activation, which moves socket creation into a unit file (`contrib/systemd/hopd.socket`) |
-| [#39](https://github.com/pedrosousa13/hop/issues/39) | Decision 2's rule, sequenced with #72 and #88 on the load path #37, #38, #43 and #44 have already changed — plus the `ProviderManifest` opt-in field the recents consequence needs, which does not exist today (`provider.rs`:85–121 [Amended 2026-08-10]) and changes the plugin seam. The field's **default is an open question**, not something this model settles. **[Amended 2026-08-10]** The shape half has **landed** (`193dc4d`, `e83c373`) — see Decision 2, "Where today's code stands." The manifest opt-in field is unchanged by that landing and still does not exist; it rides with #72, as before |
-| [#57](https://github.com/pedrosousa13/hop/issues/57), M5 providers | Whatever the manifest field's default turns out to be, applied to each built-in provider: either each one declares whether its ids are safe to persist in plaintext, or the default covers those that say nothing. **[Amended 2026-08-10]** Not "open until #39 decides the default": #39 landed the shape half only and explicitly deferred the manifest default to #72 (see the #39 row above) — open until #72 decides it |
+| [#39](https://github.com/pedrosousa13/hop/issues/39) | Decision 2's rule, sequenced with #72 and #88 on the load path #37, #38, #43 and #44 have already changed — plus the `ProviderManifest` opt-in field the recents consequence needs, which does not exist today (`provider.rs`:85–121 [Amended 2026-08-10]) and changes the plugin seam. The field's **default is an open question**, not something this model settles. **[Amended 2026-08-10]** The shape half has **landed** (`193dc4d`, `e83c373`) — see Decision 2, "Where today's code stands." The manifest opt-in field is unchanged by that landing and still does not exist; it rides with #72, as before **[Amended 2026-08-10]** The manifest field has since landed too, under #72 rather than #39 — see the #72 row below |
+| [#57](https://github.com/pedrosousa13/hop/issues/57), M5 providers | Whatever the manifest field's default turns out to be, applied to each built-in provider: either each one declares whether its ids are safe to persist in plaintext, or the default covers those that say nothing. **[Amended 2026-08-10]** Not "open until #39 decides the default": #39 landed the shape half only and explicitly deferred the manifest default to #72 (see the #39 row above) — open until #72 decides it **[Amended 2026-08-10]** #72 decided it: no default, the field required. Every built-in manifest states it explicitly — `apps.rs` and `hopd::source::SkeletonProvider` opt in, `calculator.rs` does not |
+| [#72](https://github.com/pedrosousa13/hop/issues/72) | **[Amended 2026-08-10] Landed.** The provider dimension the store key was missing (`4f5acf9`): `persistence_key` now folds `(provider, id)` into one key, by a composition proven injective in `provider_scoped_key`'s own doc comment, and `rank.rs`'s `Boosts::by_item_id` (`9a595bb`) carries the identical dimension in the ranker — closing T12 on both the persisted and in-memory sides. Alongside it, Decision 2's manifest half landed too (`0c50a98`): `ProviderManifest::ids_are_safe_to_persist_in_the_clear`, required with no default, is now the sole authority `persistence_key` consults, retiring the known-safe-shape check #39 landed rather than layering on top of it |
 | M3 (spec §8) | The empty-query view's behaviour for a provider that did not opt in — learned, ranked, and absent from that screen |
 | [#93](https://github.com/pedrosousa13/hop/issues/93) | The icon-root check #24 deliberately left out, and the open half of T8's pair: allowed roots computed at startup from `XDG_DATA_DIRS` and the icon theme spec's locations, enforced by whatever resolves the path, and checked against what the path resolves to rather than against the string |
 | [#83](https://github.com/pedrosousa13/hop/issues/83) | The open half of T9's pair: `RoutedQuery` holds the term as a plain `String` under a derived `Debug`, so the redaction `QueryText` applies in `hop-protocol` stops at `route`, which takes a `&str`. **[Amended 2026-08-10]** **Closed** (`8bd6550`): `RoutedQuery`'s `term` and `raw` are now `RoutedText`, which redacts under `Debug` the way `QueryText` does — see T9 |

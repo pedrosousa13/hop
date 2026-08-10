@@ -909,24 +909,34 @@ impl Pipeline {
                 .entry((provider.clone(), id.clone()))
                 .or_insert(0.0) += *boost;
         }
-        // DECISION: the learning boost stays keyed on the bare item id, with
-        // no provider dimension, unlike the alias boost above. Issue #31's
-        // boost-theft criterion is only *partially* met here on purpose —
-        // `Learning::boost_for` sums `frequency_boost` (from the persisted
-        // `global_frequency` map) and `query_boost` (from the per-query
-        // `selections` map, kept in memory only, never written to disk), and
-        // both are keyed on the bare id string. Giving `global_frequency` a
-        // provider dimension is a persisted-format change, not an in-memory
-        // rekey like `Boosts::by_provider_item` above: it means bumping
-        // `hop-core`'s `learning::STORE_VERSION`, which that module answers
-        // by refusing the older store rather than migrating it (see the
-        // constant for why), so the cost is every user's learning, not a
-        // migration to write. `selections` is deferred alongside it rather
-        // than resolved on its own. Filed as issue #72.
+        // The learning boost is keyed on the provider *and* the item id, the
+        // same as the alias boost above, at both ends: `Learning::boost_for`
+        // sums `frequency_boost` (the persisted `global_frequency` map) and
+        // `query_boost` (the per-query, in-memory-only `selections` map),
+        // both provider-scoped internally — see `hop-core::learning`'s
+        // module docs and `provider_scoped_key` for how, and without the
+        // `learning::STORE_VERSION` bump that would have cost every user
+        // their whole store: a v1 store's plaintext `app:` entries are
+        // re-attributed to the apps provider on load rather than discarded —
+        // and the value that comes back is inserted here under
+        // `(item.provider, item.id)`, not under the bare id alone. That
+        // second half is load-bearing on its own: a `boost_for` call that
+        // answers `0.0` for a hostile provider correctly contributes nothing
+        // to *its own* slot, but a bare-`ItemId` key would still let that
+        // provider's item be *scored* against whatever a genuine, identically
+        // -id'd item already added to the shared slot — issue #31's
+        // boost-theft criterion reopened one aggregation step up from
+        // `Learning` itself. See `Boosts::by_item_id`'s doc comment and
+        // `tests::learning_boost_does_not_land_on_an_identically_id_item_from_a_different_provider`.
         for item in &provider_items {
-            let learned = self.learning.boost_for(routed.term.as_str(), &item.id);
+            let learned = self
+                .learning
+                .boost_for(&item.provider, routed.term.as_str(), &item.id);
             if learned != 0.0 {
-                *boosts.by_item_id.entry(item.id.clone()).or_insert(0.0) += learned;
+                *boosts
+                    .by_item_id
+                    .entry((item.provider.clone(), item.id.clone()))
+                    .or_insert(0.0) += learned;
             }
         }
 
@@ -1120,6 +1130,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(50),
+                ids_are_safe_to_persist_in_the_clear: false,
             },
         }
     }
@@ -1311,7 +1322,7 @@ mod tests {
         for _ in 0..10 {
             pipeline
                 .learning
-                .record_launch("fire", &ItemId::new("app:learned").unwrap());
+                .record_launch("test", "fire", &ItemId::new("app:learned").unwrap());
         }
         let items = vec![
             item(Kind::App, "app:learned", "Fireplace"),
@@ -1322,9 +1333,11 @@ mod tests {
         // otherwise-equal competitor.
         let mut unaliased_pipeline = Pipeline::default();
         for _ in 0..10 {
-            unaliased_pipeline
-                .learning
-                .record_launch("fire", &ItemId::new("app:learned").unwrap());
+            unaliased_pipeline.learning.record_launch(
+                "test",
+                "fire",
+                &ItemId::new("app:learned").unwrap(),
+            );
         }
         let sanity = unaliased_pipeline
             .assemble("fire", checked(items.clone()), 10)
@@ -2040,6 +2053,76 @@ mod tests {
         );
     }
 
+    /// The learning-boost analogue of the test above: the exact same gap,
+    /// for `Learning::boost_for` instead of an alias. A provider that
+    /// declares itself honestly — `id: "evil"`, `kinds: [Window]` — mints an
+    /// item whose id collides with the genuine apps provider's, and must not
+    /// inherit the learning boost the apps provider actually earned on that
+    /// id. This is issue #72's own scenario, run end to end through
+    /// `Pipeline::assemble` and `Ranker::rank` rather than only through
+    /// `Learning::boost_for` directly (see `learning::tests::evil_presenting_apps_item_id_gets_no_boost_from_apps_launches`
+    /// for the narrower unit-level pin, which passed even while this gap was
+    /// open — `Learning`'s own lookups were already provider-scoped;
+    /// `Boosts::by_item_id`'s aggregation was not).
+    #[test]
+    fn learning_boost_does_not_land_on_an_identically_id_item_from_a_different_provider() {
+        let mut pipeline = Pipeline::default();
+        for _ in 0..10 {
+            pipeline.learning.record_launch(
+                APPS_PROVIDER_ID,
+                "firefox",
+                &ItemId::new("app:firefox").unwrap(),
+            );
+        }
+        // Without any boost, Window (weight 30) outranks App (weight 20) on
+        // this tie — the learning boost the apps provider earned must flip
+        // that back, and must do so *only* for the apps item, not for
+        // "evil"'s identically-id'd impostor.
+        let assembly = pipeline.assemble(
+            "firefox",
+            CheckedItems::check(vec![
+                output(
+                    APPS_PROVIDER_ID,
+                    vec![Kind::App],
+                    vec![Item {
+                        provider: APPS_PROVIDER_ID.into(),
+                        ..item(Kind::App, "app:firefox", "Firefox")
+                    }],
+                ),
+                // Honestly declares itself as a Window provider — no
+                // impersonation, so this item passes both manifest checks —
+                // but happens to reuse the id "app:firefox" the apps
+                // provider's launches were recorded under.
+                output(
+                    "evil",
+                    vec![Kind::Window],
+                    vec![Item {
+                        provider: "evil".into(),
+                        ..item(Kind::Window, "app:firefox", "Firefox")
+                    }],
+                ),
+            ]),
+            10,
+        );
+        assert!(
+            assembly.rejections.is_empty(),
+            "both providers are honest about their own output; neither should be rejected"
+        );
+        assert_eq!(
+            assembly.items[0].provider, APPS_PROVIDER_ID,
+            "without the fix, the learning boost aggregated under the bare id \
+             would also lift \"evil\"'s Window item — weight 30 to App's 20 — \
+             and it would stay on top despite never having earned the boost \
+             itself"
+        );
+        assert_eq!(
+            assembly.items.len(),
+            2,
+            "both items must survive — this is about which one boosts, not \
+             about either being dropped"
+        );
+    }
+
     /// The other half: the fix must not stop the boost from landing on the
     /// item it is actually for. Same shape as
     /// `rank::tests::boost_applies_to_the_right_item`, run through the full
@@ -2107,9 +2190,11 @@ mod tests {
     fn a_rejected_item_cannot_evict_a_genuine_item_through_dedupe() {
         let mut pipeline = Pipeline::default();
         for _ in 0..10 {
-            pipeline
-                .learning
-                .record_launch("firefox", &ItemId::new("app:evil").unwrap());
+            pipeline.learning.record_launch(
+                APPS_PROVIDER_ID,
+                "firefox",
+                &ItemId::new("app:evil").unwrap(),
+            );
         }
         let out = pipeline.assemble(
             "firefox",

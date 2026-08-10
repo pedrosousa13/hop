@@ -28,7 +28,9 @@ use std::time::Duration;
 use hop_core::host::{HostPolicy, NoopLog, ProviderHost};
 use hop_core::learning::Learning;
 use hop_core::pipeline::Pipeline;
-use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
+use hop_core::provider::{
+    Provider, ProviderError, ProviderManifest, QueryCtx, plaintext_provider_ids,
+};
 use hop_core::router::{Mode, RoutedQuery};
 use hop_protocol::{
     Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ExecOutcome, Item, ItemId, Kind, QueryText,
@@ -41,11 +43,13 @@ use hopd::source::HostSource;
 /// `HostSource::record_launch`'s load/save wiring under test, not a
 /// scripted source's own (test-defined) behavior.
 ///
-/// Its item id is `app:restartable:1` rather than `restartable:1` — an
-/// `app:`-shaped id is what `hop_core::learning`'s persistence-key rule
-/// (issue #39) persists in the clear, which is what lets this file assert
-/// on the on-disk store by the literal id string. This test is about the
-/// load/save boundary across a restart, not about the key rule itself,
+/// Its item id is `app:restartable:1` rather than `restartable:1`, and its
+/// manifest opts in to plaintext persistence
+/// (`ids_are_safe_to_persist_in_the_clear: true`) — issue #72 made the
+/// manifest the sole authority for that, so opting in is what lets this file
+/// assert on the on-disk store by the literal id string; the `app:` prefix
+/// itself no longer matters to the persistence-key rule. This test is about
+/// the load/save boundary across a restart, not about the key rule itself,
 /// which `hop-core`'s own `learning` tests cover directly.
 struct RestartableProvider;
 
@@ -57,6 +61,7 @@ impl Provider for RestartableProvider {
             modes: vec![Mode::All],
             min_term_len: 0,
             budget: Duration::from_millis(10),
+            ids_are_safe_to_persist_in_the_clear: true,
         }
     }
 
@@ -101,8 +106,15 @@ impl Provider for RestartableProvider {
 fn build_source(store_path: &std::path::Path) -> HostSource {
     let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
     host.register(RestartableProvider).unwrap();
+    // Mirrors `lib.rs::run()`'s own wiring (Design decision 7): the
+    // manifest is the authority for plaintext persistence (issue #72), and
+    // `Learning` does not hold manifests itself, so whoever builds the
+    // `Pipeline` hands it the registry's answer once, right after load and
+    // before anything can look a provider up.
+    let mut learning = Learning::load(store_path);
+    learning.sync_plaintext_providers(plaintext_provider_ids(&host.manifests()));
     let pipeline = Arc::new(tokio::sync::Mutex::new(Pipeline {
-        learning: Learning::load(store_path),
+        learning,
         ..Pipeline::default()
     }));
     HostSource::with_config(
@@ -209,11 +221,18 @@ fn a_launch_recorded_in_one_daemon_lifetime_survives_a_restart_into_a_second() {
     // The load/save boundary itself: a fresh `Learning::load`, from a
     // process state that never touched lifetime 1's in-memory `Pipeline`.
     let reloaded_directly = Learning::load(&store_path);
+    // `hop-core`'s learning store persists a provider-scoped key (issue #72),
+    // not the bare item id — `<provider-len>:<provider>:<id>`. `"restartable"`
+    // is `RestartableProvider`'s manifest id, and its manifest opts in to
+    // plaintext persistence (see the struct's own doc comment), so the
+    // persisted key is exactly this composition over the raw item id; see
+    // `hop-core::learning`'s own tests for the key rule itself.
+    let expected_key = format!("{}:restartable:app:restartable:1", "restartable".len());
     assert!(
         reloaded_directly
             .recent_launches(10)
             .iter()
-            .any(|(id, _)| id == "app:restartable:1"),
+            .any(|(id, _)| *id == expected_key),
         "the launch recorded in lifetime 1 must survive a fresh \
          Learning::load in lifetime 2, got {:?}",
         reloaded_directly.recent_launches(10)
@@ -247,9 +266,12 @@ fn a_launch_recorded_in_one_daemon_lifetime_survives_a_restart_into_a_second() {
     // 2's save clobbered lifetime 1's instead of building on it).
     let final_store = Learning::load(&store_path);
     let frequent = final_store.frequent_launches(1, &[]);
+    // See the load/save-boundary assertion above for why the persisted key
+    // is provider-scoped rather than the bare item id.
+    let expected_key = format!("{}:restartable:app:restartable:1", "restartable".len());
     assert_eq!(
         frequent,
-        vec![("app:restartable:1".to_string(), 2)],
+        vec![(expected_key, 2)],
         "both the lifetime-1 launch and the lifetime-2 launch, recorded \
          across two independent daemon lifetimes sharing one store file, \
          must both be present, got {frequent:?}"

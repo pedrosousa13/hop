@@ -250,31 +250,72 @@ impl Default for Weights {
 ///   (a preview pane, a re-rank, a benchmark harness) that skips
 ///   `CheckedItems`, it inherits that hole; this comment is the only thing
 ///   telling it so.
-/// - `by_item_id`: a **learning** boost, applied to any item bearing this id
-///   regardless of which provider produced it — the sum of
-///   `Learning::frequency_boost` (backed by the persisted `global_frequency`
-///   map) and `Learning::query_boost` (backed by the in-memory, per-query
-///   `selections` map), both keyed on the bare id string.
-///   DECISION: kept unscoped, deliberately. The persisted learning store's
-///   id namespace is out of scope for this change — adding a provider
-///   dimension to `global_frequency` is a persisted-format change gated on
-///   a `learning::STORE_VERSION` bump, which that module answers by refusing
-///   the older store rather than migrating it, not an in-memory rekey;
-///   `selections` is deferred alongside it rather than resolved on its own.
-///   Filed as issue #72; see the comment at the call site in
-///   `Pipeline::assemble` where this field is populated.
+/// - `by_item_id`: a **learning** boost, keyed by `(provider, ItemId)` —
+///   the same shape `by_provider_item` uses, and for the identical reason:
+///   two items can legitimately share an id while coming from two different,
+///   individually honest providers, and only one of them is who actually
+///   earned the boost. Issue #72 closed this in two steps — `Learning::
+///   frequency_boost` and `Learning::query_boost` (summed as
+///   `Learning::boost_for`) were made provider-scoped first, then this
+///   field's own key, since scoping the library call and still aggregating
+///   its result under the bare id here left the vulnerability open at this
+///   layer: a provider `evil` that mints an item sharing a genuine
+///   provider's id contributed `0.0` to a bare-`ItemId` slot itself, but was
+///   scored against whatever the *genuine* provider's item had already added
+///   to that same slot — inheriting a boost it never earned. See
+///   `tests::provider_scoped_boost_only_applies_to_the_matching_producer` for
+///   the alias-boost pin this mirrors, and
+///   `crate::pipeline::tests::learning_boost_does_not_land_on_an_identically_id_item_from_a_different_provider`
+///   for this field's own, run end to end through `Pipeline::assemble`.
 ///
-/// One further boundary neither dimension closes: `CheckedItems::check`
-/// never requires that two answering providers declare *distinct*
-/// `manifest.id`s. `by_provider_item`'s guarantee is really "the item came
-/// from whichever provider declared this id", not "the item came from *the*
-/// provider everyone means by that id" — see [`crate::provider::APPS_PROVIDER_ID`]'s
-/// doc comment for what that costs if a provider registry ever allows two
-/// providers to share an id.
+/// # Why two fields, now that both share a key shape
+///
+/// It would compile to merge them into one `HashMap<(String, ItemId), f32>`,
+/// summing an alias and a learning contribution into the same slot at
+/// insertion time instead of at lookup time in `Ranker::rank_matching`. Kept
+/// separate instead, on two grounds checked directly rather than assumed:
+///
+/// - **They are not the same kind of fact,** and the type already reflects
+///   that split rather than inventing it here: `CONTEXT.md`'s own Scoring
+///   section lists an alias boost and a learning boost as the two boost
+///   *sources*, not as arithmetic that happens to produce two numbers. An
+///   alias is an explicit user instruction; a learning boost is inferred from
+///   history. A field per source is what lets a test — and a future
+///   explainability feature, should one ever read `Boosts` instead of just
+///   `Ranked::score` — name which mechanism it is pinning, the way
+///   `provider_scoped_boost_only_applies_to_the_matching_producer` (alias) and
+///   `boost_applies_to_the_right_item` (learning) already do.
+/// - **The invariant that an alias always beats learning does not depend on
+///   this split, and merging would not endanger it** — worth stating plainly
+///   since it is the one place these two fields' values interact. It holds
+///   because `ALIAS_BOOST` (180.0) sits strictly above `LEARNING_BOOST_CAP`
+///   (85.0), checked once at the constants and never re-derived from storage
+///   shape; summing two `f32`s from one map or two produces the identical
+///   total either way. So this is *not* the reason to keep them apart — a
+///   reader is not meant to infer "merging would break the ordering
+///   guarantee" from this doc comment, because it would not.
+///
+/// The historical reason the split existed before this field had a provider
+/// dimension — skipping the `(provider, ItemId)` clone entirely on the
+/// overwhelmingly common query where no alias applies, guarded by
+/// `by_provider_item.is_empty()` — no longer carries its old weight: this
+/// field needs that same clone for *its own* lookup now, on almost every
+/// item, since a returning user's learning table is rarely empty the way
+/// aliases are rarely configured. `Ranker::rank_matching` still shares one
+/// clone between both lookups rather than paying for it twice; see its own
+/// comment for the current shape of that guard.
+///
+/// One further boundary neither field closes: `CheckedItems::check` never
+/// requires that two answering providers declare *distinct* `manifest.id`s.
+/// Both fields' guarantee is really "the item came from whichever provider
+/// declared this id", not "the item came from *the* provider everyone means
+/// by that id" — see [`crate::provider::APPS_PROVIDER_ID`]'s doc comment for
+/// what that costs if a provider registry ever allows two providers to share
+/// an id.
 #[derive(Default)]
 pub struct Boosts {
     pub by_provider_item: HashMap<(String, ItemId), f32>,
-    pub by_item_id: HashMap<ItemId, f32>,
+    pub by_item_id: HashMap<(String, ItemId), f32>,
 }
 
 /// An [`Item`] together with the final score it was ranked with.
@@ -405,30 +446,32 @@ impl Ranker {
                 };
 
                 let weight = kind_weight(weights, &item.kind);
-                // `by_provider_item` is empty on virtually every keystroke —
-                // `Aliases::apply` only ever populates it when the routed
-                // term matches an alias key exactly. `HashMap::get` already
-                // short-circuits on an empty map before hashing, but
-                // building the lookup key clones two `String`s
-                // (`item.provider` and the `ItemId`'s inner `String`), and
-                // that allocation happens unconditionally as soon as the key
-                // expression is evaluated — before `get` ever runs. Guarding
-                // on `is_empty()` skips constructing the key at all on the
-                // overwhelmingly common empty-map path, which is the only
-                // per-item allocation this loop would otherwise do for an
-                // empty query term (the `Matching::Everything` arm above
-                // does no `haystack_of` allocation).
-                let provider_boost = if boosts.by_provider_item.is_empty() {
+                // Both boost maps are keyed by `(provider, ItemId)` as of
+                // issue #72 — see `Boosts`'s own doc comment for why
+                // `by_item_id` gained that dimension and why the two fields
+                // stayed separate rather than merging now that they share a
+                // key shape.
+                //
+                // `by_provider_item` is still empty on virtually every
+                // keystroke — `Aliases::apply` only ever populates it when
+                // the routed term matches an alias key exactly — but
+                // `by_item_id` commonly is not, once a user has launched
+                // anything at all, so gating the `(provider, ItemId)` clone
+                // on `by_provider_item.is_empty()` alone no longer buys what
+                // it used to: `by_item_id`'s own lookup needs that same key
+                // regardless. Gate on *both* maps being empty instead — the
+                // only case with genuinely nothing to look up, e.g. a fresh
+                // install with no aliases configured and no learning
+                // recorded yet — and build the key once, shared between both
+                // lookups, rather than paying for `item.provider.clone()`
+                // and `item.id.clone()` twice over on every other query.
+                let boost = if boosts.by_provider_item.is_empty() && boosts.by_item_id.is_empty() {
                     0.0
                 } else {
-                    boosts
-                        .by_provider_item
-                        .get(&(item.provider.clone(), item.id.clone()))
-                        .copied()
-                        .unwrap_or(0.0)
+                    let key = (item.provider.clone(), item.id.clone());
+                    boosts.by_provider_item.get(&key).copied().unwrap_or(0.0)
+                        + boosts.by_item_id.get(&key).copied().unwrap_or(0.0)
                 };
-                let learning_boost = boosts.by_item_id.get(&item.id).copied().unwrap_or(0.0);
-                let boost = provider_boost + learning_boost;
                 Some(Ranked {
                     score: fuzzy + weight + boost,
                     item,
@@ -951,9 +994,10 @@ mod tests {
         // Without the boost, Window (weight 30) outranks App (weight 20)
         // on this tie. +50 flips it.
         let mut boosts = Boosts::default();
-        boosts
-            .by_item_id
-            .insert(ItemId::new("app:firefox").unwrap(), 50.0);
+        boosts.by_item_id.insert(
+            ("test".to_string(), ItemId::new("app:firefox").unwrap()),
+            50.0,
+        );
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &boosts);
         assert_eq!(ranked[0].item.id, ItemId::new("app:firefox").unwrap());
@@ -1144,9 +1188,10 @@ mod tests {
         );
 
         let mut boosts = Boosts::default();
-        boosts
-            .by_item_id
-            .insert(ItemId::new("app:scattered").unwrap(), 40.0);
+        boosts.by_item_id.insert(
+            ("test".to_string(), ItemId::new("app:scattered").unwrap()),
+            40.0,
+        );
         let boosted = ranker.rank(build_items(), &query, &Weights::default(), &boosts);
         assert_eq!(boosted[0].item.id, ItemId::new("app:scattered").unwrap());
     }
@@ -1203,7 +1248,7 @@ mod tests {
         let mut boosts = Boosts::default();
         boosts
             .by_item_id
-            .insert(ItemId::new("file:a").unwrap(), 25.0);
+            .insert(("test".to_string(), ItemId::new("file:a").unwrap()), 25.0);
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &boosts);
         let titles: Vec<_> = ranked.iter().map(|r| r.item.title.as_str()).collect();

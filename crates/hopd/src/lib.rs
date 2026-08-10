@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use hop_core::learning::Learning;
 use hop_core::pipeline::Pipeline;
+use hop_core::provider::plaintext_provider_ids;
 use hop_core::rank::Weights;
 use tokio::sync::Mutex;
 
@@ -131,9 +132,26 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Invocation {
 /// consumed inside `Ranker::rank` off `self.weights`, a field the `Pipeline`
 /// already owns — so setting it once here, at construction, is the whole
 /// job; no per-call plumbing needed.
-fn pipeline_for(config: &crate::config::Config, store_path: &std::path::Path) -> Pipeline {
+///
+/// `host` is why this takes the built [`ProviderHost`] rather than only
+/// `config` and `store_path`: issue #72 made a provider's manifest the sole
+/// authority for whether its ids persist in the clear, and `Learning` does
+/// not hold manifests itself (see `hop_core::learning`'s module docs) — it
+/// holds the *answer*, synced in once here from `host.manifests()` via
+/// [`plaintext_provider_ids`], right after `Learning::load` and before this
+/// `Pipeline` is handed to anything that could look a provider up. `load`
+/// itself never restores that answer from the file (it is
+/// `#[serde(skip)]`), precisely so a store cannot grant itself plaintext
+/// persistence — see [`Learning::sync_plaintext_providers`] for why.
+fn pipeline_for(
+    config: &crate::config::Config,
+    store_path: &std::path::Path,
+    host: &hop_core::host::ProviderHost,
+) -> Pipeline {
+    let mut learning = Learning::load(store_path);
+    learning.sync_plaintext_providers(plaintext_provider_ids(&host.manifests()));
     Pipeline {
-        learning: Learning::load(store_path),
+        learning,
         weights: Weights {
             max_term_chars: config.max_term_chars,
             ..Weights::default()
@@ -226,14 +244,14 @@ pub fn run() -> ExitCode {
     // `hop_core::learning`), so a damaged or absent store never stops the
     // daemon from starting; the store *path* (`Some`) rides into the source
     // so a later slice can persist recorded launches back to the same file.
+    //
+    // The host is built *before* the pipeline now, not after: `pipeline_for`
+    // needs `host.manifests()` to sync the learning store's plaintext-provider
+    // set (issue #72), so the manifest registry has to exist first.
     let store_path = state_dir.join(crate::state_dir::STORE_FILE_NAME);
-    let pipeline = Arc::new(Mutex::new(pipeline_for(&config, &store_path)));
-    let source = HostSource::with_config(
-        Arc::new(server::build_host()),
-        pipeline,
-        config.max_results,
-        Some(store_path),
-    );
+    let host = Arc::new(server::build_host());
+    let pipeline = Arc::new(Mutex::new(pipeline_for(&config, &store_path, &host)));
+    let source = HostSource::with_config(host, pipeline, config.max_results, Some(store_path));
 
     match runtime.block_on(server::serve_with(&runtime_dir, source)) {
         Ok(()) => ExitCode::SUCCESS,
@@ -325,8 +343,13 @@ mod tests {
         // temp dir is safe here and touches no real user state.
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("does-not-exist.json");
+        // Empty and unregistered: this test is about `max_term_chars`, not
+        // about the plaintext-provider sync `pipeline_for` also does, and an
+        // empty host is a legitimate registry to sync against — it just
+        // means every provider hashes.
+        let host = hop_core::host::ProviderHost::with_log(Arc::new(hop_core::host::NoopLog));
 
-        let default_pipeline = pipeline_for(&crate::config::Config::default(), &store_path);
+        let default_pipeline = pipeline_for(&crate::config::Config::default(), &store_path, &host);
         assert_eq!(
             default_pipeline.weights.max_term_chars,
             hop_core::rank::MAX_TERM_CHARS
@@ -336,7 +359,7 @@ mod tests {
             max_term_chars: 10,
             ..crate::config::Config::default()
         };
-        let lowered_pipeline = pipeline_for(&lowered_config, &store_path);
+        let lowered_pipeline = pipeline_for(&lowered_config, &store_path, &host);
         assert_eq!(lowered_pipeline.weights.max_term_chars, 10);
     }
 }

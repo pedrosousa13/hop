@@ -2457,6 +2457,13 @@ impl Provider for AppsProvider {
             modes: vec![Mode::All, Mode::Apps],
             min_term_len: 0,
             budget: std::time::Duration::from_millis(5),
+            // Opts in (issue #72): every id this provider mints is
+            // `app:<desktop-entry-id>` (`AppIndex`'s own construction), where
+            // `<desktop-entry-id>` names which installed `.desktop` file
+            // matched — enumerable from what is installed on the system, and
+            // never anything the user typed. Contrast `CalculatorProvider`,
+            // which embeds the raw query text in its ids and does not opt in.
+            ids_are_safe_to_persist_in_the_clear: true,
         }
     }
 

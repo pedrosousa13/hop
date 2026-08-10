@@ -165,6 +165,7 @@ impl ScriptedProvider {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(20),
+                ids_are_safe_to_persist_in_the_clear: false,
             },
             script,
         }
