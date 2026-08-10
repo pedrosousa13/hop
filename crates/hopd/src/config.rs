@@ -3,14 +3,16 @@
 //! This is the daemon's one read of the user's real filesystem at startup,
 //! and it is deliberately read-only: nothing in this module ever writes a
 //! file. The config carves out of a larger system (a launcher renders as
-//! many rows as a user can look at) exactly one knob today — `max_results` —
-//! under the XDG Base Directory path `hop/config.toml`, because that is where
-//! the spec (§9) says a launcher's config lives. A config that is absent means
-//! the documented defaults; a config that exists but does not parse, or parses
-//! to a value that breaks the results-frame contract, is an explicit error
-//! rather than a silently-invented fallback — the same posture
-//! [`crate::runtime_dir`] takes toward a missing `XDG_RUNTIME_DIR`, and
-//! `Aliases::from_json` toward invalid JSON.
+//! many rows as a user can look at, and matches a query term against them)
+//! two knobs today — `max_results` and `max_term_chars` — under the XDG
+//! Base Directory path `hop/config.toml`, because that is where the spec
+//! (§9) says a launcher's config lives. A config that is absent means the
+//! documented defaults; a config that exists but does not parse, or parses
+//! to a value that breaks the results-frame contract (`max_results`) or
+//! exceeds the ranker's absolute term-length ceiling (`max_term_chars`), is
+//! an explicit error rather than a silently-invented fallback or a silent
+//! clamp — the same posture [`crate::runtime_dir`] takes toward a missing
+//! `XDG_RUNTIME_DIR`, and `Aliases::from_json` toward invalid JSON.
 
 use std::env;
 use std::fs;
@@ -38,7 +40,8 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 
 /// hopd's configuration, loaded once at startup and never written.
 ///
-/// One field today: how many results the daemon assembles for a query. The
+/// Two fields today: how many results the daemon assembles for a query, and
+/// how many characters of a query term the ranker matches against. The
 /// struct is deliberately not `#[non_exhaustive]` — future keys arrive here
 /// with the slices that read them, rather than being anticipated ahead of
 /// time (see Design decision 1).
@@ -46,14 +49,21 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 pub struct Config {
     /// The `max_results` passed to the pipeline on every assembly.
     pub max_results: usize,
+    /// The `max_term_chars` set on the pipeline's `Weights`, capping how
+    /// many characters of a query term reach `Pattern::new` — see
+    /// [`hop_core::rank::Weights::max_term_chars`].
+    pub max_term_chars: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        // The single source of truth for the default, shared with the daemon's
-        // compile-time frame-bound assertion in `source.rs`.
+        // The single source of truth for `max_results`'s default, shared
+        // with the daemon's compile-time frame-bound assertion in
+        // `source.rs`; `max_term_chars`'s default and ceiling are likewise
+        // one source of truth, shared with the ranker itself.
         Self {
             max_results: crate::source::MAX_RESULTS,
+            max_term_chars: hop_core::rank::MAX_TERM_CHARS,
         }
     }
 }
@@ -125,6 +135,42 @@ pub enum ConfigError {
         /// The offending value.
         value: usize,
     },
+
+    /// `max_term_chars` is present but is not a whole number.
+    #[error("config `max_term_chars` in {} is not a whole number", .path.display())]
+    MaxTermCharsNotInteger {
+        /// The config path that carried the bad value.
+        path: PathBuf,
+    },
+
+    /// `max_term_chars` is an integer below the valid range of
+    /// `1..=MAX_TERM_CHARS`.
+    #[error(
+        "config `max_term_chars` in {} is {value}, but at least 1 is required",
+        .path.display()
+    )]
+    MaxTermCharsOutOfRange {
+        /// The config path that carried the bad value.
+        path: PathBuf,
+        /// The offending value, kept as the signed integer the TOML carried.
+        value: i64,
+    },
+
+    /// `max_term_chars` exceeds [`hop_core::rank::MAX_TERM_CHARS`], the
+    /// ranker's absolute ceiling on the knob — refused at load time instead
+    /// of clamping, exactly as `MaxResultsOverFrame` refuses a `max_results`
+    /// that would break the frame contract rather than truncating it down.
+    #[error(
+        "config `max_term_chars` in {} is {value}, which exceeds the maximum of {} characters",
+        .path.display(),
+        hop_core::rank::MAX_TERM_CHARS
+    )]
+    MaxTermCharsOverCeiling {
+        /// The config path that carried the bad value.
+        path: PathBuf,
+        /// The offending value.
+        value: usize,
+    },
 }
 
 impl Config {
@@ -142,11 +188,17 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::MissingHome`] if neither variable is set, a read or
-    /// parse error if the config exists but is unusable, and
-    /// [`ConfigError::MaxResultsOverFrame`] (or an out-of-range error) if the
-    /// parsed value would break the frame contract. An absent config file is
-    /// [`Ok`], by contract, never an error.
+    /// [`ConfigError::MissingHome`] if neither variable is set, and a read or
+    /// parse error if the config exists but is unusable. Beyond that, each of
+    /// the two knobs has its own error family, refused rather than clamped:
+    /// [`ConfigError::MaxResultsOutOfRange`] or
+    /// [`ConfigError::MaxResultsNotInteger`] if `max_results` isn't a usable
+    /// positive integer, and [`ConfigError::MaxResultsOverFrame`] if it would
+    /// break the frame contract; [`ConfigError::MaxTermCharsOutOfRange`] or
+    /// [`ConfigError::MaxTermCharsNotInteger`] if `max_term_chars` isn't a
+    /// usable positive integer, and [`ConfigError::MaxTermCharsOverCeiling`]
+    /// if it would exceed the ranker's term-length ceiling. An absent config
+    /// file is [`Ok`], by contract, never an error.
     pub fn load() -> Result<Config, ConfigError> {
         let xdg = env::var(XDG_CONFIG_HOME).ok().filter(|v| !v.is_empty());
         let home = env::var(HOME).ok().filter(|v| !v.is_empty());
@@ -199,10 +251,12 @@ impl Config {
 ///
 /// Parsed via [`toml::Value`] rather than a serde `Deserialize` derive so
 /// that this crate needs no serde dependency of its own — the toml crate's
-/// generic value tree already does the parse, and the one field is read out of
-/// it directly. A key absent from the file falls back to the default
-/// `max_results`; a value that is not a usable positive integer within
-/// `1..=MAX_ITEMS_PER_RESULTS_FRAME` is an explicit error, never a clamp.
+/// generic value tree already does the parse, and each field is read out of
+/// it directly. A key absent from the file falls back to that field's
+/// default; a value that is not a usable positive integer within its valid
+/// range (`1..=MAX_ITEMS_PER_RESULTS_FRAME` for `max_results`,
+/// `1..=hop_core::rank::MAX_TERM_CHARS` for `max_term_chars`) is an explicit
+/// error, never a clamp.
 fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
     let value: toml::Value = toml::from_str(text).map_err(|err| ConfigError::Parse {
         path: path.to_owned(),
@@ -224,7 +278,25 @@ fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
         }
     };
 
-    Ok(Config { max_results })
+    let max_term_chars = match value.get("max_term_chars") {
+        None => Config::default().max_term_chars,
+        Some(v) => {
+            let n = match v.as_integer() {
+                Some(n) => n,
+                None => {
+                    return Err(ConfigError::MaxTermCharsNotInteger {
+                        path: path.to_owned(),
+                    });
+                }
+            };
+            validate_max_term_chars(path, n)?
+        }
+    };
+
+    Ok(Config {
+        max_results,
+        max_term_chars,
+    })
 }
 
 /// Validates a parsed `max_results` integer against the valid range.
@@ -238,6 +310,24 @@ fn validate_max_results(path: &Path, n: i64) -> Result<usize, ConfigError> {
     let n = n as usize;
     if n > MAX_ITEMS_PER_RESULTS_FRAME {
         return Err(ConfigError::MaxResultsOverFrame {
+            path: path.to_owned(),
+            value: n,
+        });
+    }
+    Ok(n)
+}
+
+/// Validates a parsed `max_term_chars` integer against the valid range.
+fn validate_max_term_chars(path: &Path, n: i64) -> Result<usize, ConfigError> {
+    if n < 1 {
+        return Err(ConfigError::MaxTermCharsOutOfRange {
+            path: path.to_owned(),
+            value: n,
+        });
+    }
+    let n = n as usize;
+    if n > hop_core::rank::MAX_TERM_CHARS {
+        return Err(ConfigError::MaxTermCharsOverCeiling {
             path: path.to_owned(),
             value: n,
         });
@@ -380,6 +470,84 @@ mod tests {
         let home_str = home.path().to_string_lossy().into_owned();
         let config = Config::load_from_env(None, Some(home_str)).unwrap();
         assert_eq!(config.max_results, 7);
+    }
+
+    // --- `max_term_chars` (issue #46's remaining acceptance criterion): a
+    // second, independent knob, mirroring `max_results`'s shape exactly.
+
+    #[test]
+    fn absent_max_term_chars_key_uses_the_default() {
+        let (config, _dir) = config_from_text("some_future_key = 1");
+        assert_eq!(config.max_term_chars, Config::default().max_term_chars);
+        assert_eq!(config.max_term_chars, hop_core::rank::MAX_TERM_CHARS);
+    }
+
+    #[test]
+    fn valid_flat_toml_parses_max_term_chars() {
+        let (config, _dir) = config_from_text("max_term_chars = 64");
+        assert_eq!(config.max_term_chars, 64);
+    }
+
+    #[test]
+    fn zero_max_term_chars_is_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "max_term_chars = 0").unwrap();
+
+        let err = Config::load_from_env(Some(dir.path().to_string_lossy().into_owned()), None)
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MaxTermCharsOutOfRange { value: 0, .. }),
+            "expected MaxTermCharsOutOfRange, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn over_ceiling_max_term_chars_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let over = hop_core::rank::MAX_TERM_CHARS + 1;
+        fs::write(&path, format!("max_term_chars = {over}")).unwrap();
+
+        let err = Config::load_from_env(Some(dir.path().to_string_lossy().into_owned()), None)
+            .unwrap_err();
+        match &err {
+            ConfigError::MaxTermCharsOverCeiling { path: p, value } => {
+                assert_eq!(*p, path);
+                assert_eq!(*value, over);
+            }
+            other => panic!("expected MaxTermCharsOverCeiling, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "error message must name the config path: {err}"
+        );
+    }
+
+    #[test]
+    fn ceiling_bound_max_term_chars_is_accepted() {
+        let (config, _dir) = config_from_text(&format!(
+            "max_term_chars = {}",
+            hop_core::rank::MAX_TERM_CHARS
+        ));
+        assert_eq!(config.max_term_chars, hop_core::rank::MAX_TERM_CHARS);
+    }
+
+    #[test]
+    fn non_integer_max_term_chars_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "max_term_chars = \"lots\"").unwrap();
+
+        let err = Config::load_from_env(Some(dir.path().to_string_lossy().into_owned()), None)
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MaxTermCharsNotInteger { .. }),
+            "expected MaxTermCharsNotInteger, got {err:?}"
+        );
     }
 
     #[test]

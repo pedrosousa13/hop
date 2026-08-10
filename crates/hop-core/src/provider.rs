@@ -97,13 +97,20 @@ pub struct ProviderManifest {
     /// regardless of term length".
     ///
     /// This is a per-provider **minimum** — the opposite end of the axis
-    /// from [`crate::rank::MAX_TERM_CHARS`], a single global **maximum**
-    /// enforced inside the ranker, before pattern construction, regardless
-    /// of which provider produced the items being ranked (issue #61 /
-    /// #46). See that constant's doc comment for the full reasoning. The
-    /// two never conflict: nothing stops a manifest from declaring a
-    /// `min_term_len` above `MAX_TERM_CHARS` (that provider would simply
-    /// never run), but no legitimate manifest has reason to.
+    /// from [`crate::rank::Weights::max_term_chars`], a configurable
+    /// effective **maximum** enforced inside the ranker, before pattern
+    /// construction, regardless of which provider produced the items being
+    /// ranked (issue #61 / #46). [`crate::rank::MAX_TERM_CHARS`] is that
+    /// field's default, and the ceiling `hopd`'s config loader enforces at
+    /// the config seam — a config-sourced value may lower the effective
+    /// maximum, never raise it above that ceiling. The field itself is a
+    /// bare `usize`, though, not a validating type, so code that constructs
+    /// a `Weights` directly rather than through the config loader is not
+    /// held to that ceiling at all. See both doc comments for the full
+    /// reasoning. The two never conflict: nothing stops a manifest from
+    /// declaring a `min_term_len` above the effective `max_term_chars`
+    /// (that provider would simply never run), but no legitimate manifest
+    /// has reason to.
     pub min_term_len: usize,
     /// Per-query deadline. Not enforced by this module —
     /// [`ProviderHost::run_one`](crate::host::ProviderHost) is what enforces

@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use hop_core::learning::Learning;
 use hop_core::pipeline::Pipeline;
+use hop_core::rank::Weights;
 use tokio::sync::Mutex;
 
 use crate::source::HostSource;
@@ -102,6 +103,42 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Invocation {
         Invocation::Usage
     } else {
         Invocation::Serve
+    }
+}
+
+/// Builds the daemon's [`Pipeline`]: the `Learning` store loaded from
+/// `store_path`, and `weights` carrying `config.max_term_chars`.
+///
+/// Split out of [`run`] so this construction — the one place `Config`'s
+/// `max_term_chars` actually lands on the pipeline the ranker reads — is
+/// unit-testable. `run` itself binds a socket and blocks, so nothing inside
+/// it can be asserted on directly; without this seam, a `max_term_chars`
+/// that parses into `Config` but never reaches `Weights` would be a silent
+/// regression no test could catch.
+///
+/// `learning` is loaded fresh here, once, rather than per-connection: every
+/// query shares price-of-admission-loaded state rather than each getting
+/// [`Pipeline::default`]'s empty one. `Learning::load` degrades to a fresh
+/// store on any load problem (its own documented contract — see
+/// `hop_core::learning`), so a damaged or absent store never stops the
+/// daemon from starting.
+///
+/// `max_term_chars` rides in on `Weights` rather than through
+/// `HostSource::with_config` the way `max_results` does, because the two
+/// knobs sit at different layers: `max_results` is a per-call parameter
+/// `Pipeline::assemble` takes fresh on every query, so `HostSource` is what
+/// has to carry it forward from one call to the next. `max_term_chars` is
+/// consumed inside `Ranker::rank` off `self.weights`, a field the `Pipeline`
+/// already owns — so setting it once here, at construction, is the whole
+/// job; no per-call plumbing needed.
+fn pipeline_for(config: &crate::config::Config, store_path: &std::path::Path) -> Pipeline {
+    Pipeline {
+        learning: Learning::load(store_path),
+        weights: Weights {
+            max_term_chars: config.max_term_chars,
+            ..Weights::default()
+        },
+        ..Pipeline::default()
     }
 }
 
@@ -190,10 +227,7 @@ pub fn run() -> ExitCode {
     // daemon from starting; the store *path* (`Some`) rides into the source
     // so a later slice can persist recorded launches back to the same file.
     let store_path = state_dir.join(crate::state_dir::STORE_FILE_NAME);
-    let pipeline = Arc::new(Mutex::new(Pipeline {
-        learning: Learning::load(&store_path),
-        ..Pipeline::default()
-    }));
+    let pipeline = Arc::new(Mutex::new(pipeline_for(&config, &store_path)));
     let source = HostSource::with_config(
         Arc::new(server::build_host()),
         pipeline,
@@ -275,5 +309,34 @@ mod tests {
         // 0x80 is a continuation byte with no lead byte: never valid UTF-8.
         let invalid = OsString::from_vec(vec![b'-', b'-', 0x80]);
         assert_eq!(parse(vec![invalid]), Invocation::Usage);
+    }
+
+    /// The regression `pipeline_for` exists to make impossible: a
+    /// `max_term_chars` that parses into `Config` but never reaches the
+    /// pipeline's `Weights`, silently dropped on the floor between the
+    /// config seam and the ranker. `run()` itself binds a socket and blocks,
+    /// so it cannot be unit-tested directly — this exercises the exact
+    /// construction it delegates to instead.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn pipeline_for_carries_the_configured_max_term_chars_onto_weights() {
+        // `Learning::load` degrades to a fresh store on any load problem
+        // (its own documented contract), so a nonexistent path in a fresh
+        // temp dir is safe here and touches no real user state.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("does-not-exist.json");
+
+        let default_pipeline = pipeline_for(&crate::config::Config::default(), &store_path);
+        assert_eq!(
+            default_pipeline.weights.max_term_chars,
+            hop_core::rank::MAX_TERM_CHARS
+        );
+
+        let lowered_config = crate::config::Config {
+            max_term_chars: 10,
+            ..crate::config::Config::default()
+        };
+        let lowered_pipeline = pipeline_for(&lowered_config, &store_path);
+        assert_eq!(lowered_pipeline.weights.max_term_chars, 10);
     }
 }

@@ -101,12 +101,22 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::router::RoutedQuery;
 
-/// Ceiling on how many **characters** of a query term reach
-/// [`Pattern::new`] — the only call site in this crate that constructs a
-/// nucleo `Pattern` (see [`Matching::for_term`], which truncates to this
-/// many characters *before* that call). Nothing enforces this on the way
-/// in; it is applied unconditionally, inside the ranker, regardless of how
-/// the term arrived.
+/// Default value of [`Weights::max_term_chars`], and the ceiling `hopd`'s
+/// config loader enforces on it — how many **characters** of a query term
+/// reach [`Pattern::new`] (the only call site in this crate that constructs a
+/// nucleo `Pattern`; see [`Matching::for_term`], which truncates to whatever
+/// `max_term_chars` it is handed *before* that call). That ceiling lives at
+/// one config seam, not in the type: `hopd::config::validate_max_term_chars`
+/// (`crate::config` in the `hopd` crate) refuses a config value over this
+/// constant as an explicit error rather than clamping to it, the same
+/// posture it takes toward an out-of-range `max_results`. `Weights` itself is
+/// a plain struct with a bare `pub max_term_chars: usize`, not a validating
+/// newtype, so code that constructs a `Weights` directly — as this module's
+/// own tests do — can set the field arbitrarily high; nothing in `hop-core`
+/// stops it. Nothing enforces the *default* on the way in either, beyond
+/// that one caller's refusal; below whatever the field is actually set to,
+/// truncation is applied unconditionally, inside the ranker, regardless of
+/// how the term arrived.
 ///
 /// # Why 256, and why it's a character count, not a byte count
 ///
@@ -116,14 +126,14 @@ use crate::router::RoutedQuery;
 /// module. It sits well under
 /// [`hop_protocol::limits::MAX_QUERY_TEXT`] (1 024 **bytes**, the wire's
 /// whole-query cap) — coherent, not competing: `MAX_QUERY_TEXT` bounds what
-/// a client can send at all; `MAX_TERM_CHARS` bounds what actually reaches
-/// `Pattern::new`, and it is the *only* cap on the alias-rewrite sink,
-/// which is **not** wire-bound at all
-/// ([`Pipeline::assemble`](crate::pipeline::Pipeline::assemble) substitutes
-/// an alias's rewrite target — arbitrary text from a config file — as the
-/// effective term; see this module's own docs on why escaping/bounding has
-/// to happen at this one seam). Unlike every constant in
-/// `hop_protocol::limits` (all byte-denominated), this one counts
+/// a client can send at all; `MAX_TERM_CHARS` bounds the default and
+/// ceiling of what actually reaches `Pattern::new`, and it is the *only*
+/// upper bound on the alias-rewrite sink, which is **not** wire-bound at
+/// all ([`Pipeline::assemble`](crate::pipeline::Pipeline::assemble)
+/// substitutes an alias's rewrite target — arbitrary text from a config
+/// file — as the effective term; see this module's own docs on why
+/// escaping/bounding has to happen at this one seam). Unlike every constant
+/// in `hop_protocol::limits` (all byte-denominated), this one counts
 /// **characters**: what it bounds is nucleo pattern-construction and match
 /// cost, which scales with character count, not the byte length a wire
 /// frame happens to carry.
@@ -138,27 +148,46 @@ use crate::router::RoutedQuery;
 /// (`hop_protocol::limits`'s own docs: "silently shortening an id would
 /// produce a different id") deliberately — a search term is not an
 /// identity, truncating it does not corrupt anything the way truncating an
-/// `ItemId` would.
+/// `ItemId` would. (The config loader's *own* posture toward an
+/// out-of-range `max_term_chars` value is the opposite — refuse, don't
+/// clamp — because there the wrong value is a config mistake to surface,
+/// not a query to keep serving in degraded form.)
 ///
 /// # Relationship to [`ProviderManifest::min_term_len`](crate::provider::ProviderManifest::min_term_len)
 ///
 /// That field is a per-provider **minimum** — a pre-filter deciding
 /// whether to run a provider at all, for a given routed term length. This
-/// constant is a single, global **maximum**, applied inside the ranker
+/// constant is the default and ceiling of a configurable, effective
+/// **maximum** ([`Weights::max_term_chars`]), applied inside the ranker
 /// regardless of which provider produced the items being ranked. The two
 /// bound opposite ends of the same axis and never conflict: nothing stops
-/// a manifest from declaring a `min_term_len` above `MAX_TERM_CHARS` (that
-/// provider would simply never run), but no legitimate manifest has reason
-/// to.
+/// a manifest from declaring a `min_term_len` above the effective
+/// `max_term_chars` (that provider would simply never run), but no
+/// legitimate manifest has reason to.
 pub const MAX_TERM_CHARS: usize = 256;
 
-/// Per-kind score weights, and the fuzzy-score floor a match must clear.
+/// Per-kind score weights, the fuzzy-score floor a match must clear, and the
+/// term-length cap a match is truncated to.
 pub struct Weights {
     pub per_kind: HashMap<Kind, f32>,
     /// The minimum *fuzzy* score (post-normalization) a non-empty-term
     /// match must reach to survive. Never applied to empty-term queries —
     /// see [`Ranker::rank`].
     pub min_score: f32,
+    /// How many **characters** of a query term [`Ranker::rank`] passes to
+    /// [`Matching::for_term`], which truncates to this many before
+    /// constructing a nucleo `Pattern`. Defaults to [`MAX_TERM_CHARS`], which
+    /// is also the ceiling `hopd`'s config loader enforces on this field —
+    /// see that constant's doc comment for why 256, why a character count,
+    /// and why truncate rather than reject. That ceiling is enforced at the
+    /// config seam, not by this type: `Weights` is a plain struct with a
+    /// bare `pub max_term_chars: usize`, so any caller that builds a
+    /// `Weights` directly, in-process, can set this field above
+    /// `MAX_TERM_CHARS` — nothing here stops it. `hopd`'s config loader is
+    /// the one caller that validates a config-sourced value, lowering this
+    /// below the default and refusing one that would raise it above
+    /// `MAX_TERM_CHARS`.
+    pub max_term_chars: usize,
 }
 
 impl Default for Weights {
@@ -185,6 +214,7 @@ impl Default for Weights {
         Weights {
             per_kind,
             min_score: 0.0,
+            max_term_chars: MAX_TERM_CHARS,
         }
     }
 }
@@ -289,9 +319,10 @@ impl Ranker {
     ///   match at all, or whose fuzzy component alone falls below
     ///   `weights.min_score`, is dropped — the threshold applies to the
     ///   fuzzy score, not the final total.
-    /// - A term longer than [`MAX_TERM_CHARS`] characters is truncated to
-    ///   that many characters before matching — see that constant's doc
-    ///   comment for the full rationale (issue #46 / #61).
+    /// - A term longer than `weights.max_term_chars` characters is
+    ///   truncated to that many characters before matching — see
+    ///   [`Weights::max_term_chars`] and [`MAX_TERM_CHARS`] (its default
+    ///   and absolute ceiling) for the full rationale (issue #46 / #61).
     /// - **The term is matched literally.** It is split on unescaped
     ///   whitespace into one atom per word, and that is the only
     ///   interpretation applied: `$`, `!`, `'` and `^` are ordinary
@@ -327,7 +358,7 @@ impl Ranker {
         weights: &Weights,
         boosts: &Boosts,
     ) -> Vec<Ranked> {
-        let matching = Matching::for_term(query.term.trim());
+        let matching = Matching::for_term(query.term.trim(), weights.max_term_chars);
         self.rank_matching(&matching, items, weights, boosts)
     }
 
@@ -439,11 +470,14 @@ impl Matching {
     /// Classifies a **trimmed** term. This is where the zero-atom rationale
     /// the rest of the module points at lives, in full.
     ///
-    /// Also truncates the term to at most [`MAX_TERM_CHARS`] characters
+    /// Also truncates the term to at most `max_term_chars` characters
     /// *before* [`Pattern::new`] is called — this is the trust boundary
     /// issue #46 names, and the only call site in this crate that
-    /// constructs a `Pattern`. See `MAX_TERM_CHARS`'s doc comment for the
-    /// full justification. `term_chars` (used for score normalization; see
+    /// constructs a `Pattern`. [`Ranker::rank`] always calls this with
+    /// `weights.max_term_chars`, which defaults to, and is capped at,
+    /// [`MAX_TERM_CHARS`] — see that constant's and
+    /// [`Weights::max_term_chars`]'s doc comments for the full
+    /// justification. `term_chars` (used for score normalization; see
     /// the module docs) is the *truncated* length, not the original, so a
     /// truncated term's score isn't diluted by counting characters that
     /// were never matched against. Truncating on `.chars()` rather than a
@@ -472,11 +506,11 @@ impl Matching {
     /// be shaped conveniently. Because no term reaches it, the guard is
     /// pinned instead through [`Ranker::rank_matching`], by
     /// [`tests::matching_nothing_drops_every_item`].
-    fn for_term(term: &str) -> Matching {
+    fn for_term(term: &str, max_term_chars: usize) -> Matching {
         if term.is_empty() {
             return Matching::Everything;
         }
-        let truncated: String = term.chars().take(MAX_TERM_CHARS).collect();
+        let truncated: String = term.chars().take(max_term_chars).collect();
         let pattern = Pattern::new(
             &truncated,
             CaseMatching::Ignore,
@@ -1395,7 +1429,7 @@ mod tests {
     #[test]
     fn term_exactly_at_the_cap_is_unaffected() {
         let term = "a".repeat(MAX_TERM_CHARS);
-        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term) else {
+        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term, MAX_TERM_CHARS) else {
             panic!("a non-empty term must classify as Fuzzy");
         };
         assert_eq!(
@@ -1407,7 +1441,7 @@ mod tests {
     #[test]
     fn term_one_character_over_the_cap_is_truncated() {
         let term = "a".repeat(MAX_TERM_CHARS + 1);
-        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term) else {
+        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term, MAX_TERM_CHARS) else {
             panic!("a non-empty term must classify as Fuzzy");
         };
         assert_eq!(
@@ -1433,7 +1467,7 @@ mod tests {
     fn overlong_term_pattern_is_built_from_the_truncated_term() {
         let term = "a".repeat(MAX_TERM_CHARS + 1000);
         let haystack = "a".repeat(MAX_TERM_CHARS);
-        let Matching::Fuzzy { pattern, .. } = Matching::for_term(&term) else {
+        let Matching::Fuzzy { pattern, .. } = Matching::for_term(&term, MAX_TERM_CHARS) else {
             panic!("a non-empty term must classify as Fuzzy");
         };
         let mut matcher = Matcher::new(Config::DEFAULT);
@@ -1459,9 +1493,37 @@ mod tests {
             term.len() > term.chars().count(),
             "sanity check: the fixture really is multi-byte"
         );
-        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term) else {
+        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term, MAX_TERM_CHARS) else {
             panic!("a non-empty term must classify as Fuzzy");
         };
         assert_eq!(term_chars, MAX_TERM_CHARS);
+    }
+
+    // --- `max_term_chars` as a configurable knob beside `min_score` (issue
+    // #46's remaining acceptance criterion): the cap is a `Weights` field
+    // now, defaulting to `MAX_TERM_CHARS`, and `Matching::for_term` truncates
+    // to whatever value it's handed rather than reading the const directly.
+
+    #[test]
+    fn weights_default_max_term_chars_is_the_const_ceiling() {
+        assert_eq!(Weights::default().max_term_chars, MAX_TERM_CHARS);
+    }
+
+    #[test]
+    fn lowered_max_term_chars_truncates_the_term_before_pattern_construction() {
+        let weights = Weights {
+            max_term_chars: 10,
+            ..Weights::default()
+        };
+        let term = "a".repeat(weights.max_term_chars + 5);
+        let Matching::Fuzzy { term_chars, .. } = Matching::for_term(&term, weights.max_term_chars)
+        else {
+            panic!("a non-empty term must classify as Fuzzy");
+        };
+        assert_eq!(
+            term_chars, weights.max_term_chars,
+            "a Weights with a lowered max_term_chars must truncate at that \
+             value, not MAX_TERM_CHARS"
+        );
     }
 }
