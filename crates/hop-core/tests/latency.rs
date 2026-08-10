@@ -604,3 +604,229 @@ fn the_ten_thousand_item_fixture_is_deterministic() {
          catch."
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #128: the files-shaped arm.
+//
+// The arm above measures 10 000 items with deliberately *short* titles
+// ("Firefox", "Chrome 2"). `formulaic_title`'s own comment records what
+// happens when that assumption breaks: inflating titles to ~45 bytes measured
+// p95 ~11.8ms, over the 10ms budget. So the gate's headroom is a property of
+// haystack length, and the arm above deliberately measures the short case.
+//
+// M5 ships a files provider, whose titles are paths. This arm changes exactly
+// one variable — title shape and length — holding provider count, item count,
+// query set and methodology identical, so the two p95 numbers are directly
+// comparable and any difference is attributable to the haystack alone.
+//
+// # Why item count is *not* the variable
+//
+// The research brief for this arm asked for "an item count at the order of
+// magnitude a real indexed home directory produces". That count is
+// unreachable through the real path, and saying so is more useful than
+// simulating it: `MAX_ITEMS_PER_PROVIDER_ANSWER` bounds one provider's answer
+// to 1 000 items and truncates the rest, and `MAX_ITEMS_PER_QUERY` bounds the
+// daemon's retained set to 5 000. A files provider with 400 000 indexed paths
+// still hands `assemble` at most 1 000 of them. The fixture above, at 10 000,
+// already sits at twice the retained cap — it is adversarial on count
+// already. Scaling count further would measure a shape the protocol forbids
+// while leaving the shape it permits untested.
+// ---------------------------------------------------------------------------
+
+/// Directory-name components, combined by [`path_title`] into nested paths.
+/// Ordinary developer-machine vocabulary, mixed case included, because case
+/// folding is work `nucleo_matcher` actually does per candidate.
+const PATH_SEGMENTS: [&str; 12] = [
+    "home",
+    "pedro",
+    "Documents",
+    "projects",
+    "src",
+    "hop-launcher",
+    "crates",
+    "node_modules",
+    "Downloads",
+    ".config",
+    "target",
+    "Screenshots",
+];
+
+/// File extensions, cycled independently of depth so length and suffix vary
+/// on different periods rather than in lockstep.
+const EXTENSIONS: [&str; 6] = ["rs", "toml", "md", "png", "tar.gz", "json"];
+
+/// One item's title as a **path**, the shape a files provider produces.
+///
+/// Depth cycles 2..=7 segments and the basename carries an index and an
+/// extension, so lengths spread across roughly 30–110 bytes rather than
+/// sitting at one fixed size — a distribution, because a real index has one
+/// and because a single length would make the result an artifact of whichever
+/// length was picked.
+///
+/// Deliberately well under [`MAX_TITLE`](hop_protocol::limits::MAX_TITLE)
+/// (1 KiB). A title at that bound is an adversarial input, and this file
+/// already has arms for adversarial input
+/// ([`oversized_provider_input_is_truncated_before_ranking`],
+/// [`overlong_term_is_truncated_before_pattern_construction`]). This arm's
+/// claim is about *realistic* paths, which is the claim M5 needs.
+///
+/// Purely a function of `item_index`: no RNG, no clock, no environment.
+fn path_title(item_index: usize) -> String {
+    let depth = 2 + (item_index % 6);
+    let mut parts = Vec::with_capacity(depth + 1);
+    for step in 0..depth {
+        // `step * 5` walks the segment list at a stride coprime with its
+        // length (12), so successive components differ rather than repeating
+        // the same word down a path.
+        parts.push(PATH_SEGMENTS[(item_index + step * 5) % PATH_SEGMENTS.len()]);
+    }
+    let stem = VOCAB[item_index % VOCAB.len()];
+    let ext = EXTENSIONS[item_index % EXTENSIONS.len()];
+    format!("/{}/{stem}-{item_index}.{ext}", parts.join("/"))
+}
+
+/// One path-shaped item. `Kind::File` throughout — a files provider produces
+/// one kind — still inside [`manifest_for`]'s declared kinds.
+fn path_item(provider_id: &'static str, item_index: usize) -> Item {
+    Item {
+        id: ItemId::new(format!("{provider_id}:path-{item_index}")).unwrap(),
+        kind: Kind::File,
+        title: path_title(item_index),
+        subtitle: None,
+        icon: None,
+        actions: vec![open_action()],
+        default_action: ActionId::new("open").unwrap(),
+        copy_text: None,
+        append_to_end: false,
+        provider: provider_id.into(),
+    }
+}
+
+/// One provider's at-cap answer of path-shaped items.
+fn path_provider_output(provider_id: &'static str) -> ProviderOutput {
+    let provider = FixtureProvider {
+        manifest: manifest_for(provider_id),
+    };
+    let items = (0..MAX_ITEMS_PER_PROVIDER_ANSWER)
+        .map(|i| path_item(provider_id, i))
+        .collect();
+    ProviderOutput::from_provider(&provider, items)
+}
+
+/// The files-shaped fixture: same ten providers and same 10 000 items as
+/// [`ten_thousand_item_fixture`], with path titles instead of short ones.
+fn files_shaped_fixture() -> CheckedItems {
+    let mut outputs = Vec::with_capacity(PROVIDER_IDS.len());
+    for provider_id in PROVIDER_IDS {
+        outputs.push(path_provider_output(provider_id));
+    }
+    CheckedItems::check(outputs)
+}
+
+/// Pinned as a literal for the same reason
+/// [`EXPECTED_ID_SEQUENCE_DIGEST`] is — see that constant, and the module
+/// docs' "Fixture determinism" section.
+const EXPECTED_PATH_ID_SEQUENCE_DIGEST: u64 = 0x784a_a143_1dc2_0dc7;
+
+/// p95 over the files-shaped fixture, asserted under the same 10ms budget.
+///
+/// Release-mode only and `#[ignore]`d for exactly the reasons the arm above
+/// documents; the same CI `latency-gate` job runs it, since that job passes
+/// `--ignored` for the whole test binary rather than naming tests.
+///
+/// **If this arm fails, the response is not to relax the budget or shorten
+/// these paths** (issue #128's acceptance criterion 6). A breach here means a
+/// files provider needs a different approach to candidate selection — prefix
+/// or path-segment indexing, pre-filtering before the fuzzy scorer — and that
+/// is a design input to M5, not a number to negotiate. Report the measurement
+/// and stop.
+#[test]
+#[ignore]
+fn p95_query_latency_over_a_files_shaped_fixture_is_under_10ms_in_release_mode() {
+    let checked = files_shaped_fixture();
+    assert_eq!(
+        checked.items().len(),
+        10_000,
+        "fixture sanity: nothing truncated"
+    );
+    assert!(
+        checked.rejections().is_empty(),
+        "fixture sanity: nothing rejected — path titles must be inside MAX_TITLE"
+    );
+
+    let mut pipeline = Pipeline::default();
+
+    for i in 0..50 {
+        let term = QUERIES[i % QUERIES.len()];
+        let _ = pipeline.assemble(term, checked.clone(), 50);
+    }
+
+    let mut samples: Vec<Duration> = Vec::with_capacity(500);
+    for i in 0..500 {
+        let term = QUERIES[i % QUERIES.len()];
+        let call_input = checked.clone();
+        let start = Instant::now();
+        let _ = pipeline.assemble(term, call_input, 50);
+        samples.push(start.elapsed());
+    }
+
+    samples.sort();
+    let rank = (0.95_f64 * samples.len() as f64).ceil() as usize;
+    let p95 = samples[rank - 1];
+
+    // Printed unconditionally, like the arm above: this margin is the number
+    // M5's design depends on, so it is worth watching whether or not the
+    // assertion happens to pass today.
+    let mean_title: usize = checked
+        .items()
+        .iter()
+        .map(|item| item.title.len())
+        .sum::<usize>()
+        / checked.items().len();
+    println!(
+        "p95_query_latency_over_a_files_shaped_fixture_is_under_10ms_in_release_mode: \
+         p95 = {p95:?}, min = {:?}, max = {:?}, mean title = {mean_title} bytes",
+        samples.first().unwrap(),
+        samples.last().unwrap(),
+    );
+
+    assert!(
+        p95 < Duration::from_millis(10),
+        "p95 over the files-shaped fixture was {p95:?} (release mode only); \
+         expected under 10ms. Per issue #128 the response is to treat this as \
+         a design input for M5's files provider — candidate pre-filtering \
+         ahead of the fuzzy scorer — not to relax the budget or shorten the \
+         fixture's paths."
+    );
+}
+
+#[test]
+fn the_files_shaped_fixture_is_deterministic() {
+    let a = files_shaped_fixture();
+    let b = files_shaped_fixture();
+
+    assert_eq!(a.items().len(), 10_000);
+    assert!(a.rejections().is_empty());
+
+    let ids_a: Vec<&ItemId> = a.items().iter().map(|item| &item.id).collect();
+    let ids_b: Vec<&ItemId> = b.items().iter().map(|item| &item.id).collect();
+    assert_eq!(ids_a, ids_b);
+
+    // Titles too, not only ids: this fixture's whole point is the *titles*,
+    // so an id sequence that matched while path construction drifted would
+    // pass a digest check and silently measure a different haystack.
+    let titles_a: Vec<&str> = a.items().iter().map(|item| item.title.as_str()).collect();
+    let titles_b: Vec<&str> = b.items().iter().map(|item| item.title.as_str()).collect();
+    assert_eq!(titles_a, titles_b);
+
+    let digest = fnv1a64(titles_a.join("\n").as_bytes());
+    assert_eq!(
+        digest, EXPECTED_PATH_ID_SEQUENCE_DIGEST,
+        "the files-shaped fixture's title sequence hashed to {digest:#x}, not \
+         the literal in EXPECTED_PATH_ID_SEQUENCE_DIGEST. Same reasoning as \
+         EXPECTED_ID_SEQUENCE_DIGEST: a literal is what proves determinism \
+         across separate process invocations, not merely within one. If path \
+         construction changed intentionally, recompute and update this \
+         deliberately."
+    );
+}
