@@ -14,7 +14,7 @@
 //! weren't come back as [`Rejection`]s.
 //!
 //! Not every rejection is such an item, though, and reading one as proof that
-//! a provider lied would be wrong: assembly also refuses items it was
+//! a provider lied would be wrong: assembly also declines items it was
 //! perfectly satisfied with, when a query asks for more pinned rows than the
 //! **pin budget** honors — either half of it, so see both
 //! [`MAX_PINNED_ITEMS_PER_PROVIDER`] and [`MAX_PINNED_ITEMS_PER_QUERY`]. A rejection
@@ -144,7 +144,7 @@ impl ProviderOutput {
 /// The **pin budget**'s per-provider half: the most `append_to_end` items one
 /// producing provider is honored for on a single query. Together with
 /// [`MAX_PINNED_ITEMS_PER_QUERY`] this is the whole budget, and a pinned item
-/// over either half is refused as a [`FailedCheck::PinBudget`] rejection.
+/// over either half is declined as a [`FailedCheck::PinBudget`] rejection.
 ///
 /// ## What the pinned tail bypasses, and why it needs a budget at all
 ///
@@ -178,7 +178,7 @@ impl ProviderOutput {
 /// list, and a list of things the user might want is what ranking is for — so
 /// the second row belongs in the ranked body, as an *unflagged* item. That is
 /// the provider's move to make and not something assembly does on its behalf:
-/// step 4 refuses an over-share pin outright and never demotes one into the
+/// step 4 declines an over-share pin outright and never demotes one into the
 /// body, and only an item that did not ask for the tail reaches the body at
 /// all.
 ///
@@ -198,15 +198,15 @@ impl ProviderOutput {
 /// hands the choice back to the provider the share exists to limit.
 ///
 /// And it is what keeps a flooding provider from taking the pinned path *for
-/// itself*. Because the share is per producer, a provider that flags a hundred
-/// items is refused its second pin for having had its first, not for being who
-/// it is: the refusal is arithmetic over producer ids, needing no notion of
-/// privilege. A genuine web-search row behind such a flooder therefore still
-/// lands — provided the per-query total has a slot left for it, which is the
-/// qualification this half cannot make on its own.
+/// itself*. Because the share is per producer, a provider that flags a
+/// hundred items has its second pin declined for having had its first, not
+/// for being who it is: the rejection is arithmetic over producer ids,
+/// needing no notion of privilege. A genuine web-search row behind such a
+/// flooder therefore still lands — provided the per-query total has a slot
+/// left for it, which is the qualification this half cannot make on its own.
 /// `tests::a_flooding_provider_that_answers_first_cannot_crowd_out_another_providers_pin`
 /// is that case with one flooder ahead of the row;
-/// `tests::a_fourth_provider_is_refused_once_the_query_total_is_spent` is the
+/// `tests::a_fourth_provider_is_declined_once_the_query_total_is_spent` is the
 /// case where the total has run out first. That is the guarantee worth having,
 /// and it is why this half — not the per-query total — is the load-bearing one.
 pub const MAX_PINNED_ITEMS_PER_PROVIDER: usize = 1;
@@ -221,12 +221,12 @@ pub const MAX_PINNED_ITEMS_PER_PROVIDER: usize = 1;
 /// This half is a judgement call, and worth marking as one: with
 /// [`MAX_PINNED_ITEMS_PER_PROVIDER`] already holding every provider to a
 /// single row, the total only decides how many *different* providers may pin
-/// on one query before the rest are refused. Three is enough for the
+/// on one query before the rest are declined. Three is enough for the
 /// first-party web-search row and two rows of the same shape from *other*
 /// providers (a second search engine, a "search in files" action) without a
 /// constant bump — other providers because
 /// [`MAX_PINNED_ITEMS_PER_PROVIDER`] means a second row from the same one is
-/// refused however much room this total has left — and small enough that the
+/// declined however much room this total has left — and small enough that the
 /// count of unfiltered rows stays something a reader of this module can hold
 /// in their head.
 ///
@@ -258,9 +258,9 @@ pub const MAX_PINNED_ITEMS_PER_PROVIDER: usize = 1;
 /// asking honestly for one row each is indistinguishable from three hostile
 /// ones. What it does is make the question a smaller one: an unentitled
 /// provider that wins a slot wins one unfiltered row rather than the list, and
-/// every refusal is visible in [`Assembly::rejections`] rather than silent.
+/// every rejection is visible in [`Assembly::rejections`] rather than silent.
 /// What stays open is this half, not the other: three providers pinning
-/// honestly leave a fourth refused, and which three they are is
+/// honestly leave a fourth declined, and which three they are is
 /// provider-supplied order — so a hostile provider can still cost a fourth
 /// provider its row, though never more than one row and never the whole tail.
 /// Deciding who is *entitled* to a slot is a capability check, and designing
@@ -268,7 +268,7 @@ pub const MAX_PINNED_ITEMS_PER_PROVIDER: usize = 1;
 ///
 /// ## What the pin budget gives up
 ///
-/// A legitimate fourth pinned provider, refused for being fourth, and an
+/// A legitimate fourth pinned provider, declined for being fourth, and an
 /// honest provider's legitimate second row — the sharper of the two, since
 /// [`MAX_PINNED_ITEMS_PER_PROVIDER`] is 1 and a web-search provider that
 /// wanted to offer two engines as two rows must now offer one. The
@@ -417,8 +417,8 @@ pub enum FailedCheck {
     /// left to spend on it: either its producer already had its
     /// [`MAX_PINNED_ITEMS_PER_PROVIDER`] pins, or the query had already
     /// honored [`MAX_PINNED_ITEMS_PER_QUERY`] of them across every provider.
-    /// Assembly refused it the pinned path rather than granting it placement
-    /// no later step could take back.
+    /// Assembly declined its place on the pinned path rather than granting it
+    /// placement no later step could take back.
     ///
     /// Unlike the three per-item checks above (and unlike
     /// [`FailedCheck::TooManyItems`], which is about an answer rather than
@@ -427,12 +427,12 @@ pub enum FailedCheck {
     /// pinned path at all — and it is here only because its producer's
     /// share, or the query's total, was already spent. Which items spend the
     /// budget is provider-supplied order, so the same item can be honored on
-    /// one query and refused on the next as other providers' answers change
+    /// one query and declined on the next as other providers' answers change
     /// around it.
     PinBudget,
 }
 
-/// One item assembly refused, and why.
+/// One item assembly declined, and why.
 ///
 /// The four descriptive fields mean the same thing under every
 /// [`FailedCheck`], but they read differently under
@@ -458,7 +458,7 @@ pub enum FailedCheck {
 /// Rejections are *returned as data* rather than logged from here, because
 /// [`Pipeline::assemble`] is pure — it runs on every keystroke and may not
 /// perform side effects. Everything here is owned, so a rejection outlives
-/// both the item it describes and the borrow of the manifest that refused it:
+/// both the item it describes and the borrow of the manifest that declined it:
 /// a logging seam can move a `Vec<Rejection>` off the query path and format
 /// it whenever it likes, without this type having to change shape. That seam
 /// now exists — [`ProviderLog`](crate::host::ProviderLog) — and
@@ -512,7 +512,7 @@ pub struct Rejection {
 ///
 /// The rejections ride along inside the value, and come back out in
 /// [`Assembly`], rather than being handed back from `check` separately: what
-/// assembly refused belongs to the query it refused them for, so one call
+/// assembly declined belongs to the query it declined them for, so one call
 /// yields one outcome. It is worth being precise about what that does *not*
 /// buy, since it would be easy to read as more: nothing obliges *this* caller
 /// to look at them. [`Assembly`]'s fields are public and `.items` discards
@@ -769,7 +769,7 @@ pub struct Assembly {
     /// The final result list: the ranked body followed by the pinned tail,
     /// truncated to the `max_results` the call asked for.
     pub items: Vec<Item>,
-    /// Every item refused for this query: first the ones the manifest checks
+    /// Every item declined for this query: first the ones the manifest checks
     /// rejected, in the order [`CheckedItems::check`] rejected them, then the
     /// pinned items the **pin budget** could not afford, in provider-supplied
     /// order. Empty when every provider was honest about its own output and
@@ -943,9 +943,9 @@ impl Pipeline {
         // constants for what each half is worth, and MAX_PINNED_ITEMS_PER_QUERY
         // for where a capability check deciding *who* may pin belongs.
         //
-        // A pin refused here is refused outright rather than left to step 9's
-        // cap, because the two refuse different things: the cap drops what a
-        // full list has no room for, while this refuses an item the pinned
+        // A pin declined here is declined outright rather than left to step 9's
+        // cap, because the two act on different things: the cap drops what a
+        // full list has no room for, while this declines an item the pinned
         // path will not carry at all — so a pin over budget is rejected
         // whether or not the cap would have squeezed it out anyway.
         //
@@ -988,8 +988,8 @@ impl Pipeline {
         // item this query honors survives an exclusive filter regardless of
         // its kind — see
         // `tests::pinned_item_survives_exclusive_filter_regardless_of_kind`.
-        // The pin budget in step 4 is the only thing that can refuse it, and
-        // it refuses on count alone, never on kind or score.
+        // The pin budget in step 4 is the only thing that can decline it, and
+        // it declines on count alone, never on kind or score.
         if routed.exclusive
             && let Some(kinds) = kinds_for_mode(routed.mode)
         {
@@ -1497,7 +1497,7 @@ mod tests {
     // items off *before* step 5's exclusive-mode filter runs, so the filter
     // never sees one. A pinned item therefore survives an exclusive filter
     // even when its own kind doesn't match the mode the user asked for. The
-    // pin budget is the only thing that can refuse it, and the single pin
+    // pin budget is the only thing that can decline it, and the single pin
     // here is well inside both halves of it.
     #[test]
     fn pinned_item_survives_exclusive_filter_regardless_of_kind() {
@@ -1634,14 +1634,14 @@ mod tests {
             ids(&out.items),
             vec!["web:0"],
             "two pins from one provider, and a query total of 3 nothing else is \
-             competing for: the second is still refused, because the per-provider \
+             competing for: the second is still declined, because the per-provider \
              share is a cap in its own right and not merely a way of dividing up \
              a contested total"
         );
         assert_eq!(
             ids_of_rejections(&out.rejections),
             vec!["web:1"],
-            "and the refused pin is reported rather than dropped in silence"
+            "and the declined pin is reported rather than dropped in silence"
         );
     }
 
@@ -1698,7 +1698,7 @@ mod tests {
         assert_eq!(
             ids_of_rejections(&out.rejections),
             vec!["web:second"],
-            "and the second output's pin is refused for being the producer's \
+            "and the second output's pin is declined for being the producer's \
              second, exactly as it would have been inside one output"
         );
     }
@@ -1728,7 +1728,7 @@ mod tests {
         assert_eq!(
             out.rejections.len(),
             9,
-            "and the other nine are refused: three per provider, none of them \
+            "and the other nine are declined: three per provider, none of them \
              for anything the provider claimed about itself"
         );
         assert!(
@@ -1739,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fourth_provider_is_refused_once_the_query_total_is_spent() {
+    fn a_fourth_provider_is_declined_once_the_query_total_is_spent() {
         let mut pipeline = Pipeline::default();
         let out = pipeline.assemble(
             "firefox",
@@ -1755,7 +1755,7 @@ mod tests {
             out.items.len(),
             MAX_PINNED_ITEMS_PER_QUERY,
             "the per-provider share does not make the query total decorative: a \
-             fourth provider within its own share is still refused once the \
+             fourth provider within its own share is still declined once the \
              query has spent MAX_PINNED_ITEMS_PER_QUERY pins"
         );
         assert_eq!(ids_of_rejections(&out.rejections), vec!["fourth:0"]);
@@ -1767,8 +1767,8 @@ mod tests {
     /// web-search row rejected — placed before this issue's change, dropped
     /// after it, which is a regression against "the existing first-party
     /// pinned-row behavior is unchanged". Sharing the budget by producer fixes
-    /// it without any notion of who is first-party: the flooder is refused a
-    /// second pin because it already has one, not because of who it is.
+    /// it without any notion of who is first-party: the flooder's second pin
+    /// is declined because it already has one, not because of who it is.
     #[test]
     fn a_flooding_provider_that_answers_first_cannot_crowd_out_another_providers_pin() {
         let mut pipeline = Pipeline::default();
@@ -1791,7 +1791,7 @@ mod tests {
             ids(&out.items),
             vec!["evil:0", "web:search"],
             "the flooder answered first and still takes exactly one slot, so the \
-             first-party row lands: what it is refused is a second pin, which \
+             first-party row lands: what gets declined is its second pin, which \
              needs no notion of who may pin at all"
         );
         assert!(
@@ -1800,7 +1800,7 @@ mod tests {
                 .all(|r| r.check == FailedCheck::PinBudget),
             "the flooder is honest about its own output — its items fail no \
              manifest check — and the seven it does not get back are pin-budget \
-             refusals"
+             rejections"
         );
     }
 
@@ -1815,7 +1815,7 @@ mod tests {
         assert_eq!(
             ids_of_rejections(&out.rejections),
             vec!["web:1", "web:2", "web:3"],
-            "the refusal is observable: every pinned item the budget would not \
+            "the rejection is observable: every pinned item the budget would not \
              honor comes back as a Rejection, in the order the providers \
              returned them, rather than disappearing between step 4 and the \
              returned list"
@@ -1829,7 +1829,7 @@ mod tests {
         );
     }
 
-    /// The whole record for a pin-budget refusal, field by field — the
+    /// The whole record for a pin-budget rejection, field by field — the
     /// companion to
     /// `tests::a_rejection_names_the_item_the_claim_the_producer_and_the_failed_check`
     /// for the one [`FailedCheck`] that is not a manifest check. Both provider
