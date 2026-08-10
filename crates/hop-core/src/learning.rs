@@ -750,30 +750,98 @@ fn canonicalize_result_id(result_id: &str) -> String {
     result_id.to_string()
 }
 
-/// Whether `stripped` — the output of [`canonicalize_result_id`] — is one of
-/// the shapes [`persistence_key`] is willing to persist in the clear.
+/// Whether `stripped` has one of the three known-safe plaintext prefixes —
+/// a bare prefix check, nothing more. This alone is **not** what decides
+/// whether a *raw* id may persist in the clear; see
+/// [`raw_id_proves_a_known_safe_shape`] for that stricter question and why
+/// the two are different functions rather than one.
 ///
-/// Exactly three prefixes qualify, and the reasoning is the same for all
-/// three: the part of the id that would identify *what the user typed or
-/// looked at* has already been removed by the time this is checked.
-///
-/// - `app:<rest>` — a desktop-entry id. `<rest>` names which `.desktop` file
-///   matched, not anything the user entered; the set of possible values is
-///   exactly what is installed on the system, which is not secret and is
-///   not authored by this user's input.
-/// - `utility:<kind>` and `web-search:<service>` — by construction the only
-///   two shapes [`canonicalize_result_id`] ever *produces* by stripping
-///   (every other input it returns unchanged), so reaching this function
-///   with one of these two prefixes means the payload is already gone.
-///
-/// A prefix check rather than a full-shape parse, deliberately: checking
-/// only the prefix is what makes the partition provable by construction
-/// (see [`persistence_key`]) without this function needing to agree with
-/// [`canonicalize_result_id`] about every character after the colon.
+/// What this *is* for: recognizing a string already sitting in
+/// `global_frequency` — on disk, or freshly re-keyed — as already being in
+/// one of the three final plaintext shapes, so [`rekeyed_global_frequency`]
+/// can leave it alone rather than running it back through
+/// [`persistence_key`]. By the time a key reaches that check, whatever
+/// stripping was ever going to happen already has: `record` only ever
+/// writes `app:<rest>` unchanged or the *output* of
+/// [`canonicalize_result_id`] for `utility:`/`web-search:`, never a raw
+/// unstripped payload — a bare prefix check is exactly right for a value
+/// with that provenance, unlike for a raw id fresh off a provider, where
+/// the prefix alone cannot tell a stripped kind from a payload that merely
+/// looks like one (see [`raw_id_proves_a_known_safe_shape`]).
 fn is_known_safe_shape(stripped: &str) -> bool {
     stripped.starts_with("app:")
         || stripped.starts_with("utility:")
         || stripped.starts_with("web-search:")
+}
+
+/// Whether `raw_id` — as it arrived, before any stripping — proves it is
+/// safe for [`persistence_key`] to persist in the clear. This is the check
+/// that runs on the *record* path, over the raw id a provider minted, and
+/// it is stricter than [`is_known_safe_shape`]'s bare prefix check on
+/// purpose.
+///
+/// - `app:<rest>` — a desktop-entry id, unconditionally. `<rest>` names
+///   which `.desktop` file matched, not anything the user entered; the set
+///   of possible values is exactly what is installed on the system, which
+///   is not secret and is not authored by this user's input.
+///   [`canonicalize_result_id`] never touches an `app:` id, so there is no
+///   stripping step to prove here.
+/// - `utility:<kind>` and `web-search:<service>` — safe **only when a
+///   payload was actually stripped**, which means the raw id carried a
+///   *second* colon after the prefix: `utility:<kind>:<payload>`, not bare
+///   `utility:<kind>`. [`canonicalize_result_id`] returns
+///   `format!("utility:{kind}")` whenever the segment right after the
+///   prefix is non-empty, whether or not anything followed it — so a raw
+///   `utility:2+2` (one segment, no payload to strip) and the *result* of
+///   stripping `utility:calculator:2+2` down to `utility:calculator` are
+///   not distinguishable from the stripped string alone: both are
+///   `"utility:<word>"`-shaped, plausible-kind strings. A prefix check on
+///   the stripped output, on its own, cannot tell "a kind was isolated from
+///   a payload" from "the whole raw id happened to already look like
+///   one" — and the second case is exactly a provider minting
+///   `utility:<raw user content>` with no second colon, which is the
+///   payload Decision 2 exists to hash. Requiring the second colon on the
+///   *raw* id is what makes "a payload was stripped" a checked fact rather
+///   than an inference from what the output looks like. Fail-closed on the
+///   ambiguous case: a single-segment `utility:X` is not provably a kind,
+///   so it hashes rather than persisting in the clear.
+///
+/// No `Kind::Utility` provider exists in this tree today, and `calc:`
+/// already hashes regardless (it matches neither prefix), so the gap this
+/// closes was dormant rather than exploited — but the guarantee has to hold
+/// for a provider this code has never seen, which is the whole point of a
+/// *known-safe* shape rather than a *trusted* one.
+///
+/// # Why this is not also what [`rekeyed_global_frequency`] uses
+///
+/// This function needs the *raw* id to do its job — the second-colon
+/// evidence lives only there, and stripping destroys it. A key already
+/// sitting in `global_frequency` — on disk, or read back mid-re-key — is
+/// never that raw id; it is either a hash or [`canonicalize_result_id`]'s
+/// *output*, and running this check against an output that this module
+/// itself already reduced to `utility:<kind>` would find no second colon
+/// (there is nothing left to strip) and wrongly hash a key that was already
+/// safe. [`is_known_safe_shape`]'s plain prefix check is what
+/// [`rekeyed_global_frequency`] uses instead, and its own doc comment says
+/// why that is the right check for a value with that provenance.
+fn raw_id_proves_a_known_safe_shape(raw_id: &str) -> bool {
+    if raw_id.starts_with("app:") {
+        return true;
+    }
+    for prefix in ["utility:", "web-search:"] {
+        if let Some(tail) = raw_id.strip_prefix(prefix) {
+            let kind = tail.split(':').next().unwrap_or_default();
+            // `tail.len() > kind.len()` is true exactly when there is a
+            // byte at `tail[kind.len()]`, and `split(':').next()` only
+            // stops short of the whole tail at a `:` — so this is "a
+            // second colon followed the kind," i.e. a real payload was
+            // there to strip, not "the kind happens to be short."
+            if !kind.is_empty() && tail.len() > kind.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether `stripped` is already exactly the shape [`persistence_key`]'s
@@ -808,15 +876,18 @@ fn is_already_a_persistence_hash(stripped: &str) -> bool {
 ///
 /// 1. Strip a dynamic payload with [`canonicalize_result_id`] — unchanged
 ///    from before this existed, and still the only step some ids need.
-/// 2. If the stripped id is a [`is_known_safe_shape`] — `app:`, `utility:`
-///    or `web-search:` — persist that string, in the clear.
-/// 3. Otherwise — `calc:` included, every id a provider this code has never
-///    heard of mints, **and an id that already begins `sha256:`** — persist
-///    `sha256:` followed by the lowercase hex SHA-256 digest of `raw_id`
-///    **as it arrived**, not the stripped form. Hashing the raw id rather
-///    than the stripped one matters for exactly the ids that reach this
-///    branch: nothing has stripped their payload, so the payload is what
-///    gets hashed away.
+/// 2. If the *raw* id is [`is_known_safe_shape`] — `app:`, or `utility:`/
+///    `web-search:` with a payload actually stripped (see that function's
+///    doc comment for why the check runs against the raw id and not the
+///    stripped one) — persist the stripped string, in the clear.
+/// 3. Otherwise — `calc:`, a single-segment `utility:X`/`web-search:X` with
+///    no payload to prove it apart from the rest of the id, every id a
+///    provider this code has never heard of mints, and an id that already
+///    begins `sha256:` — persist `sha256:` followed by the lowercase hex
+///    SHA-256 digest of `raw_id` **as it arrived**, not the stripped form.
+///    Hashing the raw id rather than the stripped one matters for exactly
+///    the ids that reach this branch: nothing has stripped their payload,
+///    so the payload is what gets hashed away.
 ///
 /// This function is total in the sense the brief asks for: there is no id
 /// for which it returns its input unchanged except a known-safe shape. An
@@ -839,12 +910,13 @@ fn is_already_a_persistence_hash(stripped: &str) -> bool {
 /// `if`/`else`. So a plaintext key and a hashed key can never collide on
 /// the same string: doing so would require a plaintext key to begin
 /// `sha256:`, which [`is_known_safe_shape`] does not allow through branch
-/// 2, or a hashed key to begin one of the other three prefixes, which
-/// branch 3 never produces (SHA-256 hex never starts with a
-/// colon-terminated word). An id that itself begins `sha256:` — one already
-/// in this format, or one crafted to look like it — is not a known-safe
-/// shape, so it falls to branch 3 and is hashed again, never written
-/// through as though it were already a persistence key.
+/// 2 (a raw id already spelled `sha256:...` has no second colon proving a
+/// stripped payload, so it does not qualify), or a hashed key to begin one
+/// of the other three prefixes, which branch 3 never produces (SHA-256 hex
+/// never starts with a colon-terminated word). An id that itself begins
+/// `sha256:` — one already in this format, or one crafted to look like it —
+/// is not a known-safe shape, so it falls to branch 3 and is hashed again,
+/// never written through as though it were already a persistence key.
 ///
 /// # What the hash is not
 ///
@@ -859,7 +931,7 @@ fn is_already_a_persistence_hash(stripped: &str) -> bool {
 /// explicitly not this function's job.
 fn persistence_key(raw_id: &str) -> String {
     let stripped = canonicalize_result_id(raw_id);
-    if is_known_safe_shape(&stripped) {
+    if raw_id_proves_a_known_safe_shape(raw_id) {
         stripped
     } else {
         format!("sha256:{:x}", Sha256::digest(raw_id.as_bytes()))
@@ -880,41 +952,83 @@ fn persistence_key(raw_id: &str) -> String {
 ///
 /// # Why this does not simply call `persistence_key` on every key
 ///
-/// [`persistence_key`] hashes an id shaped `sha256:` + 64 lowercase hex
-/// like any other unrecognized id (see its own doc comment) — which is
-/// correct for a *raw* id arriving at `record`, but wrong for a key already
-/// sitting in `global_frequency` on disk: that key may well be exactly
-/// [`persistence_key`]'s own prior output for some raw id, since a store
-/// this module saved is nothing but such keys. Re-keying it again would
-/// hash the *string* `"sha256:<64 hex>"`, landing on a different key than a
-/// fresh `persistence_key` call over the original raw id computes — so
-/// `frequency_boost`'s lookup, which always calls [`persistence_key`]
-/// directly on the raw id, would never find the entry again after its
-/// *first* post-save load. Every hashed provider's learning would die not
-/// on some later restart but on the very next one.
-/// `a_hashed_ids_learning_survives_a_save_and_load_round_trip` pins the fix:
-/// a key already shaped like this module's own hash
-/// ([`is_already_a_persistence_hash`]) is left exactly as it is here,
-/// rather than being run through [`persistence_key`] a second time.
+/// [`persistence_key`] answers a different question than this pass needs
+/// answered, and answering the wrong one here is actively wrong rather than
+/// merely redundant, for two separate shapes of stored key:
+///
+/// - A key shaped `sha256:` + 64 lowercase hex. [`persistence_key`] hashes
+///   an id in this shape like any other unrecognized id (see its own doc
+///   comment) — correct for a *raw* id arriving at `record`, but wrong for
+///   a key already sitting in `global_frequency` on disk: that key may well
+///   be exactly [`persistence_key`]'s own prior output for some raw id,
+///   since a store this module saved is nothing but such keys. Re-keying it
+///   again would hash the *string* `"sha256:<64 hex>"`, landing on a
+///   different key than a fresh `persistence_key` call over the original
+///   raw id computes — so `frequency_boost`'s lookup, which always calls
+///   [`persistence_key`] directly on the raw id, would never find the entry
+///   again after its *first* post-save load. Every hashed provider's
+///   learning would die not on some later restart but on the very next
+///   one. `a_hashed_ids_learning_survives_a_save_and_load_round_trip` pins
+///   the fix: a key already shaped like this module's own hash
+///   ([`is_already_a_persistence_hash`]) is left exactly as it is here,
+///   rather than being run through [`persistence_key`] a second time.
+/// - A key already shaped `app:`/`utility:`/`web-search:`.
+///   [`persistence_key`] calls [`raw_id_proves_a_known_safe_shape`], which
+///   needs the *raw* id's second colon as evidence that
+///   [`canonicalize_result_id`] actually stripped a payload (see that
+///   function's doc comment for the full reasoning — this is issue #39's
+///   fix for a review finding on the shape rule itself). A key already
+///   sitting in `global_frequency` is never that raw id; it is
+///   [`canonicalize_result_id`]'s *output*, which by definition has no
+///   payload left to prove was there — `web-search:duckduckgo` has no
+///   second colon whether it came from stripping
+///   `web-search:duckduckgo:<payload>` or was never anything but exactly
+///   that. Calling [`raw_id_proves_a_known_safe_shape`] on it would find no
+///   evidence and hash a key that was already safely in the clear, breaking
+///   the ordinary round trip for every genuinely-stripped `utility:`/
+///   `web-search:` entry the moment it survives one save and load. But a
+///   bare prefix check ([`is_known_safe_shape`]) is not enough on its own
+///   either: it cannot tell `web-search:duckduckgo` (already reduced,
+///   nothing left to strip) apart from `web-search:duckduckgo:<payload>`
+///   (still carrying one, and in genuine need of
+///   [`canonicalize_result_id`]) — both start with `web-search:`. The
+///   second colon that settles it either way is exactly what
+///   [`raw_id_proves_a_known_safe_shape`] already checks, so
+///   [`stored_key_needs_no_rekeying`] combines the two: a bare-prefix match
+///   with **no** second colon is accepted as already settled, one **with**
+///   a second colon still needs the full [`persistence_key`] treatment.
 ///
 /// # The one case this cannot resolve, and is not trying to
 ///
-/// A key shaped `sha256:` + 64 lowercase hex in the file is treated as
-/// already a persistence key — but nothing on load can actually prove that.
-/// A *legacy* v1 store predating issue #39 could contain a genuine plaintext
-/// id that happens to have exactly this shape (a provider that, however
-/// implausibly, minted one), and this pass would leave it exactly as
-/// written rather than hashing it — the one id in a legacy store that would
-/// escape the migration every other legacy entry gets. Telling the two
-/// apart would need a marker this format does not carry: `STORE_VERSION`
-/// stays at 1 (issue #38 refuses a version mismatch in either direction
-/// rather than migrating across it, so bumping it would discard every
-/// existing store instead of converting this one case), and nothing else in
-/// a `PersistedLearningStore` says which hop version wrote a given key. This
-/// is accepted as the shape of the problem, not a gap to close here: no
-/// provider in this tree mints ids that way, and an id that did would be a
-/// fixed-width opaque token carrying no payload hashing would have hidden
-/// regardless.
+/// Both of the checks above accept a stored key on trust once it has the
+/// right *shape*, and neither can prove how that shape came to be. A
+/// *legacy* store — v1 predating issue #39's fix for the finding above, or
+/// simply not this module's own output — could contain a genuine plaintext
+/// id that happens to already have one of these shapes:
+///
+/// - `sha256:` + 64 lowercase hex, from a provider that, however
+///   implausibly, minted one (see [`is_already_a_persistence_hash`]'s call
+///   site above).
+/// - A single-segment `utility:X` or `web-search:X` written by an older
+///   version of this same module, which had exactly the ambiguity
+///   [`raw_id_proves_a_known_safe_shape`] now closes on the record path —
+///   or written by any other code that never checked at all.
+///
+/// Either way, this pass leaves the entry exactly as written rather than
+/// hashing it — the one shape of id in a legacy store that escapes the
+/// migration every other legacy entry gets. Telling a genuine instance of
+/// either shape apart from a merely coincidental one would need a marker
+/// this format does not carry: `STORE_VERSION` stays at 1 (issue #38
+/// refuses a version mismatch in either direction rather than migrating
+/// across it, so bumping it would discard every existing store instead of
+/// converting this one case), and nothing else in a
+/// `PersistedLearningStore` says which hop version — or which check — wrote
+/// a given key. This is accepted as the shape of the problem, not a gap to
+/// close here: no provider in this tree mints ids either way, and an id
+/// that did would be a fixed-width opaque token (the hash case) or would
+/// have to collide with a real `.desktop`-adjacent kind name from a
+/// nonexistent `Kind::Utility` provider (the `utility:`/`web-search:`
+/// case) — neither carries a payload hashing would have hidden regardless.
 ///
 /// # The merge itself
 ///
@@ -936,12 +1050,46 @@ fn persistence_key(raw_id: &str) -> String {
 /// keyed by raw id in memory while a reload keyed it by hash, silently
 /// breaking every hashed provider's learning. See [`Learning::record`] and
 /// [`Learning::purge_and_bound`] for the two ends of where that moved to.
+/// Whether a key already sitting in `global_frequency` (on disk, or mid
+/// re-key) is already in its final persisted form, so
+/// [`rekeyed_global_frequency`] can skip [`persistence_key`] for it
+/// entirely — see that function's doc comment for the full reasoning this
+/// implements.
+///
+/// Three cases, checked in order:
+///
+/// 1. Already shaped like this module's own hash
+///    ([`is_already_a_persistence_hash`]) — settled.
+/// 2. Not one of the three known-safe prefixes at all
+///    ([`is_known_safe_shape`]) — not settled; some other raw or legacy id
+///    (`calc:2+2`, an unknown provider's id, …) that needs the full
+///    [`persistence_key`] treatment.
+/// 3. One of the three prefixes, and it is `app:` — settled
+///    unconditionally, since [`canonicalize_result_id`] never touches an
+///    `app:` id and there is nothing further to check.
+/// 4. `utility:`/`web-search:` — settled only if
+///    [`raw_id_proves_a_known_safe_shape`] finds **no** second colon. A
+///    second colon here means the stored string is not actually a settled
+///    `utility:<kind>`/`web-search:<service>` key at all, but a raw,
+///    never-stripped id that happens to carry that prefix — a hand-written
+///    or otherwise malformed store's `utility:calculator:2+2`, say — and
+///    must be routed through [`persistence_key`] instead of trusted as-is.
+fn stored_key_needs_no_rekeying(id: &str) -> bool {
+    if is_already_a_persistence_hash(id) {
+        return true;
+    }
+    if !is_known_safe_shape(id) {
+        return false;
+    }
+    id.starts_with("app:") || !raw_id_proves_a_known_safe_shape(id)
+}
+
 fn rekeyed_global_frequency(
     input: &HashMap<String, LearningEntry>,
 ) -> HashMap<String, LearningEntry> {
     let mut out: HashMap<String, LearningEntry> = HashMap::new();
     for (id, entry) in input {
-        let key = if is_already_a_persistence_hash(id) {
+        let key = if stored_key_needs_no_rekeying(id) {
             id.clone()
         } else {
             persistence_key(id)
@@ -3833,6 +3981,48 @@ mod tests {
         }
     }
 
+    // Whole-branch review finding: `canonicalize_result_id` only strips a
+    // payload when a *second* colon is present. For a single-segment
+    // `utility:2+2` or `web-search:secretquery`, the kind and the payload
+    // collapse into one field, nothing is stripped, and a bare prefix check
+    // would have accepted the unstripped id as "already safe" — persisting
+    // exactly the payload Decision 2 exists to hash. Both shapes must hash
+    // instead, fail-closed, and — the point of the pin — must not appear
+    // verbatim in the written file's bytes. Contrast
+    // `canonicalizes_dynamic_result_ids_for_persistence` below, where a
+    // genuine second colon *does* prove a payload was stripped and the
+    // `utility:<kind>`/`web-search:<service>` form persists in the clear.
+    #[test]
+    fn a_single_segment_utility_or_web_search_id_hashes_rather_than_persisting_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let mut store = Learning::load(&path);
+
+        store.record_launch("2+2", &ItemId::new("utility:2+2").unwrap());
+        store.record_launch(
+            "secretquery",
+            &ItemId::new("web-search:secretquery").unwrap(),
+        );
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains("utility:2+2"),
+            "a single-segment utility: id has no proven kind and must not persist \
+             verbatim, got: {saved}"
+        );
+        assert!(
+            !saved.contains("web-search:secretquery"),
+            "a single-segment web-search: id has no proven service and must not persist \
+             verbatim, got: {saved}"
+        );
+        assert_eq!(
+            saved.matches("sha256:").count(),
+            2,
+            "both ids must be hashed instead, got: {saved}"
+        );
+    }
+
     // The persisted bytes, not the in-memory map: a `calc:` id carries the
     // raw expression the user typed, and this is the leak issue #39 exists
     // to close (`crates/hopd/src/calculator.rs` mints these ids from routed
@@ -4039,6 +4229,45 @@ mod tests {
         assert!(
             !saved.contains("calc:2+2"),
             "the legacy plaintext key must not be re-persisted verbatim, got: {saved}"
+        );
+    }
+
+    // Review coverage gap: a legacy plaintext entry re-keyed on load, and
+    // then the *same* raw id launched again in the new session, must land on
+    // the one entry `record`'s own persistence-key insert already re-keyed
+    // it to — not a second, parallel entry that only merges on some later
+    // load. Both paths (load's `rekeyed_global_frequency` and `record`'s
+    // `persistence_key` insert) are guaranteed to compute the same key by
+    // construction, since both call `persistence_key` over the same raw id,
+    // but nothing before this exercised a load immediately followed by new
+    // activity on the same id in one running process.
+    #[test]
+    fn a_legacy_entry_rekeyed_on_load_and_relaunched_in_the_same_session_is_one_entry_not_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let now = now_ms();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{STORE_VERSION},"global_frequency":{{"calc:2+2":{{"count":7,"last_ms":{now}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let mut loaded = Learning::load(&path);
+        loaded.record_launch("2+2", &ItemId::new("calc:2+2").unwrap());
+
+        assert_eq!(
+            loaded.global_frequency.len(),
+            1,
+            "the re-keyed legacy entry and the freshly recorded launch of the same raw \
+             id must be one entry, not two"
+        );
+        let key = format!("sha256:{:x}", Sha256::digest(b"calc:2+2"));
+        assert_eq!(
+            loaded.global_frequency.get(&key).map(|e| e.count),
+            Some(8),
+            "the count must reflect both the migrated legacy launch and the new one"
         );
     }
 
