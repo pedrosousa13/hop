@@ -3,7 +3,7 @@
 Date: 2026-08-02
 Issue: [#53](https://github.com/pedrosousa13/hop/issues/53)
 Milestone: M2 — Daemon
-Status: Recorded; amended 2026-08-04
+Status: Recorded; amended 2026-08-04, 2026-08-06, 2026-08-10
 Decisions by: Pedro Sousa
 
 Two design forks are settled here —
@@ -42,6 +42,80 @@ boundary in full to the M2 OWASP sweep; none of these four changes model it
 beyond correcting what was said. Each change is marked **[Amended
 2026-08-04]** in place.
 
+**Amendment, 2026-08-06.** T3's row picked up an inline note — "amended
+2026-08-06 for #103's replace-frame assembly" — when issue #103 replaced the
+daemon's accumulate-across-frames model with the replace-frame rule, but no
+`Amendment,` block was written for it and the `Status:` line above was never
+updated to carry the date. That is the same lapse issue #102 was filed to
+fix, one slice earlier than the commits it names. This entry exists so the
+convention's own record is honest about it: T3's row is correct as written,
+and it stands as this date's amendment on its own account, folded into the
+2026-08-10 entry below because it was never given one of its own at the time.
+
+**Amendment, 2026-08-10.** Issue #102's audit, covering everything #55's
+landing (2026-08-04's amendment) did not reach and the 2026-08-06 lapse just
+above, plus the two sites #99 named that #102 had not yet reached when this
+entry was first written. Three kinds of change, in three passes.
+
+First, a sweep corrected drifted `file.rs:NN` references throughout — mostly
+in `wire.rs`, whose module doc grew a "Where peer trust comes from" section
+that pushed everything below it down, and in `limits.rs`, `content.rs`,
+`learning.rs`, `provider.rs`, `pipeline.rs` and `lib.rs`, all of which grew
+substantially over M2's slices. These are pure pointer maintenance — no
+claim changed, only where to find the thing it was always claiming — so each
+is corrected in place and marked `[Amended 2026-08-10]` without further
+comment. The full before/after list is in this issue's closing report rather
+than repeated here.
+
+Second, six sites stated a claim that later code falsified outright: the
+"Entry points that are not frames" bullets on the length prefix ("No codec
+and no byte cap exist (#21)"), the connection itself ("no accept loop
+exists... they belong to #54 and #55" — the exact sentence #55 was raised to
+correct, corrected in T13 and in "What this model does not cover" but left
+standing here), the socket path and socket activation (both written
+forward-looking); "The boundary"'s opening ("Neither the directory nor the
+socket is created by any code in the workspace yet"); and "Exposure paths
+off the machine"'s diagnostics-bundle bullet ("no CLI crate exists," which
+also self-contradicted the document's own Actors table and Decision 1). A
+threat model is a record of an analysis made at a point in time, and
+rewriting a falsified claim destroys the record of what the model was drawn
+against — so none of these six were rewritten. Each keeps its original
+wording and gets a `[Amended 2026-08-10]` annotation immediately after,
+naming what has since landed and the commit, in the shape the learning-store
+section already uses for `96d5713`/`59fd5fe`/`056893e`/`edb8258`: #21 and #54
+by the same commit, `ac782c7` (the walking skeleton PR built the frame codec
+and cap alongside the accept loop and socket handling); #62 by `294836b`.
+
+Third, the same treatment applies to every place a claim changed for reasons
+other than pointer drift: the Assets table's "Exists today?" column for
+action execution, the item stream, the learning store and the daemon's
+availability (#57 `da5f65f`, #58 `3b53a7a`, #60 `6ef926d`, #54/#62 above);
+the query-text asset row, the "No audit trail" bullet, T9, and the #83
+Follow-up row, all of which described `RoutedQuery.term` as an unredacted
+plain `String` with #83 open (#83 closed by `8bd6550`, giving `RoutedText`
+the same redacting shape `QueryText` has); T5, T6, Decision 1's "not settled"
+paragraph, and the #59/#85 Follow-up rows, which posed "distinguishable from
+one the daemon never emitted" as open (#59 closed by `4c1aff4`, and settled
+it by ruling the two are *not* worth distinguishing — the opposite of what
+this document expected, which the annotations say plainly); Decision 1's
+byte-figure paragraph and the #55/#56 Follow-up rows, which charged issue
+#30 with the field-length gap (#30 closed by `80b7ffd`, via
+`CheckedItems::check`'s `FailedCheck::FieldTooLong`); T7 (#61 also closed by
+`80b7ffd`, whose same PR introduced `rank.rs`'s `MAX_TERM_CHARS` truncation;
+#46 closed separately, by `85b4c2f`, which turned that truncation into a
+configurable knob and added `hopd`'s loader enforcement); and Decision 2's "Where today's
+code stands" bullet on provider ids (same `da5f65f`/`3b53a7a`). The "No audit
+trail" bullet also named #34 as open; #34 is closed (`ad038d5`), but for the
+provider seam's own logging, a different crossing from the one that bullet
+is about. Every one of these keeps its original claim intact and carries the
+annotation after it, not instead of it — including where the claim was only
+partly falsified, the same way #85's residual is carried past #59's landing.
+
+This document's remaining residual findings — #25, #34's provider-seam
+descendants, #72, #78, #85's wire-signal half, #88, #93, #98, #104 — are
+unchanged by this pass: closing a stale note is not the same claim as
+closing a gap, and nothing here asserts the latter where the code does not.
+
 ---
 
 ## What this is
@@ -71,8 +145,8 @@ and `hop-core` (`Cargo.toml`, `[workspace] members`). There is no `hopd`, no
 | --- | --- | --- |
 | Does any code open a socket? | `grep -rn "UnixListener\|UnixStream\|tokio::net" crates/` | No hits. `tokio`'s workspace features are `sync`, `time`, `macros`, `rt` — `net` is not among them. |
 | Does any code compute the runtime-dir path? | `grep -rn "XDG_RUNTIME_DIR" crates/` | No hits. |
-| Does any code spawn a process? | `grep -rn "Command::new" crates/` | Two hits, both `std::process::Command::new("mkfifo")` inside `learning.rs`'s `#[cfg(test)]` module (which begins at `learning.rs`:1704). No non-test code spawns anything. |
-| Is there a frame codec or a frame-size cap? | `grep -rn "FRAME" crates/hop-protocol/src/` | Matches outside doc prose are `MAX_ITEMS_PER_RESULTS_FRAME` and its uses — an item-count bound, not a byte cap. [#21](https://github.com/pedrosousa13/hop/issues/21) is open. |
+| Does any code spawn a process? | `grep -rn "Command::new" crates/` | Two hits, both `std::process::Command::new("mkfifo")` inside `learning.rs`'s `#[cfg(test)]` module (which begins at `learning.rs`:1704, now `learning.rs`:1717 [Amended 2026-08-10]). No non-test code spawns anything. |
+| Is there a frame codec or a frame-size cap? | `grep -rn "FRAME" crates/hop-protocol/src/` | Matches outside doc prose are `MAX_ITEMS_PER_RESULTS_FRAME` and its uses — an item-count bound, not a byte cap. [#21](https://github.com/pedrosousa13/hop/issues/21) is open. **[Amended 2026-08-10]** #21 is now **closed** (`ac782c7`) — `hop-protocol`'s `framing` module and `MAX_FRAME_BYTES` answer this; see "Entry points that are not frames". |
 | Is a peer credential consulted? | `grep -rni "peercred\|peer_cred" .` over `.rs`, `.md`, `.toml` | No hits outside this document. |
 | Is there a logging seam? | `tracing`/`log` in either crate's `Cargo.toml` | Neither is a dependency. The full list, so the claim is checkable rather than gestured at: `hop-protocol` takes `serde`, `serde_json`, `thiserror` and, under `[target.'cfg(unix)'.dependencies]`, `libc` — for the `O_NONBLOCK` flag on `IconPath::open_regular_file` — plus `tempfile` as a dev-dependency. `hop-core` takes those same three, `hop-protocol` itself, `nucleo-matcher`, `regex` and `tokio` (`sync`, `time`, `macros`, `rt`), plus `tempfile`. No logging crate is among them. |
 | Does `hop doctor` exist? | `grep -rn "doctor" --include=*.rs .` | No hits. It is specified (§9, §11) and not implemented. |
@@ -90,11 +164,17 @@ Persistent connections carrying length-prefixed JSON frames.
 
 Neither the directory nor the socket is created by any code in the workspace
 yet. Three properties of the boundary are therefore *design intent* at this
-point, and #54 is where they become behaviour:
+point, and #54 is where they become behaviour. **[Amended 2026-08-10]** #54
+is now **closed** (`ac782c7`): `crates/hopd/src/runtime_dir.rs` and
+`server.rs` create both — the directory at 0700, the socket at 0600 — so the
+three properties below are behaviour rather than intent. The bullets are left
+as written, since they still name the file that carries each rule correctly;
+only the "yet" above and the "should decide" below are what landed since.
 
 - **The directory's mode.** 0700 withholds traverse permission from other
   uids. There is an in-repo precedent for creating it correctly:
-  `learning.rs`'s `persist_atomically` (crates/hop-core/src/learning.rs:1491–1559)
+  `learning.rs`'s `persist_atomically`
+  (crates/hop-core/src/learning.rs:1504–1572 [Amended 2026-08-10])
   passes the mode as an argument to `mkdir(2)` through `fs::DirBuilder`, so the
   directory is born at 0700 with no window at a wider mode to race, and a
   pre-existing path is left as found rather than chmodded. The same reasoning
@@ -104,11 +184,13 @@ point, and #54 is where they become behaviour:
   directory *and* write on the socket, so the directory carries the control
   as designed — but leaving the socket's mode unstated means it will be
   whatever the umask makes it. #54 should decide it rather than inherit it.
+  **[Amended 2026-08-10]** It did: `acquire_listener` (`server.rs`, `ac782c7`)
+  narrows the socket to 0600 with `set_permissions` right after `bind`.
 - **`$XDG_RUNTIME_DIR` is an environment variable the user controls.** It is
   0700 and user-owned on a systemd session, which is the case the spec
   assumes; it is not a guarantee the daemon can make about a value handed to
   it. This is the same shape as the reasoning already written down in
-  `learning.rs`:1493–1501 about `XDG_STATE_HOME` — a path derived from
+  `learning.rs`:1506–1514 [Amended 2026-08-10] about `XDG_STATE_HOME` — a path derived from
   user-controlled environment is not a path the process can reason about
   unaided.
 
@@ -121,12 +203,12 @@ would be worst to lose.
 
 | Asset | What it is | Where it lives | Exists today? |
 | --- | --- | --- | --- |
-| **Action execution** | The daemon acts on the user's behalf: launching applications, focusing and closing windows, opening URLs. This is the asset that makes the boundary worth modelling. | Spec §5's provider table; `ExecOutcome` in `wire.rs`:102–110 | No. No provider is implemented and no code spawns a process. |
-| **The item stream** | Titles, subtitles, icon paths and ids describing the user's installed applications, open windows and — from M5 — files. The items a query answers with are a description of the user's machine. | `Item` in `item.rs`:242–302 | The type exists; nothing produces real items. |
-| **Query text** | Keystrokes typed into the launcher overlay, which can be a pasted credential. | `QueryText` in `redaction.rs`:136–138 on the wire; the same text again as `RoutedQuery.term`, a plain `String`, once `hop-core` has routed it (`router.rs`:257–258) | Both types exist. Only the first redacts — see T9 and [#83](https://github.com/pedrosousa13/hop/issues/83). |
-| **The learning store** | Per-item launch frequency, persisted. Reveals what the user launches and, through ids, what they launch it *on*. | `$XDG_STATE_HOME/hop/learning.json`, mode 0600, 90-day retention (`learning.rs`) | The store exists; no code computes its path yet ([#60](https://github.com/pedrosousa13/hop/issues/60)). |
+| **Action execution** | The daemon acts on the user's behalf: launching applications, focusing and closing windows, opening URLs. This is the asset that makes the boundary worth modelling. | Spec §5's provider table; `ExecOutcome` in `wire.rs`:320–328 [Amended 2026-08-10] | No. No provider is implemented and no code spawns a process. **[Amended 2026-08-10]** #57 (`da5f65f`) and #58 (`3b53a7a`) are closed: the apps provider launches applications via `std::process::Command`, and the calculator provider answers real queries; window focus/close is not yet a provider. |
+| **The item stream** | Titles, subtitles, icon paths and ids describing the user's installed applications, open windows and — from M5 — files. The items a query answers with are a description of the user's machine. | `Item` in `item.rs`:242–302 | The type exists; nothing produces real items. **[Amended 2026-08-10]** #57 and #58 (`da5f65f`, `3b53a7a`) are closed: the apps and calculator providers now produce real items from the user's machine; windows and files remain unimplemented. |
+| **Query text** | Keystrokes typed into the launcher overlay, which can be a pasted credential. | `QueryText` in `redaction.rs`:136–138 on the wire; the same text again as `RoutedQuery.term`, a plain `String`, once `hop-core` has routed it (`router.rs`:257–258) | Both types exist. Only the first redacts — see T9 and #83. **[Amended 2026-08-10]** #83 (`8bd6550`) is closed: `RoutedQuery.term`/`raw` are now `RoutedText` (`router.rs`:378–393), which redacts under `Debug` the same way `QueryText` does — see T9. |
+| **The learning store** | Per-item launch frequency, persisted. Reveals what the user launches and, through ids, what they launch it *on*. | `$XDG_STATE_HOME/hop/learning.json`, mode 0600, 90-day retention (`learning.rs`) | The store exists; no code computes its path yet ([#60](https://github.com/pedrosousa13/hop/issues/60)). **[Amended 2026-08-10]** #60 (`6ef926d`) is closed: `hopd/src/state_dir.rs` computes the real path and `HostSource::record_launch` persists to it. |
 | **The client's clipboard and URL handler** | `ExecOutcome::CopyText` and `ExecOutcome::OpenUrl` are instructions to a client, not reports. | `content.rs` | Types and content rules exist; no client. |
-| **The daemon's availability** | A resident, socket-activated process the user's launcher depends on. Losing it loses the launcher. | Spec §3, [#62](https://github.com/pedrosousa13/hop/issues/62) | No. |
+| **The daemon's availability** | A resident, socket-activated process the user's launcher depends on. Losing it loses the launcher. | Spec §3, [#62](https://github.com/pedrosousa13/hop/issues/62) | No. **[Amended 2026-08-10]** #54 and #62 (`ac782c7`, `294836b`) are closed: `hopd` is a resident accept loop (`server.rs`) startable standalone or via systemd socket activation. |
 | **Provider-held state** | From M5, network providers hold cached rates, geocoded locations, and the endpoints they talk to. | Spec §5 | No. A10 (SSRF) was recorded not-applicable by the M1 sweep for this reason and re-runs at M5. |
 
 Two things that are **not** behind this boundary, recorded so a later reader
@@ -144,8 +226,8 @@ anything on the network — no HTTP client is a dependency of either crate.
 | **Any other process running as the same uid** | Same path, same permissions. A shell script, a compromised application, an editor plugin, anything the user runs | The 0700 directory does not distinguish it from the real client. The protocol does not either — see the next section. |
 | **root**, and a process holding `CAP_DAC_OVERRIDE` | Directory mode does not apply | Nothing at this boundary. A root-equivalent adversary is outside the model. |
 | **A process that inherits an open descriptor** | Does not traverse the directory at all | Directory mode is checked at open, not per write. Whatever the daemon or a client passes on, it passes on. |
-| **The daemon, toward a client** | The reverse direction of the same socket | Bounds on `DaemonMsg`. `wire.rs`:59–64 states the reason: "A client trusts its daemon no more than the daemon trusts its clients." |
-| **A provider, in-process** | Not across the socket — but a provider supplies the values that cross it | **[Amended 2026-08-04]** `CheckedItems::check` (`pipeline.rs`:393) holds each item to the manifest of the provider that produced it, called through `ProviderHost::run_one` (`hop-core`'s `host.rs`, issue #56), which also compares the manifest it captured at registration against a fresh call before accepting a provider's answer, runs the provider under a host-enforced budget it aborts on a miss, contains a panicking provider's failure at the `tokio::spawn` seam, and bounds and strips a provider's error text before it can leave. `content.rs`:1–9 states the residual: "the daemon is trusted" degrades to "every installed provider is trusted". A further residual #56 left open, owned by issue #104: a panic *payload* still reaches the daemon's stderr through Rust's default panic hook, unsanitized, before the host's own failure classification runs. |
+| **The daemon, toward a client** | The reverse direction of the same socket | Bounds on `DaemonMsg`. `wire.rs`:135–140 [Amended 2026-08-10] states the reason: "A client trusts its daemon no more than the daemon trusts its clients." |
+| **A provider, in-process** | Not across the socket — but a provider supplies the values that cross it | **[Amended 2026-08-04, 2026-08-10]** `CheckedItems::check` (`pipeline.rs`:592) holds each item to the manifest of the provider that produced it, called through `ProviderHost::run_one` (`hop-core`'s `host.rs`, issue #56), which also compares the manifest it captured at registration against a fresh call before accepting a provider's answer, runs the provider under a host-enforced budget it aborts on a miss, contains a panicking provider's failure at the `tokio::spawn` seam, and bounds and strips a provider's error text before it can leave. `content.rs`:1–9 states the residual: "the daemon is trusted" degrades to "every installed provider is trusted". A further residual #56 left open, owned by issue #104: a panic *payload* still reaches the daemon's stderr through Rust's default panic hook, unsanitized, before the host's own failure classification runs. |
 | **A remote network actor** | No route today | Neither crate depends on an HTTP client, and nothing listens on a TCP socket. This changes at M5. |
 
 The row that matters is the second one. It is the boundary's actual shape: the
@@ -159,7 +241,7 @@ control is *which uid*, and there is no finer distinction available.
 
 | Frame | Fields | Enforced today, and where | Not enforced |
 | --- | --- | --- | --- |
-| `hello` | `api_version: u32` | Fixed-width integer; nothing to bound. `wire.rs`:33–35 | That it arrives first — nothing in the type requires it ([#26](https://github.com/pedrosousa13/hop/issues/26)) |
+| `hello` | `api_version: u32` | Fixed-width integer; nothing to bound. `wire.rs`:79 [Amended 2026-08-10] | That it arrives first — nothing in the type requires it ([#26](https://github.com/pedrosousa13/hop/issues/26)) |
 | `query` | `id: u64`, `text: QueryText` | `MAX_QUERY_TEXT` = 1 024 bytes, applied by `QueryText`'s `Deserialize` (`redaction.rs`:140–149) through its constructor (`redaction.rs`:167–171) | How many query frames arrive, and how fast — no read loop exists to bound either |
 | `cancel` | `id: u64` | Fixed-width | That the id names a live query |
 | `execute` | `query_id: u64`, `item_id: ItemId`, `action_id: ActionId` | Length bounds only — `MAX_ITEM_ID` = 4 096, `MAX_ACTION_ID` = 128 (`item.rs`:43–47, 86–90) | That the ids name anything the daemon delivered. This is [#25](https://github.com/pedrosousa13/hop/issues/25), settled below |
@@ -168,11 +250,11 @@ control is *which uid*, and there is no finer distinction available.
 
 | Frame | Fields | Enforced today, and where |
 | --- | --- | --- |
-| `hello_ack` | `api_version: u32` | Fixed-width. Negotiates no capability set (`wire.rs`:68–70) |
-| `results` | `query_id`, `partial: bool`, `items: Vec<Item>` | `MAX_ITEMS_PER_RESULTS_FRAME` = 1 000, applied at the parse (`limits.rs`:515–519) and refusing on the element past the maximum without reserving capacity for a peer-claimed length (`limits.rs`:300–316, 446–468) |
+| `hello_ack` | `api_version: u32` | Fixed-width. Negotiates no capability set (`wire.rs`:159–161 [Amended 2026-08-10]) |
+| `results` | `query_id`, `partial: bool`, `items: Vec<Item>` | `MAX_ITEMS_PER_RESULTS_FRAME` = 1 000, applied at the parse (`limits.rs`:738–742 [Amended 2026-08-10]) and refusing on the element past the maximum without reserving capacity for a peer-claimed length (`limits.rs`:659–690 [Amended 2026-08-10]) |
 | `query_done` | `query_id` | — |
 | `executed` | `query_id`, `outcome: ExecOutcome` | `CopyText` and `OpenUrl` are validating newtypes carrying content rules as well as bounds (`content.rs`) |
-| `error` | `query_id: Option<u64>`, `error: ProtoError` | `MAX_ERROR_MESSAGE` = 1 024 on the message (`limits.rs`:505–507) |
+| `error` | `query_id: Option<u64>`, `error: ProtoError` | `MAX_ERROR_MESSAGE` = 1 024 on the message (`limits.rs`:728–730 [Amended 2026-08-10]) |
 
 ### Entry points that are not frames
 
@@ -181,14 +263,41 @@ control is *which uid*, and there is no finer distinction available.
   ([#21](https://github.com/pedrosousa13/hop/issues/21)); #54's acceptance
   criteria require the cap to be a constant exported by `hop-protocol` and
   checked before any allocation sized by the prefix.
+  **[Amended 2026-08-10]** #21 and #54 are now **closed**, by the same
+  commit (`ac782c7`, the walking skeleton PR): `hop-protocol`'s `framing`
+  module is the codec, and `MAX_FRAME_BYTES` (`limits.rs`) is the byte cap,
+  applied by `framing::payload_len` — the pre-allocation gate — before a
+  caller reads or allocates the payload the prefix describes, and wired into
+  `hopd`'s `read_frame` (`connection.rs`), which calls it on every frame,
+  refusing a length prefix over the cap (`ErrorCode::FrameTooLarge`) on the
+  four prefix bytes alone, before this connection reads a byte of the
+  payload it names.
 - **The connection itself.** Accept rate, concurrent connection count and
   per-connection memory are unmodelled because no accept loop exists. They
   belong to #54 and #55.
+  **[Amended 2026-08-10]** #54 (`ac782c7`) is closed and built the accept
+  loop (`server.rs`'s `serve_with`). The three bounds remain unmodelled all
+  the same, and belong to [#98](https://github.com/pedrosousa13/hop/issues/98),
+  not #55 — see T13, which #55 already corrected to say this; this bullet was
+  the third, uncorrected site.
 - **The socket path.** Creating, binding to and unlinking a path inside a
   directory the daemon may not have created. #54.
+  **[Amended 2026-08-10]** #54 (`ac782c7`) is closed: `acquire_listener`
+  (`server.rs`) removes whatever sits at the socket path unconditionally
+  before binding — tolerating only `NotFound`, which is what makes
+  restarting after a crash work without a TOCTOU window or a
+  dangling-symlink blind spot — and narrows the socket file to 0600 with
+  `set_permissions` right after `bind`, decided rather than inherited from
+  the umask.
 - **Socket activation.** systemd passes a listening descriptor the daemon did
   not create ([#62](https://github.com/pedrosousa13/hop/issues/62)). The unit
   file's socket mode becomes part of the boundary at that point.
+  **[Amended 2026-08-10]** #62 (`294836b`) is closed: under activation,
+  `acquire_listener` takes the inherited descriptor directly and never
+  binds, removes or `chmod`s anything at the runtime dir; the socket's mode
+  (0600) and its directory's (0700) are carried instead by
+  `contrib/systemd/hopd.socket`'s `SocketMode=`/`DirectoryMode=`, pinned by
+  `server.rs`'s `systemd_unit_tests`.
 - **The learning store on disk.** Not a socket entry point, but untrusted
   input reaching the same process. The M1 sweep filed **four** gaps against
   this load path — [#37](https://github.com/pedrosousa13/hop/issues/37),
@@ -196,8 +305,8 @@ control is *which uid*, and there is no finer distinction available.
   [#43](https://github.com/pedrosousa13/hop/issues/43) and
   [#44](https://github.com/pedrosousa13/hop/issues/44) — and all four are now
   closed. The load is bounded and checked: `Learning::load`
-  (`learning.rs`:879–881), over `Learning::load_reporting`
-  (`learning.rs`:911–943), stats for a regular file before the open, reads
+  (`learning.rs`:892–894 [Amended 2026-08-10]), over `Learning::load_reporting`
+  (`learning.rs`:924–956 [Amended 2026-08-10]), stats for a regular file before the open, reads
   through `Read::take` against `MAX_STORE_BYTES` rather than trusting the
   file's reported length, drops keys over `MAX_ITEM_ID` after the parse and
   applies the entry cap to what was parsed (#37, **closed** by `96d5713`); it
@@ -220,7 +329,7 @@ control is *which uid*, and there is no finer distinction available.
     it left alone in the same breath: **eviction's preference for a
     future-dated entry**. #38's clamp did not close that half and `59fd5fe`
     says so outright — "`min` is monotonic, so it cannot change which honest
-    entry survives". `learning.rs`:855–878 prices it: a clamped entry is
+    entry survives". `learning.rs`:868–891 [Amended 2026-08-10] prices it: a clamped entry is
     stamped at the load instant, which makes it the newest stamp in the map
     and so the last one `evict_lru_map` drops, so a forged store still holds
     one of `MAX_GLOBAL_ENTRIES`' slots against real learning. What the clamp
@@ -243,9 +352,10 @@ That is not a summary of something the types express — it is a description of
 their silence, and the silence is checkable:
 
 - `ClientMsg::Hello` carries `api_version: u32` and no other field
-  (`wire.rs`:33–35). `DaemonMsg::HelloAck` carries `api_version: u32` and no
-  other field (`wire.rs`:68–70). Neither carries a credential, a token, a
-  nonce, or a peer identifier.
+  (`wire.rs`:79 [Amended 2026-08-10]). `DaemonMsg::HelloAck` carries
+  `api_version: u32` and no other field (`wire.rs`:159–161 [Amended
+  2026-08-10]). Neither carries a credential, a token, a nonce, or a peer
+  identifier.
 - Both are ordinary variants of the message enums rather than a distinct
   pre-session type, so nothing in the types prevents `execute` as a first
   frame. Whether that is refused depends on daemon-side state the protocol
@@ -254,8 +364,8 @@ their silence, and the silence is checkable:
   acceptance criterion.
 - `SO_PEERCRED` does not appear in the workspace's Rust, Markdown or TOML
   (checked by grep). There is no connection-handling code to consult it in.
-- `API_VERSION` (`lib.rs`:16) is a compatibility marker. It is not an
-  authorization value and nothing treats it as one.
+- `API_VERSION` (`lib.rs`:55 [Amended 2026-08-10]) is a compatibility marker.
+  It is not an authorization value and nothing treats it as one.
 
 ### What that means for everything below
 
@@ -273,9 +383,9 @@ is what puts the sentence above where a plugin-tier implementer will read it.
 ### Trust directions, stated
 
 - The daemon does not trust a client: `ClientMsg`'s fields are bounded at the
-  parse (`wire.rs`:10–29).
+  parse (`wire.rs`:39–58 [Amended 2026-08-10]).
 - A client does not trust the daemon: `DaemonMsg`'s fields are bounded for the
-  same reason (`wire.rs`:59–64).
+  same reason (`wire.rs`:135–140 [Amended 2026-08-10]).
 - The daemon does not fully trust a provider: `CheckedItems::check` holds each
   item to its own producer's manifest, and `CONTEXT.md` names what survives
   that check **checked items**. The residual is recorded in
@@ -292,9 +402,9 @@ on a stated baseline.
 
 **Size budget** (`limits.rs`). Enumerating the variable-length fields of
 `ClientMsg`, `DaemonMsg`, `Item` and `Action`, each carries a bound: either a
-`deserialize_with` target (`limits.rs`:470–519) or a validating newtype that
-applies one. That enumeration is the whole of the claim — it says nothing
-about a field added later. The constants:
+`deserialize_with` target (`limits.rs`:706–742 [Amended 2026-08-10]) or a
+validating newtype that applies one. That enumeration is the whole of the
+claim — it says nothing about a field added later. The constants:
 
 | Constant | Value | Field |
 | --- | --- | --- |
@@ -328,8 +438,9 @@ a leading `-`, and refuses ASCII space and any `Cc` control character.
 (`content.rs`:170 — tab and newline). Both arms of an icon carry rules too,
 since [#24](https://github.com/pedrosousa13/hop/issues/24) closed: `IconPath`
 must be absolute, free of any `..` component, free of NUL and free of control
-characters (`content.rs`:634–681), and `IconName` must be non-empty, free of
-`/` and free of control characters (`content.rs`:526–552) — the `/` rule being
+characters (`content.rs`:646–687 [Amended 2026-08-10]), and `IconName` must
+be non-empty, free of `/` and free of control characters (`content.rs`:538–564
+[Amended 2026-08-10]) — the `/` rule being
 the one that keeps the two arms apart, so `name` cannot become a second channel
 for a path-shaped value that passed none of `IconPath`'s rules.
 `content.rs`:102–123 states what these rules do not close, and
@@ -355,8 +466,9 @@ and `redaction.rs`:73–117 prices that disclosure rather than filing it under
 
 **Query text is not written by `Learning`'s persistence path.**
 `Learning::save` writes a `PersistedLearningStore`, which has no `selections`
-field (`learning.rs`:356–360), and the in-memory `selections` map is
-`#[serde(default, skip_serializing)]` (`learning.rs`:348–349). The test
+field (`learning.rs`:369–372 [Amended 2026-08-10]), and the in-memory
+`selections` map is `#[serde(default, skip_serializing)]`
+(`learning.rs`:361–362 [Amended 2026-08-10]). The test
 `save_and_load_round_trip_without_persisting_query_keys` asserts the saved
 file does not contain the query key. That is a statement about this path in
 this module, not about code that does not exist yet.
@@ -385,8 +497,10 @@ Stated as gaps, with the issue that owns each.
   frame, entirely within every bound in the module. A test recomputes the
   figure from the constants.
 - **Nothing bounds a query's total across frames.** `MAX_ITEMS_PER_RESULTS_FRAME`
-  bounds one frame; a daemon may send several partial `results` frames for one
-  `query_id` (`wire.rs`:74–77). This matters directly to Decision 1 below.
+  bounds one frame; a daemon may send several `results` frames for one
+  `query_id`, each replacing the last in full under the replace-frame rule
+  (`wire.rs`:215–224 [Amended 2026-08-10]). This matters directly to Decision 1
+  below.
 - **`Item.copy_text` carries no content rules** — it is a bounded `String`,
   and reaches the same clipboard as `ExecOutcome::CopyText` by a different
   route ([#78](https://github.com/pedrosousa13/hop/issues/78)).
@@ -426,10 +540,17 @@ Stated as gaps, with the issue that owns each.
   `RoutedQuery` it returns (`router.rs`:257–258) derives `Debug` over a plain
   `String` term, so the same keystrokes format verbatim one crate downstream.
   That half is [#83](https://github.com/pedrosousa13/hop/issues/83) and is
-  open; `router.rs`:249–256 says so in place. The nearest thing to a signal
-  today is narrow, and deliberately:
+  open; `router.rs`:249–256 says so in place.
+  **[Amended 2026-08-10]** #34 is now **closed** (`ad038d5`), but for the
+  provider seam's own logging (`ProviderLog`/`ProviderEvent`, `hop-core`'s
+  `host.rs`) — a different crossing from the one this bullet is about, which
+  it leaves exactly as bare. #83 is also **closed** (`8bd6550`): `RoutedQuery`'s
+  `term` and `raw` are now `RoutedText` (`router.rs`:378–393), which redacts
+  under `Debug` the way `QueryText` does, so the same keystrokes no longer
+  format verbatim one crate downstream; `router.rs`:363–377 states the change
+  in place. The nearest thing to a signal today is narrow, and deliberately:
   [#43](https://github.com/pedrosousa13/hop/issues/43) is **closed**
-  (`056893e`), and what it produced is `LoadReport` (`learning.rs`:466–544) —
+  (`056893e`), and what it produced is `LoadReport` (`learning.rs`:479–557 [Amended 2026-08-10]) —
   seven variants naming one condition each, `Loaded` plus the six a
   learning-store load can fall back on, returned beside the store by
   `Learning::load_reporting`. That is a report about one file read at startup.
@@ -450,16 +571,16 @@ exists yet.
 | T2 | Memory amplification below the cap, via tagged-enum buffering | Any frame | Bounds apply post-buffer (`limits.rs`:27–39) | Frame cap sized against the 84 MB figure in `limits.rs`:41–72 |
 | T3 | **Unbounded retained item set.** Decision 1 has the daemon retain what it delivered per query id, accumulating across frames; `MAX_ITEMS_PER_RESULTS_FRAME` bounds one frame, and the protocol permits several partial frames per query, so absent a total the retained set would have no ceiling. Reachable by a **well-behaved** client, not only a hostile one | `results`, and Decision 1's registry | **Bounded, by item count, since #55 — amended 2026-08-06 for #103's replace-frame assembly.** The daemon no longer accumulates a retained set across frames. Under the replace rule (#103), `connection.rs`'s `Exchange::delivered` holds only the **last assembled list** for a query id, replaced whole by each `results` frame, and `forward_batch` enforces `MAX_ITEMS_PER_RESULTS_FRAME` = 1 000 on it — defensively, since the **result source** is untrusted — truncating an over-long arrival to fit and ending the exchange with `QueryDone` (truncate-and-terminate). `MAX_ITEMS_PER_QUERY` = 5 000 is no longer a per-connection binding; it now bounds the daemon-side accumulator in the result source (`source.rs`, `HostSource::start`), where the growth happens, still by truncating the arrival that crossed the line. Truncation of the undelivered remainder, never eviction of what was delivered — the two are named differently on purpose, because only one of them is visible to the client (see Decision 1's overflow paragraph). What is **not** bounded is bytes — see "count or bytes" under Decision 1 below | A documented per-query total cap on retained items. [#85](https://github.com/pedrosousa13/hop/issues/85) is the standalone record of this gap; #55 (the state) and #59 (the binding that retains it) carry it as acceptance criteria, amended 2026-08-03. #55 has landed the cap; #59 still has to resolve `execute` against the capped set, and to make an item lost to the cap distinguishable from one the daemon never emitted — which the terminal `QueryDone` does not do today |
 | T4 | A frame acted on before the handshake | `execute`, `query` | Nothing in the types requires ordering (#26) | Connection loop refuses pre-handshake frames (#54) |
-| T5 | `execute` naming an item the daemon never delivered | `execute` | Length bounds only | Decision 1, implemented by #59 |
-| T6 | `execute` naming an action the item does not carry | `execute` | Nothing ties `action_id` to `Item.actions` | Decision 1's second half — see below |
-| T7 | Query-path cost amplification | `query` | `MAX_QUERY_TEXT` bounds one query's bytes; ranking is `O(atoms × items)` with 4.09 s measured (#46), and `boost_for` lowercases per candidate item (#75) | Input caps decided in M2, gated by #61's adversarial arm |
+| T5 | `execute` naming an item the daemon never delivered | `execute` | Length bounds only | Decision 1, implemented by #59. **[Amended 2026-08-10]** #59 is now **closed** (`4c1aff4`): `connection.rs`'s Execute arm resolves `item_id` against `Exchange::delivered`, the retained set, and refuses with `ErrorCode::UnknownItem` (`ErrorDetail::Item`) otherwise — an id lost to the per-query cap and one the daemon never emitted are refused identically, deliberately (see Decision 1, "What the implementing slice settled") |
+| T6 | `execute` naming an action the item does not carry | `execute` | Nothing ties `action_id` to `Item.actions` | Decision 1's second half — see below. **[Amended 2026-08-10]** #59 (`4c1aff4`) is closed: the same arm checks `action_id` against the resolved item's `actions` and refuses with `ErrorCode::UnknownAction` (`ErrorDetail::Action`) if it is not among them |
+| T7 | Query-path cost amplification | `query` | `MAX_QUERY_TEXT` bounds one query's bytes; ranking is `O(atoms × items)` with 4.09 s measured (#46), and `boost_for` lowercases per candidate item (#75) | Input caps decided in M2, gated by #61's adversarial arm. **[Amended 2026-08-10]** #61 is now **closed** (`80b7ffd`), whose PR introduced `rank.rs`'s `MAX_TERM_CHARS` (256), truncating the term before `Pattern::new` is built. #46 is closed separately, by `85b4c2f`, which turned that fixed truncation into a configurable knob and added `hopd`'s loader enforcement (`config.rs`'s `validate_max_term_chars`). `boost_for`'s per-candidate lowercasing (#75) remains open |
 | T8 | A provider aiming a command-shaped outcome at a client | `executed`, and `Item.icon` on `results` | Content rules on `CopyText`/`OpenUrl` (#23, closed) and on `IconName`/`IconPath` (#24, closed) | Residual on both halves, and an **open** issue owns each: `Item.copy_text` still reaches the clipboard as a bare bounded string ([#78](https://github.com/pedrosousa13/hop/issues/78), open), and an icon path is validated but not contained — the roots are documented, not enforced, so a regular file outside them still opens ([#93](https://github.com/pedrosousa13/hop/issues/93), open, split out of #24 for this half) |
-| T9 | Keystrokes reaching the journal, then a shared bundle | Logging | No logging dependency. `QueryText` redacts (#27, closed) — **in `hop-protocol` only**. `route` takes a `&str` and `RoutedQuery` (`router.rs`:257–258) derives `Debug` over a plain `String` term, so the same text formats verbatim in `hop-core`; `router.rs`:249–256 says not to treat one as safe to log ([#83](https://github.com/pedrosousa13/hop/issues/83), open) | Any added logging keeps the redacting type at the field, and #83 carries the redaction across the crate boundary rather than stopping at `route` |
+| T9 | Keystrokes reaching the journal, then a shared bundle | Logging | No logging dependency. `QueryText` redacts (#27, closed) — **in `hop-protocol` only**. `route` takes a `&str` and `RoutedQuery` (`router.rs`:257–258) derives `Debug` over a plain `String` term, so the same text formats verbatim in `hop-core`; `router.rs`:249–256 says not to treat one as safe to log ([#83](https://github.com/pedrosousa13/hop/issues/83), open). **[Amended 2026-08-10]** #83 is now **closed** (`8bd6550`): `RoutedQuery` (`router.rs`:378–393) carries `term` and `raw` as `RoutedText`, which redacts under `Debug` the same way `QueryText` does, so the same text no longer formats verbatim in `hop-core`; `router.rs`:363–377 states the change in place | Any added logging keeps the redacting type at the field, and #83 carries the redaction across the crate boundary rather than stopping at `route`. **[Amended 2026-08-10]** Landed — see the Today column |
 | T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the `version` is refused on mismatch and a future-dated timestamp clamped (#38, closed by `59fd5fe`); the version probe and the per-condition `LoadReport` are #43's (closed by `056893e`, which replaced #38's two per-branch checks); a persisted `count` is saturated at the boundary (#44, closed by `edb8258`). **Two residuals, one owner**: still no integrity check, so a plausible forged store passes all of it — and eviction still prefers a clamped future-dated entry, which `96d5713` left open and `59fd5fe` explicitly did not close (#88, open) | #88's integrity check, which is what lets a forged entry be *refused* rather than clamped, sequenced with #72 and with Decision 2 on the same load path |
-| T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:694–708) | Decision 2 |
+| T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:707–721 [Amended 2026-08-10]) | Decision 2 |
 | T12 | Cross-provider boost theft | Provider seam | `CheckedItems::check` closes provenance forgery; the store keys on a bare id (#72) | A provider dimension in the store key |
 | T13 | Connection flood / socket occupancy | Accept loop | An accept loop exists (#54) and spawns one unbounded task per peer (`server.rs`, `serve_with`); nothing caps concurrent connections, aggregate memory across them, or the accept rate, and `read_frame` has no read timeout, so a peer that sends a valid length prefix and then stalls holds a task and its payload buffer open indefinitely (`connection.rs` says so in place) | Belongs to [#98](https://github.com/pedrosousa13/hop/issues/98); this document does not settle it. #54 and #55 have both landed and neither took it: #55 bounded per-*query* retained state (T3) and deliberately left every connection-level bound to #98 |
-| T14 | A provider opts in to plaintext persistence for ids that carry user content | Manifest, under Decision 2's consequence | The opt-in field does not exist yet (`provider.rs`:62–78). `CheckedItems::check` verifies an item's kind and provider id, and inspects nothing about what the id *contains* | Documentation a provider author reads before setting the field, and the extension store's PR review (spec §6) as the gate. No code check can verify the claim |
+| T14 | A provider opts in to plaintext persistence for ids that carry user content | Manifest, under Decision 2's consequence | The opt-in field does not exist yet (`provider.rs`:85–121 [Amended 2026-08-10]). `CheckedItems::check` verifies an item's kind and provider id, and inspects nothing about what the id *contains* | Documentation a provider author reads before setting the field, and the extension store's PR review (spec §6) as the gate. No code check can verify the claim |
 
 ---
 
@@ -477,6 +598,12 @@ it is worth naming concretely rather than gesturing at.
   exists. When it is built, whatever it collects becomes a thing users paste
   into issue trackers, and what it may collect is a decision that slice has to
   make rather than inherit.
+  **[Amended 2026-08-10]** `crates/hop-cli` now exists (#54, `ac782c7`), with
+  a working `exec` subcommand (#59, `4c1aff4`) — this document already
+  references `hop-cli` as existing elsewhere (the Actors table; Decision 1's
+  overflow paragraph), which this sentence contradicted. `hop doctor` itself
+  remains unimplemented: `grep -rn "doctor" --include=*.rs .` still returns
+  nothing, and the rest of this bullet holds.
 - **Backups and sync clients.** `learning.json` is mode 0600, which withholds
   it from other local users. It does not withhold it from a backup agent, a
   file-sync client, or an offline read of the home directory, all of which run
@@ -500,7 +627,8 @@ The daemon retains the items it has delivered for a query id, and refuses any
 
 - The daemon retains, per query id, the items it delivered under that id,
   together with each item's action ids. **Delivered, not last sent**: a query
-  is answered by several partial `results` frames (`wire.rs`:74–77), and every
+  is answered by several `results` frames (`wire.rs`:215–224 [Amended
+  2026-08-10]), and every
   item in every one of them stays executable until the retained set is
   released. A rule that kept only the most recent frame would break Enter on
   anything a client is still showing from an earlier one, and it is the reason
@@ -510,10 +638,10 @@ The daemon retains the items it has delivered for a query id, and refuses any
   set and its `action_id` appears in that item's `actions`. Anything else is
   refused rather than dispatched.
 - Refusals use the error codes the contract already carries:
-  `ErrorCode::UnknownItem` and `ErrorCode::UnknownAction` (`wire.rs`:125–131).
-  No new code, no new variant.
-- **No new wire field.** `ClientMsg::Execute` (`wire.rs`:52–56) is unchanged,
-  and so is `Item`.
+  `ErrorCode::UnknownItem` and `ErrorCode::UnknownAction` (`wire.rs`:593–594
+  [Amended 2026-08-10]). No new code, no new variant.
+- **No new wire field.** `ClientMsg::Execute` (`wire.rs`:128–132 [Amended
+  2026-08-10]) is unchanged, and so is `Item`.
 
 ### Why
 
@@ -531,7 +659,7 @@ The daemon retains the items it has delivered for a query id, and refuses any
   reasoning for this decision would not survive leaving it uncapped.
 - **It puts no obligation on a future plugin ABI.** The host resolves the ids
   before dispatch, so `Provider::execute`'s existing prose contract
-  (`provider.rs`:257–258, on `Provider::execute` — "both of which this provider
+  (`provider.rs`:327–328 [Amended 2026-08-10], on `Provider::execute` — "both of which this provider
   must have produced from a prior `Provider::query` call") becomes a guarantee
   the host makes to a provider, rather than a rule each plugin author has to
   remember. A token scheme would have to be carried through that ABI by every
@@ -616,6 +744,18 @@ to reconstruct them from `connection.rs`.
   obligation on a source; closing it is issue #30's, not #56's, and until #30
   lands the byte figure above remains an argument about the wire and not a
   bound on the daemon's memory.
+  **[Amended 2026-08-10]** [#30](https://github.com/pedrosousa13/hop/issues/30)
+  is now **closed** (`80b7ffd`): `CheckedItems::check` (`pipeline.rs`:592)
+  rejects an item whose `title`, `subtitle`, `copy_text`, an action's
+  `label`, or action count is over the same bound `limits.rs` applies at the
+  parse (`FailedCheck::FieldTooLong`), at the one seam every provider's
+  answer must cross — `ProviderHost::run_one` calls it before an answer
+  reaches assembly. The byte figure above is therefore a real bound on the
+  daemon's memory for a provider's answer, not only an argument about the
+  wire. It narrows rather than disappears, and `limits.rs`'s own doc says so
+  in place: a caller that builds and consumes items without ever reaching
+  `CheckedItems::check` — `Ranker::rank` taken directly, say — still gets no
+  field-length enforcement at all.
 - **Per connection or per daemon: per connection.** The retained set lives in
   the connection driver's own state (`connection.rs`, `Exchange`), and there
   is no cross-connection registry for a query id to reach into. Client-chosen
@@ -643,6 +783,23 @@ needs a wire signal that does not exist today, so **this half is not settled
 by #55** — it stays with #59, which the follow-up table already charges with
 "an item lost to that cap distinguishable from one the daemon never emitted".
 See T3.
+
+**[Amended 2026-08-10]** [#59](https://github.com/pedrosousa13/hop/issues/59)
+is now **closed** (`4c1aff4`), and it answers the question above
+differently from what this document expected of it: not by making a
+cap-truncated id distinguishable from one the daemon never emitted, but by
+ruling that they are not worth distinguishing. `connection.rs`'s Execute arm
+resolves `item_id` against `Exchange::delivered` and refuses anything absent
+from it as `ErrorCode::UnknownItem`, and its own doc comment states the
+reasoning in place: whether the daemon never emitted the id, a later frame
+replaced it away, or the per-query cap dropped it, all three leave the
+client in the same state — an id it cannot execute — and inventing a fourth
+code for "lost to the cap" would name a distinction the retained set no
+longer carries any evidence for, since nothing survives past the
+replace-frame rule to tell a capped id from a superseded one. #85's other
+half — a wire signal that an exchange was truncated at all, as against
+`QueryDone`'s silence — is a different question from this one and remains
+open; it is not something #59's landing settles.
 
 ---
 
@@ -705,8 +862,8 @@ alternative.
 
 Hashing keeps learning working for every provider, but it takes something with
 it: a hashed key cannot be turned back into an item, so it cannot be rendered.
-`Learning::recent_launches` (`learning.rs`:1296–1305) and
-`Learning::frequent_launches` (`learning.rs`:1309–1319) both return the stored
+`Learning::recent_launches` (`learning.rs`:1309–1318 [Amended 2026-08-10]) and
+`Learning::frequent_launches` (`learning.rs`:1322–1332 [Amended 2026-08-10]) both return the stored
 keys directly, and spec §8 designs the empty-query view around
 "recent/frequent items from learning". Under
 hashing alone, a third-party provider's items would be learned — and so would
@@ -739,7 +896,7 @@ misunderstanding, writes plaintext to `learning.json`, and no check in the
 workspace catches that.
 
 **It needs a manifest field that does not exist yet.** `ProviderManifest`
-(`provider.rs`:62–78) carries `id`, `kinds`, `modes`, `min_term_len` and
+(`provider.rs`:85–121 [Amended 2026-08-10]) carries `id`, `kinds`, `modes`, `min_term_len` and
 `budget` — there is no field for this and no code reads one. Adding it is a
 change to the plugin seam (spec §6), so it should land while the seam is still
 open to change rather than after the extension store ships. It also interacts
@@ -773,9 +930,9 @@ project goal (spec §1, §6).
 
 ### Where today's code stands
 
-`canonicalize_result_id` (`learning.rs`:694–708) strips dynamic payloads for
+`canonicalize_result_id` (`learning.rs`:707–721 [Amended 2026-08-10]) strips dynamic payloads for
 two prefixes, `utility:` and `web-search:`. An id that matches neither falls
-through to `result_id.to_string()` (`learning.rs`:707) and is written into
+through to `result_id.to_string()` (`learning.rs`:720 [Amended 2026-08-10]) and is written into
 plaintext JSON with the 90-day retention `PERSIST_RETENTION_MS` sets. So does
 an id that carries one of the two prefixes with an empty first segment after
 it — `utility:` alone takes the same fall-through, since the guard requires a
@@ -790,6 +947,12 @@ Two facts about that worth carrying into the implementing slice:
   no non-test code in the workspace produces an id with either prefix. The
   allowlist as it stands is keyed to a naming scheme the current kind set has
   dropped.
+  **[Amended 2026-08-10]** The apps and calculator providers are implemented
+  now (#57 `da5f65f`, #58 `3b53a7a`, both closed), and neither produces an id
+  with either prefix — apps ids are `app:`-namespaced, calculator ids
+  `calc:`-namespaced (`APPS_PROVIDER_ID`, `hopd/src/apps.rs` and
+  `hopd/src/calculator.rs`) — so the conclusion above still holds, on a
+  different premise.
 - **Nothing constrains what a provider puts in an id.** `ItemId::new`
   (`item.rs`:43–47) applies `MAX_ITEM_ID` and no shape rule.
 
@@ -816,10 +979,13 @@ Two facts about that worth carrying into the implementing slice:
   [#35](https://github.com/pedrosousa13/hop/issues/35) is **closed**
   (`0168107`), and `cargo deny check` runs advisories, bans, licenses and
   sources against `deny.toml` as its own CI job. A hashing crate therefore has
-  to clear three separate checks, not one: the `[licenses]` allow-list — today
-  GPL-3.0-only, MIT, MPL-2.0 and Unicode-3.0, with `exceptions` empty
-  (`deny.toml`:124-138) — plus `[bans]`'s empty `deny` list (`deny.toml`:158)
-  and `[advisories]`'s empty `ignore` list (`deny.toml`:75). These are a
+  to clear three separate checks, not one: the `[licenses]` allow-list —
+  today GPL-3.0-only, ISC, MIT, MPL-2.0 and Unicode-3.0, with `exceptions`
+  empty (`deny.toml`:135–141 [Amended 2026-08-10]; ISC was added since, by
+  `da5f65f` (#57), for `inotify`/`inotify-sys`, the apps provider's
+  filesystem watcher) — plus
+  `[bans]`'s empty `deny` list (`deny.toml`:170 [Amended 2026-08-10]) and
+  `[advisories]`'s empty `ignore` list (`deny.toml`:75). These are a
   constraint on the choice rather than a reason not to make it.
 
   **What #35 closed is narrower than the issue it was filed under, and this
@@ -894,17 +1060,17 @@ What has to be true for this model to describe reality rather than intent:
 
 | Slice or issue | What it must establish |
 | --- | --- |
-| [#54](https://github.com/pedrosousa13/hop/issues/54) | Socket and directory created with a decided mode; frame cap from a `hop-protocol` constant, checked before allocation (#21); handshake-first ordering enforced (#26) |
-| [#55](https://github.com/pedrosousa13/hop/issues/55) | **Landed.** Per-query state, server-side cancellation and client-side stale-frame drop, and the retained item set Decision 1 rides on: one set per connection, holding the most recent query id's delivered items, replaced whole by the next `Query` and released when the connection closes. Capped by `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — by item **count**, not bytes — enforced by truncating the undelivered remainder, never by evicting delivered ones (T3, and [#85](https://github.com/pedrosousa13/hop/issues/85), which owns the cap). Decision 1's "rides on state the daemon needs anyway" reasoning therefore holds. Two things #55 deliberately did **not** take: bytes, which rest on per-item bounds — **[Amended 2026-08-04]** #56 landed the provider host without adding that enforcement, and issue #30 owns it — and connection-level bounds, which are #98's (T13) |
-| [#56](https://github.com/pedrosousa13/hop/issues/56) | **[Amended 2026-08-04] Landed.** The provider host: each provider's manifest captured once at registration and compared against a fresh call before its answer is accepted, catching a provider that answers differently after registration; a host-enforced per-provider budget that aborts a non-cooperating provider's task; panic containment via `tokio::spawn`/`JoinError`; and provider error text bounded and stripped (`hop-core`'s `sanitize` module) before it can leave. Two things #56 deliberately did **not** take: per-item field-length enforcement on items a provider returns in-process, which remains open with issue #30 owning it; and a panic hook, so a panicking provider's payload still reaches the daemon's stderr through Rust's default hook, unsanitized, before the host's own failure classification runs — issue #104 owns that decision |
-| [#59](https://github.com/pedrosousa13/hop/issues/59) | Decision 1's binding, including the action check, refusing with the existing error codes — and enforcing the retained-set cap #55 sets, with an item lost to that cap distinguishable from one the daemon never emitted (#85) |
-| [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation. #55 answered the first two — 5 000, item count only, reasoning in `hop_protocol::limits` — and left the third half-answered: the daemon truncates the undelivered remainder rather than evicting what it delivered, but says nothing on the wire that lets a client tell a capped exchange from a completed one, so its half is still a truncation and not a refusal. See Decision 1's settled answers |
-| [#60](https://github.com/pedrosousa13/hop/issues/60) | A real state directory, which is where `learning.json`'s path stops being hypothetical |
-| [#62](https://github.com/pedrosousa13/hop/issues/62) | Socket activation, which moves socket creation into a unit file |
-| [#39](https://github.com/pedrosousa13/hop/issues/39) | Decision 2's rule, sequenced with #72 and #88 on the load path #37, #38, #43 and #44 have already changed — plus the `ProviderManifest` opt-in field the recents consequence needs, which does not exist today (`provider.rs`:62–78) and changes the plugin seam. The field's **default is an open question**, not something this model settles |
+| [#54](https://github.com/pedrosousa13/hop/issues/54) | **[Amended 2026-08-10] Landed.** Socket and directory created with a decided mode (`server.rs`'s `acquire_listener`); frame cap from a `hop-protocol` constant, checked before allocation (#21, closed — `framing::payload_len`); handshake-first ordering enforced (#26, closed — `connection.rs`'s `HandshakeState`) |
+| [#55](https://github.com/pedrosousa13/hop/issues/55) | **Landed.** Per-query state, server-side cancellation and client-side stale-frame drop, and the retained item set Decision 1 rides on: one set per connection, holding the most recent query id's delivered items, replaced whole by the next `Query` and released when the connection closes. Capped by `hop_protocol::limits::MAX_ITEMS_PER_QUERY` = 5 000 — by item **count**, not bytes — enforced by truncating the undelivered remainder, never by evicting delivered ones (T3, and [#85](https://github.com/pedrosousa13/hop/issues/85), which owns the cap). Decision 1's "rides on state the daemon needs anyway" reasoning therefore holds. Two things #55 deliberately did **not** take: bytes, which rest on per-item bounds — **[Amended 2026-08-04]** #56 landed the provider host without adding that enforcement, and issue #30 owns it — and connection-level bounds, which are #98's (T13). **[Amended 2026-08-10]** #30 is now **closed** too (`80b7ffd`), via `CheckedItems::check`'s field-length rejections — see Decision 1 |
+| [#56](https://github.com/pedrosousa13/hop/issues/56) | **[Amended 2026-08-04] Landed.** The provider host: each provider's manifest captured once at registration and compared against a fresh call before its answer is accepted, catching a provider that answers differently after registration; a host-enforced per-provider budget that aborts a non-cooperating provider's task; panic containment via `tokio::spawn`/`JoinError`; and provider error text bounded and stripped (`hop-core`'s `sanitize` module) before it can leave. Two things #56 deliberately did **not** take: per-item field-length enforcement on items a provider returns in-process, which remains open with issue #30 owning it; and a panic hook, so a panicking provider's payload still reaches the daemon's stderr through Rust's default hook, unsanitized, before the host's own failure classification runs — issue #104 owns that decision. **[Amended 2026-08-10]** #30 is now **closed** (`80b7ffd`) — see Decision 1 |
+| [#59](https://github.com/pedrosousa13/hop/issues/59) | Decision 1's binding, including the action check, refusing with the existing error codes — and enforcing the retained-set cap #55 sets, with an item lost to that cap distinguishable from one the daemon never emitted (#85). **[Amended 2026-08-10]** **Landed** (`4c1aff4`), but not as this row expected: `connection.rs`'s Execute arm refuses both an id lost to the cap and one the daemon never emitted as the same `ErrorCode::UnknownItem`, deliberately not distinguishing them — see Decision 1, "What the implementing slice settled" |
+| [#85](https://github.com/pedrosousa13/hop/issues/85) | The per-query total cap itself, as the standalone record #55 and #59 carry as acceptance criteria: the number and its reasoning, whether it bounds item count or total bytes or both, and whether overflow is a refusal or a **rejection** — never a silent truncation. #55 answered the first two — 5 000, item count only, reasoning in `hop_protocol::limits` — and left the third half-answered: the daemon truncates the undelivered remainder rather than evicting what it delivered, but says nothing on the wire that lets a client tell a capped exchange from a completed one, so its half is still a truncation and not a refusal. **[Amended 2026-08-10]** #59 (`4c1aff4`) has since landed and settled the sub-question this row used to pose to it — a cap-truncated id and a never-emitted one are deliberately not distinguished — without touching this remaining half: no wire signal for a capped exchange exists yet, and none of the closed M2 slices added one. See Decision 1's settled answers |
+| [#60](https://github.com/pedrosousa13/hop/issues/60) | **[Amended 2026-08-10] Landed.** A real state directory, which is where `learning.json`'s path stops being hypothetical |
+| [#62](https://github.com/pedrosousa13/hop/issues/62) | **[Amended 2026-08-10] Landed.** Socket activation, which moves socket creation into a unit file (`contrib/systemd/hopd.socket`) |
+| [#39](https://github.com/pedrosousa13/hop/issues/39) | Decision 2's rule, sequenced with #72 and #88 on the load path #37, #38, #43 and #44 have already changed — plus the `ProviderManifest` opt-in field the recents consequence needs, which does not exist today (`provider.rs`:85–121 [Amended 2026-08-10]) and changes the plugin seam. The field's **default is an open question**, not something this model settles |
 | [#57](https://github.com/pedrosousa13/hop/issues/57), M5 providers | Whatever the manifest field's default turns out to be, applied to each built-in provider: either each one declares whether its ids are safe to persist in plaintext, or the default covers those that say nothing. Open until #39 decides the default |
 | M3 (spec §8) | The empty-query view's behaviour for a provider that did not opt in — learned, ranked, and absent from that screen |
 | [#93](https://github.com/pedrosousa13/hop/issues/93) | The icon-root check #24 deliberately left out, and the open half of T8's pair: allowed roots computed at startup from `XDG_DATA_DIRS` and the icon theme spec's locations, enforced by whatever resolves the path, and checked against what the path resolves to rather than against the string |
-| [#83](https://github.com/pedrosousa13/hop/issues/83) | The open half of T9's pair: `RoutedQuery` holds the term as a plain `String` under a derived `Debug`, so the redaction `QueryText` applies in `hop-protocol` stops at `route`, which takes a `&str` |
+| [#83](https://github.com/pedrosousa13/hop/issues/83) | The open half of T9's pair: `RoutedQuery` holds the term as a plain `String` under a derived `Debug`, so the redaction `QueryText` applies in `hop-protocol` stops at `route`, which takes a `&str`. **[Amended 2026-08-10]** **Closed** (`8bd6550`): `RoutedQuery`'s `term` and `raw` are now `RoutedText`, which redacts under `Debug` the way `QueryText` does — see T9 |
 | [#88](https://github.com/pedrosousa13/hop/issues/88) | The open half of T10: an integrity check on the store, which is what closes both residuals #37 and #38 left — the forged-but-plausible store, and eviction's preference for the entry #38's clamp stamps at the load instant |
 | [#52](https://github.com/pedrosousa13/hop/issues/52) | The M2 sweep, auditing the code rather than inheriting this document's verdicts |
