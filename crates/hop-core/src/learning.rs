@@ -891,30 +891,59 @@ fn provider_scoped_key(provider: &str, id_part: &str) -> String {
 /// produced by [`provider_scoped_key`] itself, over the provider and
 /// id-part it was actually called with.
 ///
-/// [`rekeyed_legacy_key`] is the one caller: a key already in this shape is
-/// this module's own prior output round-tripping through a save and a load,
-/// and is left untouched rather than run through the legacy migration below
-/// it, which is only for a v1 store predating issue #72's provider
-/// dimension. No key issue #39-era code ever wrote can accidentally match
-/// this shape: every one of the four shapes it produced (`app:`, `utility:`,
+/// [`rekeyed_legacy_key`] is the one caller of the boolean form
+/// ([`is_already_provider_scoped`]): a key already in this shape is this
+/// module's own prior output round-tripping through a save and a load, and
+/// is left untouched rather than run through the legacy migration below it,
+/// which is only for a v1 store predating issue #72's provider dimension.
+/// No key issue #39-era code ever wrote can accidentally match this shape:
+/// every one of the four shapes it produced (`app:`, `utility:`,
 /// `web-search:`, `sha256:`) opens with an ASCII letter, never a digit, so a
 /// legacy key can never be mistaken for this module's current output.
-fn is_already_provider_scoped(key: &str) -> bool {
-    let Some((len_digits, rest)) = key.split_once(':') else {
-        return false;
-    };
-    let Ok(provider_len) = len_digits.parse::<usize>() else {
-        return false;
-    };
+///
+/// Returns the parsed `(provider, id_part)` on success — used directly by
+/// [`Learning::rehash_entries_for_providers_no_longer_opted_in`], which
+/// needs both halves of an already-scoped key, not just the yes/no
+/// [`is_already_provider_scoped`] answers.
+fn parse_provider_scoped_key(key: &str) -> Option<(&str, &str)> {
+    let (len_digits, rest) = key.split_once(':')?;
+    let provider_len: usize = len_digits.parse().ok()?;
     // Reject a non-canonical length field (a leading zero, or anything else
     // `parse::<usize>` tolerates that `Display` never writes) so the digits
     // consumed here are exactly the digits `provider_scoped_key` itself
     // would have written — see that function's doc comment for why the
     // prefix has to be canonical for the shape to be unambiguous at all.
     if len_digits != provider_len.to_string() {
-        return false;
+        return None;
     }
-    rest.as_bytes().get(provider_len) == Some(&b':')
+    if rest.as_bytes().get(provider_len) != Some(&b':') {
+        return None;
+    }
+    Some((&rest[..provider_len], &rest[provider_len + 1..]))
+}
+
+/// Whether `key` is already shaped like [`provider_scoped_key`]'s own
+/// output — see [`parse_provider_scoped_key`], which does the actual
+/// parsing this just discards the result of.
+fn is_already_provider_scoped(key: &str) -> bool {
+    parse_provider_scoped_key(key).is_some()
+}
+
+/// Whether `id_part` is exactly the shape [`persistence_key`]'s hash branch
+/// produces: `sha256:` followed by 64 lowercase hex characters. Used by
+/// [`Learning::rehash_entries_for_providers_no_longer_opted_in`] to avoid
+/// hashing an id-part that is already a hash — see that method's doc
+/// comment for the one case this still cannot tell apart from a genuine
+/// hash (a plaintext id that happens to look like one), which is not new to
+/// this function: [`persistence_key`]'s own doc comment already discusses
+/// it for the record path.
+fn looks_like_a_persistence_hash(id_part: &str) -> bool {
+    id_part.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 /// The key [`Learning::record`] and every `global_frequency` lookup use —
@@ -1073,15 +1102,36 @@ fn rekeyed_global_frequency(
         let Some(key) = rekeyed_legacy_key(id) else {
             continue;
         };
-        let aggregate = out.entry(key).or_insert(LearningEntry {
-            count: 0,
-            last_ms: 0,
-        });
-        aggregate.count = (saturating_count_i32(aggregate.count)
-            .saturating_add(saturating_count_i32(entry.count))) as u32;
-        aggregate.last_ms = aggregate.last_ms.max(entry.last_ms);
+        merge_learning_entry(&mut out, key, entry);
     }
     out
+}
+
+/// Merges `entry` into whatever `map` already holds under `key` — summing
+/// counts (saturating, the same posture [`deserialize_saturating_count`]
+/// takes for the same reason; see [`saturating_count_i32`]'s doc comment)
+/// and taking the later of the two `last_ms` values, since that is the more
+/// recent launch either source entry attests to — or inserts `entry` fresh
+/// if `key` is not yet present.
+///
+/// The one merge rule this module has, shared by [`rekeyed_global_frequency`]'s
+/// load-time migration and
+/// [`Learning::rehash_entries_for_providers_no_longer_opted_in`]'s
+/// revocation re-hash, so the two callers cannot disagree about what
+/// "merge" means — a single collision two entries can land on either way,
+/// with one policy rather than two that could drift.
+fn merge_learning_entry(
+    map: &mut HashMap<String, LearningEntry>,
+    key: String,
+    entry: &LearningEntry,
+) {
+    let aggregate = map.entry(key).or_insert(LearningEntry {
+        count: 0,
+        last_ms: 0,
+    });
+    aggregate.count = (saturating_count_i32(aggregate.count)
+        .saturating_add(saturating_count_i32(entry.count))) as u32;
+    aggregate.last_ms = aggregate.last_ms.max(entry.last_ms);
 }
 
 /// The key a single stored entry re-keys to, or `None` if the entry does not
@@ -1625,9 +1675,127 @@ impl Learning {
     /// Set once, from the whole current registry, rather than grown
     /// incrementally: a provider that stops declaring the flag — or stops
     /// registering at all — must lose plaintext persistence the next time
-    /// this is called, not keep an entry a caller forgot to remove.
+    /// this is called, not keep an entry a caller forgot to remove. That
+    /// loss is not just a matter of future writes hashing instead of not —
+    /// see the next paragraph for what it does to what is already on disk.
+    ///
+    /// # Revocation reaches what is already stored, not only what is next recorded
+    ///
+    /// Replacing the set alone would leave a gap: a provider that persisted
+    /// ids in the clear while opted in, then flips
+    /// `ids_are_safe_to_persist_in_the_clear` to `false`, would have every id
+    /// it already wrote sit on disk in the clear for the rest of
+    /// `PERSIST_RETENTION_MS` (90 days) regardless — [`Learning::load`]'s
+    /// legacy-shape migration and this module's own round-trip both leave an
+    /// already-provider-scoped key exactly as they found it, without asking
+    /// whether its id-part still matches what the provider *currently*
+    /// claims. This call is where that gets checked, because it is the
+    /// moment the registry's answer changes: every `global_frequency` entry
+    /// whose provider is no longer in the set just installed, and whose
+    /// id-part is not already a hash, is re-hashed on the spot, carrying its
+    /// count and `last_ms` over to the new key under the same merge
+    /// [`rekeyed_global_frequency`] uses. See
+    /// [`Learning::rehash_entries_for_providers_no_longer_opted_in`] for the
+    /// mechanics, what it assumes about `ids`, and the one direction this
+    /// cannot fix (a hash cannot be turned back into the plaintext it came
+    /// from, for a provider that opts in *later*).
     pub fn sync_plaintext_providers(&mut self, ids: impl IntoIterator<Item = String>) {
         self.plaintext_providers = ids.into_iter().collect();
+        self.rehash_entries_for_providers_no_longer_opted_in();
+    }
+
+    /// [`Learning::sync_plaintext_providers`]'s revocation half: re-hashes
+    /// every `global_frequency` entry whose provider is not in
+    /// `self.plaintext_providers` (just replaced by the caller) but whose
+    /// stored id-part is still plaintext.
+    ///
+    /// # Only one direction is fixable
+    ///
+    /// A plaintext id-part re-hashes to `sha256:` plus the digest of that
+    /// exact id-part — precisely what [`persistence_key`] would compute for
+    /// the same raw id under `persist_plaintext: false`, so a future lookup
+    /// for the now-unopted provider finds it under the new key, with its
+    /// count intact. The reverse can never happen, and this method does not
+    /// attempt it: a hash-shaped id-part for a provider that has since opted
+    /// *in* is left exactly as it is, because a SHA-256 digest is one-way —
+    /// there is no raw id here to recover and write back in the clear. Those
+    /// entries simply age out of `PERSIST_RETENTION_MS` on their own, the
+    /// same as any other hashed entry; nothing here accelerates or delays
+    /// that. This asymmetry is a property of hashing, not a gap in this
+    /// method.
+    ///
+    /// # Why this runs here, and not in `Learning::load`
+    ///
+    /// `load` cannot make this call: it runs before this method is ever
+    /// invoked — `hopd`'s daemon wiring calls
+    /// [`Learning::sync_plaintext_providers`] *after* `Learning::load`, once
+    /// the registry is available (see that method's own doc comment) — so at
+    /// load time there is no registry answer yet to check a stored key's
+    /// provider against, only the empty default every load starts from. The
+    /// moment the answer *does* arrive is this call, so this is where the
+    /// check happens: on every sync, against whichever set was just
+    /// installed.
+    ///
+    /// # `ids` is assumed to be the complete, authoritative registry
+    ///
+    /// This treats "provider absent from the just-installed set" as
+    /// "currently not opted in" — there is no third answer available to it,
+    /// and none is invented: [`Learning::sync_plaintext_providers`]'s own
+    /// contract already requires callers to pass the complete current
+    /// registry, never a partial one (`plaintext_provider_ids(&host.manifests())`,
+    /// which captures every registered provider at once — see
+    /// `hop_core::provider::plaintext_provider_ids`). A caller that violates
+    /// that contract — passing a set missing a provider that is genuinely
+    /// still opted in, rather than one that has revoked or never
+    /// registered — gets that provider's entries re-hashed exactly as if it
+    /// had revoked, because nothing at this layer can tell the two apart
+    /// from the set alone; there is no flag carried alongside `ids` saying
+    /// "this is everyone."
+    ///
+    /// What this method does *not* do is treat a `Learning` that has never
+    /// been synced at all as though every provider had revoked. That state —
+    /// between `Learning::load` and the first call to
+    /// [`Learning::sync_plaintext_providers`] — never reaches this method,
+    /// because this method only runs *from inside* a sync call. There is no
+    /// standing "run on every access" version of this check that could catch
+    /// a `Learning` before its first sync in a comparison against an
+    /// as-yet-nonexistent answer; the check exists only at the instant an
+    /// answer is supplied.
+    ///
+    /// # The one gap this cannot close
+    ///
+    /// A raw id can, in principle, already look exactly like this module's
+    /// own hash output (`sha256:` plus 64 lowercase hex characters) —
+    /// [`persistence_key`]'s own doc comment discusses this for the record
+    /// path, where it is harmless as long as the provider stays opted in.
+    /// If such an id was written in the clear by a provider that has since
+    /// revoked, [`looks_like_a_persistence_hash`] cannot distinguish it from
+    /// an entry that was already a genuine hash, and this method leaves it
+    /// as it found it. A narrow, pre-existing ambiguity this module has
+    /// always accepted, not a new one this method introduces — see
+    /// [`persistence_key`]'s doc comment, "Why the plaintext/hash partition
+    /// is still provable with a provider folded in".
+    fn rehash_entries_for_providers_no_longer_opted_in(&mut self) {
+        let mut migrations = Vec::new();
+        for (key, entry) in &self.global_frequency {
+            let Some((provider, id_part)) = parse_provider_scoped_key(key) else {
+                // Not this module's own key shape at all — nothing for this
+                // pass to do; `rekeyed_legacy_key` (load-time only) is what
+                // handles a legacy shape, not this method.
+                continue;
+            };
+            if self.plaintext_providers.contains(provider) || looks_like_a_persistence_hash(id_part)
+            {
+                continue;
+            }
+            let hashed_id_part = format!("sha256:{:x}", Sha256::digest(id_part.as_bytes()));
+            let new_key = provider_scoped_key(provider, &hashed_id_part);
+            migrations.push((key.clone(), new_key, entry.clone()));
+        }
+        for (old_key, new_key, entry) in migrations {
+            self.global_frequency.remove(&old_key);
+            merge_learning_entry(&mut self.global_frequency, new_key, &entry);
+        }
     }
 
     /// Record a launch: the user reached `item_id`, produced by `provider`,
@@ -4311,6 +4479,152 @@ mod tests {
         assert!(
             saved.contains("sha256:"),
             "it must be hashed instead, got: {saved}"
+        );
+    }
+
+    // --- Revocation: a stored key's shape is re-checked against the
+    // provider's *current* manifest flag, not just left alone forever
+    // because it once round-tripped through this module's own output shape.
+
+    // The scenario the finding is about: a provider opts in, persists an id
+    // in the clear, then revokes — its already-stored key must not sit on
+    // disk in the clear for the rest of the retention window just because
+    // nothing used to re-check it against the provider's current answer.
+    #[test]
+    fn a_revoked_providers_plaintext_entry_is_hashed_on_the_next_sync_and_keeps_its_count() {
+        let mut store = Learning::empty();
+        store.sync_plaintext_providers(["widget".to_string()]);
+        for _ in 0..5 {
+            store.record_launch("widget", "banana", &ItemId::new("widget:banana").unwrap());
+        }
+        let plaintext_key = provider_scoped_key("widget", "widget:banana");
+        assert_eq!(
+            store.global_frequency.get(&plaintext_key).map(|e| e.count),
+            Some(5),
+            "sanity check: the entry must actually be plaintext before revocation"
+        );
+
+        // Revoke: the next sync no longer includes "widget".
+        store.sync_plaintext_providers([]);
+
+        assert!(
+            !store.global_frequency.contains_key(&plaintext_key),
+            "the plaintext key must not survive a sync that revokes its provider"
+        );
+        let hashed_key = provider_scoped_key(
+            "widget",
+            &format!("sha256:{:x}", Sha256::digest(b"widget:banana")),
+        );
+        assert_eq!(
+            store.global_frequency.get(&hashed_key).map(|e| e.count),
+            Some(5),
+            "the count must survive the re-hash, under the key a future \
+             (hashed) lookup for \"widget\" will actually compute"
+        );
+    }
+
+    // The other side: a provider that is *still* opted in must not have its
+    // plaintext entry disturbed just because a sync happened. Without this,
+    // a passing revocation test could hide a bug that re-hashes everything
+    // indiscriminately rather than only what actually lost its opt-in.
+    #[test]
+    fn a_still_opted_in_providers_plaintext_entry_is_untouched_across_a_sync() {
+        let mut store = Learning::empty();
+        store.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
+        store.record_launch(
+            APPS_PROVIDER_ID,
+            "firefox",
+            &ItemId::new("app:firefox").unwrap(),
+        );
+        let plaintext_key = provider_scoped_key(APPS_PROVIDER_ID, "app:firefox");
+        assert!(store.global_frequency.contains_key(&plaintext_key));
+
+        // Synced again with the identical set — apps never revoked.
+        store.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
+
+        assert_eq!(
+            store.global_frequency.get(&plaintext_key).map(|e| e.count),
+            Some(1),
+            "a still-opted-in provider's plaintext entry must be untouched \
+             by a sync, not merely eventually restored to it"
+        );
+    }
+
+    // The "absent from the synced set" case, pinned on its own: this store
+    // never learned "apps" opted in through any sync at all — the entry
+    // reaches its plaintext shape through the *load-time legacy migration*
+    // (`rekeyed_legacy_key`, which re-attributes a v1 `app:` key to the apps
+    // provider unconditionally, before any registry answer exists) rather
+    // than through an explicit prior opt-in. Established in
+    // `Learning::rehash_entries_for_providers_no_longer_opted_in`'s own doc
+    // comment: there is no third state between "in the set" and "not", so
+    // "absent" gets the identical treatment as an explicit revocation —
+    // this is that case, not the revocation case above with different
+    // words.
+    #[test]
+    fn an_entry_whose_provider_is_absent_from_the_synced_set_is_hashed_same_as_a_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let now = now_ms();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{STORE_VERSION},"global_frequency":{{"app:firefox":{{"count":7,"last_ms":{now}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let mut loaded = Learning::load(&path);
+        let plaintext_key = provider_scoped_key(APPS_PROVIDER_ID, "app:firefox");
+        assert_eq!(
+            loaded.global_frequency.get(&plaintext_key).map(|e| e.count),
+            Some(7),
+            "sanity check: the legacy key re-attributes to the apps provider \
+             on load regardless of any sync having happened yet"
+        );
+
+        // The registry answer arrives, and "apps" is not in it.
+        loaded.sync_plaintext_providers(["some-other-provider".to_string()]);
+
+        assert!(
+            !loaded.global_frequency.contains_key(&plaintext_key),
+            "a provider merely absent from the synced set must not keep a \
+             plaintext entry any more than an explicitly revoked one would"
+        );
+        let hashed_key = provider_scoped_key(
+            APPS_PROVIDER_ID,
+            &format!("sha256:{:x}", Sha256::digest(b"app:firefox")),
+        );
+        assert_eq!(
+            loaded.global_frequency.get(&hashed_key).map(|e| e.count),
+            Some(7),
+            "the count must survive the re-hash"
+        );
+    }
+
+    // Correctness guard against the fix's most likely regression: an entry
+    // that is already hashed must not be hashed *again* just because its
+    // provider is absent from a sync — that would silently orphan it (a
+    // future lookup recomputes the single hash, never the double one) for
+    // no security benefit, since it was never in the clear to begin with.
+    #[test]
+    fn an_already_hashed_entry_is_not_rehashed_again_when_its_provider_is_absent_from_a_sync() {
+        let mut store = Learning::empty();
+        // Recorded while "widget" was never opted in — `record`'s own
+        // persist_plaintext: false path produces this shape directly.
+        store.record_launch("widget", "banana", &ItemId::new("widget:banana").unwrap());
+        let hashed_key = provider_scoped_key(
+            "widget",
+            &format!("sha256:{:x}", Sha256::digest(b"widget:banana")),
+        );
+        assert!(store.global_frequency.contains_key(&hashed_key));
+
+        store.sync_plaintext_providers([]);
+
+        assert_eq!(
+            store.global_frequency.get(&hashed_key).map(|e| e.count),
+            Some(1),
+            "an entry that is already hashed must not be hashed again"
         );
     }
 
