@@ -2696,8 +2696,38 @@ mod provider_tests {
 }
 
 use std::io;
+use std::time::Duration;
 
 use inotify::{Inotify, WatchMask};
+
+/// The size, in bytes, of the buffer [`run_watcher_loop`] reads inotify
+/// events into.
+///
+/// Issue #106 gap 4 speculated that a large-enough burst of events could
+/// overflow the previous 4096-byte buffer and surface as a read error.
+/// That premise does not hold: a single event can never come close to
+/// filling even 4096 bytes. The kernel's `struct inotify_event` is 16
+/// bytes (four `u32`-sized fields — `wd`, `mask`, `cookie`, `len`), and
+/// `inotify(7)` gives `sizeof(struct inotify_event) + NAME_MAX + 1` as the
+/// minimum buffer a caller needs to be guaranteed to fit *one* event —
+/// `NAME_MAX` is 255, so that ceiling is 272 bytes. What the read side
+/// actually errors over is only a buffer too small to hold *that next
+/// single event*: `Inotify::read_events`'s own docs promise
+/// `ErrorKind::InvalidInput` (`UnexpectedEof` on very old kernels) for
+/// exactly and only that case — they say nothing about what happens to a
+/// batch that does not fit as a whole. That part is not the crate's
+/// documented behavior but the kernel's: `inotify(7)` describes `read(2)`
+/// on an inotify fd as returning as many complete events as currently fit
+/// in the caller's buffer, with whatever is left simply staying queued
+/// for the next call rather than being lost or erroring — which is what
+/// actually rules out the issue's overflow scenario for a burst larger
+/// than one buffer's worth. 4096 was over fifteen times the largest event
+/// that can exist; it was never a correctness risk, and this buffer is
+/// not being resized to fix one. It is resized anyway, to sixteen times
+/// its old size, purely for throughput: a burst of many small events (a
+/// package manager unpacking a few dozen `.desktop` files in one
+/// transaction) is drained in fewer `read` syscalls.
+const WATCH_BUFFER_LEN: usize = 64 * 1024;
 
 /// The inotify events worth rebuilding the index over: a file created,
 /// removed, finished being written, or moved in or out of a watched
@@ -2720,18 +2750,32 @@ fn watch_mask() -> WatchMask {
 /// mirroring [`scan_apps`]'s own tolerance for missing roots. Fails only if
 /// *no* root could be watched at all.
 ///
-/// **Known gap, accepted rather than fixed here:** a root skipped because it
-/// does not exist yet stays unwatched even if something later creates it —
-/// inotify has no event for "a directory now exists at a path I never had a
-/// watch on," only for changes under a watch that already exists. On a
-/// fresh machine with no `~/.local/share/applications` yet, that directory's
-/// own creation (which the first user-level app install causes) is
-/// therefore invisible until the daemon restarts. Closing it means watching
-/// each root's *parent* for the child's own `CREATE` and adding a real watch
-/// once it appears — materially larger than this function's fix for
-/// issue #57's scan-then-watch race (that fix only reordered two calls; it
-/// does not synthesize watches for paths that don't exist yet). Tracked as
-/// part of issue #106 rather than fixed in this slice.
+/// **Known gap, narrowed but not closed (issue #106 gap 2, and gap 1 in
+/// the same circumstance):** a root skipped here because it does not
+/// exist yet is picked up without a daemon restart in the common case —
+/// [`run_watcher_loop`] re-adds a watch on every root, including this
+/// one, before every rescan, so the next event from *any other* watched
+/// root retries this one and succeeds once something has created it. The
+/// identical residual applies to a root deleted after being watched
+/// (gap 1): if it is still missing at the moment the loop's next re-arm
+/// runs, that `Watches::add` call fails the exact same way this one does,
+/// and from that point on there is nothing distinguishing "never existed"
+/// from "existed, then vanished." What neither case's re-arm covers is a
+/// system where no other watched root ever produces an event at all: with
+/// only this one root configured, or every other root equally quiet,
+/// nothing wakes the loop to retry the missing or deleted one, and it
+/// stays unwatched until the daemon restarts — the same as before this
+/// fix, just for a narrower set of machines (multi-root setups where at
+/// least one other root is ever touched are covered; single-root setups,
+/// or setups where every other root is as dormant as this one, are not).
+/// Closing that residual fully means watching each root's *parent* for
+/// the child's own `CREATE` and adding a real watch once it appears —
+/// deliberately declined: it means either a full rescan on every
+/// unrelated change under a busy parent like `~/.local/share`, or
+/// teaching the loop to inspect event names when it currently and
+/// deliberately ignores them entirely (see [`run_watcher_loop`]'s doc
+/// comment). Tracked as part of issue #106; this slice narrows both gaps
+/// rather than closing either.
 fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
     let inotify = Inotify::init()?;
     let mask = watch_mask();
@@ -2757,7 +2801,11 @@ fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
 /// already-open `inotify`: an initial build is assumed already done by the
 /// caller (`AppIndex::new` from a [`scan_apps`] call), and this thread
 /// rebuilds it every time a watched directory changes, forever, until the
-/// process exits.
+/// process exits. Unlike an earlier version of this function, that is now
+/// literally true rather than "until a read happens to fail" — the loop
+/// body, [`run_watcher_loop`], retries a read error rather than returning
+/// from the thread; see its doc comment for that and for the re-arming
+/// that narrows issue #106 gaps 1 and 2.
 ///
 /// Takes the opened [`Inotify`] rather than opening one itself — unlike an
 /// earlier version of this function — so the caller controls exactly when
@@ -2779,19 +2827,147 @@ fn open_watch(roots: &[PathBuf]) -> io::Result<Inotify> {
 /// identical response — a full rescan — so there is nothing to gain from
 /// knowing which file changed, and the crate's own `Events` iterator is
 /// simply drained by letting it drop.
-pub fn spawn_index_watcher(mut inotify: Inotify, index: Arc<AppIndex>, roots: Vec<PathBuf>) {
+pub fn spawn_index_watcher(inotify: Inotify, index: Arc<AppIndex>, roots: Vec<PathBuf>) {
     std::thread::spawn(move || {
-        let mut buffer = [0u8; 4096];
-        loop {
-            match inotify.read_events_blocking(&mut buffer) {
-                Ok(_events) => index.replace(scan_apps(&roots)),
-                Err(err) => {
-                    eprintln!("hopd: apps provider: desktop-entry watcher stopped: {err}");
-                    return;
+        run_watcher_loop(
+            inotify,
+            index,
+            roots,
+            BackoffSchedule::PRODUCTION,
+            |inotify, buffer| inotify.read_events_blocking(buffer).map(|_events| ()),
+        );
+    });
+}
+
+/// How long [`run_watcher_loop`] waits before retrying a failed read, and
+/// how that wait grows on repeated failures: doubles from `base` on each
+/// consecutive failure, capped at `max`, and reset back to `base` the
+/// moment a watch is re-established. A struct rather than two bare
+/// [`Duration`] parameters purely so [`spawn_index_watcher`]'s production
+/// call site and `watcher_tests`' zero-delay call site both read as
+/// passing *a policy*, not two easily-transposed numbers.
+///
+/// A zero `base` disables backoff entirely: doubling zero is still zero,
+/// so `delay` never grows no matter how many consecutive failures occur.
+/// `watcher_tests` relies on exactly that to make its retry test run in
+/// milliseconds instead of sleeping in real wall-clock time, and it is
+/// safe there only because that test's injected failure is bounded — it
+/// fails exactly once, then succeeds forever after. A zero-`base`
+/// schedule used anywhere failures can repeat without bound would instead
+/// spin hot, retrying with no delay between attempts at all. `PRODUCTION`
+/// must never be this, and no other schedule should be either unless its
+/// caller can make the same bounded-failure guarantee a test can.
+struct BackoffSchedule {
+    base: Duration,
+    max: Duration,
+}
+
+impl BackoffSchedule {
+    /// 200ms doubling to a 30s ceiling. A watcher thread dying used to be
+    /// silent and total — nothing else in the process noticed — so the
+    /// base is short enough that a transient error (an `EMFILE` from a fd
+    /// leak elsewhere, say) barely delays the next rescan, while the 30s
+    /// cap keeps a watch that stays broken for a while (the filesystem
+    /// backing a root gone until the next mount, say) from retrying at a
+    /// sub-second cadence indefinitely.
+    const PRODUCTION: BackoffSchedule = BackoffSchedule {
+        base: Duration::from_millis(200),
+        max: Duration::from_secs(30),
+    };
+}
+
+/// [`spawn_index_watcher`]'s actual loop body, factored out so a test can
+/// drive it with an injected `read` and a zero-delay `schedule` instead of
+/// a real inotify fd and real wall-clock backoff. See
+/// `a_read_error_does_not_kill_the_watcher_thread_and_indexing_resumes_after_recovery`
+/// in `watcher_tests` for why an injected `read` is the only practical way
+/// to exercise the retry path at all: there is no portable way to force a
+/// real inotify file descriptor into an error state from a test.
+///
+/// **Retry, forever, on error (issue #106 gap 3).** The previous version
+/// of this loop logged a read error and returned, silently freezing the
+/// index for the rest of the process's life — the bug this issue exists
+/// to close. This version instead logs, backs off per `schedule`, and
+/// calls [`open_watch`] again, looping forever rather than giving up
+/// after some number of attempts. When that call succeeds, its new
+/// [`Inotify`] replaces the broken one and the backoff resets to `base`;
+/// when it fails too, there is no better `Inotify` to hold, so the loop
+/// keeps the one it has and tries reading from it again next iteration,
+/// backed off further, until some later `open_watch` call finally
+/// succeeds. "Retry forever" rather than "retry a few times, then alert"
+/// is deliberate: this crate has no alerting channel and no `tracing` (or
+/// any other structured logging) seam to page anyone through —
+/// `eprintln!("hopd: …")` to stderr is the entire logging convention
+/// here, confirmed directly against every other call site in this crate
+/// rather than assumed. An `eprintln!` that nobody is watching, followed
+/// by a thread that gives up, is strictly worse than one that keeps
+/// trying: retrying costs nothing but a little CPU once backed off to the
+/// cap, and a root that starts working again (the disk that held it
+/// remounting, say) recovers the index without a daemon restart instead
+/// of requiring one.
+///
+/// **Re-arm every root before every rescan (issue #106 gaps 1 and 2).**
+/// After each successful read, every root in `roots` gets `Watches::add`ed
+/// again, unconditionally, before [`scan_apps`] runs — ignoring individual
+/// failures. `Watches::add` on a path that already has a watch updates it
+/// and returns the same descriptor rather than erroring (confirmed
+/// against the crate's own docs for `Watches::add`, and pinned by
+/// `watches_add_on_an_already_watched_root_updates_the_watch_rather_than_erroring`
+/// in `watcher_tests`), so this needs no bookkeeping of which roots are
+/// currently watched — a root that's still missing just fails this call
+/// and is skipped, same tolerance [`open_watch`] itself has. This is one
+/// mechanism that narrows both gap 1 (a root deleted out from under its
+/// watch) and gap 2 (a root that did not exist at startup): either is
+/// picked back up the next time *any other* watched root's event wakes
+/// this loop, since every root gets re-armed on every successful read,
+/// not just the one whose event fired. Neither gap is *closed*, and for
+/// the same reason in both cases: if no other root ever produces an
+/// event — a single-root configuration, or every other root equally
+/// quiet — nothing wakes the loop to retry the missing or deleted one,
+/// and it stays unwatched until the daemon restarts. See [`open_watch`]'s
+/// doc comment for that residual spelled out concretely. This
+/// deliberately does not inspect which events were read or which root
+/// they came from: re-arming every root on every successful read is
+/// cheap enough (a handful of `inotify_add_watch` calls) that there is
+/// nothing to gain from tracking which one changed.
+fn run_watcher_loop(
+    mut inotify: Inotify,
+    index: Arc<AppIndex>,
+    roots: Vec<PathBuf>,
+    schedule: BackoffSchedule,
+    mut read: impl FnMut(&mut Inotify, &mut [u8]) -> io::Result<()>,
+) -> ! {
+    let mut buffer = vec![0u8; WATCH_BUFFER_LEN];
+    let mut delay = schedule.base;
+    loop {
+        match read(&mut inotify, &mut buffer) {
+            Ok(()) => {
+                let mut watches = inotify.watches();
+                for root in &roots {
+                    let _ = watches.add(root, watch_mask());
+                }
+                index.replace(scan_apps(&roots));
+            }
+            Err(err) => {
+                eprintln!(
+                    "hopd: apps provider: desktop-entry watcher read error, retrying in {delay:?}: {err}"
+                );
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(schedule.max);
+                match open_watch(&roots) {
+                    Ok(new_inotify) => {
+                        inotify = new_inotify;
+                        delay = schedule.base;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "hopd: apps provider: could not re-establish the desktop-entry watch, will keep retrying: {err}"
+                        );
+                    }
                 }
             }
         }
-    });
+    }
 }
 
 /// [`build_watched_index`]'s actual body, with `after_watch` run at the
@@ -3019,6 +3195,211 @@ mod watcher_tests {
                 .iter()
                 .any(|i| i.title == "Later")),
             "a change after construction must still be picked up by the watcher"
+        );
+    }
+
+    // --- Issue #106: watcher robustness. Gaps 1 and 2 (a deleted or
+    // late-created root never gets a watch back) share one fix —
+    // `run_watcher_loop` re-arming every root on every successful read —
+    // and gap 3 (the thread dying silently on a read error) is that same
+    // loop's retry-forever behavior. ---
+
+    #[test]
+    fn watches_add_on_an_already_watched_root_updates_the_watch_rather_than_erroring() {
+        // Verifies the assumption `run_watcher_loop`'s re-arm step relies
+        // on: calling `Watches::add` again on a path that already has a
+        // watch is documented to update the existing watch and return the
+        // same descriptor, not fail. That is what makes it safe to re-add
+        // a watch on every root on every loop iteration unconditionally,
+        // with no bookkeeping of which roots are already watched.
+        let dir = tempfile::tempdir().unwrap();
+        let inotify = open_watch(&[dir.path().to_path_buf()]).unwrap();
+        let mut watches = inotify.watches();
+        let first = watches.add(dir.path(), watch_mask()).unwrap();
+        let second = watches.add(dir.path(), watch_mask()).unwrap();
+        assert_eq!(
+            first, second,
+            "re-adding a watch on the same path must update the existing \
+             watch and return the same descriptor, not create a second one"
+        );
+    }
+
+    #[test]
+    fn a_deleted_and_recreated_root_is_rewatched_without_a_daemon_restart() {
+        // Issue #106 gap 1: inotify drops a watch silently when its
+        // directory is removed, and nothing re-established it. `dir_a` is
+        // removed and recreated here, and does end up watched again — but
+        // this deliberately does not pin down *which* event actually woke
+        // the loop for the re-arm that picked it back up. Removing a
+        // watched directory always emits `IN_IGNORED`, delivered by the
+        // kernel regardless of the requested watch mask, so `dir_a`'s own
+        // removal is itself a plausible wake source here: `create_dir`
+        // below runs synchronously right after `remove_dir`, so by the
+        // time the watcher thread gets around to processing `IN_IGNORED`
+        // the directory may already exist again, making that alone
+        // sufficient without any help from `dir_b`. Proving the wake came
+        // from `dir_b` specifically would mean suppressing or
+        // intercepting `IN_IGNORED`, which the watch mask cannot do and
+        // which this test does not attempt. What it does prove is the
+        // outcome that matters: a root deleted and recreated ends up
+        // watched again with no daemon restart, through some combination
+        // of these two roots' events driving the re-arm.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let roots = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
+        let inotify = open_watch(&roots).unwrap();
+        let index = Arc::new(AppIndex::new(scan_apps(&roots)));
+
+        spawn_index_watcher(inotify, index.clone(), roots);
+
+        std::fs::remove_dir(dir_a.path()).unwrap();
+        std::fs::create_dir(dir_a.path()).unwrap();
+
+        // dir_b's event guarantees at least one more read/re-arm pass
+        // runs, whether or not dir_a's own IN_IGNORED already did the job.
+        std::fs::write(
+            dir_b.path().join("wake.desktop"),
+            "[Desktop Entry]\nName=Wake\nExec=wake\n",
+        )
+        .unwrap();
+        assert!(
+            wait_until(&index, Duration::from_secs(5), |items| items
+                .iter()
+                .any(|i| i.title == "Wake")),
+            "sanity: dir_b's event must be processed before dir_a's rewatch can be checked"
+        );
+
+        // dir_a should be watched again now — a new file inside it must be
+        // seen with no further help from dir_b.
+        std::fs::write(
+            dir_a.path().join("recovered.desktop"),
+            "[Desktop Entry]\nName=Recovered\nExec=recovered\n",
+        )
+        .unwrap();
+        assert!(
+            wait_until(&index, Duration::from_secs(5), |items| items
+                .iter()
+                .any(|i| i.title == "Recovered")),
+            "a root re-created after being deleted must be re-watched, not left dark until a restart"
+        );
+    }
+
+    #[test]
+    fn a_root_missing_at_startup_is_watched_once_it_exists_and_another_roots_event_wakes_the_loop()
+    {
+        // Issue #106 gap 2's residual: a root that does not exist yet when
+        // `open_watch` runs is skipped, per that function's contract, but
+        // the same re-arm-every-root step that also narrows gap 1 means
+        // the next event from *any other* watched root retries the watch
+        // on it too — so once something creates the missing root, one
+        // unrelated event elsewhere is enough to pick it up. (What is
+        // still not covered — a missing root that never gets this nudge
+        // because no other root ever fires an event — is exactly the
+        // residual `open_watch`'s doc comment now documents, shared with
+        // gap 1's identical circumstance.)
+        let missing = tempfile::tempdir().unwrap();
+        let missing_path = missing.path().to_path_buf();
+        // Delete it immediately, so `open_watch` below sees a root that
+        // does not exist yet — the way a never-created
+        // `~/.local/share/applications` would on a fresh machine.
+        std::fs::remove_dir(&missing_path).unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let roots = vec![missing_path.clone(), dir_b.path().to_path_buf()];
+        let inotify = open_watch(&roots).unwrap();
+        let index = Arc::new(AppIndex::new(scan_apps(&roots)));
+
+        spawn_index_watcher(inotify, index.clone(), roots);
+
+        std::fs::create_dir(&missing_path).unwrap();
+
+        std::fs::write(
+            dir_b.path().join("wake.desktop"),
+            "[Desktop Entry]\nName=Wake\nExec=wake\n",
+        )
+        .unwrap();
+        assert!(
+            wait_until(&index, Duration::from_secs(5), |items| items
+                .iter()
+                .any(|i| i.title == "Wake")),
+            "sanity: dir_b's event must be processed before the missing root's rewatch can be checked"
+        );
+
+        std::fs::write(
+            missing_path.join("arrived.desktop"),
+            "[Desktop Entry]\nName=Arrived\nExec=arrived\n",
+        )
+        .unwrap();
+        assert!(
+            wait_until(&index, Duration::from_secs(5), |items| items
+                .iter()
+                .any(|i| i.title == "Arrived")),
+            "a root that appeared after startup must be watched once another root's event nudges the loop"
+        );
+    }
+
+    #[test]
+    fn a_read_error_does_not_kill_the_watcher_thread_and_indexing_resumes_after_recovery() {
+        // Issue #106 gap 3, the core of this issue: `read_events_blocking`
+        // returning `Err` used to log it and return from the thread,
+        // freezing the index for the rest of the process's life.
+        // `run_watcher_loop` must instead retry: back off, re-establish
+        // the watch via `open_watch`, and keep going.
+        //
+        // The injected `read` fails exactly once, then defers to the real
+        // `read_events_blocking` — there is no portable way to force a
+        // real inotify fd into an error state from a test, which is
+        // exactly why `run_watcher_loop` was factored out to take `read`
+        // as a parameter. A channel signals the instant the loop is about
+        // to perform its first post-recovery read — which is also the
+        // instant `open_watch` has already re-armed the watch — so writing
+        // the trigger file after that signal cannot race the watch being
+        // established.
+        let dir = tempfile::tempdir().unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        let inotify = open_watch(&roots).unwrap();
+        let index = Arc::new(AppIndex::new(scan_apps(&roots)));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let mut has_failed = false;
+        let read = move |inotify: &mut Inotify, buffer: &mut [u8]| -> io::Result<()> {
+            if !has_failed {
+                has_failed = true;
+                return Err(io::Error::other("synthetic read error for the test"));
+            }
+            let _ = ready_tx.send(());
+            inotify.read_events_blocking(buffer).map(|_events| ())
+        };
+
+        let index_for_loop = index.clone();
+        std::thread::spawn(move || {
+            run_watcher_loop(
+                inotify,
+                index_for_loop,
+                roots,
+                BackoffSchedule {
+                    base: Duration::ZERO,
+                    max: Duration::ZERO,
+                },
+                read,
+            );
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the watcher must retry and reach a post-recovery read rather than exiting");
+
+        std::fs::write(
+            dir.path().join("recovered.desktop"),
+            "[Desktop Entry]\nName=Recovered\nExec=recovered\n",
+        )
+        .unwrap();
+
+        assert!(
+            wait_until(&index, Duration::from_secs(5), |items| items
+                .iter()
+                .any(|i| i.title == "Recovered")),
+            "indexing must resume after the watcher recovers from a read error"
         );
     }
 }
