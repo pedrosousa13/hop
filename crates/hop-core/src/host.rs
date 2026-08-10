@@ -552,7 +552,7 @@ impl ProviderHost {
         self.providers
             .iter()
             .filter(|r| {
-                let long_enough = q.term.chars().count() >= r.effective.min_term_len;
+                let long_enough = q.term.as_str().chars().count() >= r.effective.min_term_len;
                 let augments =
                     !q.exclusive && r.effective.modes.contains(&Mode::All) && long_enough;
                 let run = should_query(&r.effective, q) || augments;
@@ -1617,7 +1617,7 @@ mod tests {
         host.register(ShiftyProvider::new()).unwrap();
 
         let short = route("a hi");
-        assert_eq!(short.term, "hi");
+        assert_eq!(short.term.as_str(), "hi");
         assert!(
             host.selected_ids(&short).is_empty(),
             "the captured minimum of 3 governs, not the 0 it now answers with"

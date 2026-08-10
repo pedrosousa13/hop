@@ -99,6 +99,121 @@ use regex::Regex;
 /// frame with none of this context.
 pub use hop_protocol::Mode;
 
+/// Query text carried by a [`RoutedQuery`]: both [`RoutedQuery::term`] and
+/// [`RoutedQuery::raw`] hold this type rather than a plain `String`, so a
+/// value built from either field prints the same redacted marker wherever it
+/// is formatted — inside the frame, or destructured out of it. Mirrors
+/// `hop-protocol`'s [`hop_protocol::redaction::QueryText`], which is the
+/// pattern this type extends one crate downstream (issue #83).
+///
+/// # Why this is not `QueryText`
+///
+/// Reusing `QueryText` here was considered and rejected.
+/// [`Pipeline::assemble`] builds the `RoutedQuery` it hands to
+/// [`crate::rank::Ranker::rank`] by substituting `alias_effect.effective_term`
+/// into `term` — an alias **rewrite target**: arbitrary text out of a user's
+/// config file, never bound to the wire. It can legitimately exceed
+/// [`hop_protocol::limits::MAX_QUERY_TEXT`], the exact bound `QueryText::new`
+/// enforces, so reusing `QueryText` for `term` would mean either refusing a
+/// long alias rewrite at query time — a new failure mode on the one path
+/// that is unbounded by design — or adding an unchecked constructor to
+/// `QueryText`, which would discard the guarantee that type exists to carry.
+/// The two values have genuinely different invariants: `QueryText` asserts a
+/// bound because every byte of it crossed the wire and was checked against
+/// one; `RoutedText` asserts none, on purpose, because at least one of its
+/// producers never had a bound to check against. [`RoutedText::new`] is
+/// therefore infallible — there is no refusal to report, ever. Do not add
+/// one to make this type look more like `QueryText`; that is precisely the
+/// difference between them.
+///
+/// [`Pipeline::assemble`]: crate::pipeline::Pipeline::assemble
+///
+/// # What `Debug` prints
+///
+/// `RoutedText(<redacted, N bytes>)`, where `N` is [`RoutedText::len`] — the
+/// length of the text in bytes. The text itself never appears, `{:#?}`
+/// prints the same one-line marker as `{:?}` (this `Debug` does not vary on
+/// the alternate flag), and this holds for an empty value too: an empty
+/// `RoutedText` still prints the marker, reporting `0 bytes`, rather than
+/// looking like a value that was never redacted at all. See
+/// `hop_protocol::redaction::QueryText`'s own docs for the full worked
+/// reasoning; this type follows it exactly rather than re-deriving it.
+///
+/// # What reporting the length costs
+///
+/// Same trade `QueryText` makes, and for the same reason: reporting the byte
+/// length rather than bucketing it is a disclosure, and it is worth pricing
+/// rather than filing under "something about the value". A launcher sends a
+/// `query` frame — and, downstream of it, a routed query — per keystroke, so
+/// a typed secret produces a run of lengths climbing toward N one character
+/// at a time, and a pasted one produces a single frame at N outright; a log
+/// of redacted values tells those two apart, and in the paste case records
+/// the pasted value's exact length on one line. That narrows the search
+/// space for a credential, and it is not nothing. It is accepted here for
+/// the same three reasons `QueryText` accepts it — the exact count is what a
+/// bound refusal already reports elsewhere in this codebase, bucketing does
+/// not recover the paste-versus-typing distinction (that shape is in the
+/// *number* of redacted values, not in their lengths), and what this type
+/// exists to close is the text, not its size — see
+/// `hop_protocol::redaction::QueryText`'s "What reporting the length costs"
+/// for the argument in full; nothing about it changes by moving one crate
+/// downstream.
+///
+/// # No `Display`
+///
+/// Deliberately absent, exactly as `QueryText` omits it: a `Display` writing
+/// the text would put it back within reach of `{}`, reached for without a
+/// thought about `Debug` at all, and a `Display` writing the redacted form
+/// instead would hand `{}` — what code reaches for to show a value to a
+/// user — a marker instead of text, a different problem wearing the first
+/// one's shape. The text is reached by name, through [`RoutedText::as_str`]
+/// or [`RoutedText::into_string`], a visible act at the call site rather
+/// than a formatting default. Pinned by the test
+/// `tests::routed_text_does_not_implement_display`, which asserts in a
+/// `const` block, so adding the impl fails the crate's test build rather
+/// than silently reopening the path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RoutedText(String);
+
+impl RoutedText {
+    /// Builds routed text. Infallible, unlike `QueryText::new` — see this
+    /// type's "Why this is not `QueryText`" for why no bound is enforced
+    /// here.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The text as a string slice. This is the disclosing accessor: what it
+    /// returns is a plain `&str` whose own `Debug` and `Display` print the
+    /// characters, so formatting the result puts them wherever that
+    /// formatting goes.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the text, yielding the string inside. Discloses as
+    /// [`RoutedText::as_str`] does.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// The length of the text in bytes, which is what `Debug` reports.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the text is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for RoutedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RoutedText(<redacted, {} bytes>)", self.0.len())
+    }
+}
+
 /// The result of routing a raw query string.
 ///
 /// # Both string fields are unvalidated, untrusted input
@@ -159,16 +274,19 @@ pub use hop_protocol::Mode;
 /// ```
 ///
 /// The second is the concrete parameter-injection shape: a weather provider
-/// building `format!("https://api/...?q={}", q.term)` hands the author of the
-/// query a free extra URL parameter. **Exclusive** is the user having named
-/// the mode explicitly, not a finding that the text is fit for whatever
-/// answers it.
+/// building `format!("https://api/...?q={}", q.term.as_str())` hands the
+/// author of the query a free extra URL parameter. **Exclusive** is the user
+/// having named the mode explicitly, not a finding that the text is fit for
+/// whatever answers it.
 ///
 /// Escaping the value for a sink is the provider's job, because only the
 /// provider knows which sink it has; [`crate::provider::Provider::query`]
 /// carries that contract and the reasoning for it. This type documents the
-/// hazard and enforces nothing about it — both fields are plain `String`s
-/// that will interpolate into anything, silently.
+/// hazard and enforces nothing about it — both fields' text, once reached
+/// through [`RoutedText::as_str`], will interpolate into anything, silently.
+/// `RoutedText` redacts what formatting a field prints; it validates nothing
+/// about what the text itself contains, so it closes none of this section's
+/// hazard.
 ///
 /// # An exclusive mode filters results; it never checks the term's shape
 ///
@@ -200,9 +318,9 @@ pub use hop_protocol::Mode;
 /// instead, because `looks_like_currency` and `looks_like_math` both count
 /// only ASCII digits — so the parseable-numeric-portion guarantee belongs to
 /// the inferred currency route, never to [`Mode::Currency`] as such. Reading
-/// the mode as the guarantee is how `q.term.parse::<f64>().unwrap()` gets
-/// written, and that panic is two keystrokes away from any keyboard that
-/// types `٢`.
+/// the mode as the guarantee is how `q.term.as_str().parse::<f64>().unwrap()`
+/// gets written, and that panic is two keystrokes away from any keyboard
+/// that types `٢`.
 ///
 /// Nor does inference imply a *usable* term. Each of the three inference
 /// predicates checks something, but no two of them check the same kind of
@@ -242,14 +360,21 @@ pub use hop_protocol::Mode;
 /// point [`Mode::Currency`] means two different things and the change has lost
 /// the single-meaning advantage that motivated it.
 ///
-/// # Debug-formatting this type prints what the user typed
+/// # `Debug`-formatting this type does not print what the user typed
 ///
-/// `RoutedQuery` derives `Debug` and holds `term` and `raw` as plain
-/// `String`s, so `format!("{q:?}")` — or a `tracing` call capturing `?q` —
-/// discloses the query verbatim. `hop-protocol`'s `QueryText` redacts the
-/// same text one crate upstream, but that redaction stops at [`route`], which
-/// takes a `&str`. Issue #83 is open on the gap; this type does **not** close
-/// it, so do not treat a `RoutedQuery` as safe to format into a log.
+/// `RoutedQuery` derives `Debug`, and that is safe because `term` and `raw`
+/// are [`RoutedText`], not plain `String`s: `format!("{q:?}")` — or a
+/// `tracing` call capturing `?q` — prints each as `RoutedText(<redacted, N
+/// bytes>)` rather than the characters. `hop-protocol`'s `QueryText` redacts
+/// the same text one crate upstream, for `ClientMsg::Query.text`; that
+/// redaction used to stop at [`route`], which takes a `&str` and used to
+/// hand the text straight to a `String` field. Issue #83 closed the gap by
+/// giving `RoutedText` the same shape `QueryText` has rather than by
+/// widening `route`'s signature — see [`RoutedText`]'s own docs for why it
+/// is not `QueryText` itself. Formatting a `RoutedQuery` is safe as a
+/// result, but reaching into either field with [`RoutedText::as_str`] or
+/// [`RoutedText::into_string`] and formatting *that* is exactly as unsafe as
+/// it always was: the type only redacts while it is still the type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutedQuery {
     pub mode: Mode,
@@ -263,8 +388,9 @@ pub struct RoutedQuery {
     ///
     /// Trimmed, sometimes stripped, never sanitized: see the type's docs
     /// before interpolating this into a path, an argv element, a URL or a
-    /// query string.
-    pub term: String,
+    /// query string. [`RoutedText::as_str`] is how a caller that has decided
+    /// it is safe to do so reaches the characters.
+    pub term: RoutedText,
     /// `true` only when the user named the mode outright — an explicit
     /// prefix, a sigil, or a trailing phrase. An exclusive route should
     /// replace the general search; a non-exclusive (inferred) route should
@@ -283,7 +409,10 @@ pub struct RoutedQuery {
     pub exclusive: bool,
     /// The untouched original input, exactly as passed to [`route`] — and
     /// untrusted exactly as `term` is, having had not even the trim applied:
-    /// see the type's docs.
+    /// see the type's docs. Also [`RoutedText`], for the same reason `term`
+    /// is: `raw` holds whatever the user typed in full, with nothing
+    /// stripped, so it discloses under `Debug` exactly as much as `term`
+    /// does and needs the same redaction.
     ///
     /// **No code consults this field's value, and no prospective consumer is
     /// known.** Checked when this comment was written: the only read in the
@@ -311,7 +440,7 @@ pub struct RoutedQuery {
     /// question rather than carry it further: either a provider names the
     /// field, or it and `CONTEXT.md`'s **raw query** entry are retired
     /// together, as one change.
-    pub raw: String,
+    pub raw: RoutedText,
 }
 
 /// The timezone aliases known to the router. Ported from the previous
@@ -447,18 +576,18 @@ pub fn route(raw: &str) -> RoutedQuery {
 fn exclusive(mode: Mode, term: &str, raw: &str) -> RoutedQuery {
     RoutedQuery {
         mode,
-        term: term.trim().to_string(),
+        term: RoutedText::new(term.trim()),
         exclusive: true,
-        raw: raw.to_string(),
+        raw: RoutedText::new(raw),
     }
 }
 
 fn inferred(mode: Mode, term: &str, raw: &str) -> RoutedQuery {
     RoutedQuery {
         mode,
-        term: term.trim().to_string(),
+        term: RoutedText::new(term.trim()),
         exclusive: false,
-        raw: raw.to_string(),
+        raw: RoutedText::new(raw),
     }
 }
 
@@ -856,8 +985,8 @@ mod tests {
     #[test]
     fn raw_is_untouched_original_with_leading_whitespace() {
         let r = route("  w fire");
-        assert_eq!(r.term, "fire");
-        assert_eq!(r.raw, "  w fire");
+        assert_eq!(r.term.as_str(), "fire");
+        assert_eq!(r.raw.as_str(), "  w fire");
     }
 
     // --- The worked examples on `RoutedQuery`, pinned.
@@ -1097,6 +1226,7 @@ mod tests {
             assert_eq!(r.mode, Mode::Currency, "{q:?} must reach currency mode");
             let numeric: String = r
                 .term
+                .as_str()
                 .chars()
                 .take_while(|c| !c.is_ascii_alphabetic() && !c.is_whitespace())
                 .collect();
@@ -1164,5 +1294,90 @@ mod tests {
             (r.mode, r.term.as_str(), r.exclusive),
             (Mode::Timezone, "São Paulo", false)
         );
+    }
+
+    // --- Issue #83: `RoutedText` redacts `term` and `raw` under `Debug`.
+
+    /// A value distinctive enough that finding it in formatted output is
+    /// finding this value and not a coincidence.
+    const TYPED: &str = "correct horse battery staple";
+
+    #[test]
+    fn routed_text_debug_reports_a_marker_and_a_byte_count_instead_of_the_text() {
+        let text = RoutedText::new(TYPED);
+        assert_eq!(
+            format!("{text:?}"),
+            format!("RoutedText(<redacted, {} bytes>)", TYPED.len())
+        );
+    }
+
+    #[test]
+    fn routed_text_accessors_round_trip_the_text_unchanged() {
+        let text = RoutedText::new(TYPED);
+        assert_eq!(text.as_str(), TYPED);
+        assert_eq!(text.clone().into_string(), TYPED);
+        assert_eq!(text.len(), TYPED.len());
+        assert!(!text.is_empty());
+        assert!(RoutedText::new("").is_empty());
+    }
+
+    #[test]
+    fn routed_text_accepts_a_term_longer_than_max_query_text() {
+        // The alias-rewrite case (`Pipeline::assemble`'s `effective_term`,
+        // built from `alias_effect.effective_term`) is arbitrary text out of
+        // a user's config file, not bound to the wire — `QueryText::new`
+        // would refuse this, and `RoutedText::new` must not.
+        let long = "a".repeat(hop_protocol::limits::MAX_QUERY_TEXT + 1);
+        let text = RoutedText::new(&long);
+        assert_eq!(text.as_str(), long);
+    }
+
+    #[test]
+    fn routing_a_distinctive_query_does_not_reveal_it_in_debug() {
+        // The issue's own acceptance criterion, run against the whole
+        // `RoutedQuery` — not just `term`. `raw` carries the same typed text
+        // (route() strips nothing from it), so this only holds if `raw` is
+        // redacted too.
+        let routed = route(TYPED);
+        let debug = format!("{routed:?}");
+        assert!(!debug.contains(TYPED), "got: {debug}");
+    }
+
+    /// Answers "does `T` implement [`fmt::Display`]?" as a value, the same
+    /// probe `hop_protocol::redaction`'s `QueryText` tests use: an inherent
+    /// associated constant and a blanket trait one on the same name, so the
+    /// inherent one wins where it exists.
+    struct DisplayProbe<T>(std::marker::PhantomData<T>);
+
+    trait MaybeDisplay {
+        const IMPLEMENTS_DISPLAY: bool = false;
+    }
+
+    impl<T> MaybeDisplay for DisplayProbe<T> {}
+
+    impl<T: std::fmt::Display> DisplayProbe<T> {
+        const IMPLEMENTS_DISPLAY: bool = true;
+    }
+
+    #[test]
+    fn routed_text_does_not_implement_display() {
+        // Both are const blocks, so this fails at compile time rather than
+        // at run time: adding the impl stops the crate's tests building.
+        //
+        // `String` is the control: it does implement `Display`, so a probe
+        // that answered `false` for everything would fail here rather than
+        // let the assertion below pass for the wrong reason.
+        const {
+            assert!(
+                DisplayProbe::<String>::IMPLEMENTS_DISPLAY,
+                "the probe reports no Display for a type that has one"
+            );
+        }
+        const {
+            assert!(
+                !DisplayProbe::<RoutedText>::IMPLEMENTS_DISPLAY,
+                "RoutedText must not implement Display; see its docs for why"
+            );
+        }
     }
 }

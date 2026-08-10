@@ -358,7 +358,7 @@ impl Ranker {
         weights: &Weights,
         boosts: &Boosts,
     ) -> Vec<Ranked> {
-        let matching = Matching::for_term(query.term.trim(), weights.max_term_chars);
+        let matching = Matching::for_term(query.term.as_str().trim(), weights.max_term_chars);
         self.rank_matching(&matching, items, weights, boosts)
     }
 
@@ -1235,9 +1235,9 @@ mod tests {
     fn term_query(term: &str) -> RoutedQuery {
         RoutedQuery {
             mode: crate::router::Mode::All,
-            term: term.to_string(),
+            term: crate::router::RoutedText::new(term),
             exclusive: false,
-            raw: term.to_string(),
+            raw: crate::router::RoutedText::new(term),
         }
     }
 
