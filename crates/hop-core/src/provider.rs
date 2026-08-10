@@ -118,6 +118,49 @@ pub struct ProviderManifest {
     /// provider's task is aborted at this budget whether or not the provider
     /// ever reads [`QueryCtx::deadline`].
     pub budget: Duration,
+    /// A claim about this provider's own ids, not a feature to turn on:
+    /// **my ids are safe to persist in the clear.** `true` means every id
+    /// this provider's [`Provider::query`] and [`Provider::execute`] can
+    /// ever produce is fit to sit on disk, legible, in
+    /// [`crate::learning::Learning`]'s store — enumerable, not user-authored,
+    /// carrying no fragment of what the user typed or a path to a document
+    /// they own. `false` means `hop-core`'s learning store hashes this
+    /// provider's ids instead of writing them through.
+    ///
+    /// This is issue #72's answer to the question issue #39 first raised and
+    /// left open: whether a provider's ids are safe to write in the clear is
+    /// a fact only the provider itself can state, and this field is where it
+    /// states it — replacing #39's guess at the raw id's own *shape*
+    /// (`app:`, `utility:`, ...) as the thing that decision now rests on.
+    /// See `hop-core::learning`'s `persistence_key` for the mechanics, and
+    /// [`crate::learning::Learning::sync_plaintext_providers`] for how a
+    /// manifest's answer here actually reaches it — `Learning` does not hold
+    /// manifests, so nothing here is read by that module directly.
+    ///
+    /// **No default, deliberately.** [`ProviderManifest`] derives neither
+    /// `Default` nor any other way to construct one without naming every
+    /// field, and this one especially must never have a silent answer: a
+    /// manifest literal that leaves this out is a compile error, not a
+    /// provider that quietly inherited `false` (safe) or `true` (unsafe,
+    /// silently). A maintainer adding a new provider is forced to make this
+    /// call by hand, once, for that provider's own ids.
+    ///
+    /// **What setting this wrongly costs the user.** Nothing downstream
+    /// checks the claim. [`crate::pipeline::CheckedItems::check`] holds an
+    /// item to its producer's manifest for `kind` and `provider` — never for
+    /// this field, and there is no way for it to: whether an id is "safe to
+    /// persist" is a fact about meaning, not shape, and no structural check
+    /// can verify it. A manifest that sets this `true` for ids that in fact
+    /// carry user-authored content is exactly the exposure Decision 2 exists
+    /// to prevent, reopened from the other direction: a search term, a
+    /// filesystem path, an email address — anything a user typed or a
+    /// provider read off their disk — lands legible on sight in a learning
+    /// store this project's own threat model treats as attacker-readable
+    /// on a shared or compromised machine, in a backup, or in a support
+    /// bundle. Setting it `false` for ids that are in fact safe costs
+    /// nothing but a hex digest in the file instead of the id itself — the
+    /// wrong-direction mistake is always the free one to make.
+    pub ids_are_safe_to_persist_in_the_clear: bool,
 }
 
 /// What a provider's async methods receive for one in-flight query: a
@@ -351,6 +394,33 @@ pub fn should_query(m: &ProviderManifest, q: &RoutedQuery) -> bool {
     true
 }
 
+/// Projects `manifests` down to the ids of those that claim
+/// [`ProviderManifest::ids_are_safe_to_persist_in_the_clear`] — the plain set
+/// `hop-core`'s learning store takes, rather than a manifest or a registry of
+/// its own, so it stays exactly as decoupled from `ProviderManifest`'s other
+/// fields as it already is from everything else about a provider.
+///
+/// A provider absent from `manifests` entirely — one that never
+/// registered — is therefore never in the returned set either: this
+/// function has nothing to consult for it, so it cannot end up there by
+/// omission. That is issue #72's fail-closed requirement, met here rather
+/// than inside the learning store itself, since the store does not hold a
+/// manifest registry to consult in the first place.
+///
+/// Callers pass this straight to
+/// [`crate::learning::Learning::sync_plaintext_providers`] — typically
+/// `plaintext_provider_ids(&host.manifests())`, once at startup,
+/// since [`ProviderHost`](crate::host::ProviderHost) captures every manifest
+/// once at registration and treats it as constant thereafter (see that
+/// type's module docs).
+pub fn plaintext_provider_ids(manifests: &[ProviderManifest]) -> std::collections::HashSet<String> {
+    manifests
+        .iter()
+        .filter(|m| m.ids_are_safe_to_persist_in_the_clear)
+        .map(|m| m.id.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -366,6 +436,7 @@ mod tests {
             modes,
             min_term_len,
             budget: Duration::from_millis(50),
+            ids_are_safe_to_persist_in_the_clear: false,
         }
     }
 
@@ -552,5 +623,41 @@ mod tests {
         assert_eq!(a, manifest(vec![Mode::Apps], 3));
         assert_ne!(a, manifest(vec![Mode::Apps], 4));
         assert_ne!(a, manifest(vec![Mode::All], 3));
+        let mut opted_in = manifest(vec![Mode::Apps], 3);
+        opted_in.ids_are_safe_to_persist_in_the_clear = true;
+        assert_ne!(
+            a, opted_in,
+            "the plaintext-persistence flag must participate in equality like any \
+             other manifest field"
+        );
+    }
+
+    /// [`plaintext_provider_ids`]'s three cases: a manifest that opts in is
+    /// in the result, one that does not is absent (not merely `false` — the
+    /// id itself is gone), and — the fail-closed case issue #72's brief
+    /// requires — a provider that never appears in `manifests` at all is
+    /// just as absent as one that appeared and declined. There is nothing
+    /// this function could consult for a provider it was never handed.
+    #[test]
+    fn plaintext_provider_ids_includes_only_opted_in_manifests() {
+        let mut opted_in = manifest(vec![Mode::Apps], 0);
+        opted_in.id = "apps";
+        opted_in.ids_are_safe_to_persist_in_the_clear = true;
+
+        let mut opted_out = manifest(vec![Mode::Calculator], 0);
+        opted_out.id = "calculator";
+        opted_out.ids_are_safe_to_persist_in_the_clear = false;
+
+        let ids = plaintext_provider_ids(&[opted_in, opted_out]);
+        assert!(ids.contains("apps"));
+        assert!(!ids.contains("calculator"));
+        assert!(
+            !ids.contains("never-registered"),
+            "a provider absent from the manifest list must never be in the result"
+        );
+        assert!(
+            plaintext_provider_ids(&[]).is_empty(),
+            "no manifests at all must project to no plaintext providers"
+        );
     }
 }

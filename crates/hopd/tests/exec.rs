@@ -25,7 +25,9 @@ use common::{hello, recv, send, start_daemon};
 use hop_core::host::{HostPolicy, NoopLog, ProviderHost};
 use hop_core::learning::Learning;
 use hop_core::pipeline::Pipeline;
-use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
+use hop_core::provider::{
+    Provider, ProviderError, ProviderManifest, QueryCtx, plaintext_provider_ids,
+};
 use hop_core::router::{Mode, RoutedQuery};
 use hop_protocol::{
     Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ErrorCode, ExecOutcome, Item, ItemId, Kind,
@@ -378,6 +380,7 @@ impl Provider for HangingExecProvider {
             modes: vec![Mode::All],
             min_term_len: 0,
             budget: Duration::from_millis(10),
+            ids_are_safe_to_persist_in_the_clear: false,
         }
     }
 
@@ -518,13 +521,15 @@ fn a_hanging_execute_is_bounded_and_the_connection_stays_responsive() {
 /// `execute`, because it is [`HostSource::record_launch`] under test here,
 /// not the connection's dispatch.
 ///
-/// Its item id is `app:launchable:1` rather than `launchable:1` — an
-/// `app:`-shaped id is what `hop_core::learning`'s persistence-key rule
-/// (issue #39) persists in the clear, which is what lets the assertions
-/// below check the on-disk store by the literal id string. `hop-core`'s own
-/// `learning` tests already cover an id that hashes; this test is about the
-/// wiring from a real socket exchange to a real save, not about the key
-/// rule itself.
+/// Its item id is `app:launchable:1` rather than `launchable:1`, and its
+/// manifest opts in to plaintext persistence
+/// (`ids_are_safe_to_persist_in_the_clear: true`) — issue #72 made the
+/// manifest the sole authority for that, so opting in is what lets the
+/// assertions below check the on-disk store by the literal id string; the
+/// `app:` prefix itself no longer matters to the persistence-key rule.
+/// `hop-core`'s own `learning` tests already cover an id that hashes; this
+/// test is about the wiring from a real socket exchange to a real save, not
+/// about the key rule itself.
 struct LaunchableProvider;
 
 impl Provider for LaunchableProvider {
@@ -535,6 +540,7 @@ impl Provider for LaunchableProvider {
             modes: vec![Mode::All],
             min_term_len: 0,
             budget: Duration::from_millis(10),
+            ids_are_safe_to_persist_in_the_clear: true,
         }
     }
 
@@ -587,7 +593,15 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
 
     let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
     host.register(LaunchableProvider).unwrap();
-    let pipeline = Arc::new(tokio::sync::Mutex::new(Pipeline::default()));
+    // The manifest is the authority for plaintext persistence (issue #72);
+    // `Learning` does not hold manifests, so this hands it the registry's
+    // answer once, mirroring `lib.rs::run()`'s own wiring.
+    let mut learning = Learning::default();
+    learning.sync_plaintext_providers(plaintext_provider_ids(&host.manifests()));
+    let pipeline = Arc::new(tokio::sync::Mutex::new(Pipeline {
+        learning,
+        ..Pipeline::default()
+    }));
     let source = HostSource::with_config(
         Arc::new(host),
         pipeline,
@@ -657,10 +671,10 @@ fn a_successful_execute_persists_a_launch_to_the_learning_store() {
     let recent = reloaded.recent_launches(10);
     // `hop-core`'s learning store persists a provider-scoped key (issue #72),
     // not the bare item id — `<provider-len>:<provider>:<id>`. `"launchable"`
-    // is `LaunchableProvider`'s manifest id, and `app:launchable:1` is a
-    // known-safe shape that persists in the clear, so the persisted key is
-    // exactly this composition; see `hop-core::learning`'s own tests for the
-    // key rule itself.
+    // is `LaunchableProvider`'s manifest id, and its manifest opts in to
+    // plaintext persistence (see the struct's own doc comment), so the
+    // persisted key is exactly this composition over the raw item id; see
+    // `hop-core::learning`'s own tests for the key rule itself.
     let expected_key = format!("{}:launchable:app:launchable:1", "launchable".len());
     assert!(
         recent.iter().any(|(id, _)| *id == expected_key),
@@ -682,7 +696,15 @@ fn two_sequential_launches_both_land_in_the_learning_store() {
 
     let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
     host.register(LaunchableProvider).unwrap();
-    let pipeline = Arc::new(tokio::sync::Mutex::new(Pipeline::default()));
+    // The manifest is the authority for plaintext persistence (issue #72);
+    // `Learning` does not hold manifests, so this hands it the registry's
+    // answer once, mirroring `lib.rs::run()`'s own wiring.
+    let mut learning = Learning::default();
+    learning.sync_plaintext_providers(plaintext_provider_ids(&host.manifests()));
+    let pipeline = Arc::new(tokio::sync::Mutex::new(Pipeline {
+        learning,
+        ..Pipeline::default()
+    }));
     let source = HostSource::with_config(
         Arc::new(host),
         pipeline,

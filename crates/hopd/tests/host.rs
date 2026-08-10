@@ -351,6 +351,7 @@ fn a_fast_providers_items_arrive_before_a_slow_providers_budget_expires() {
                     modes: vec![Mode::All],
                     min_term_len: 0,
                     budget: Duration::from_millis(500),
+                    ids_are_safe_to_persist_in_the_clear: false,
                 },
             ),
             ScriptedProvider::new(

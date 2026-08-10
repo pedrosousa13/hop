@@ -1112,6 +1112,7 @@ mod tests {
                     modes: vec![Mode::All],
                     min_term_len: 0,
                     budget: Duration::from_millis(10),
+                    ids_are_safe_to_persist_in_the_clear: false,
                 },
                 items,
                 manifest_calls: AtomicUsize::new(0),
@@ -1169,6 +1170,7 @@ mod tests {
                 // start being dispatched on every keystroke.
                 min_term_len: if first { 3 } else { 0 },
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -1232,6 +1234,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -1299,6 +1302,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -1336,6 +1340,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -1735,6 +1740,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -1789,6 +1795,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: self.budget,
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -1879,6 +1886,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -1955,6 +1963,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: CooperativeProvider::BUDGET,
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -1996,6 +2005,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -2028,6 +2038,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 

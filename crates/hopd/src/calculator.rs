@@ -250,6 +250,11 @@ impl Provider for CalculatorProvider {
             // spawned.
             min_term_len: 1,
             budget: Duration::from_millis(5),
+            // Does not opt in (issue #72 — this is the case #39 was filed
+            // about): `build_item` mints `calc:{term}` straight from the
+            // routed query text, so an id here is exactly what the user
+            // typed. `hop-core::learning::persistence_key` hashes it.
+            ids_are_safe_to_persist_in_the_clear: false,
         }
     }
 

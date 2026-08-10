@@ -231,6 +231,13 @@ impl Provider for SkeletonProvider {
             modes: vec![Mode::All],
             min_term_len: 0,
             budget: Duration::from_millis(1),
+            // Opts in (issue #72): this provider's one item id,
+            // `hop:walking-skeleton`, is a compile-time literal `hardcoded_item`
+            // writes verbatim — never derived from a query, from disk
+            // enumeration, or from anything else that varies at runtime. A
+            // constant has no user-authored content to leak, so there is
+            // nothing here for a shape rule to have guessed wrong about.
+            ids_are_safe_to_persist_in_the_clear: true,
         }
     }
 
@@ -799,6 +806,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(10),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -850,6 +858,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(100),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -901,6 +910,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(200),
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 
@@ -998,6 +1008,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: self.budget,
+                ids_are_safe_to_persist_in_the_clear: false,
             }
         }
 

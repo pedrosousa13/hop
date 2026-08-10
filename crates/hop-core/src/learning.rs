@@ -64,22 +64,37 @@
 //!   file a report is about: `save` still overwrites it, which
 //!   [`Learning::save`] says.
 //! - An unrecognized id no longer reaches disk verbatim (issue #39, Decision
-//!   2's shape half). The salvage — and this module, until now — persisted
-//!   `global_frequency`'s key as whatever [`canonicalize_result_id`] made of
-//!   the raw id, which strips a payload from exactly two providers'
-//!   ids and leaves every other one, `calc:{term}`'s raw query text among
-//!   them, untouched. [`persistence_key`] replaces that as the map's key
-//!   function: three known-safe shapes still persist in the clear, and
-//!   everything else — `calc:` included — persists as a SHA-256 hash of the
-//!   raw id instead. The change is at the boundary an id enters the store
-//!   rather than at `save`: [`Learning::record`] keys `global_frequency` by
-//!   [`persistence_key`] directly, [`Learning::frequency_boost`] computes
-//!   the same key before its lookup, and a load re-keys whatever it finds
-//!   through [`rekeyed_global_frequency`] — so a v1 store's plaintext
-//!   entries migrate in place rather than going unmatched by every lookup
-//!   that now keys by hash. [`persistence_key`]'s own doc comment has the
-//!   rule and what hashing does and does not buy; `selections` is untouched,
-//!   being in-memory only.
+//!   2's shape half — superseded by the manifest half below, issue #72). The
+//!   salvage — and this module, until #39 — persisted `global_frequency`'s
+//!   key as whatever `canonicalize_result_id` made of the raw id, untouched
+//!   for every provider but two. [`persistence_key`] replaced that as the
+//!   map's key function, and originally decided plaintext versus hash by
+//!   guessing at the raw id's own *shape*: three known-safe prefixes
+//!   persisted in the clear, everything else — `calc:` included — hashed.
+//!   That guess is gone now (the next bullet); [`persistence_key`] keeps the
+//!   same job — decide the id-part before [`provider_scoped_key`] folds in
+//!   the provider — but no longer looks at the id itself to do it.
+//! - The shape guess is replaced by a manifest claim (issue #72, Decision 2's
+//!   manifest half — the half #39 deferred here). A provider's own manifest
+//!   now says, once and up front, whether its ids are safe to persist in the
+//!   clear
+//!   ([`ProviderManifest::ids_are_safe_to_persist_in_the_clear`](crate::provider::ProviderManifest::ids_are_safe_to_persist_in_the_clear)),
+//!   and [`persistence_key`] just reads that answer instead of inferring one.
+//!   `Learning` does not hold manifests — importing
+//!   [`ProviderManifest`](crate::provider::ProviderManifest) here would
+//!   couple this module to a type it has no other reason to know about — so
+//!   it holds the *answer* instead, as a plain set of ids:
+//!   [`Learning::sync_plaintext_providers`] is how whoever does hold the
+//!   registry (`hopd`'s daemon wiring, from `ProviderHost::manifests()`)
+//!   hands it over. The set is never restored from a loaded file —
+//!   [`Learning::load`] always starts it empty, hashing every provider,
+//!   until something calls `sync_plaintext_providers` with the real
+//!   registry — see that method's own doc comment for why an untrusted file
+//!   granting itself plaintext persistence would defeat the whole point of
+//!   moving this decision to the manifest. A provider absent from the
+//!   synced set — one that never registered, or one whose registration this
+//!   process has not learned about yet — hashes by the same default, which
+//!   is issue #72's fail-closed requirement.
 //! - Every key gets a provider dimension (issue #72). Issue #39 closed the
 //!   shape half of Decision 2 and left the other half open on purpose: a
 //!   provider that answers honestly at the manifest level can still present
@@ -165,7 +180,7 @@
 //! bought is that a *damaged* store is no longer indistinguishable from a
 //! first run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -260,8 +275,9 @@ const MAX_PROVIDER_ID_DIGITS: usize = 2;
 /// of provider, a second `:`, and the longest id-part [`persistence_key`] can
 /// produce. That last figure is [`MAX_ITEM_ID`] itself, not the hash branch's
 /// fixed 71 bytes (`"sha256:"` plus 64 hex digits): the plaintext branch can
-/// write an `app:`-shaped id verbatim up to the full item-id bound, which is
-/// longer, so the plaintext branch is the one that sets this ceiling.
+/// write a plaintext-eligible provider's raw id verbatim up to the full
+/// item-id bound, which is longer, so the plaintext branch is the one that
+/// sets this ceiling.
 const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_ID + 1 + MAX_ITEM_ID;
 
 /// The most bytes [`Learning::load`] will read from a store file. A file
@@ -429,6 +445,30 @@ pub struct Learning {
     #[serde(default, skip_serializing)]
     selections: HashMap<String, HashMap<String, LearningEntry>>,
     global_frequency: HashMap<String, LearningEntry>,
+    /// The provider ids [`persistence_key`] currently treats as safe to
+    /// persist in the clear — see [`Learning::sync_plaintext_providers`] for
+    /// how this is set and why it is set from outside rather than computed
+    /// here.
+    ///
+    /// `#[serde(skip)]`, not merely `skip_serializing` the way `selections`
+    /// is: `selections` is excluded from the *written* shape because raw
+    /// query text has no business on disk at all, but a `Learning` is still
+    /// free to *read* one back from a file that happens to carry one (a
+    /// hand-edited store, say) with no consequence, because nothing downstream
+    /// trusts it either way. This field is different — reading one back from
+    /// an untrusted file would let a forged store grant itself plaintext
+    /// persistence for every lookup this process makes from then on, which is
+    /// exactly the authority issue #72 moves to the manifest and away from
+    /// anything the id (or, here, the file) can assert about itself. `skip`
+    /// excludes it in both directions: every deserialized `Learning` —
+    /// through [`Learning::load`]'s own parse or through any other route that
+    /// reaches `Learning`'s `Deserialize` impl (see `MAX_STORE_BYTES`'s doc
+    /// comment on why that impl is reachable from outside this module at
+    /// all) — starts this set at `HashSet::default()`, empty, hashing every
+    /// provider until [`Learning::sync_plaintext_providers`] is called with
+    /// the real registry.
+    #[serde(skip)]
+    plaintext_providers: HashSet<String>,
 }
 
 /// The on-disk shape: per-query selections are intentionally left out, so
@@ -772,103 +812,6 @@ fn evict_lru_outer(map: &mut HashMap<String, HashMap<String, LearningEntry>>, ma
     }
 }
 
-/// Strips a dynamic payload off `utility:` and `web-search:` ids, leaving
-/// the fixed `utility:<kind>` / `web-search:<service>` shape behind. Every
-/// other id — `app:`, `calc:`, anything a provider this code has never heard
-/// of mints — passes through unchanged.
-///
-/// This is step one of [`persistence_key`], not a persistence decision on
-/// its own: what this returns still carries a payload for every id it did
-/// not recognize, and [`persistence_key`] is what decides whether the result
-/// is safe to write in the clear. Kept as a separate function because its
-/// job is narrower and worth naming — "strip a payload" is a fact about the
-/// two providers that put one in the id, where "is this safe to persist" is
-/// a fact about the whole id space.
-fn canonicalize_result_id(result_id: &str) -> String {
-    if let Some(utility_tail) = result_id.strip_prefix("utility:") {
-        let utility_kind = utility_tail.split(':').next().unwrap_or_default();
-        if !utility_kind.is_empty() {
-            return format!("utility:{utility_kind}");
-        }
-    }
-    if let Some(web_tail) = result_id.strip_prefix("web-search:") {
-        let service = web_tail.split(':').next().unwrap_or_default();
-        if !service.is_empty() {
-            return format!("web-search:{service}");
-        }
-    }
-    result_id.to_string()
-}
-
-/// Whether `raw_id` — as it arrived, before any stripping — proves it is
-/// safe for [`persistence_key`] to persist in the clear. This is the check
-/// that runs on the *record* path, over the raw id a provider minted.
-///
-/// - `app:<rest>` — a desktop-entry id, unconditionally. `<rest>` names
-///   which `.desktop` file matched, not anything the user entered; the set
-///   of possible values is exactly what is installed on the system, which
-///   is not secret and is not authored by this user's input.
-///   [`canonicalize_result_id`] never touches an `app:` id, so there is no
-///   stripping step to prove here.
-/// - `utility:<kind>` and `web-search:<service>` — safe **only when a
-///   payload was actually stripped**, which means the raw id carried a
-///   *second* colon after the prefix: `utility:<kind>:<payload>`, not bare
-///   `utility:<kind>`. [`canonicalize_result_id`] returns
-///   `format!("utility:{kind}")` whenever the segment right after the
-///   prefix is non-empty, whether or not anything followed it — so a raw
-///   `utility:2+2` (one segment, no payload to strip) and the *result* of
-///   stripping `utility:calculator:2+2` down to `utility:calculator` are
-///   not distinguishable from the stripped string alone: both are
-///   `"utility:<word>"`-shaped, plausible-kind strings. A prefix check on
-///   the stripped output, on its own, cannot tell "a kind was isolated from
-///   a payload" from "the whole raw id happened to already look like
-///   one" — and the second case is exactly a provider minting
-///   `utility:<raw user content>` with no second colon, which is the
-///   payload Decision 2 exists to hash. Requiring the second colon on the
-///   *raw* id is what makes "a payload was stripped" a checked fact rather
-///   than an inference from what the output looks like. Fail-closed on the
-///   ambiguous case: a single-segment `utility:X` is not provably a kind,
-///   so it hashes rather than persisting in the clear.
-///
-/// No `Kind::Utility` provider exists in this tree today, and `calc:`
-/// already hashes regardless (it matches neither prefix), so the gap this
-/// closes was dormant rather than exploited — but the guarantee has to hold
-/// for a provider this code has never seen, which is the whole point of a
-/// *known-safe* shape rather than a *trusted* one.
-///
-/// # Why the load path does not call this
-///
-/// This function needs the *raw* id to do its job — the second-colon
-/// evidence lives only there, and stripping destroys it. A key already
-/// sitting in `global_frequency` on disk is never that raw id; it is either
-/// a hash or [`canonicalize_result_id`]'s *output*, with nothing left to
-/// prove a stripped payload existed. [`rekeyed_legacy_key`] sidesteps the
-/// question rather than answering it: issue #72's option A drops every
-/// legacy `utility:`/`web-search:` entry outright rather than trying to
-/// re-derive whether it was safely stripped, so this function's raw-id-only
-/// evidence — which a stored key no longer carries by the time a load sees
-/// it — is moot on that path. See [`rekeyed_legacy_key`] for the migration
-/// rule itself.
-fn raw_id_proves_a_known_safe_shape(raw_id: &str) -> bool {
-    if raw_id.starts_with("app:") {
-        return true;
-    }
-    for prefix in ["utility:", "web-search:"] {
-        if let Some(tail) = raw_id.strip_prefix(prefix) {
-            let kind = tail.split(':').next().unwrap_or_default();
-            // `tail.len() > kind.len()` is true exactly when there is a
-            // byte at `tail[kind.len()]`, and `split(':').next()` only
-            // stops short of the whole tail at a `:` — so this is "a
-            // second colon followed the kind," i.e. a real payload was
-            // there to strip, not "the kind happens to be short."
-            if !kind.is_empty() && tail.len() > kind.len() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Folds `provider` into `id_part` so that no `(provider, id_part)` pair can
 /// ever produce the same string as a *different* pair — the composition
 /// [`persistence_key`] and `selections`'s per-provider lookup both build
@@ -975,38 +918,45 @@ fn is_already_provider_scoped(key: &str) -> bool {
 }
 
 /// The key [`Learning::record`] and every `global_frequency` lookup use —
-/// issue #39's shape rule (Decision 2's shape half), extended by issue #72
-/// to fold in the provider that presented `raw_id`. This is the one function
-/// that decides what a *raw* id, from a *named* provider, looks like once it
-/// can reach disk, and every site on the live record/lookup path calls it,
-/// so the two are kept in sync by construction rather than by convention.
-/// [`Learning::load`]'s re-keying pass is the one caller that does *not* call
-/// this directly on every stored key — see [`rekeyed_legacy_key`] for why.
+/// Decision 2's rule for what a *raw* id, from a *named* provider, looks
+/// like once it can reach disk, folded together with issue #72's provider
+/// dimension. Every site on the live record/lookup path calls it, so the two
+/// are kept in sync by construction rather than by convention.
+/// [`Learning::load`]'s re-keying pass is the one caller that does *not*
+/// call this directly on every stored key — see [`rekeyed_legacy_key`] for
+/// why.
 ///
 /// # The rule
 ///
-/// 1. Decide the id-part exactly as issue #39 did, unaffected by which
-///    provider is asking: strip a dynamic payload with
-///    [`canonicalize_result_id`], then check [`raw_id_proves_a_known_safe_shape`]
-///    against the *raw* `raw_id` — `app:`, or `utility:`/`web-search:` with a
-///    payload actually stripped — and persist the stripped string in the
-///    clear if it does. Otherwise — `calc:`, a single-segment
-///    `utility:X`/`web-search:X`, every id a provider this code has never
-///    heard of mints, and an id that already begins `sha256:` — the id-part
-///    is `sha256:` followed by the lowercase hex SHA-256 digest of `raw_id`
-///    **as it arrived**, not the stripped form.
+/// 1. If `persist_plaintext` is `true`, the id-part is `raw_id` verbatim.
+///    Otherwise it is `sha256:` followed by the lowercase hex SHA-256 digest
+///    of `raw_id` **as it arrived** — including when `raw_id` already begins
+///    `sha256:`, which is hashed again rather than written through; see
+///    below.
 /// 2. Fold `provider` into that id-part with [`provider_scoped_key`], whose
 ///    own doc comment has the forgery proof: this step is what stops the
 ///    scenario issue #72 exists to close — a provider `evil` presenting
 ///    `app:firefox` must never compute the same key as the genuine `apps`
 ///    presenting `app:firefox`, and after this step it structurally cannot.
 ///
-/// This function is total in the sense the brief asks for at the id-part
-/// step: there is no id for which that step returns its input unchanged
-/// except a known-safe shape. An id shaped exactly like this function's own
-/// hash output — `sha256:` plus 64 lowercase hex characters — is *not*
-/// treated as already-hashed there; it is hashed again, landing under
-/// `sha256:` followed by the digest of that whole string.
+/// `persist_plaintext` is not decided here. Issue #39 decided it by
+/// inspecting `raw_id`'s own shape (`app:`, or `utility:`/`web-search:` with
+/// a payload actually stripped); issue #72 replaced that guess with the
+/// manifest's own claim
+/// ([`ProviderManifest::ids_are_safe_to_persist_in_the_clear`](crate::provider::ProviderManifest::ids_are_safe_to_persist_in_the_clear)),
+/// read off `provider` by whoever calls this function —
+/// [`Learning::record`] and [`Learning::frequency_boost`], via
+/// `self.plaintext_providers` (see [`Learning::sync_plaintext_providers`]).
+/// This function itself no longer looks at `raw_id`'s shape at all: a
+/// `calc:`-shaped id from a provider whose manifest opts in persists
+/// verbatim, and an `app:`-shaped id from a provider that does not persists
+/// hashed — the partition is entirely the caller's to make, and this
+/// function only executes it.
+///
+/// An id shaped exactly like this function's own hash output — `sha256:`
+/// plus 64 lowercase hex characters — is *not* treated as already-hashed on
+/// the hash branch; it is hashed again, landing under `sha256:` followed by
+/// the digest of that whole string.
 /// `an_id_beginning_sha256_is_hashed_rather_than_written_through` pins this
 /// with the exposing shape the brief asks for: a raw id that is a
 /// syntactically valid 64-character hex digest, not merely a short
@@ -1014,17 +964,27 @@ fn is_already_provider_scoped(key: &str) -> bool {
 ///
 /// # Why the plaintext/hash partition is still provable with a provider folded in
 ///
-/// Step 1's id-part begins `app:`, `utility:` or `web-search:` (the
-/// known-safe branch) or `sha256:` (the hash branch), and no input reaches
-/// both — they are `if`/`else`, exactly as before this issue. Step 2 then
-/// wraps whichever id-part step 1 produced with [`provider_scoped_key`],
-/// which — per its own proof — is injective in `(provider, id_part)`: two
-/// calls collide only if both their provider and their id-part were equal.
-/// So a plaintext-id-part key and a hashed-id-part key can never collide
-/// with each other regardless of provider, and two calls with the *same*
-/// id-part collide only when their providers also agree — which is exactly
-/// [`Learning::record`] merging repeat launches of the same id by the same
-/// provider, not a cross-provider collision.
+/// Step 1's id-part is either `raw_id` verbatim (the plaintext branch) or
+/// `sha256:` followed by a 64-character hex digest (the hash branch), and no
+/// input reaches both — they are `if`/`else` on `persist_plaintext`, a plain
+/// `bool`. Step 2 then wraps whichever id-part step 1 produced with
+/// [`provider_scoped_key`], which — per its own proof — is injective in
+/// `(provider, id_part)`: two calls collide only if both their provider and
+/// their id-part were equal. So a plaintext-id-part key and a hashed-id-part
+/// key can never collide with each other regardless of provider, and two
+/// calls with the *same* id-part collide only when their providers also
+/// agree — which is exactly [`Learning::record`] merging repeat launches of
+/// the same id by the same provider, not a cross-provider collision.
+///
+/// A plaintext id-part could, in principle, happen to already start with
+/// `sha256:` followed by 64 hex characters — an opted-in provider is free to
+/// mint an id shaped exactly like this module's hash output, since nothing
+/// about opting in constrains an id's *content*. That does not reopen the
+/// partition: what distinguishes the two branches is which key `persistence_key`
+/// itself was called with `persist_plaintext` true or false for, not
+/// anything inferred from the resulting string's shape after the fact, so a
+/// plaintext id that merely *looks* hashed is still found by a lookup that
+/// (correctly, for that provider) passes `persist_plaintext: true` again.
 ///
 /// # What the hash is not
 ///
@@ -1040,10 +1000,9 @@ fn is_already_provider_scoped(key: &str) -> bool {
 /// hidden by this function at all — it is folded in for partitioning, not
 /// for secrecy, and appears in the clear in every persisted key regardless
 /// of which branch step 1 took.
-fn persistence_key(provider: &str, raw_id: &str) -> String {
-    let stripped = canonicalize_result_id(raw_id);
-    let id_part = if raw_id_proves_a_known_safe_shape(raw_id) {
-        stripped
+fn persistence_key(provider: &str, raw_id: &str, persist_plaintext: bool) -> String {
+    let id_part = if persist_plaintext {
+        raw_id.to_string()
     } else {
         format!("sha256:{:x}", Sha256::digest(raw_id.as_bytes()))
     };
@@ -1098,7 +1057,8 @@ fn persistence_key(provider: &str, raw_id: &str) -> String {
 /// longer occur.
 ///
 /// Was `canonicalized_global_frequency` and ran inside [`Learning::save`],
-/// keying only through [`canonicalize_result_id`] rather than the full
+/// keying only through what was then `canonicalize_result_id` (removed as
+/// of issue #72; see this module's docs) rather than the full
 /// [`persistence_key`] rule. Moved to the load path because the key a
 /// lookup computes has to be the key a launch was recorded under, across a
 /// restart — hashing only on the way to disk would leave `global_frequency`
@@ -1187,6 +1147,7 @@ impl Learning {
             version: STORE_VERSION,
             selections: HashMap::new(),
             global_frequency: HashMap::new(),
+            plaintext_providers: HashSet::new(),
         }
     }
 
@@ -1621,6 +1582,54 @@ impl Learning {
         )
     }
 
+    /// Replaces the set of provider ids this store currently treats as safe
+    /// to persist in the clear, wholesale, with `ids` — [`persistence_key`]'s
+    /// `persist_plaintext` argument, for whichever provider [`Learning::record`]
+    /// or [`Learning::frequency_boost`] next asks about, is read straight off
+    /// this set (`self.plaintext_providers.contains(provider)`).
+    ///
+    /// # Why this exists, and why `Learning` does not compute it itself
+    ///
+    /// [`persistence_key`]'s plaintext-versus-hash decision is the
+    /// manifest's alone now (issue #72's Composition decision), and a
+    /// [`ProviderManifest`](crate::provider::ProviderManifest) is not
+    /// something this module holds or knows how to read — `Learning` is
+    /// `hop-core`'s persistence layer, not its provider registry, and this
+    /// method keeps it that way on purpose. What it takes is the *answer* to
+    /// "which ids has a manifest already vouched for", computed by whoever
+    /// does hold the registry — `hopd`'s daemon wiring, at startup, from
+    /// `ProviderHost::manifests()` — and handed over as plain ids, so this
+    /// module needs nothing about `ProviderManifest`'s other fields (its
+    /// `kinds`, its `budget`, ...) to use the answer.
+    ///
+    /// # Fail-closed by construction
+    ///
+    /// A provider id absent from `ids` is `false`/hashed the moment `record`
+    /// or `frequency_boost` next asks — there is no third state here, only
+    /// "in the set" or "not". A provider that never registered is never in
+    /// `ids` in the first place, so it can never be granted plaintext
+    /// persistence by omission: this method has nothing to consult for it,
+    /// and neither does whoever built `ids`.
+    ///
+    /// # Not persisted, deliberately
+    ///
+    /// The field this sets, `plaintext_providers`, is `#[serde(skip)]` — see
+    /// its own doc comment for why a store loaded from disk must never be
+    /// able to grant itself plaintext persistence for the reads and writes
+    /// that follow. [`Learning::load`] therefore always returns a value with
+    /// this set empty, hashing everything, until whoever holds the live
+    /// store calls this method with the real one.
+    ///
+    /// # Wholesale replacement, not a merge
+    ///
+    /// Set once, from the whole current registry, rather than grown
+    /// incrementally: a provider that stops declaring the flag — or stops
+    /// registering at all — must lose plaintext persistence the next time
+    /// this is called, not keep an entry a caller forgot to remove.
+    pub fn sync_plaintext_providers(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.plaintext_providers = ids.into_iter().collect();
+    }
+
     /// Record a launch: the user reached `item_id`, produced by `provider`,
     /// while typing `query`.
     ///
@@ -1725,10 +1734,14 @@ impl Learning {
 
         // Update global frequency, keyed by the persistence key rather than
         // the raw id — see this function's doc comment for why here rather
-        // than at `save`.
+        // than at `save`. `persist_plaintext` reads whichever answer
+        // `sync_plaintext_providers` last gave for `provider`; a provider
+        // never synced (never registered, or registered after the last
+        // sync) is not in the set and defaults to `false` — hashed.
+        let persist_plaintext = self.plaintext_providers.contains(provider);
         let global = self
             .global_frequency
-            .entry(persistence_key(provider, result_id))
+            .entry(persistence_key(provider, result_id, persist_plaintext))
             .or_insert(LearningEntry {
                 count: 0,
                 last_ms: 0,
@@ -1812,9 +1825,10 @@ impl Learning {
     /// same raw id, which is issue #72's boost-theft gap exactly.
     fn frequency_boost(&self, provider: &str, result_id: &str) -> i32 {
         let now = now_ms();
-        if let Some(entry) = self
-            .global_frequency
-            .get(&persistence_key(provider, result_id))
+        let persist_plaintext = self.plaintext_providers.contains(provider);
+        if let Some(entry) =
+            self.global_frequency
+                .get(&persistence_key(provider, result_id, persist_plaintext))
         {
             let raw = saturating_count_i32(entry.count).saturating_mul(FREQ_BOOST_PER_COUNT);
             apply_decay(raw, entry.last_ms, now).clamp(0, FREQ_BOOST_CAP)
@@ -2286,11 +2300,16 @@ mod tests {
             1
         );
 
-        // global frequency
+        // global frequency — `false` throughout: this test is about
+        // recording and lookup agreeing on one key, not about which side of
+        // the plaintext/hash partition that key falls on, and `store` was
+        // never synced with `sync_plaintext_providers`, so `false` is what
+        // `record`'s own internal decision for `APPS_PROVIDER_ID` actually
+        // is here.
         assert_eq!(
             store
                 .global_frequency
-                .get(&persistence_key(APPS_PROVIDER_ID, "app:firefox"))
+                .get(&persistence_key(APPS_PROVIDER_ID, "app:firefox", false))
                 .unwrap()
                 .count,
             2
@@ -2298,7 +2317,7 @@ mod tests {
         assert_eq!(
             store
                 .global_frequency
-                .get(&persistence_key(APPS_PROVIDER_ID, "app:firewall"))
+                .get(&persistence_key(APPS_PROVIDER_ID, "app:firewall", false))
                 .unwrap()
                 .count,
             1
@@ -2306,7 +2325,7 @@ mod tests {
         assert_eq!(
             store
                 .global_frequency
-                .get(&persistence_key(APPS_PROVIDER_ID, "app:vscode"))
+                .get(&persistence_key(APPS_PROVIDER_ID, "app:vscode", false))
                 .unwrap()
                 .count,
             1
@@ -2341,7 +2360,9 @@ mod tests {
         assert_eq!(
             loaded
                 .global_frequency
-                .get(&persistence_key(APPS_PROVIDER_ID, "app:firefox"))
+                // `false`: this store was never synced, so this is what its
+                // own `record` call hashed `"app:firefox"` under too.
+                .get(&persistence_key(APPS_PROVIDER_ID, "app:firefox", false))
                 .unwrap()
                 .count,
             2
@@ -2352,35 +2373,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn canonicalizes_dynamic_result_ids_for_persistence() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("learning.json");
-
-        let mut store = Learning::load(&path);
-        store.record(
-            APPS_PROVIDER_ID,
-            "rust docs",
-            "web-search:duckduckgo:https%3A%2F%2Fduckduckgo.com%2F%3Fq%3Drust%2Bdocs",
-        );
-        store.record(APPS_PROVIDER_ID, "2+2", "utility:calculator:2+2");
-        store.save(&path).unwrap();
-
-        let loaded = Learning::load(&path);
-        assert!(
-            loaded.global_frequency.contains_key(&provider_scoped_key(
-                APPS_PROVIDER_ID,
-                "web-search:duckduckgo"
-            )),
-            "web-search ids should strip query payloads before persistence"
-        );
-        assert!(
-            loaded
-                .global_frequency
-                .contains_key(&provider_scoped_key(APPS_PROVIDER_ID, "utility:calculator")),
-            "utility ids should strip dynamic suffixes before persistence"
-        );
-    }
+    // `canonicalizes_dynamic_result_ids_for_persistence` used to live here,
+    // pinning issue #39's shape rule stripping a payload off `utility:`/
+    // `web-search:` ids before persisting them in the clear. Issue #72
+    // removed that stripping along with the shape rule itself — the
+    // manifest is the sole authority now, and an opted-in provider's raw id
+    // persists verbatim, unstripped — so there is nothing left for that test
+    // to pin. See `an_opted_in_providers_id_persists_in_the_clear_regardless_of_shape`
+    // below for its replacement.
 
     #[test]
     fn empty_store_returns_no_boosts() {
@@ -2438,10 +2438,10 @@ mod tests {
         let path = dir.path().join("learning.json");
         let mut store = Learning::load(&path);
 
-        // `app:`-shaped ids, not the salvage's bare `.desktop` strings: issue
-        // #39 persists a non-`app:`/`utility:`/`web-search:` id under its
-        // hash, and this test is about `recent_launches`' sort order, not
-        // about that keying, so it needs ids `persistence_key` leaves alone.
+        // This test is about `recent_launches`' sort order, not about the
+        // plaintext/hash partition, so `false` throughout (unsynced store)
+        // is as good a key as any — what matters is that `record` and the
+        // assertion below compute the same one.
         store.record(APPS_PROVIDER_ID, "a", "app:first");
         std::thread::sleep(std::time::Duration::from_millis(10));
         store.record(APPS_PROVIDER_ID, "b", "app:second");
@@ -2450,10 +2450,13 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(
             recent[0].0,
-            persistence_key(APPS_PROVIDER_ID, "app:second"),
+            persistence_key(APPS_PROVIDER_ID, "app:second", false),
             "most recent should be first"
         );
-        assert_eq!(recent[1].0, persistence_key(APPS_PROVIDER_ID, "app:first"));
+        assert_eq!(
+            recent[1].0,
+            persistence_key(APPS_PROVIDER_ID, "app:first", false)
+        );
     }
 
     #[test]
@@ -2462,9 +2465,10 @@ mod tests {
         let path = dir.path().join("learning.json");
         let mut store = Learning::load(&path);
 
-        // `app:`-shaped ids for the same reason as `recent_launches_sorted_by_time`
-        // above: this test is about exclusion, which needs the id it excludes
-        // by to be the id `global_frequency` is actually keyed by.
+        // This test is about exclusion, which needs the id it excludes by to
+        // be the id `global_frequency` is actually keyed by; the
+        // plaintext/hash partition itself is not what is under test here, so
+        // `false` (this store is never synced) is fine.
         for _ in 0..5 {
             store.record(APPS_PROVIDER_ID, "a", "app:popular");
         }
@@ -2472,7 +2476,7 @@ mod tests {
             store.record(APPS_PROVIDER_ID, "b", "app:other");
         }
 
-        let popular_key = persistence_key(APPS_PROVIDER_ID, "app:popular");
+        let popular_key = persistence_key(APPS_PROVIDER_ID, "app:popular", false);
         let frequent = store.frequent_launches(10, std::slice::from_ref(&popular_key));
         assert!(
             frequent.iter().all(|(id, _)| *id != popular_key),
@@ -2692,7 +2696,7 @@ mod tests {
     fn frequency_boost_is_non_negative_and_capped_for_an_in_memory_out_of_range_count() {
         let mut l = Learning::empty();
         l.global_frequency.insert(
-            persistence_key(APPS_PROVIDER_ID, "app:firefox"),
+            persistence_key(APPS_PROVIDER_ID, "app:firefox", false),
             LearningEntry {
                 count: u32::MAX,
                 last_ms: now_ms(),
@@ -2732,7 +2736,13 @@ mod tests {
         )
         .unwrap();
 
-        let l = Learning::load(&path);
+        let mut l = Learning::load(&path);
+        // The legacy plaintext `app:` key is re-attributed to the apps
+        // provider on load regardless of syncing (`rekeyed_legacy_key`
+        // doesn't consult the plaintext set at all); the *lookup* below does,
+        // though, and has to agree that "apps" persists in the clear or it
+        // recomputes a hashed key that no longer matches the migrated entry.
+        l.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
         let boost = l.frequency_boost(APPS_PROVIDER_ID, "app:firefox");
         assert!(
             boost >= 0,
@@ -2800,7 +2810,7 @@ mod tests {
             )]),
         );
         l.global_frequency.insert(
-            persistence_key(APPS_PROVIDER_ID, "app:firefox"),
+            persistence_key(APPS_PROVIDER_ID, "app:firefox", false),
             LearningEntry {
                 count: 2,
                 last_ms: now,
@@ -3358,7 +3368,11 @@ mod tests {
         let padded = whitespace_padded_store(MAX_STORE_BYTES as usize);
         std::fs::write(&path, &padded).unwrap();
 
-        let loaded = Learning::load(&path);
+        let mut loaded = Learning::load(&path);
+        // The fixture's legacy `app:a` key re-attributes to the apps
+        // provider on load regardless; the lookup below needs to agree that
+        // provider persists in the clear to recompute the same key.
+        loaded.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
 
         assert!(
             loaded.frequency_boost(APPS_PROVIDER_ID, "app:a") > 0,
@@ -3704,8 +3718,10 @@ mod tests {
         let path = dir.path().join("learning.json");
         std::fs::write(&path, store_at_version(STORE_VERSION, now_ms())).unwrap();
 
+        let mut loaded = Learning::load(&path);
+        loaded.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
         assert!(
-            Learning::load(&path).frequency_boost(APPS_PROVIDER_ID, "app:a") > 0,
+            loaded.frequency_boost(APPS_PROVIDER_ID, "app:a") > 0,
             "a store on the current version is ordinary learning and must load"
         );
     }
@@ -4134,119 +4150,167 @@ mod tests {
         }
     }
 
-    // --- Unknown ids hash before persistence (issue #39, Decision 2's shape
-    // half). ---
+    // --- The manifest is the sole authority for plaintext persistence
+    // (issue #72, Decision 2's manifest half). ---
     //
     // `persistence_key` is the one function deciding what an id looks like
-    // once it can reach disk; these pin its rule directly, then pin the two
-    // things that rule is worthless without: the same key on both sides of a
-    // restart, and a legacy store's plaintext migrating in place rather than
-    // going unmatched forever.
+    // once it can reach disk; these pin its rule directly (a plain `bool` in,
+    // one of two partitions out — no inspection of `raw_id` at all), then pin
+    // the two things that rule is worthless without: the same key on both
+    // sides of a restart, and a legacy store's plaintext migrating in place
+    // rather than going unmatched forever.
 
-    // The rule itself, and the partition it claims to guarantee: every
-    // known-safe shape persists unchanged, and everything else — `calc:`,
-    // an id from a provider this module has never heard of, and an id that
-    // already looks hashed — is hashed under the *raw* id, landing in a key
-    // space the plaintext one can never collide with by construction.
+    // The rule itself: `persistence_key`'s `bool` argument decides the
+    // partition outright, and nothing about the raw id's own shape moves it
+    // from one side to the other. Held fixed at `APPS_PROVIDER_ID` throughout
+    // — this test is about the id-part decision, not about the provider fold
+    // on top of it, which has its own tests below (see "A provider cannot
+    // forge another provider's key").
     #[test]
-    fn persistence_key_partitions_known_safe_shapes_from_hashed_ids() {
-        // The provider is held fixed at `APPS_PROVIDER_ID` throughout: this
-        // test is about the id-part partition [`persistence_key`] computes
-        // *before* folding in the provider, not about the provider fold
-        // itself — that half has its own tests below (see "A provider
-        // cannot forge another provider's key").
+    fn persistence_key_partitions_on_the_bool_alone_not_on_the_raw_ids_shape() {
         let id_part_of = |key: &str| {
             key.strip_prefix(&provider_scoped_key(APPS_PROVIDER_ID, ""))
                 .expect("every key here is scoped to APPS_PROVIDER_ID")
                 .to_string()
         };
 
-        assert_eq!(
-            id_part_of(&persistence_key(APPS_PROVIDER_ID, "app:firefox.desktop")),
-            "app:firefox.desktop"
-        );
-        assert_eq!(
-            id_part_of(&persistence_key(APPS_PROVIDER_ID, "utility:calculator:2+2")),
-            "utility:calculator"
-        );
-        assert_eq!(
-            id_part_of(&persistence_key(
-                APPS_PROVIDER_ID,
-                "web-search:duckduckgo:https%3A%2F%2Fexample"
-            )),
-            "web-search:duckduckgo"
-        );
-
         for raw in [
             "calc:2+2",
+            "app:firefox.desktop",
             "some-future-provider:opaque-payload",
             "sha256:not-a-real-hash",
         ] {
-            let key = persistence_key(APPS_PROVIDER_ID, raw);
-            let id_part = id_part_of(&key);
             assert_eq!(
-                id_part,
+                id_part_of(&persistence_key(APPS_PROVIDER_ID, raw, true)),
+                raw,
+                "persist_plaintext: true must write {raw:?} through verbatim, \
+                 whatever it looks like"
+            );
+            let hashed = id_part_of(&persistence_key(APPS_PROVIDER_ID, raw, false));
+            assert_eq!(
+                hashed,
                 format!("sha256:{:x}", Sha256::digest(raw.as_bytes())),
-                "unrecognized id {raw:?} must be hashed under the raw id"
+                "persist_plaintext: false must hash {raw:?} under the raw id"
             );
             assert_ne!(
-                id_part, raw,
-                "a hashed key must never equal its raw input verbatim, or an id \
-                 already claiming to be one would be written through unhashed"
-            );
-            assert!(
-                !id_part.starts_with("app:")
-                    && !id_part.starts_with("utility:")
-                    && !id_part.starts_with("web-search:"),
-                "a hashed key must never fall into the plaintext partition: got {id_part:?}"
+                hashed, raw,
+                "a hashed key must never equal its raw input verbatim"
             );
         }
     }
 
-    // Whole-branch review finding: `canonicalize_result_id` only strips a
-    // payload when a *second* colon is present. For a single-segment
-    // `utility:2+2` or `web-search:secretquery`, the kind and the payload
-    // collapse into one field, nothing is stripped, and a bare prefix check
-    // would have accepted the unstripped id as "already safe" — persisting
-    // exactly the payload Decision 2 exists to hash. Both shapes must hash
-    // instead, fail-closed, and — the point of the pin — must not appear
-    // verbatim in the written file's bytes. Contrast
-    // `canonicalizes_dynamic_result_ids_for_persistence` below, where a
-    // genuine second colon *does* prove a payload was stripped and the
-    // `utility:<kind>`/`web-search:<service>` form persists in the clear.
+    // The brief's own minimum: a provider whose manifest does *not* opt in
+    // hashes even an id in the exact shape issue #39's shape rule used to
+    // wave through unconditionally. `APPS_PROVIDER_ID` presenting `app:`
+    // proves the point precisely because `app:` was the one shape the old
+    // rule trusted unconditionally — under the manifest rule it is no safer
+    // than any other shape the moment the manifest says so.
     #[test]
-    fn a_single_segment_utility_or_web_search_id_hashes_rather_than_persisting_verbatim() {
+    fn a_non_opted_in_providers_id_hashes_even_in_an_old_known_safe_shape() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let mut store = Learning::load(&path);
+        // Deliberately not synced: `APPS_PROVIDER_ID` is not in the
+        // (empty) plaintext set, so it hashes exactly like any other
+        // provider this store has never heard of.
 
         store.record_launch(
             APPS_PROVIDER_ID,
-            "2+2",
-            &ItemId::new("utility:2+2").unwrap(),
-        );
-        store.record_launch(
-            APPS_PROVIDER_ID,
-            "secretquery",
-            &ItemId::new("web-search:secretquery").unwrap(),
+            "firefox",
+            &ItemId::new("app:firefox").unwrap(),
         );
         store.save(&path).unwrap();
 
         let saved = std::fs::read_to_string(&path).expect("saved learning file");
         assert!(
-            !saved.contains("utility:2+2"),
-            "a single-segment utility: id has no proven kind and must not persist \
-             verbatim, got: {saved}"
+            !saved.contains("\"app:firefox\"")
+                && !saved.contains(&provider_scoped_key(APPS_PROVIDER_ID, "app:firefox")),
+            "an app:-shaped id from a provider that did not opt in must not persist \
+             in the clear, got: {saved}"
         );
         assert!(
-            !saved.contains("web-search:secretquery"),
-            "a single-segment web-search: id has no proven service and must not persist \
-             verbatim, got: {saved}"
+            saved.contains("sha256:"),
+            "it must be hashed instead, got: {saved}"
         );
+    }
+
+    // The other required minimum: an opted-in provider's id persists in the
+    // clear regardless of its shape — proving the flag is the *sole*
+    // authority rather than one more condition alongside a shape check. A
+    // provider id and an id shape that share nothing with `app:`/`utility:`/
+    // `web-search:` is the point: nothing here would have passed issue #39's
+    // rule, and it persists anyway because the manifest says so.
+    #[test]
+    fn an_opted_in_providers_id_persists_in_the_clear_regardless_of_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let mut store = Learning::load(&path);
+        store.sync_plaintext_providers(["widget".to_string()]);
+
+        store.record_launch(
+            "widget",
+            "banana",
+            &ItemId::new("widget-payload:banana-split").unwrap(),
+        );
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            saved.contains(&format!(
+                "\"{}\"",
+                provider_scoped_key("widget", "widget-payload:banana-split")
+            )),
+            "an opted-in provider's id must persist in the clear even in a shape \
+             no known-safe prefix would ever have matched, got: {saved}"
+        );
+
+        let reloaded = Learning::load(&path);
         assert_eq!(
-            saved.matches("sha256:").count(),
-            2,
-            "both ids must be hashed instead, got: {saved}"
+            reloaded
+                .global_frequency
+                .get(&provider_scoped_key(
+                    "widget",
+                    "widget-payload:banana-split"
+                ))
+                .map(|e| e.count),
+            Some(1),
+            "the key round-trips through a save and load unchanged — it is \
+             already shaped like this module's own provider-scoped output, so \
+             the load-time legacy migration leaves it alone"
+        );
+    }
+
+    // The fail-closed requirement itself: a provider absent from the synced
+    // set — one this process has never learned opted in, including one that
+    // simply never registered at all — hashes, even while *other* providers
+    // in the very same store are opted in. Presence in the set is what
+    // grants plaintext persistence; nothing else does, and nothing about
+    // being "the provider on this launch" substitutes for it.
+    #[test]
+    fn an_id_from_a_provider_absent_from_the_synced_set_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let mut store = Learning::load(&path);
+        // "apps" is synced in; "mystery" — the provider actually presenting
+        // this launch — is not, and never was.
+        store.sync_plaintext_providers(["apps".to_string()]);
+
+        store.record_launch(
+            "mystery",
+            "anything",
+            &ItemId::new("app:mystery-item").unwrap(),
+        );
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains(&provider_scoped_key("mystery", "app:mystery-item")),
+            "a provider absent from the synced set must never persist in the \
+             clear merely because some other provider is opted in, got: {saved}"
+        );
+        assert!(
+            saved.contains("sha256:"),
+            "it must be hashed instead, got: {saved}"
         );
     }
 
@@ -4329,7 +4393,7 @@ mod tests {
         );
     }
 
-    // A known-safe shape is the one case where the persisted bytes should
+    // An opted-in provider is the one case where the persisted bytes should
     // name the id in the clear — the opposite assertion from the two tests
     // above, and both are needed to pin the partition on the disk-writing
     // side rather than only inside `persistence_key`.
@@ -4340,6 +4404,7 @@ mod tests {
         let item_id = ItemId::new("app:firefox").unwrap();
 
         let mut store = Learning::load(&path);
+        store.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
         store.record_launch(APPS_PROVIDER_ID, "firefox", &item_id);
         store.save(&path).unwrap();
 
@@ -4353,20 +4418,22 @@ mod tests {
                 "\"{}\"",
                 provider_scoped_key(APPS_PROVIDER_ID, "app:firefox")
             )),
-            "a known-safe app: id should persist with its id-part in the clear, got: {saved}"
+            "an opted-in provider's app: id should persist with its id-part in the clear, \
+             got: {saved}"
         );
 
-        let reloaded = Learning::load(&path);
+        let mut reloaded = Learning::load(&path);
+        reloaded.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
         assert!(reloaded.boost_for(APPS_PROVIDER_ID, "firefox", &item_id) > 0.0);
     }
 
-    // The partition's own edge case: an id that already begins `sha256:` is
-    // not one of the three known-safe prefixes, so it is hashed like any
-    // other unrecognized id rather than being written through as though it
-    // already were a persistence key — see `persistence_key`'s doc comment
-    // for why that matters for the partition being provable at all. This is
-    // the short, non-hash-shaped case; the full 64-hex-character case below
-    // is the exposing shape the brief specifically asks for.
+    // The partition's own edge case: an id that already begins `sha256:`,
+    // from a provider not synced as plaintext-eligible (this store is never
+    // synced), is hashed like any other id rather than being written through
+    // as though it already were a persistence key — see `persistence_key`'s
+    // doc comment for why that matters for the partition being provable at
+    // all. This is the short, non-hash-shaped case; the full 64-hex-character
+    // case below is the exposing shape the brief specifically asks for.
     #[test]
     fn an_id_beginning_sha256_is_hashed_rather_than_written_through() {
         let dir = tempfile::tempdir().unwrap();
@@ -4481,7 +4548,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = Learning::load(&path);
+        let mut loaded = Learning::load(&path);
         let expected_key = provider_scoped_key(APPS_PROVIDER_ID, "app:firefox");
         assert_eq!(
             loaded.global_frequency.get(&expected_key).map(|e| e.count),
@@ -4489,7 +4556,12 @@ mod tests {
             "the count must survive re-attribution on load"
         );
         // The read side agrees: a caller that looks this id up as the apps
-        // provider's finds it, exactly as it would for a fresh recording.
+        // provider's finds it, exactly as it would for a fresh recording —
+        // once synced with the manifest's own answer that apps opts in
+        // (`rekeyed_legacy_key`'s re-attribution runs regardless of syncing,
+        // but a lookup that disagreed about the plaintext/hash partition
+        // would still miss the entry it just re-attributed).
+        loaded.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
         assert!(loaded.frequency_boost(APPS_PROVIDER_ID, "app:firefox") > 0);
 
         loaded.save(&path).unwrap();
@@ -4580,6 +4652,11 @@ mod tests {
         .unwrap();
 
         let mut loaded = Learning::load(&path);
+        // Without this, the fresh launch below would hash "app:firefox"
+        // (unsynced defaults to `false`) and land on a *different* key from
+        // the one the legacy migration re-attributed, defeating the merge
+        // this test exists to pin.
+        loaded.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
         loaded.record_launch(
             APPS_PROVIDER_ID,
             "firefox",

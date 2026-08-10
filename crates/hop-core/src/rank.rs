@@ -250,19 +250,31 @@ impl Default for Weights {
 ///   (a preview pane, a re-rank, a benchmark harness) that skips
 ///   `CheckedItems`, it inherits that hole; this comment is the only thing
 ///   telling it so.
-/// - `by_item_id`: a **learning** boost, applied to any item bearing this id
-///   regardless of which provider produced it — the sum of
+/// - `by_item_id`: a **learning** boost — the sum of
 ///   `Learning::frequency_boost` (backed by the persisted `global_frequency`
 ///   map) and `Learning::query_boost` (backed by the in-memory, per-query
-///   `selections` map), both keyed on the bare id string.
-///   DECISION: kept unscoped, deliberately. The persisted learning store's
-///   id namespace is out of scope for this change — adding a provider
-///   dimension to `global_frequency` is a persisted-format change gated on
-///   a `learning::STORE_VERSION` bump, which that module answers by refusing
-///   the older store rather than migrating it, not an in-memory rekey;
-///   `selections` is deferred alongside it rather than resolved on its own.
-///   Filed as issue #72; see the comment at the call site in
-///   `Pipeline::assemble` where this field is populated.
+///   `selections` map). Issue #72 gave both of those a provider dimension:
+///   each is computed by `Pipeline::assemble` from `boost_for(&item.provider,
+///   ...)`, so the *value* summed into a given item's slot is that item's own
+///   producer's honest history, never another provider's.
+///
+///   **This field's own key is still the bare `ItemId`, though, and that is
+///   a narrower gap than it looks rather than a closed one.** Two items that
+///   share an id but come from two different, individually honest providers
+///   — the exact shape `by_provider_item`'s own doc comment above and
+///   `tests::alias_boost_does_not_land_on_an_identically_id_item_from_a_different_provider`
+///   worked through for the *alias* boost — still write into the *same*
+///   `by_item_id` slot, because nothing about this field's key says which
+///   producer a value came from. A provider `evil` that mints an item
+///   sharing a genuine provider's id, honestly declared as `evil`'s own,
+///   contributes `0.0` to that slot itself (its own `boost_for` correctly
+///   answers zero) but is scored against whatever the *genuine* provider's
+///   item already added there — so `evil`'s row can still inherit a boost it
+///   never earned, through this field, in the one query where both rows are
+///   present. Closing it needs the same `(provider, ItemId)` key
+///   `by_provider_item` already uses, which is a `Boosts`-shape change (and
+///   a `Ranker::rank` lookup change) this issue's brief did not ask for and
+///   this comment does not attempt.
 ///
 /// One further boundary neither dimension closes: `CheckedItems::check`
 /// never requires that two answering providers declare *distinct*

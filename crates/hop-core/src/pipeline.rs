@@ -909,20 +909,17 @@ impl Pipeline {
                 .entry((provider.clone(), id.clone()))
                 .or_insert(0.0) += *boost;
         }
-        // DECISION: the learning boost stays keyed on the bare item id, with
-        // no provider dimension, unlike the alias boost above. Issue #31's
-        // boost-theft criterion is only *partially* met here on purpose —
-        // `Learning::boost_for` sums `frequency_boost` (from the persisted
-        // `global_frequency` map) and `query_boost` (from the per-query
-        // `selections` map, kept in memory only, never written to disk), and
-        // both are keyed on the bare id string. Giving `global_frequency` a
-        // provider dimension is a persisted-format change, not an in-memory
-        // rekey like `Boosts::by_provider_item` above: it means bumping
-        // `hop-core`'s `learning::STORE_VERSION`, which that module answers
-        // by refusing the older store rather than migrating it (see the
-        // constant for why), so the cost is every user's learning, not a
-        // migration to write. `selections` is deferred alongside it rather
-        // than resolved on its own. Filed as issue #72.
+        // The learning boost is keyed on the provider *and* the item id, the
+        // same as the alias boost above — issue #31's boost-theft criterion
+        // is fully met as of issue #72, which closed the gap a `// DECISION:`
+        // here used to record: `Learning::boost_for` sums `frequency_boost`
+        // (the persisted `global_frequency` map) and `query_boost` (the
+        // per-query, in-memory-only `selections` map), and both are now
+        // keyed by provider as well as id — see `hop-core::learning`'s
+        // module docs and `provider_scoped_key` for how, and without the
+        // `learning::STORE_VERSION` bump that would have cost every user
+        // their whole store: a v1 store's plaintext `app:` entries are
+        // re-attributed to the apps provider on load rather than discarded.
         for item in &provider_items {
             let learned = self
                 .learning
@@ -1122,6 +1119,7 @@ mod tests {
                 modes: vec![Mode::All],
                 min_term_len: 0,
                 budget: Duration::from_millis(50),
+                ids_are_safe_to_persist_in_the_clear: false,
             },
         }
     }

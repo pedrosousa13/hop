@@ -64,6 +64,7 @@ impl Provider for DelayedProvider {
             modes: vec![Mode::All],
             min_term_len: 0,
             budget: self.budget,
+            ids_are_safe_to_persist_in_the_clear: false,
         }
     }
 
@@ -385,6 +386,7 @@ fn an_exclusive_route_filters_to_that_modes_kinds() {
                 modes: vec![Mode::Apps],
                 min_term_len: 0,
                 budget: Duration::from_millis(20),
+                ids_are_safe_to_persist_in_the_clear: false,
             }),
         )
         .unwrap();
@@ -405,6 +407,7 @@ fn an_exclusive_route_filters_to_that_modes_kinds() {
                 modes: vec![Mode::Apps],
                 min_term_len: 0,
                 budget: Duration::from_millis(20),
+                ids_are_safe_to_persist_in_the_clear: false,
             }),
         )
         .unwrap();
