@@ -22,6 +22,17 @@
 //! skipping it would leave an alias that looks configured and never fires;
 //! [`Aliases::from_json`] refuses the config instead.
 //!
+//! A `window` record's `app_id` and `title_contains` are fatal on their own
+//! bounds for the same reason, even though neither is resolved into anything
+//! yet (issue #76): `app_id` is the exact string a future window [`ItemId`]
+//! would be synthesized from, bounded at [`hop_protocol::MAX_ITEM_ID`]; and
+//! `title_contains` is matched against a window title, so a needle longer
+//! than [`hop_protocol::MAX_TITLE`] — the longest representable haystack —
+//! can never match anything real. Both are refused at load rather than
+//! skipped, by [`AliasError::WindowFieldTooLong`]; "Why an over-long id is not
+//! treated like a typo", below, is the argument for that and is not repeated
+//! here.
+//!
 //! ## Why an over-long id is not treated like a typo
 //!
 //! Those two paragraphs pull in opposite directions, and the tension is real:
@@ -46,7 +57,7 @@
 
 use std::collections::HashMap;
 
-use hop_protocol::{BoundError, ItemId};
+use hop_protocol::{BoundError, ItemId, MAX_ITEM_ID, MAX_TITLE, check_len};
 use serde_json::Value;
 
 use crate::provider::APPS_PROVIDER_ID;
@@ -77,15 +88,55 @@ pub enum AliasTarget {
     /// Faithfully parsed and stored, but never resolved by
     /// [`Aliases::apply`] — see that method's doc comment.
     ///
-    /// **Neither field is bounded**, unlike [`AliasTarget::AppBoost`]'s id.
-    /// They are raw config strings that no id is built from today, precisely
-    /// because `apply` cannot resolve this variant into an item id at all.
-    /// Whoever closes that gap — resolving window aliases against a live
-    /// candidate list — synthesizes an [`ItemId`] here for the first time, and
-    /// inherits the same problem `AppBoost` solved: the id has to be built and
-    /// checked at load, in [`Aliases::from_json`], or `apply` stops being
-    /// infallible. Stated on the type because it is a property of the type,
-    /// not of the work that will use it.
+    /// Both fields are checked at load, in [`Aliases::from_json`] (issue
+    /// #76).
+    ///
+    /// `title_contains` is checked against [`hop_protocol::MAX_TITLE`]
+    /// because it is matched against an item's `title`, itself a wire value
+    /// already bounded at that ceiling — a needle longer than the longest
+    /// representable title can never match anything, so rejecting it now
+    /// loses nothing a future resolver could have used. This check is
+    /// complete on its own terms; nothing about resolving window aliases
+    /// later changes it.
+    ///
+    /// `app_id` is checked against [`hop_protocol::MAX_ITEM_ID`], but this is
+    /// a **weaker** check than [`AliasTarget::AppBoost`]'s, not a repeat of
+    /// it. `AppBoost` bounds the *synthesized* string
+    /// `ItemId::new(format!("app:{app_id}"))` actually builds, so a fallible
+    /// construction has already happened and succeeded by the time that value
+    /// exists. Nothing here can do that: no resolver builds a window
+    /// [`ItemId`] yet, so there is no synthesized string to construct and
+    /// check — only the raw `app_id` a future resolver would start from.
+    /// Bounding the raw string at [`hop_protocol::MAX_ITEM_ID`] guarantees it
+    /// is not already hopeless: an id already over the ceiling could never
+    /// have fit into *any* synthesized id, whatever a future resolver builds
+    /// on top of it. It does **not** guarantee that whatever gets
+    /// synthesized later will fit — an `app_id` near the top of the range
+    /// passes this check and can still overflow once a resolver builds
+    /// something longer from it, exactly as `AppBoost` shows is possible for
+    /// its own four-byte `"app:"` prefix. Whoever closes the resolution gap
+    /// still has to synthesize an [`ItemId`] from `app_id` and from whatever
+    /// identifies the matched window, and still has to decide where *that*
+    /// construction is checked — at load, in [`Aliases::from_json`], or
+    /// `apply` stops being infallible. This check narrows that future work;
+    /// it does not finish it, and does not pretend to.
+    ///
+    /// Neither check is a **Bound** in the sense `CONTEXT.md`'s glossary
+    /// reserves for that word — a maximum on a *wire* value, declared once in
+    /// `hop-protocol`'s `limits` for both peers. These are locally-parsed
+    /// config-file strings, and `title_contains` in particular never crosses
+    /// the wire at all (see the glossary's **Pin budget** entry for the same
+    /// acknowledgment made about a different value that isn't one either).
+    /// [`hop_protocol::MAX_ITEM_ID`] and [`hop_protocol::MAX_TITLE`] are still
+    /// the right ceilings to reuse, for the reasons given above — each field
+    /// either already is, or is headed for, a value the wire does bound — but
+    /// reusing a wire ceiling for a config-file string is a deliberate
+    /// stretch of the term, not an instance of it.
+    ///
+    /// An over-long value on either field is fatal for the whole config —
+    /// [`AliasError::WindowFieldTooLong`] — not skipped like a malformed
+    /// entry; see this crate's module docs, "Why an over-long id is not
+    /// treated like a typo", for the argument, which applies here unchanged.
     WindowBoost {
         app_id: Option<String>,
         title_contains: Option<String>,
@@ -104,15 +155,19 @@ pub struct Aliases {
 
 /// Why an alias config could not be loaded at all.
 ///
-/// Both variants are fatal for the whole config, which is what separates them
+/// Every variant is fatal for the whole config, which is what separates them
 /// from the malformed *entries* [`Aliases::from_json`] skips one by one: a
 /// skipped entry is one the JS skipped too, whereas each of these is a config
 /// the user meant and that cannot be honoured.
 ///
-/// `#[non_exhaustive]` because the list is not finished: [`AliasTarget`]'s
-/// window ids are still unbounded, and bounding them adds a variant here. There
-/// are no consumers outside this crate yet, so paying for that now costs
-/// nothing and makes the next variant a non-breaking addition.
+/// `#[non_exhaustive]` because the list is still not finished: resolving a
+/// window alias against a live candidate list — the gap
+/// [`AliasTarget::WindowBoost`]'s doc comment describes — will still need to
+/// synthesize and check an `ItemId` for the matched window, which is a new
+/// fallible step this enum has no variant for yet, bounding `app_id` and
+/// `title_contains` themselves (issue #76) notwithstanding. There are no
+/// consumers outside this crate yet, so paying for that now costs nothing and
+/// makes the next variant a non-breaking addition.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AliasError {
@@ -136,6 +191,32 @@ pub enum AliasError {
         /// The offending record's alias, exactly as it appears in the config.
         alias: String,
         /// The bound that was broken.
+        #[source]
+        source: BoundError,
+    },
+    /// A `window` alias names an `app_id` or `title_contains` value over its
+    /// own load-time bound: [`hop_protocol::MAX_ITEM_ID`] for `app_id`,
+    /// [`hop_protocol::MAX_TITLE`] for `title_contains`. See
+    /// [`AliasTarget::WindowBoost`]'s doc comment for why each field carries
+    /// the bound it does (issue #76).
+    ///
+    /// One variant covers both fields rather than two, because the two
+    /// failures have the same shape and differ only in which field and which
+    /// constant applied — a distinction [`BoundError::TooLong`]'s own `field`
+    /// already carries (`"AliasTarget::WindowBoost.app_id"` or
+    /// `"AliasTarget::WindowBoost.title_contains"`). A second variant would
+    /// duplicate that distinction in this enum instead of reading it off the
+    /// source error that already names it.
+    ///
+    /// Names the alias **as the user wrote it**, and carries the bound as a
+    /// `#[source]` rather than interpolated into the message, for the same
+    /// reasons [`AliasError::AppItemIdTooLong`] does — see that variant's doc
+    /// comment.
+    #[error("alias {alias:?} names a window field over its bound")]
+    WindowFieldTooLong {
+        /// The offending record's alias, exactly as it appears in the config.
+        alias: String,
+        /// The bound that was broken; its own `field` says which one.
         #[source]
         source: BoundError,
     },
@@ -188,13 +269,15 @@ fn str_field<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> Option<&
 ///
 /// # Errors
 ///
-/// The one thing it will not skip is an `app` record whose synthesized item
-/// id breaks [`hop_protocol::MAX_ITEM_ID`]: that returns
-/// [`AliasError::AppItemIdTooLong`] and sinks the whole config. The record is
-/// well-formed and unambiguous about what the user wanted; it simply cannot be
-/// honoured, and the alternative — skipping it — would leave an alias that
-/// looks configured and never fires. Failing once at load beats failing
-/// invisibly on every keystroke.
+/// Two things it will not skip, both fatal for the whole config: an `app`
+/// record whose synthesized item id breaks [`hop_protocol::MAX_ITEM_ID`]
+/// returns [`AliasError::AppItemIdTooLong`], and a `window` record whose
+/// `app_id` or `title_contains` breaks its own bound returns
+/// [`AliasError::WindowFieldTooLong`]. Each such record is well-formed and
+/// unambiguous about what the user wanted; it simply cannot be honoured, and
+/// the alternative — skipping it — would leave an alias that looks configured
+/// and never fires. Failing once at load beats failing invisibly on every
+/// keystroke.
 fn parse_record(value: &Value) -> Result<Option<(String, AliasTarget)>, AliasError> {
     // A bare number, string, or array element that isn't an object at all
     // is a malformed entry: skip it rather than failing the whole parse.
@@ -256,10 +339,55 @@ fn parse_record(value: &Value) -> Result<Option<(String, AliasTarget)>, AliasErr
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            // Bounds the trimmed value that is actually stored on
+            // `WindowBoost::app_id` — see that field's doc comment for why
+            // `MAX_ITEM_ID` is the right bound for it. Trimming only ever
+            // removes bytes, so checking the trimmed value can only ever be
+            // *more* permissive than checking the raw field, never less: an
+            // id rejected here would have been rejected raw too.
+            //
+            // Calls `hop_protocol::check_len` — the same function
+            // `ItemId::new` itself calls — rather than reimplementing the
+            // check locally: this is a value that never becomes an `ItemId`,
+            // but "what counts as exceeding a bound" is `hop-protocol`'s
+            // decision to own once, not this crate's to duplicate.
+            check_len("AliasTarget::WindowBoost.app_id", MAX_ITEM_ID, app_id.len()).map_err(
+                |source| AliasError::WindowFieldTooLong {
+                    alias: raw_alias.to_string(),
+                    source,
+                },
+            )?;
+
             let title_contains = target_obj
                 .and_then(|t| str_field(t, "titleContains"))
                 .map(normalize_token)
                 .unwrap_or_default();
+            // Bounds the *normalized* value, deliberately, not the raw field.
+            // `normalize_token` lowercases, and lowercasing can grow a
+            // string's byte length for some Unicode input (Turkish dotted
+            // İ is the case this crate's tests pin), so the raw field and the
+            // value actually stored on `WindowBoost::title_contains` are not
+            // always the same length. Bounding the stored value is the
+            // contract that cannot be invalidated later by a config whose raw
+            // field fits but whose normalized form does not: that field would
+            // otherwise load as a `title_contains` over `MAX_TITLE` — an
+            // alias that can never match anything, precisely what this bound
+            // exists to refuse. See
+            // `tests::window_title_contains_bound_is_checked_after_normalization_not_before`.
+            //
+            // Same `hop_protocol::check_len` call as `app_id` above, for the
+            // same reason: one definition of a bound violation, not a copy of
+            // it in this crate.
+            check_len(
+                "AliasTarget::WindowBoost.title_contains",
+                MAX_TITLE,
+                title_contains.len(),
+            )
+            .map_err(|source| AliasError::WindowFieldTooLong {
+                alias: raw_alias.to_string(),
+                source,
+            })?;
+
             if app_id.is_empty() && title_contains.is_empty() {
                 return Ok(None);
             }
@@ -287,18 +415,24 @@ impl Aliases {
     ///   shape, missing required fields, an unrecognized `type`, a
     ///   non-object element) is skipped rather than failing the whole
     ///   config, so one typo can't silently disable every other alias.
-    /// - The one entry-level problem that is *not* skipped is an `app` record
-    ///   whose item id would break [`hop_protocol::MAX_ITEM_ID`]: it returns
-    ///   [`AliasError::AppItemIdTooLong`], naming the alias. Every item id an
-    ///   alias can ever boost is therefore built and checked here, once at
-    ///   load, rather than on every keystroke inside [`Aliases::apply`] — see
-    ///   [`AliasTarget::AppBoost`] for why that is where the check has to
-    ///   live.
+    /// - Two entry-level problems are *not* skipped, both fatal for the whole
+    ///   config: an `app` record whose item id would break
+    ///   [`hop_protocol::MAX_ITEM_ID`] returns
+    ///   [`AliasError::AppItemIdTooLong`], and a `window` record whose
+    ///   `app_id` or `title_contains` breaks its own bound
+    ///   ([`hop_protocol::MAX_ITEM_ID`] and [`hop_protocol::MAX_TITLE`]
+    ///   respectively) returns [`AliasError::WindowFieldTooLong`] — both name
+    ///   the alias. Every string this crate could later need to build an id
+    ///   or match a title from is therefore checked here, once at load,
+    ///   rather than on every keystroke inside [`Aliases::apply`] — see
+    ///   [`AliasTarget::AppBoost`] and [`AliasTarget::WindowBoost`] for why
+    ///   that is where each check has to live.
     ///
     /// # Errors
     ///
     /// [`AliasError::InvalidJson`] if `json` does not parse at all, or
-    /// [`AliasError::AppItemIdTooLong`] per the bullets above.
+    /// [`AliasError::AppItemIdTooLong`] / [`AliasError::WindowFieldTooLong`]
+    /// per the bullets above.
     pub fn from_json(json: &str) -> Result<Aliases, AliasError> {
         let value: Value =
             serde_json::from_str(json).map_err(|err| AliasError::InvalidJson(err.to_string()))?;
@@ -387,7 +521,7 @@ impl Aliases {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use hop_protocol::MAX_ITEM_ID;
+    use hop_protocol::{MAX_ITEM_ID, MAX_TITLE};
 
     use super::*;
 
@@ -754,6 +888,180 @@ mod tests {
         );
 
         assert!(Aliases::from_json(&json).is_err());
+    }
+
+    // --- Window alias field bounds (issue #76). ---
+    //
+    // `app_id` and `title_contains` are raw config strings `apply` never
+    // resolves into an id today, but the issue's own open question — whether
+    // they should carry load-time bounds anyway — is settled yes, by the same
+    // convention `AppItemIdTooLong` set: validate everything validatable at
+    // load, so a future resolver inherits an already-checked string instead of
+    // a fallible construction with nowhere to report failure.
+
+    // The alias is spelled with a capital, same reason as the `app` version of
+    // this test: the error has to quote the alias as written, not the
+    // normalized lookup key, or a user searching their config for `"Stand"`
+    // would not find what the message says.
+    #[test]
+    fn a_window_alias_whose_app_id_exceeds_the_bound_is_rejected_at_load_naming_the_alias_as_written()
+     {
+        let app_id = "a".repeat(MAX_ITEM_ID + 1);
+        let json =
+            format!(r#"[{{"alias":"Stand","type":"window","target":{{"appId":"{app_id}"}}}}]"#);
+
+        let err = Aliases::from_json(&json)
+            .expect_err("a window app_id over the bound must fail the whole load");
+        assert!(
+            err.to_string().contains("\"Stand\""),
+            "the error must name the alias as written, got: {err}"
+        );
+    }
+
+    // Analogous to `the_load_error_carries_the_bound_as_a_source_not_in_its_own_message`
+    // (the `app` version), for `WindowFieldTooLong`. That convention — the
+    // message must not restate the bound, and the chain must genuinely carry
+    // it as a `#[source]` — is a claim `WindowFieldTooLong`'s own doc comment
+    // makes about itself, so it gets its own test rather than relying on the
+    // `app` variant's test to stand in for both.
+    #[test]
+    fn the_window_field_error_carries_the_bound_as_a_source_not_in_its_own_message() {
+        let app_id = "a".repeat(MAX_ITEM_ID + 1);
+        let json =
+            format!(r#"[{{"alias":"big","type":"window","target":{{"appId":"{app_id}"}}}}]"#);
+
+        let err = Aliases::from_json(&json).unwrap_err();
+        assert!(
+            !err.to_string().contains("maximum"),
+            "the message must not restate what the source already says, got: {err}"
+        );
+        let source = std::error::Error::source(&err)
+            .expect("the broken bound must be reachable as a source");
+        assert!(
+            source.to_string().contains("over its maximum of"),
+            "got: {source}"
+        );
+    }
+
+    // The other side of the bound: exactly on it must still load and behave
+    // like any other window alias (parsed and stored, no boost from `apply`
+    // alone — see `window_alias_matches_but_apply_emits_no_boost_by_design`).
+    // Without this, rejecting every window alias would still pass the test
+    // above.
+    #[test]
+    fn a_window_alias_app_id_exactly_on_the_bound_still_loads() {
+        let app_id = "a".repeat(MAX_ITEM_ID);
+        let json =
+            format!(r#"[{{"alias":"stand","type":"window","target":{{"appId":"{app_id}"}}}}]"#);
+
+        let aliases = Aliases::from_json(&json).unwrap();
+        let effect = aliases.apply("stand");
+        assert_eq!(effect.effective_term, "stand");
+        assert!(
+            effect.boosts.is_empty(),
+            "a window alias never contributes a boost from apply alone"
+        );
+    }
+
+    #[test]
+    fn a_window_alias_whose_title_contains_exceeds_the_bound_is_rejected_at_load_naming_the_alias_as_written()
+     {
+        let title = "a".repeat(MAX_TITLE + 1);
+        let json = format!(
+            r#"[{{"alias":"Stand","type":"window","target":{{"titleContains":"{title}"}}}}]"#
+        );
+
+        let err = Aliases::from_json(&json)
+            .expect_err("a window title_contains over the bound must fail the whole load");
+        assert!(
+            err.to_string().contains("\"Stand\""),
+            "the error must name the alias as written, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_window_alias_title_contains_exactly_on_the_bound_still_loads() {
+        let title = "a".repeat(MAX_TITLE);
+        let json = format!(
+            r#"[{{"alias":"stand","type":"window","target":{{"titleContains":"{title}"}}}}]"#
+        );
+
+        let aliases = Aliases::from_json(&json).unwrap();
+        let effect = aliases.apply("stand");
+        assert_eq!(effect.effective_term, "stand");
+        assert!(effect.boosts.is_empty());
+    }
+
+    // An over-long window field is fatal for the *whole config*, exactly like
+    // `AppItemIdTooLong`, not skipped like the malformed `bad-window` entry in
+    // `one_malformed_entry_does_not_sink_the_rest`. Proven by asserting a
+    // separate, otherwise-valid alias in the same config never loads either —
+    // the whole call returns `Err`, so nothing in it is reachable.
+    #[test]
+    fn an_over_long_window_field_sinks_the_whole_config_rather_than_being_skipped() {
+        let app_id = "a".repeat(MAX_ITEM_ID + 1);
+        let json = format!(
+            r#"[
+                {{"alias":"good","type":"rewrite","target":{{"query":"github"}}}},
+                {{"alias":"toolong","type":"window","target":{{"appId":"{app_id}"}}}}
+            ]"#
+        );
+
+        assert!(Aliases::from_json(&json).is_err());
+    }
+
+    // Unchanged: a window record naming neither field is still malformed, not
+    // an over-long one, and stays skipped rather than fatal.
+    #[test]
+    fn a_window_record_with_neither_field_is_still_skipped() {
+        let json = r#"[{"alias":"empty-window","type":"window","target":{}}]"#;
+        let aliases = Aliases::from_json(json).unwrap();
+        let effect = aliases.apply("empty-window");
+        assert_eq!(effect.effective_term, "empty-window");
+        assert!(effect.boosts.is_empty());
+    }
+
+    // Mirrors `item.rs`'s `item_id_bound_is_counted_in_bytes_not_characters`:
+    // "é" is two bytes in UTF-8, so a value of MAX_ITEM_ID / 2 characters sits
+    // exactly at the byte bound, far short of it in characters. Proves the
+    // bound is counted in bytes, not chars, for this field too.
+    #[test]
+    fn a_window_app_id_at_the_byte_bound_in_far_fewer_chars_is_accepted() {
+        let app_id = "é".repeat(MAX_ITEM_ID / 2);
+        assert_eq!(app_id.len(), MAX_ITEM_ID);
+        assert_eq!(app_id.chars().count(), MAX_ITEM_ID / 2);
+        let json =
+            format!(r#"[{{"alias":"stand","type":"window","target":{{"appId":"{app_id}"}}}}]"#);
+
+        assert!(Aliases::from_json(&json).is_ok());
+    }
+
+    // Pins the deliberate choice to bound the *stored* (normalized) value of
+    // `title_contains`, not the raw field: `normalize_token` lowercases, and
+    // lowercasing can grow a string's byte length. 'İ' (U+0130, LATIN CAPITAL
+    // LETTER I WITH DOT ABOVE) is 2 bytes raw but lowercases to "i" plus a
+    // combining dot above (U+0307), 3 bytes — so 400 of them are 800 bytes raw
+    // (under MAX_TITLE) but 1200 bytes once normalized (over it). If this bound
+    // were checked against the raw field instead, this config would load and
+    // store a title_contains over MAX_TITLE — exactly the "accepts an alias
+    // that can never fire" failure mode this bound exists to close.
+    #[test]
+    fn window_title_contains_bound_is_checked_after_normalization_not_before() {
+        let title = "İ".repeat(400);
+        assert_eq!(title.len(), 800, "raw value must sit under MAX_TITLE");
+        assert!(
+            title.to_lowercase().len() > MAX_TITLE,
+            "normalized value must sit over MAX_TITLE, or this test proves nothing"
+        );
+        let json = format!(
+            r#"[{{"alias":"stand","type":"window","target":{{"titleContains":"{title}"}}}}]"#
+        );
+
+        let err = Aliases::from_json(&json).expect_err(
+            "a title_contains whose *normalized* form breaks the bound must fail the load, \
+             even though the raw field does not",
+        );
+        assert!(matches!(err, AliasError::WindowFieldTooLong { .. }));
     }
 
     // --- The precedence constant ---
