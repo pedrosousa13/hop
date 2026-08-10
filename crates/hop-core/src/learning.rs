@@ -938,6 +938,73 @@ fn persistence_key(raw_id: &str) -> String {
     }
 }
 
+/// Whether a key already sitting in `global_frequency` (on disk, or mid
+/// re-key) is already in its final persisted form, so
+/// [`rekeyed_global_frequency`] can skip [`persistence_key`] for it
+/// entirely — see that function's doc comment for why calling
+/// [`persistence_key`] unconditionally on every stored key would be wrong,
+/// not merely redundant, and how that reasoning leads here.
+///
+/// Three cases, checked in order:
+///
+/// 1. Already shaped like this module's own hash
+///    ([`is_already_a_persistence_hash`]) — settled.
+/// 2. Not one of the three known-safe prefixes at all
+///    ([`is_known_safe_shape`]) — not settled; some other raw or legacy id
+///    (`calc:2+2`, an unknown provider's id, …) that needs the full
+///    [`persistence_key`] treatment.
+/// 3. One of the three prefixes, and it is `app:` — settled
+///    unconditionally, since [`canonicalize_result_id`] never touches an
+///    `app:` id and there is nothing further to check.
+/// 4. `utility:`/`web-search:` — settled only if
+///    [`raw_id_proves_a_known_safe_shape`] finds **no** second colon. A
+///    second colon here means the stored string is not actually a settled
+///    `utility:<kind>`/`web-search:<service>` key at all, but a raw,
+///    never-stripped id that happens to carry that prefix — a hand-written
+///    or otherwise malformed store's `utility:calculator:2+2`, say — and
+///    must be routed through [`persistence_key`] instead of trusted as-is.
+///
+/// # The one case this cannot resolve, and is not trying to
+///
+/// Cases 1 and 4 above accept a stored key on trust once it has the right
+/// *shape*, and neither can prove how that shape came to be. A *legacy*
+/// store — v1 predating issue #39's fix for the finding above, or simply
+/// not this module's own output — could contain a genuine plaintext id
+/// that happens to already have one of these shapes:
+///
+/// - `sha256:` + 64 lowercase hex, from a provider that, however
+///   implausibly, minted one (case 1, [`is_already_a_persistence_hash`]).
+/// - A single-segment `utility:X` or `web-search:X` written by an older
+///   version of this same module, which had exactly the ambiguity
+///   [`raw_id_proves_a_known_safe_shape`] now closes on the record path —
+///   or written by any other code that never checked at all (case 4).
+///
+/// Either way, this function reports the entry as already settled and
+/// [`rekeyed_global_frequency`] leaves it exactly as written rather than
+/// hashing it — the one shape of id in a legacy store that escapes the
+/// migration every other legacy entry gets. Telling a genuine instance of
+/// either shape apart from a merely coincidental one would need a marker
+/// this format does not carry: `STORE_VERSION` stays at 1 (issue #38
+/// refuses a version mismatch in either direction rather than migrating
+/// across it, so bumping it would discard every existing store instead of
+/// converting this one case), and nothing else in a
+/// `PersistedLearningStore` says which hop version — or which check — wrote
+/// a given key. This is accepted as the shape of the problem, not a gap to
+/// close here: no provider in this tree mints ids either way, and an id
+/// that did would be a fixed-width opaque token (the hash case) or would
+/// have to collide with a real `.desktop`-adjacent kind name from a
+/// nonexistent `Kind::Utility` provider (the `utility:`/`web-search:`
+/// case) — neither carries a payload hashing would have hidden regardless.
+fn stored_key_needs_no_rekeying(id: &str) -> bool {
+    if is_already_a_persistence_hash(id) {
+        return true;
+    }
+    if !is_known_safe_shape(id) {
+        return false;
+    }
+    id.starts_with("app:") || !raw_id_proves_a_known_safe_shape(id)
+}
+
 /// Re-key every entry of a freshly parsed store's `global_frequency`,
 /// merging any two source entries that land on the same key.
 ///
@@ -996,39 +1063,9 @@ fn persistence_key(raw_id: &str) -> String {
 ///   [`raw_id_proves_a_known_safe_shape`] already checks, so
 ///   [`stored_key_needs_no_rekeying`] combines the two: a bare-prefix match
 ///   with **no** second colon is accepted as already settled, one **with**
-///   a second colon still needs the full [`persistence_key`] treatment.
-///
-/// # The one case this cannot resolve, and is not trying to
-///
-/// Both of the checks above accept a stored key on trust once it has the
-/// right *shape*, and neither can prove how that shape came to be. A
-/// *legacy* store — v1 predating issue #39's fix for the finding above, or
-/// simply not this module's own output — could contain a genuine plaintext
-/// id that happens to already have one of these shapes:
-///
-/// - `sha256:` + 64 lowercase hex, from a provider that, however
-///   implausibly, minted one (see [`is_already_a_persistence_hash`]'s call
-///   site above).
-/// - A single-segment `utility:X` or `web-search:X` written by an older
-///   version of this same module, which had exactly the ambiguity
-///   [`raw_id_proves_a_known_safe_shape`] now closes on the record path —
-///   or written by any other code that never checked at all.
-///
-/// Either way, this pass leaves the entry exactly as written rather than
-/// hashing it — the one shape of id in a legacy store that escapes the
-/// migration every other legacy entry gets. Telling a genuine instance of
-/// either shape apart from a merely coincidental one would need a marker
-/// this format does not carry: `STORE_VERSION` stays at 1 (issue #38
-/// refuses a version mismatch in either direction rather than migrating
-/// across it, so bumping it would discard every existing store instead of
-/// converting this one case), and nothing else in a
-/// `PersistedLearningStore` says which hop version — or which check — wrote
-/// a given key. This is accepted as the shape of the problem, not a gap to
-/// close here: no provider in this tree mints ids either way, and an id
-/// that did would be a fixed-width opaque token (the hash case) or would
-/// have to collide with a real `.desktop`-adjacent kind name from a
-/// nonexistent `Kind::Utility` provider (the `utility:`/`web-search:`
-/// case) — neither carries a payload hashing would have hidden regardless.
+///   a second colon still needs the full [`persistence_key`] treatment. See
+///   [`stored_key_needs_no_rekeying`]'s own doc comment for the residual
+///   neither check can close.
 ///
 /// # The merge itself
 ///
@@ -1050,40 +1087,6 @@ fn persistence_key(raw_id: &str) -> String {
 /// keyed by raw id in memory while a reload keyed it by hash, silently
 /// breaking every hashed provider's learning. See [`Learning::record`] and
 /// [`Learning::purge_and_bound`] for the two ends of where that moved to.
-/// Whether a key already sitting in `global_frequency` (on disk, or mid
-/// re-key) is already in its final persisted form, so
-/// [`rekeyed_global_frequency`] can skip [`persistence_key`] for it
-/// entirely — see that function's doc comment for the full reasoning this
-/// implements.
-///
-/// Three cases, checked in order:
-///
-/// 1. Already shaped like this module's own hash
-///    ([`is_already_a_persistence_hash`]) — settled.
-/// 2. Not one of the three known-safe prefixes at all
-///    ([`is_known_safe_shape`]) — not settled; some other raw or legacy id
-///    (`calc:2+2`, an unknown provider's id, …) that needs the full
-///    [`persistence_key`] treatment.
-/// 3. One of the three prefixes, and it is `app:` — settled
-///    unconditionally, since [`canonicalize_result_id`] never touches an
-///    `app:` id and there is nothing further to check.
-/// 4. `utility:`/`web-search:` — settled only if
-///    [`raw_id_proves_a_known_safe_shape`] finds **no** second colon. A
-///    second colon here means the stored string is not actually a settled
-///    `utility:<kind>`/`web-search:<service>` key at all, but a raw,
-///    never-stripped id that happens to carry that prefix — a hand-written
-///    or otherwise malformed store's `utility:calculator:2+2`, say — and
-///    must be routed through [`persistence_key`] instead of trusted as-is.
-fn stored_key_needs_no_rekeying(id: &str) -> bool {
-    if is_already_a_persistence_hash(id) {
-        return true;
-    }
-    if !is_known_safe_shape(id) {
-        return false;
-    }
-    id.starts_with("app:") || !raw_id_proves_a_known_safe_shape(id)
-}
-
 fn rekeyed_global_frequency(
     input: &HashMap<String, LearningEntry>,
 ) -> HashMap<String, LearningEntry> {
@@ -4044,6 +4047,38 @@ mod tests {
         assert!(
             saved.contains("sha256:"),
             "the hashed form should be what was written instead, got: {saved}"
+        );
+    }
+
+    // Issue #39's acceptance criterion, in its own literal words: "An id
+    // with an embedded path never appears verbatim on disk." Every other
+    // test in this section exercises that through a `calc:`/`utility:`/
+    // `sha256:`-shaped id; none used a path-shaped one, which is the exact
+    // scenario the criterion names — a file-provider id is not a shape this
+    // module's structural argument treats specially, but the brief's own
+    // example is worth pinning directly rather than trusting the general
+    // case to cover it.
+    #[test]
+    fn a_file_path_id_never_appears_verbatim_in_the_persisted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let raw = "file:/home/user/Documents/medical-results.pdf";
+        let mut store = Learning::load(&path);
+
+        store.record_launch("medical", &ItemId::new(raw).unwrap());
+        store.save(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).expect("saved learning file");
+        assert!(
+            !saved.contains("medical-results")
+                && !saved.contains("/home/user")
+                && !saved.contains(raw),
+            "a file: id's embedded path must not be persisted verbatim, got: {saved}"
+        );
+        let expected_key = format!("sha256:{:x}", Sha256::digest(raw.as_bytes()));
+        assert!(
+            saved.contains(&expected_key),
+            "the stored key should be the hash of the raw path, got: {saved}"
         );
     }
 
