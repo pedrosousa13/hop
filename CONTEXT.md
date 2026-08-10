@@ -138,20 +138,28 @@ asserted by referencing them rather than repeating their values.
 a query, decayed by how long ago. Not "history", not "MRU".
 
 **Persistence key** — the string `Learning::record` writes `global_frequency`
-under, and every `global_frequency` lookup keys on; computed from a raw item
-id by `persistence_key` (`hop-core`'s `learning.rs`). Three shapes are
-known-safe and persist as the id itself, in the clear: `app:`, `utility:<kind>`
-and `web-search:<service>`. Every other id — `calc:` included, and anything a
-provider this code has never heard of mints — persists as `sha256:<hex>`, the
-unsalted SHA-256 digest of the raw id. The hash is not confidentiality against
-someone who already holds the store: it has no secret input, so a targeted
-guess is checked by hashing it and comparing. What it defends is accidental
+under, and every `global_frequency` lookup keys on; computed from a provider id
+and a raw item id by `persistence_key` (`hop-core`'s `learning.rs`), which
+folds both into one key so a provider cannot collect another provider's
+boosts by presenting its item id — the identical guarantee `rank.rs`'s
+`Boosts::by_item_id` carries at the ranker, not just at the store.
+
+Whether the id-part persists in the clear or as `sha256:<hex>` (the unsalted
+digest of the raw id) is decided by one thing only: the producing provider's
+own manifest, `ProviderManifest::ids_are_safe_to_persist_in_the_clear`
+(`hop-core`'s `provider.rs`) — a required field with no default, so a manifest
+that omits it does not compile. A provider that opts in persists every id it
+mints in the clear; every other provider's ids hash, including one this
+process has never registered a manifest for. The flag is a claim only the
+provider can make about its own ids' content; nothing checks it, so a
+provider that opts in wrongly writes plaintext to disk that this decision
+otherwise keeps off it. The hash is not confidentiality against someone who
+already holds the store: it has no secret input, so a targeted guess is
+checked by hashing it and comparing. What it defends is accidental
 disclosure — a backup, a synced folder, a support bundle — where a plaintext
 `calc:2+2` is legible on sight and a hex digest is not. See the threat model's
 Decision 2 (`docs/security/2026-08-02-m2-socket-boundary-threat-model.md`) for
-the full reasoning; its manifest opt-in half — a provider declaring its own
-ids safe to persist in plaintext — is **not implemented** and rides with issue
-#72.
+the full reasoning.
 
 **Load report** — what one load of the learning store noticed: that it loaded,
 or which single fallback it took instead — absent, not a regular file,
