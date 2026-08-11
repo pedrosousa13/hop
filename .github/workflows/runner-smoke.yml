@@ -47,7 +47,7 @@ jobs:
   container-smoke:
     runs-on: [self-hosted, linux, x64, vps]
     container:
-      image: node:22-alpine
+      image: docker.io/library/node:22-alpine
     steps:
       - uses: actions/checkout@v4
       - name: Node inside container job
@@ -63,11 +63,11 @@ jobs:
     runs-on: [self-hosted, linux, x64, vps]
     services:
       redis:
-        image: redis:7-alpine
+        image: docker.io/library/redis:7-alpine
         ports:
           - 6379:6379
     container:
-      image: node:22-alpine
+      image: docker.io/library/node:22-alpine
     steps:
       - uses: actions/checkout@v4
       - name: Reach service container over the job network
