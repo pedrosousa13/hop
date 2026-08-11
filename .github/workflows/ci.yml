@@ -10,7 +10,7 @@ env:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, vps]
     steps:
       - uses: actions/checkout@v4
 
@@ -38,7 +38,7 @@ jobs:
   # collapse them into a single status.
   supply-chain:
     name: Supply chain
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, vps]
     steps:
       - uses: actions/checkout@v4
 
@@ -96,7 +96,7 @@ jobs:
   # own.
   latency-gate:
     name: Latency gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, vps]
     steps:
       - uses: actions/checkout@v4
 
