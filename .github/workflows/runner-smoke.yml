@@ -1,0 +1,84 @@
+name: runner-smoke
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, linux, x64, vps]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --version
+
+      - name: "Container runtime (docker CLI shim, run: step)"
+        run: docker run --rm docker.io/library/hello-world
+
+      - name: Rust toolchain
+        run: |
+          source "$HOME/.cargo/env"
+          cargo --version
+
+      - name: Playwright browser launch
+        run: |
+          npm install --no-save playwright@1.62.1
+          npx playwright install chromium
+          node -e "
+            const { chromium } = require('playwright');
+            (async () => {
+              const browser = await chromium.launch({ args: ['--no-sandbox'] });
+              const page = await browser.newPage();
+              await page.goto('data:text/html,<title>runner-smoke-ok</title>');
+              const title = await page.title();
+              console.log('Playwright chromium launched OK, page title=' + title);
+              await browser.close();
+            })().catch((e) => { console.error(e); process.exit(1); });
+          "
+
+      - name: Resource sanity
+        run: |
+          free -h
+          df -h /
+
+  container-smoke:
+    runs-on: [self-hosted, linux, x64, vps]
+    container:
+      image: node:22-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - name: Node inside container job
+        run: node --version
+      - name: Container identity and workdir
+        run: |
+          cat /etc/os-release
+          pwd
+          ls -la
+
+  service-container-smoke:
+    needs: container-smoke
+    runs-on: [self-hosted, linux, x64, vps]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    container:
+      image: node:22-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reach service container over the job network
+        run: |
+          node -e "
+            const net = require('net');
+            const socket = net.createConnection({ host: 'redis', port: 6379 }, () => {
+              console.log('connected to redis service container on the job network');
+              socket.end();
+              process.exit(0);
+            });
+            socket.on('error', (e) => { console.error(e); process.exit(1); });
+            setTimeout(() => { console.error('timeout connecting to redis service container'); process.exit(1); }, 5000);
+          "
