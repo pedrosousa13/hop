@@ -38,7 +38,16 @@ jobs:
   # collapse them into a single status.
   supply-chain:
     name: Supply chain
-    runs-on: [self-hosted, linux, x64, vps]
+    # Stays on ubuntu-latest. cargo-deny-action is a Docker *container action*,
+    # and the runner hard-codes /github/home, /github/workspace and
+    # /github/workflow bind mounts for those. Under the self-hosted host's
+    # rootless Podman that path resolution fails with
+    # `cannot resolve /github/home: lstat /github: no such file or directory`.
+    # Container *jobs* do work there; container *actions* are a separate code
+    # path in the runner and do not. Supply-chain scanning gains nothing from
+    # running on our own hardware anyway - it clones an advisory database and
+    # checks a lockfile.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
