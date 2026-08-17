@@ -164,23 +164,18 @@
 //! zeroing it, or decaying it hardest — would cost the attacker one edit
 //! and cost an honest user with a skewed clock their real learning.
 //!
-//! Refusing a written store outright means being able to tell that this
-//! module wrote it, which is a checksum or a message authentication code —
-//! a design decision of its own, deliberately out of scope for issue #38,
-//! filed since as issue #88, and implemented nowhere below. The store is
-//! better validated than it was. It is not trustworthy, and nothing here
-//! should be read as saying so.
-//!
-//! [`LoadReport`] does not change that, and is easy to misread as though it
-//! did. It reports what a load *detected* — the guards above, plus the ones
-//! on reaching and parsing the file at all. A store forged to be plausible
-//! trips none of them and reports [`LoadReport::Loaded`], so a report never
-//! distinguishes a tampered store from an honest one. Distinguishing a
-//! tampered store from a merely damaged one is what #88 would buy; what #43
-//! bought is that a *damaged* store is no longer indistinguishable from a
-//! first run.
+//! The v2 store is an authenticated envelope. Its HMAC-SHA256 covers a
+//! deterministic, sorted serialization of the version and every persisted
+//! entry. Load verifies that tag before applying entry bounds, timestamp
+//! clamping, retention or returning any learning. A store-only writer and a
+//! store copied without its sibling `learning.key` therefore fail closed with
+//! an integrity report. The key is deliberately stored beside the store,
+//! generated only on the first successful save, and reused without rotation;
+//! a process that can also read that key remains outside this guarantee.
+//! This is integrity only: the store stays plaintext and no protection is
+//! claimed against a process that can read the state directory.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -188,6 +183,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -241,7 +237,11 @@ pub const LEARNING_BOOST_CAP: f32 = 85.0;
 /// what the user launches and announces nothing while it does. Lost
 /// learning is rebuilt by using hop; a table silently meaning something
 /// else is never noticed at all.
-const STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
+const INTEGRITY_KEY_BYTES: usize = 32;
+const INTEGRITY_TAG_BYTES: usize = 32;
+const INTEGRITY_TAG_HEX_BYTES: usize = INTEGRITY_TAG_BYTES * 2;
+const INTEGRITY_ENVELOPE_OVERHEAD: usize = 160;
 
 // --- Constants (unchanged from the salvage) ---
 
@@ -311,13 +311,13 @@ const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_I
 ///                                           `count` a 10-digit u32,
 ///                                           `last_ms` a 20-digit u64 (51)
 ///                              ------------
-///                                25 112 000  bytes, ~23.9 MiB
+///                                25 112 000  bytes, ~23.9 MiB unsigned
 /// ```
 ///
-/// The bytes per entry that rounding leaves spare also absorb the document's
-/// own envelope (`version`, the `global_frequency` key, the enclosing
-/// braces), which is under a hundred bytes and does not warrant a term of its
-/// own.
+/// The authenticated tag is 64 hexadecimal bytes. `INTEGRITY_ENVELOPE_OVERHEAD`
+/// separately prices the envelope field names, tag quotes and fixed framing;
+/// both terms are added to `MAX_STORE_BYTES` below rather than hidden in the
+/// per-entry rounding.
 ///
 /// # What actually enforces the two rows
 ///
@@ -347,10 +347,10 @@ const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_I
 /// What none of that amounts to is a bound on every `Learning` in existence.
 /// `Learning` is public and derives `Deserialize`, and the generated impl is
 /// written inside this module, so a private field is no barrier: an outside
-/// caller can parse a `Learning` straight from JSON — the very route
-/// [`Learning::load`]'s second branch takes, which is why that branch calls
-/// `purge_and_bound` rather than inheriting a guarantee from somewhere — and
-/// building one in-module, as this module's own tests do, is another way in.
+/// caller can parse a `Learning` straight from JSON, and building one
+/// in-module, as this module's own tests do, is another way in. Those values
+/// are not load results and are bounded by nothing until their caller applies
+/// its own policy; the authenticated filesystem path never accepts that shape.
 /// A `Learning` obtained either way is bounded by nothing, and `save` would
 /// write it out exactly as it found it.
 ///
@@ -391,7 +391,9 @@ const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_I
 /// store holds — a file a tenth of this size can still carry tens of
 /// thousands of tiny entries — which is `MAX_GLOBAL_ENTRIES`'s job,
 /// applied separately after the parse.
-const MAX_STORE_BYTES: u64 = (MAX_GLOBAL_ENTRIES * (MAX_PERSISTED_KEY_LEN * 6 + 128)) as u64;
+const MAX_STORE_BYTES: u64 = (MAX_GLOBAL_ENTRIES * (MAX_PERSISTED_KEY_LEN * 6 + 128)) as u64
+    + INTEGRITY_TAG_HEX_BYTES as u64
+    + INTEGRITY_ENVELOPE_OVERHEAD as u64;
 
 /// 30 days in milliseconds — half-life for decay.
 const DECAY_HALF_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -434,9 +436,9 @@ struct LearningEntry {
 /// `Learning`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Learning {
-    /// Only ever read during a [`Learning::load`], where the second parse
-    /// branch needs somewhere to put a file's `version` before checking it
-    /// against `STORE_VERSION`. Its value means nothing once `load` has
+    /// Only ever read during a [`Learning::load`], where the parsed file's
+    /// version used to need somewhere to land before checking it against
+    /// `STORE_VERSION`. Its value means nothing once `load` has
     /// returned, and the two constructors disagree about it harmlessly:
     /// `Default` zeroes it, `Learning::empty` sets `STORE_VERSION`.
     /// [`Learning::save`] consults neither — it writes `STORE_VERSION`, for
@@ -471,12 +473,30 @@ pub struct Learning {
     plaintext_providers: HashSet<String>,
 }
 
-/// The on-disk shape: per-query selections are intentionally left out, so
-/// raw query text never lands on disk.
+/// The authenticated on-disk envelope. Per-query selections are intentionally
+/// left out, so raw query text never lands on disk.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedLearningStore {
     version: u32,
-    global_frequency: HashMap<String, LearningEntry>,
+    global_frequency: BTreeMap<String, PersistedLearningEntry>,
+    tag: String,
+}
+
+/// The unsigned semantic payload covered by [`PersistedLearningStore::tag`].
+/// `BTreeMap` is deliberate: HMAC input must not depend on randomized
+/// `HashMap` iteration order.
+#[derive(Debug, Serialize, Deserialize)]
+struct UnsignedPersistedLearningStore {
+    version: u32,
+    global_frequency: BTreeMap<String, PersistedLearningEntry>,
+}
+
+/// A raw persisted entry. Counts stay wide until the envelope has passed its
+/// HMAC check; only then are they saturated into [`LearningEntry`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedLearningEntry {
+    count: u64,
+    last_ms: u64,
 }
 
 /// The one thing read out of a store document before anything else: the
@@ -485,20 +505,18 @@ struct PersistedLearningStore {
 /// object that still says which format it is.
 ///
 /// Reading the version on its own is what makes the check a check. Both full
-/// parses below must deserialize a document *completely* before its `version`
+/// parse below must deserialize a document *completely* before its `version`
 /// field is reachable, and a version is bumped precisely because the shape
-/// changed — so a store written by a later hop generally fails both parses,
-/// and checking the version afterwards would only ever catch the one v2 that
-/// happened to keep every v1 field. That is the reverse of what
+/// changed — so a store written by a later hop is refused by the probe before
+/// this version's envelope parser runs. That is the reverse of what
 /// [`LoadReport::UnrecognizedVersion`] promises: the realistic later store
 /// would report [`LoadReport::Malformed`] and tell a user who downgraded that
 /// their live learning was damaged.
 ///
 /// This also subsumes what issue #38 achieved by checking the version inside
-/// both parse branches. That guarded against the two shapes drifting apart;
-/// this does not depend on either shape at all, so the per-branch checks are
-/// gone rather than kept alongside it — two sites deciding one outcome is how
-/// they come to disagree.
+/// the payload parse. The probe does not depend on the authenticated shape,
+/// so there is one version decision before parsing rather than two sites that
+/// could disagree.
 ///
 /// What it deliberately does not do is treat every unparseable document as a
 /// version problem. A document with no `version` to read announces nothing and
@@ -573,16 +591,10 @@ struct StoreVersionProbe {
 /// # What a report is evidence of, and what it is not
 ///
 /// It says what this load *detected*. It is not a verdict on the store.
-/// [`LoadReport::Loaded`] means the bytes passed every guard `load` applies —
-/// the byte ceiling, the version check, the parse, the key bound, the
-/// timestamp clamp — and nothing more. A store written by someone else with a
-/// plausible recent `last_ms` and a high `count` passes all of those and
-/// reports `Loaded`, because nothing here can tell it from learning this
-/// module recorded itself; the module docs work through what that buys an
-/// attacker. Telling a *tampered* store from a merely damaged one means being
-/// able to tell that this module wrote the bytes, which is a checksum or a
-/// message authentication code and is issue #88. Until that exists, no variant
-/// below reports tampering and none should be read as ruling it out.
+/// [`LoadReport::Loaded`] means the bytes passed every guard `load` applies,
+/// including the HMAC check. The check does not provide confidentiality or
+/// protect against a process that can also read `learning.key` in the state
+/// directory, because that process can forge a matching tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadReport {
     /// A store was read, parsed, and accepted. The state returned beside this
@@ -662,6 +674,14 @@ pub enum LoadReport {
     /// against `STORE_VERSION` is the only way to tell an abandoned older
     /// store from a live newer one this binary is too old to read.
     UnrecognizedVersion { found: u32 },
+    /// The current-version envelope was validly shaped, but its sibling
+    /// integrity key was absent, unreadable, or the wrong length. The error
+    /// kind preserves that distinction while still returning an empty store.
+    IntegrityKey(io::ErrorKind),
+    /// The envelope's HMAC did not verify with the sibling integrity key.
+    /// Entries are discarded before any bounds, timestamp repair, or boost
+    /// calculation can observe them.
+    IntegrityMismatch,
 }
 
 impl LoadReport {
@@ -1203,6 +1223,156 @@ fn purge_retention(
     purged
 }
 
+fn persisted_entries(
+    global_frequency: &HashMap<String, LearningEntry>,
+) -> BTreeMap<String, PersistedLearningEntry> {
+    global_frequency
+        .iter()
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                PersistedLearningEntry {
+                    count: entry.count as u64,
+                    last_ms: entry.last_ms,
+                },
+            )
+        })
+        .collect()
+}
+
+fn learning_entries(
+    global_frequency: BTreeMap<String, PersistedLearningEntry>,
+) -> HashMap<String, LearningEntry> {
+    global_frequency
+        .into_iter()
+        .map(|(key, entry)| {
+            (
+                key,
+                LearningEntry {
+                    count: entry.count.min(i32::MAX as u64) as u32,
+                    last_ms: entry.last_ms,
+                },
+            )
+        })
+        .collect()
+}
+
+fn canonical_payload(payload: &UnsignedPersistedLearningStore) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(payload).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn hmac_tag(key: &[u8; INTEGRITY_KEY_BYTES], payload: &[u8]) -> [u8; INTEGRITY_TAG_BYTES] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("32-byte HMAC keys are valid");
+    mac.update(payload);
+    mac.finalize().into_bytes().into()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex_tag(value: &str) -> Option<[u8; INTEGRITY_TAG_BYTES]> {
+    if value.len() != INTEGRITY_TAG_HEX_BYTES {
+        return None;
+    }
+    let mut decoded = [0_u8; INTEGRITY_TAG_BYTES];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = char::from(pair[0]).to_digit(16)? as u8;
+        let low = char::from(pair[1]).to_digit(16)? as u8;
+        decoded[index] = (high << 4) | low;
+    }
+    Some(decoded)
+}
+
+fn learning_key_path(store_path: &Path) -> io::Result<PathBuf> {
+    store_path
+        .parent()
+        .map(|parent| parent.join("learning.key"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))
+}
+
+fn read_integrity_key(path: &Path) -> io::Result<[u8; INTEGRITY_KEY_BYTES]> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((INTEGRITY_KEY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() != INTEGRITY_KEY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "learning integrity key must be exactly 32 bytes",
+        ));
+    }
+    let mut key = [0_u8; INTEGRITY_KEY_BYTES];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+/// Return the existing sibling key or create it exclusively. A losing
+/// concurrent creator reads the winner's completed key and never rotates it.
+fn ensure_integrity_key(path: &Path) -> io::Result<([u8; INTEGRITY_KEY_BYTES], bool)> {
+    match read_integrity_key(path) {
+        Ok(key) => return Ok((key, false)),
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+        Err(_) => {}
+    }
+
+    let mut key = [0_u8; INTEGRITY_KEY_BYTES];
+    getrandom::fill(&mut key).map_err(|err| io::Error::other(err.to_string()))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            for _ in 0..100 {
+                match read_integrity_key(path) {
+                    Ok(winner) => return Ok((winner, false)),
+                    Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                        std::thread::yield_now();
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            return read_integrity_key(path).map(|winner| (winner, false));
+        }
+        Err(err) => return Err(err),
+    };
+
+    #[cfg(unix)]
+    if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        let _ = fs::remove_file(path);
+        return Err(err);
+    }
+
+    let result = (|| -> io::Result<()> {
+        file.write_all(&key)?;
+        file.sync_all()
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(path);
+        return Err(err);
+    }
+    Ok((key, true))
+}
+
+fn ensure_parent_directory(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(parent)?;
+    }
+    Ok(())
+}
+
 // --- Learning implementation ---
 
 impl Learning {
@@ -1217,11 +1387,11 @@ impl Learning {
         }
     }
 
-    /// Load from disk, falling back to an empty state on any error — a
-    /// missing file, a path that is not a regular file, more bytes than
-    /// `MAX_STORE_BYTES`, unreadable bytes, unparseable bytes, valid JSON of
-    /// the wrong shape, or a `version` that is not `STORE_VERSION` all land
-    /// here. Never panics.
+    /// Load the authenticated v2 store from disk, falling back to an empty
+    /// state on any error — including a missing sibling key or failed HMAC —
+    /// while preserving the infallible API. A genuinely absent store remains
+    /// [`LoadReport::Absent`], and an unsigned v1 store remains
+    /// [`LoadReport::UnrecognizedVersion`]. Never panics.
     ///
     /// Which of those happened is discarded here rather than unavailable:
     /// [`Learning::load_reporting`] does the work and returns a
@@ -1236,26 +1406,21 @@ impl Learning {
     /// # The two things a store says about itself
     ///
     /// A file asserts what no parse can check: which format its bytes are in
-    /// (`version`), and when each entry was last launched (`last_ms`). Both
-    /// used to be taken at face value, and they are dealt with differently
-    /// because they are different claims.
+    /// (`version`), and when each entry was last launched (`last_ms`). The
+    /// version is probed before parsing; the timestamp is clamped only after
+    /// the authenticated envelope has passed its HMAC check.
     ///
     /// The version is checked before either parse below, by reading it and
     /// nothing else out of the document (`StoreVersionProbe`), and a mismatch
     /// refuses the whole store — see `STORE_VERSION` for why refusing beats
     /// reinterpreting, and what refusing costs a user who downgrades.
     ///
-    /// Issue #38 checked it inside both parse branches instead, which was
-    /// weaker than it read. Both branches deserialize a document completely
-    /// before its `version` field is reachable, so the check only ever ran on
-    /// documents that already parsed as *this* version's shape — and a version
-    /// is bumped because the shape changed. A store from a later hop that
-    /// moved anything failed both parses and was reported as damaged, which is
-    /// the opposite of what the check was for. Reading the version first
+    /// Issue #38 checked it inside the payload parse, which was weaker than it
+    /// read. That parse deserializes a document completely before its
+    /// `version` field is reachable, so the check only ran on documents that
+    /// already matched this version's shape. Reading the version first
     /// depends on no shape at all, so it covers every document that says which
-    /// format it is, and it replaces the two per-branch checks rather than
-    /// joining them: one outcome decided at one site cannot come to disagree
-    /// with itself.
+    /// format it is and decides one outcome at one site.
     ///
     /// The timestamps are not checked but corrected: `purge_and_bound`
     /// clamps a `last_ms` ahead of the load instant back to it, touching no
@@ -1326,7 +1491,8 @@ impl Learning {
     }
 
     /// [`Learning::load`], plus a [`LoadReport`] saying what it noticed: that
-    /// the store loaded, or which single condition sent it back empty. This is
+    /// the authenticated store loaded, or which single condition sent it back
+    /// empty. This is
     /// where both entry points' load rules actually live, and `load` is this
     /// function with the report dropped — see [`Learning::load`] for the rules
     /// themselves, and [`LoadReport`] for why the report rides beside the
@@ -1349,10 +1515,9 @@ impl Learning {
     ///
     /// # What the report cannot say
     ///
-    /// [`LoadReport::Loaded`] is not a statement that the store is
-    /// trustworthy, only that it passed the guards this module applies.
-    /// [`LoadReport`] says what that leaves undetected, and why the missing
-    /// half is issue #88 rather than something this function could add.
+    /// [`LoadReport::Loaded`] is an integrity result, not a confidentiality
+    /// result. A process that can read `learning.key` can forge a valid tag;
+    /// ownership and mode validation of pre-existing paths are out of scope.
     pub fn load_reporting(path: &Path) -> (Learning, LoadReport) {
         let data = match read_bounded_store(path) {
             Ok(data) => data,
@@ -1373,18 +1538,39 @@ impl Learning {
                 },
             );
         }
-        if let Ok(persisted) = serde_json::from_str::<PersistedLearningStore>(&data) {
-            let mut store = Self::empty();
-            store.global_frequency = persisted.global_frequency;
-            store.purge_and_bound();
-            return (store, LoadReport::Loaded);
+        let Ok(persisted) = serde_json::from_str::<PersistedLearningStore>(&data) else {
+            return (Self::empty(), LoadReport::Malformed);
+        };
+        let Some(tag) = decode_hex_tag(&persisted.tag) else {
+            return (Self::empty(), LoadReport::Malformed);
+        };
+        let unsigned = UnsignedPersistedLearningStore {
+            version: persisted.version,
+            global_frequency: persisted.global_frequency,
+        };
+        let Ok(key_path) = learning_key_path(path) else {
+            return (
+                Self::empty(),
+                LoadReport::IntegrityKey(io::ErrorKind::InvalidInput),
+            );
+        };
+        let key = match read_integrity_key(&key_path) {
+            Ok(key) => key,
+            Err(err) => return (Self::empty(), LoadReport::IntegrityKey(err.kind())),
+        };
+        let Ok(canonical) = canonical_payload(&unsigned) else {
+            return (Self::empty(), LoadReport::Malformed);
+        };
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("32-byte HMAC keys are valid");
+        mac.update(&canonical);
+        if mac.verify_slice(&tag).is_err() {
+            return (Self::empty(), LoadReport::IntegrityMismatch);
         }
-        if let Ok(mut store) = serde_json::from_str::<Learning>(&data) {
-            store.selections.clear();
-            store.purge_and_bound();
-            return (store, LoadReport::Loaded);
-        }
-        (Self::empty(), LoadReport::Malformed)
+
+        let mut store = Self::empty();
+        store.global_frequency = learning_entries(unsigned.global_frequency);
+        store.purge_and_bound();
+        (store, LoadReport::Loaded)
     }
 
     /// Everything a freshly parsed store owes before [`Learning::load`] hands
@@ -1574,15 +1760,19 @@ impl Learning {
         evict_lru_map(&mut self.global_frequency, MAX_GLOBAL_ENTRIES);
     }
 
-    /// Persist to disk via a temp file + atomic rename + directory fsync,
-    /// mode 0600. Creates the parent directory if it doesn't exist yet, at
+    /// Persist an authenticated v2 envelope to disk via a temp file + atomic
+    /// rename + directory fsync, mode 0600. Creates the fixed sibling
+    /// `learning.key` on the first successful save, using 32 bytes from the OS
+    /// CSPRNG and mode 0600 on Unix; existing keys are never overwritten or
+    /// rotated. Creates the parent directory if it doesn't exist yet, at
     /// mode 0700 on unix —
     /// but a parent that already exists is left exactly as found, whatever
     /// its mode. `persist_atomically`'s `DirBuilder` block says why that
     /// asymmetry is load-bearing.
     ///
     /// Per-query selections are never written — only the retention-purged
-    /// global frequency table is.
+    /// global frequency table is, in a sorted canonical payload authenticated
+    /// by HMAC-SHA256 before the envelope is serialized.
     ///
     /// The keys written are exactly the keys `global_frequency` holds in
     /// memory, unmodified. That is not an oversight: every entry reached
@@ -1611,10 +1801,12 @@ impl Learning {
     /// what memory holds; the clamp belongs to `purge_and_bound`, where
     /// untrusted bytes arrive.
     ///
-    /// A store that cannot be serialized returns `Err` having created
-    /// nothing at all — no file, no directory — so whatever is already on
-    /// disk survives intact. `serialize_and_persist` is where that ordering
-    /// lives.
+    /// A store that cannot be serialized returns `Err` having created nothing
+    /// at all — no file, no directory or key — so whatever is already on disk
+    /// survives intact. Key creation and signing also complete before the
+    /// store rename; a newly-created key is removed when an ordinary save
+    /// failure occurs. `serialize_and_persist` is where serialization's
+    /// ordering lives.
     ///
     /// # A save destroys the file a load reported on
     ///
@@ -1639,13 +1831,25 @@ impl Learning {
     /// filesystem.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let purged_global = purge_retention(&self.global_frequency);
-        serialize_and_persist(
-            path,
-            &PersistedLearningStore {
-                version: STORE_VERSION,
-                global_frequency: purged_global,
-            },
-        )
+        let unsigned = UnsignedPersistedLearningStore {
+            version: STORE_VERSION,
+            global_frequency: persisted_entries(&purged_global),
+        };
+        let canonical = canonical_payload(&unsigned)?;
+        ensure_parent_directory(path)?;
+        let key_path = learning_key_path(path)?;
+        let (key, created) = ensure_integrity_key(&key_path)?;
+        let tag = encode_hex(&hmac_tag(&key, &canonical));
+        let persisted = PersistedLearningStore {
+            version: unsigned.version,
+            global_frequency: unsigned.global_frequency,
+            tag,
+        };
+        let result = serialize_and_persist(path, &persisted);
+        if result.is_err() && created {
+            let _ = fs::remove_file(&key_path);
+        }
+        result
     }
 
     /// Replaces the set of provider ids this store currently treats as safe
@@ -2116,7 +2320,7 @@ impl Learning {
 /// The bytes at `path`, or the [`LoadReport`] for why there are none.
 /// [`Learning::load`]'s only way to reach the filesystem.
 ///
-/// Four of the seven reports are decided here — [`LoadReport::Absent`],
+/// Four of the nine reports are decided here — [`LoadReport::Absent`],
 /// [`LoadReport::Unreadable`], [`LoadReport::NotARegularFile`] and
 /// [`LoadReport::TooLarge`] — and the mapping from guard to report is not
 /// one-to-one in either direction. `LoadReport::from_io` splits *one* guard,
@@ -2132,10 +2336,11 @@ impl Learning {
 /// recover the distinction once it is gone, and there is nowhere else it
 /// survives.
 ///
-/// The remaining three ([`LoadReport::Loaded`], [`LoadReport::Malformed`],
-/// [`LoadReport::UnrecognizedVersion`]) are the parse's to decide, so
-/// [`Learning::load_reporting`] owns those. Nothing here reads the bytes for
-/// anything but their length and their encoding.
+/// The remaining five ([`LoadReport::Loaded`], [`LoadReport::Malformed`],
+/// [`LoadReport::UnrecognizedVersion`], [`LoadReport::IntegrityKey`] and
+/// [`LoadReport::IntegrityMismatch`]) are the parse and authentication path's
+/// to decide, so [`Learning::load_reporting`] owns those. Nothing here reads
+/// the bytes for anything but their length and their encoding.
 ///
 /// `CONTEXT.md` scopes **bound** to a length rule on a wire value, living in
 /// `hop-protocol`'s `limits`; the word is used here in that same sense —
@@ -2777,6 +2982,194 @@ mod tests {
         );
     }
 
+    #[test]
+    fn first_save_creates_a_sibling_learning_key_without_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom-store-name.json");
+        let key_path = dir.path().join("learning.key");
+        let mut store = Learning::default();
+        store.record_launch(APPS_PROVIDER_ID, "q", &ItemId::new("app:a").unwrap());
+
+        store.save(&path).unwrap();
+        let first_key = std::fs::read(&key_path).expect("first save creates learning.key");
+        assert_eq!(first_key.len(), 32);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        store.save(&path).unwrap();
+        assert_eq!(std::fs::read(&key_path).unwrap(), first_key);
+    }
+
+    #[test]
+    fn editing_a_persisted_count_without_recomputing_the_tag_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let item = ItemId::new("app:a").unwrap();
+        let mut store = Learning::default();
+        store.record_launch(APPS_PROVIDER_ID, "q", &item);
+        store.save(&path).unwrap();
+
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        document["global_frequency"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()["count"] = serde_json::json!(100);
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        let (loaded, report) = Learning::load_reporting(&path);
+        assert_eq!(report, LoadReport::IntegrityMismatch);
+        assert_eq!(loaded.boost_for(APPS_PROVIDER_ID, "q", &item), 0.0);
+    }
+
+    #[test]
+    fn a_store_copied_beside_a_different_key_is_refused() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source_path = source.path().join("learning.json");
+        let destination_path = destination.path().join("renamed-store.json");
+        let item = ItemId::new("app:a").unwrap();
+
+        let mut source_store = Learning::default();
+        source_store.record_launch(APPS_PROVIDER_ID, "q", &item);
+        source_store.save(&source_path).unwrap();
+
+        let mut destination_store = Learning::default();
+        destination_store.record_launch(APPS_PROVIDER_ID, "other", &item);
+        destination_store.save(&destination_path).unwrap();
+        std::fs::copy(&source_path, &destination_path).unwrap();
+
+        let (loaded, report) = Learning::load_reporting(&destination_path);
+        assert_eq!(report, LoadReport::IntegrityMismatch);
+        assert_eq!(loaded.boost_for(APPS_PROVIDER_ID, "q", &item), 0.0);
+    }
+
+    #[test]
+    fn copying_a_store_and_its_key_together_remains_loadable() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source_path = source.path().join("learning.json");
+        let destination_path = destination.path().join("renamed-store.json");
+        let item = ItemId::new("app:a").unwrap();
+
+        let mut store = Learning::default();
+        store.record_launch(APPS_PROVIDER_ID, "q", &item);
+        store.save(&source_path).unwrap();
+        std::fs::copy(&source_path, &destination_path).unwrap();
+        std::fs::copy(
+            source.path().join("learning.key"),
+            destination.path().join("learning.key"),
+        )
+        .unwrap();
+
+        let (loaded, report) = Learning::load_reporting(&destination_path);
+        assert_eq!(report, LoadReport::Loaded);
+        assert!(loaded.boost_for(APPS_PROVIDER_ID, "q", &item) > 0.0);
+    }
+
+    #[test]
+    fn a_current_store_without_its_key_reports_integrity_key_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let store = Learning::default();
+        store.save(&path).unwrap();
+        std::fs::remove_file(dir.path().join("learning.key")).unwrap();
+
+        let (loaded, report) = Learning::load_reporting(&path);
+        assert_eq!(report, LoadReport::IntegrityKey(io::ErrorKind::NotFound));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn a_current_store_with_a_wrong_length_key_reports_invalid_integrity_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        Learning::default().save(&path).unwrap();
+        std::fs::write(dir.path().join("learning.key"), [0_u8; 31]).unwrap();
+
+        let (loaded, report) = Learning::load_reporting(&path);
+        assert_eq!(report, LoadReport::IntegrityKey(io::ErrorKind::InvalidData));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn a_failed_save_does_not_overwrite_an_existing_store_when_the_key_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let mut store = Learning::default();
+        store.record_launch(APPS_PROVIDER_ID, "q", &ItemId::new("app:a").unwrap());
+        store.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(dir.path().join("learning.key"), [0_u8; 31]).unwrap();
+
+        assert!(store.save(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_store_write_failure_removes_a_newly_created_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(Learning::default().save(&path).is_err());
+        assert!(!dir.path().join("learning.key").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_integrity_key_is_reported_separately() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        Learning::default().save(&path).unwrap();
+        let key_path = dir.path().join("learning.key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&key_path).is_ok() {
+            eprintln!("skipped: key permissions are not enforced in this environment");
+            return;
+        }
+
+        let (loaded, report) = Learning::load_reporting(&path);
+        assert_eq!(
+            report,
+            LoadReport::IntegrityKey(io::ErrorKind::PermissionDenied)
+        );
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn loading_an_absent_store_does_not_create_its_integrity_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+
+        let (loaded, report) = Learning::load_reporting(&path);
+        assert_eq!(report, LoadReport::Absent);
+        assert!(loaded.is_empty());
+        assert!(!dir.path().join("learning.key").exists());
+    }
+
+    #[test]
+    fn an_unsigned_v1_store_is_refused_as_an_unrecognized_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"global_frequency":{"app:a":{"count":9,"last_ms":1}}}"#,
+        )
+        .unwrap();
+
+        let (loaded, report) = Learning::load_reporting(&path);
+        assert_eq!(report, LoadReport::UnrecognizedVersion { found: 1 });
+        assert!(loaded.is_empty());
+    }
+
     // --- Coverage neither source reaches. ---
 
     #[test]
@@ -2818,7 +3211,15 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(entries, vec![path.file_name().unwrap().to_owned()]);
+        let mut entries = entries;
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                std::ffi::OsString::from("learning.json"),
+                std::ffi::OsString::from("learning.key")
+            ]
+        );
     }
 
     #[test]
@@ -2944,13 +3345,10 @@ mod tests {
     fn loading_a_store_with_an_out_of_range_count_produces_a_non_negative_capped_frequency_boost() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        std::fs::write(
+        write_signed_store(
             &path,
-            format!(
-                r#"{{"version":{STORE_VERSION},"global_frequency":{{"app:firefox":{{"count":4000000000,"last_ms":18446744073709551615}}}}}}"#
-            ),
-        )
-        .unwrap();
+            r#"{"version":2,"global_frequency":{"app:firefox":{"count":4000000000,"last_ms":18446744073709551615}}}"#,
+        );
 
         let mut l = Learning::load(&path);
         // The legacy plaintext `app:` key is re-attributed to the apps
@@ -3530,18 +3928,37 @@ mod tests {
     // and still hold a hundred thousand tiny entries; a store can hold one
     // entry and be gigabytes of whitespace.
 
+    const TEST_INTEGRITY_KEY: [u8; INTEGRITY_KEY_BYTES] = [0x5a; INTEGRITY_KEY_BYTES];
+
+    /// Write a deterministic, test-only key and a signed v2 envelope for an
+    /// independently supplied unsigned JSON payload.
+    fn write_signed_store(path: &Path, unsigned_json: &str) {
+        let unsigned: UnsignedPersistedLearningStore = serde_json::from_str(unsigned_json).unwrap();
+        let canonical = serde_json::to_vec(&unsigned).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&TEST_INTEGRITY_KEY).unwrap();
+        mac.update(&canonical);
+        let envelope = PersistedLearningStore {
+            version: unsigned.version,
+            global_frequency: unsigned.global_frequency,
+            tag: encode_hex(&mac.finalize().into_bytes()),
+        };
+        std::fs::write(
+            path.parent().unwrap().join("learning.key"),
+            TEST_INTEGRITY_KEY,
+        )
+        .unwrap();
+        std::fs::write(path, serde_json::to_string_pretty(&envelope).unwrap()).unwrap();
+    }
+
     /// A parseable one-entry store, padded to exactly `total_bytes` with
     /// whitespace, which JSON ignores between tokens.
-    ///
-    /// Padding rather than more entries is what keeps the two tests below
-    /// about the byte ceiling *alone*: the store inside is a single entry,
-    /// nowhere near the entry cap, so whether it loads turns only on whether
-    /// its bytes were admitted.
-    fn whitespace_padded_store(total_bytes: usize) -> String {
-        let store = format!(
+    fn whitespace_padded_store(path: &Path, total_bytes: usize) -> String {
+        let unsigned = format!(
             r#"{{"version":{STORE_VERSION},"global_frequency":{{"app:a":{{"count":3,"last_ms":{}}}}}}}"#,
             now_ms()
         );
+        write_signed_store(path, &unsigned);
+        let store = std::fs::read_to_string(path).unwrap();
         let mut padded = String::with_capacity(total_bytes);
         padded.push_str(&store);
         padded.push_str(&" ".repeat(total_bytes - store.len()));
@@ -3549,21 +3966,23 @@ mod tests {
     }
 
     /// A parseable store of `entries` entries, all stamped `last_ms`.
-    fn store_of_entries(entries: usize, last_ms: u64) -> String {
+    fn store_of_entries(path: &Path, entries: usize, last_ms: u64) -> String {
         let body: Vec<String> = (0..entries)
             .map(|i| format!(r#""app:{i}":{{"count":1,"last_ms":{last_ms}}}"#))
             .collect();
-        format!(
+        let unsigned = format!(
             r#"{{"version":{STORE_VERSION},"global_frequency":{{{}}}}}"#,
             body.join(",")
-        )
+        );
+        write_signed_store(path, &unsigned);
+        std::fs::read_to_string(path).unwrap()
     }
 
     #[test]
     fn a_store_one_byte_over_the_byte_ceiling_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        let padded = whitespace_padded_store(MAX_STORE_BYTES as usize + 1);
+        let padded = whitespace_padded_store(&path, MAX_STORE_BYTES as usize + 1);
         std::fs::write(&path, &padded).unwrap();
 
         let loaded = Learning::load(&path);
@@ -3581,7 +4000,7 @@ mod tests {
     fn a_store_exactly_on_the_byte_ceiling_is_still_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        let padded = whitespace_padded_store(MAX_STORE_BYTES as usize);
+        let padded = whitespace_padded_store(&path, MAX_STORE_BYTES as usize);
         std::fs::write(&path, &padded).unwrap();
 
         let mut loaded = Learning::load(&path);
@@ -3618,13 +4037,12 @@ mod tests {
         let path = dir.path().join("learning.json");
         let over_long = "a".repeat(MAX_PERSISTED_KEY_LEN + 1);
         let now = now_ms();
-        std::fs::write(
+        write_signed_store(
             &path,
-            format!(
+            &format!(
                 r#"{{"version":{STORE_VERSION},"global_frequency":{{"{over_long}":{{"count":9,"last_ms":{now}}},"app:a":{{"count":1,"last_ms":{now}}}}}}}"#
             ),
-        )
-        .unwrap();
+        );
 
         let loaded = Learning::load(&path);
 
@@ -3661,13 +4079,12 @@ mod tests {
         let key = provider_scoped_key(&provider, &id_part);
         assert_eq!(key.len(), MAX_PERSISTED_KEY_LEN);
         let now = now_ms();
-        std::fs::write(
+        write_signed_store(
             &path,
-            format!(
+            &format!(
                 r#"{{"version":{STORE_VERSION},"global_frequency":{{"{key}":{{"count":9,"last_ms":{now}}}}}}}"#
             ),
-        )
-        .unwrap();
+        );
 
         assert!(
             Learning::load(&path).global_frequency.contains_key(&key),
@@ -3736,7 +4153,11 @@ mod tests {
     fn a_store_over_the_entry_cap_is_evicted_down_to_it_on_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        std::fs::write(&path, store_of_entries(MAX_GLOBAL_ENTRIES + 500, now_ms())).unwrap();
+        std::fs::write(
+            &path,
+            store_of_entries(&path, MAX_GLOBAL_ENTRIES + 500, now_ms()),
+        )
+        .unwrap();
 
         let loaded = Learning::load(&path);
 
@@ -3764,7 +4185,11 @@ mod tests {
     fn future_dated_entries_do_not_evade_the_entry_cap() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        std::fs::write(&path, store_of_entries(MAX_GLOBAL_ENTRIES + 500, u64::MAX)).unwrap();
+        std::fs::write(
+            &path,
+            store_of_entries(&path, MAX_GLOBAL_ENTRIES + 500, u64::MAX),
+        )
+        .unwrap();
 
         let loaded = Learning::load(&path);
 
@@ -3905,17 +4330,23 @@ mod tests {
     // achieve.
 
     /// A store on `version`, carrying one entry stamped `last_ms`.
-    fn store_at_version(version: u32, last_ms: u64) -> String {
-        format!(
+    fn store_at_version(path: &Path, version: u32, last_ms: u64) -> String {
+        let unsigned = format!(
             r#"{{"version":{version},"global_frequency":{{"app:a":{{"count":3,"last_ms":{last_ms}}}}}}}"#
-        )
+        );
+        if version == STORE_VERSION {
+            write_signed_store(path, &unsigned);
+            std::fs::read_to_string(path).unwrap()
+        } else {
+            unsigned
+        }
     }
 
     #[test]
     fn a_store_on_an_unrecognized_version_is_refused_rather_than_parsed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        std::fs::write(&path, store_at_version(STORE_VERSION + 1, now_ms())).unwrap();
+        std::fs::write(&path, store_at_version(&path, STORE_VERSION + 1, now_ms())).unwrap();
 
         let loaded = Learning::load(&path);
 
@@ -3932,7 +4363,7 @@ mod tests {
     fn a_store_on_the_version_this_code_understands_is_still_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        std::fs::write(&path, store_at_version(STORE_VERSION, now_ms())).unwrap();
+        std::fs::write(&path, store_at_version(&path, STORE_VERSION, now_ms())).unwrap();
 
         let mut loaded = Learning::load(&path);
         loaded.sync_plaintext_providers([APPS_PROVIDER_ID.to_string()]);
@@ -3967,7 +4398,7 @@ mod tests {
     fn a_far_future_timestamp_is_clamped_to_the_load_instant() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        std::fs::write(&path, store_at_version(STORE_VERSION, u64::MAX)).unwrap();
+        std::fs::write(&path, store_at_version(&path, STORE_VERSION, u64::MAX)).unwrap();
 
         let before = now_ms();
         let loaded = Learning::load(&path);
@@ -3997,7 +4428,7 @@ mod tests {
     fn a_clamped_timestamp_decays_where_the_future_one_it_replaced_never_would() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        std::fs::write(&path, store_at_version(STORE_VERSION, u64::MAX)).unwrap();
+        std::fs::write(&path, store_at_version(&path, STORE_VERSION, u64::MAX)).unwrap();
 
         let loaded = Learning::load(&path);
         let clamped = loaded
@@ -4030,7 +4461,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let a_minute_ago = now_ms() - 60_000;
-        std::fs::write(&path, store_at_version(STORE_VERSION, a_minute_ago)).unwrap();
+        std::fs::write(&path, store_at_version(&path, STORE_VERSION, a_minute_ago)).unwrap();
 
         let loaded = Learning::load(&path);
 
@@ -4182,7 +4613,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let newer = STORE_VERSION + 1;
-        std::fs::write(&path, store_at_version(newer, now_ms())).unwrap();
+        std::fs::write(&path, store_at_version(&path, newer, now_ms())).unwrap();
 
         let (loaded, report) = Learning::load_reporting(&path);
 
@@ -4288,7 +4719,11 @@ mod tests {
     fn a_store_over_the_byte_ceiling_reports_the_ceiling_and_not_damage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
-        std::fs::write(&path, whitespace_padded_store(MAX_STORE_BYTES as usize + 1)).unwrap();
+        std::fs::write(
+            &path,
+            whitespace_padded_store(&path, MAX_STORE_BYTES as usize + 1),
+        )
+        .unwrap();
 
         assert_eq!(Learning::load_reporting(&path).1, LoadReport::TooLarge);
     }
@@ -4308,7 +4743,7 @@ mod tests {
         // Padded to the ceiling exactly, then one two-byte character. `take`
         // stops after `MAX_STORE_BYTES + 1` bytes, which is that character's
         // first byte and not its second.
-        let mut bytes = whitespace_padded_store(MAX_STORE_BYTES as usize).into_bytes();
+        let mut bytes = whitespace_padded_store(&path, MAX_STORE_BYTES as usize).into_bytes();
         bytes.extend_from_slice("é".as_bytes());
         assert_eq!(bytes.len() as u64, MAX_STORE_BYTES + 2);
         assert!(
@@ -4340,14 +4775,14 @@ mod tests {
         let wrong_version = dir.path().join("wrong-version.json");
         std::fs::write(
             &wrong_version,
-            store_at_version(STORE_VERSION + 1, now_ms()),
+            store_at_version(&wrong_version, STORE_VERSION + 1, now_ms()),
         )
         .unwrap();
 
         let too_large = dir.path().join("too-large.json");
         std::fs::write(
             &too_large,
-            whitespace_padded_store(MAX_STORE_BYTES as usize + 1),
+            whitespace_padded_store(&too_large, MAX_STORE_BYTES as usize + 1),
         )
         .unwrap();
 
@@ -4614,13 +5049,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let now = now_ms();
-        std::fs::write(
+        write_signed_store(
             &path,
-            format!(
+            &format!(
                 r#"{{"version":{STORE_VERSION},"global_frequency":{{"app:firefox":{{"count":7,"last_ms":{now}}}}}}}"#
             ),
-        )
-        .unwrap();
+        );
 
         let mut loaded = Learning::load(&path);
         let plaintext_key = provider_scoped_key(APPS_PROVIDER_ID, "app:firefox");
@@ -4902,13 +5336,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let now = now_ms();
-        std::fs::write(
+        write_signed_store(
             &path,
-            format!(
+            &format!(
                 r#"{{"version":{STORE_VERSION},"global_frequency":{{"app:firefox":{{"count":7,"last_ms":{now}}}}}}}"#
             ),
-        )
-        .unwrap();
+        );
 
         let mut loaded = Learning::load(&path);
         let expected_key = provider_scoped_key(APPS_PROVIDER_ID, "app:firefox");
@@ -4950,9 +5383,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let now = now_ms();
-        std::fs::write(
+        write_signed_store(
             &path,
-            format!(
+            &format!(
                 r#"{{"version":{STORE_VERSION},"global_frequency":{{
                     "calc:2+2":{{"count":7,"last_ms":{now}}},
                     "utility:calculator:2+2":{{"count":3,"last_ms":{now}}},
@@ -4962,8 +5395,7 @@ mod tests {
                 }}}}"#,
                 "deadbeef".repeat(8)
             ),
-        )
-        .unwrap();
+        );
 
         let loaded = Learning::load(&path);
         assert_eq!(
@@ -5005,13 +5437,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
         let now = now_ms();
-        std::fs::write(
+        write_signed_store(
             &path,
-            format!(
+            &format!(
                 r#"{{"version":{STORE_VERSION},"global_frequency":{{"app:firefox":{{"count":7,"last_ms":{now}}}}}}}"#
             ),
-        )
-        .unwrap();
+        );
 
         let mut loaded = Learning::load(&path);
         // Without this, the fresh launch below would hash "app:firefox"

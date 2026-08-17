@@ -133,6 +133,8 @@ ignore = []
 # actually needs it, rather than a permission granted years earlier to nothing in
 # particular.
 allow = [
+    # hmac 0.12's constant-time verification path depends on subtle.
+    "BSD-3-Clause",
     "GPL-3.0-only",
     "ISC",
     "MIT",

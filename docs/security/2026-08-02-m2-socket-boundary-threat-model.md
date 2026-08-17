@@ -3,7 +3,7 @@
 Date: 2026-08-02
 Issue: [#53](https://github.com/pedrosousa13/hop/issues/53)
 Milestone: M2 — Daemon
-Status: Recorded; amended 2026-08-04, 2026-08-06, 2026-08-10
+Status: Recorded; amended 2026-08-04, 2026-08-06, 2026-08-10, 2026-08-17
 Decisions by: Pedro Sousa
 
 Two design forks are settled here —
@@ -111,8 +111,26 @@ is about. Every one of these keeps its original claim intact and carries the
 annotation after it, not instead of it — including where the claim was only
 partly falsified, the same way #85's residual is carried past #59's landing.
 
+**Amendment, 2026-08-17.** Issue #88's authenticated learning-store slice
+landed in `hop-core` and closes T10's store-integrity residual. The v2
+envelope carries the version, provider-scoped learning entries and an
+HMAC-SHA256 tag over a deterministic sorted serialization of that payload.
+The key is a 32-byte sibling `learning.key`, created with exclusive creation
+at mode 0600 on Unix and reused without rotation. Loading bounds the store
+before consulting the key, then verifies the tag before applying count bounds,
+timestamp clamping or retention. A missing, unreadable or wrong-length key is
+reported separately from an HMAC mismatch; both fail closed to empty learning.
+Unsigned v1 stores are refused as an unrecognized version rather than treated
+as trusted state.
+
+This is option A's deliberate boundary: a store-only writer, or a store copied
+without its sibling key, is detected; an attacker or process that can also
+read `learning.key` can compute a valid tag and remains outside the guarantee.
+The store remains plaintext and this change does not claim confidentiality or
+protection from a process that can read the state directory.
+
 This document's remaining residual findings — #25, #34's provider-seam
-descendants, #72, #78, #85's wire-signal half, #88, #93, #98, #104 — are
+descendants, #72, #78, #85's wire-signal half, #93, #98, #104 — are
 unchanged by this pass: closing a stale note is not the same claim as
 closing a gap, and nothing here asserts the latter where the code does not.
 
@@ -462,6 +480,13 @@ control is *which uid*, and there is no finer distinction available.
   Both residuals need the same missing thing, and it is
   [#88](https://github.com/pedrosousa13/hop/issues/88), which is open.
 
+**[Amended 2026-08-17]** #88 has landed. The authenticated v2 envelope now
+rejects the plausible forged store before clamping or eviction, so a
+store-only writer cannot consume an eviction slot. The future-stamp eviction
+preference remains a defensive behavior for authenticated data (and for a
+process that can read the key), not an integrity bypass; option A does not
+cover that key-reading process.
+
 ---
 
 ## Where peer trust comes from
@@ -722,7 +747,7 @@ exists yet.
 | T7 | Query-path cost amplification | `query` | `MAX_QUERY_TEXT` bounds one query's bytes; ranking is `O(atoms × items)` with 4.09 s measured (#46), and `boost_for` lowercases per candidate item (#75) | Input caps decided in M2, gated by #61's adversarial arm. **[Amended 2026-08-10]** #61 is now **closed** (`80b7ffd`), whose PR introduced `rank.rs`'s `MAX_TERM_CHARS` (256), truncating the term before `Pattern::new` is built. #46 is closed separately, by `85b4c2f`, which turned that fixed truncation into a configurable knob and added `hopd`'s loader enforcement (`config.rs`'s `validate_max_term_chars`). `boost_for`'s per-candidate lowercasing (#75) remains open |
 | T8 | A provider aiming a command-shaped outcome at a client | `executed`, and `Item.icon` on `results` | Content rules on `CopyText`/`OpenUrl` (#23, closed) and on `IconName`/`IconPath` (#24, closed) | Residual on both halves, and an **open** issue owns each: `Item.copy_text` still reaches the clipboard as a bare bounded string ([#78](https://github.com/pedrosousa13/hop/issues/78), open), and an icon path is validated but not contained — the roots are documented, not enforced, so a regular file outside them still opens ([#93](https://github.com/pedrosousa13/hop/issues/93), open, split out of #24 for this half). **[Amended 2026-08-10]** #78 is now **closed** (PR [#133](https://github.com/pedrosousa13/hop/pull/133)): `Item.copy_text` is `Option<content::CopyText>`, and `CopyText`'s only constructors apply the same content rules #23 already put on `ExecOutcome::CopyText` — refused control characters and the length bound — to every value that exists, in-process or off the wire. `content.rs`'s module docs name the one thing that still differs between the two routes: which field a refusal names. The icon-path half is untouched by this — #93 remains open |
 | T9 | Keystrokes reaching the journal, then a shared bundle | Logging | No logging dependency. `QueryText` redacts (#27, closed) — **in `hop-protocol` only**. `route` takes a `&str` and `RoutedQuery` (`router.rs`:257–258) derives `Debug` over a plain `String` term, so the same text formats verbatim in `hop-core`; `router.rs`:249–256 says not to treat one as safe to log ([#83](https://github.com/pedrosousa13/hop/issues/83), open). **[Amended 2026-08-10]** #83 is now **closed** (`8bd6550`): `RoutedQuery` (`router.rs`:378–393) carries `term` and `raw` as `RoutedText`, which redacts under `Debug` the same way `QueryText` does, so the same text no longer formats verbatim in `hop-core`; `router.rs`:363–377 states the change in place | Any added logging keeps the redacting type at the field, and #83 carries the redaction across the crate boundary rather than stopping at `route`. **[Amended 2026-08-10]** Landed — see the Today column |
-| T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the `version` is refused on mismatch and a future-dated timestamp clamped (#38, closed by `59fd5fe`); the version probe and the per-condition `LoadReport` are #43's (closed by `056893e`, which replaced #38's two per-branch checks); a persisted `count` is saturated at the boundary (#44, closed by `edb8258`). **Two residuals, one owner**: still no integrity check, so a plausible forged store passes all of it — and eviction still prefers a clamped future-dated entry, which `96d5713` left open and `59fd5fe` explicitly did not close (#88, open) **[Amended 2026-08-10]** #72 (`4f5acf9`, `0c50a98`, `9a595bb`) has since landed on this same load path — provider-scoped keys, manifest-gated plaintext — without touching either residual named here | #88's integrity check, which is what lets a forged entry be *refused* rather than clamped, sequenced with #72 and with Decision 2 on the same load path. **[Amended 2026-08-10]** #72 has landed; #88's integrity check is still what's needed for either residual |
+| T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the version probe and per-condition `LoadReport` are #43's (closed by `056893e`); persisted counts are saturated only after authentication (#44, `edb8258`). **[Amended 2026-08-17]** The v2 envelope is authenticated with HMAC-SHA256 before bounds, clamping, retention or boosts are applied. `learning.key` is a fixed 32-byte sibling created exclusively on first save at 0600 on Unix; missing/unreadable/wrong-length keys and mismatched tags return distinct integrity reports and empty learning. Unsigned v1 stores are refused as `UnrecognizedVersion`. Option A detects store-only writes and stores copied without their key; a process that can read the key remains outside this guarantee. |
 | T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:737–751 [Amended 2026-08-10]). **[Amended 2026-08-10]** Decision 2's shape half has landed (#39, `193dc4d`, `e83c373`): `persistence_key` (`learning.rs`) now sits between that scrubbing and disk — an id outside the three known-safe shapes persists as `sha256:<hex>` rather than unchanged. **[Amended 2026-08-10]** The shape half described above is retired, not merely extended: issue #72 (`4f5acf9`, `0c50a98`, `9a595bb`) deleted the known-safe-shape check outright and made `ProviderManifest::ids_are_safe_to_persist_in_the_clear` the sole authority — an id from an opted-in provider persists in the clear regardless of its shape, and an id from any other provider, including one presenting an `app:`-shaped id, hashes. | Decision 2. **[Amended 2026-08-10]** Shape half done; the manifest opt-in half is still open, riding with #72 **[Amended 2026-08-10]** Landed: the field exists, required with no default, and every production manifest (`apps.rs`, `calculator.rs`, `hopd::source::SkeletonProvider`) states it explicitly |
 | T12 | Cross-provider boost theft | Provider seam | `CheckedItems::check` closes provenance forgery; the store keys on a bare id (#72) **[Amended 2026-08-10]** #72 (`4f5acf9`, `0c50a98`, `9a595bb`) is now **closed**: the store keys on `(provider, id)`, folded by `provider_scoped_key` into a composition proven injective in its own doc comment, so a provider cannot forge another provider's persisted key by choosing its own id or provider string; and `rank.rs`'s `Boosts::by_item_id` gained the identical provider dimension, closing the in-memory half of the same gap for a query where the genuine and impostor items both appear before anything is ever persisted | A provider dimension in the store key. **[Amended 2026-08-10]** Landed — see the Today column |
 | T13 | Connection flood / socket occupancy | Accept loop | An accept loop exists (#54) and spawns one unbounded task per peer (`server.rs`, `serve_with`); nothing caps concurrent connections, aggregate memory across them, or the accept rate, and `read_frame` has no read timeout, so a peer that sends a valid length prefix and then stalls holds a task and its payload buffer open indefinitely (`connection.rs` says so in place) | Belongs to [#98](https://github.com/pedrosousa13/hop/issues/98); this document does not settle it. #54 and #55 have both landed and neither took it: #55 bounded per-*query* retained state (T3) and deliberately left every connection-level bound to #98 |
@@ -1340,5 +1365,5 @@ What has to be true for this model to describe reality rather than intent:
 | M3 (spec §8) | The empty-query view's behaviour for a provider that did not opt in — learned, ranked, and absent from that screen |
 | [#93](https://github.com/pedrosousa13/hop/issues/93) | The icon-root check #24 deliberately left out, and the open half of T8's pair: allowed roots computed at startup from `XDG_DATA_DIRS` and the icon theme spec's locations, enforced by whatever resolves the path, and checked against what the path resolves to rather than against the string |
 | [#83](https://github.com/pedrosousa13/hop/issues/83) | The open half of T9's pair: `RoutedQuery` holds the term as a plain `String` under a derived `Debug`, so the redaction `QueryText` applies in `hop-protocol` stops at `route`, which takes a `&str`. **[Amended 2026-08-10]** **Closed** (`8bd6550`): `RoutedQuery`'s `term` and `raw` are now `RoutedText`, which redacts under `Debug` the way `QueryText` does — see T9 |
-| [#88](https://github.com/pedrosousa13/hop/issues/88) | The open half of T10: an integrity check on the store, which is what closes both residuals #37 and #38 left — the forged-but-plausible store, and eviction's preference for the entry #38's clamp stamps at the load instant |
+| [#88](https://github.com/pedrosousa13/hop/issues/88) | **[Amended 2026-08-17] Landed.** `hop-core` v2 learning envelopes carry an HMAC-SHA256 over the sorted version and entries, with a fixed sibling `learning.key`; verification precedes bounds and timestamp handling. Store-only writes and stores copied without the key fail closed; a process that can read the key remains outside option A's guarantee |
 | [#52](https://github.com/pedrosousa13/hop/issues/52) | The M2 sweep, auditing the code rather than inheriting this document's verdicts |
