@@ -144,10 +144,13 @@ allow = [
 # into build failures for no gain here, since every crate in this tree declares
 # its license in metadata.
 confidence-threshold = 0.8
-# Per-crate escapes from the allow list above. Empty. If a crate ever needs one
-# it needs a sentence here saying which crate, which license, and why the
-# incompatibility is acceptable.
-exceptions = []
+# Per-crate escape for RustCrypto's constant-time HMAC dependency. Keep this
+# narrow: subtle is the only crate that needs BSD-3-Clause, and the license is
+# accepted for that implementation rather than added to the workspace-wide
+# allow list.
+exceptions = [
+    { allow = ["BSD-3-Clause"], name = "subtle" },
+]
 
 [licenses.private]
 # hop's own crates are GPL-3.0-only and are not marked `publish = false`, so

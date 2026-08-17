@@ -26,6 +26,8 @@ thiserror.workspace = true
 nucleo-matcher.workspace = true
 tokio.workspace = true
 regex.workspace = true
+hmac = "0.12"
+getrandom = "0.4"
 # Issue #39 (Decision 2's shape half): a `global_frequency` id outside the
 # three known-safe shapes persists as `sha256:<hex>` of the raw id rather
 # than the id itself. This defends accidental disclosure — a backup, a
