@@ -1801,12 +1801,14 @@ impl Learning {
     /// what memory holds; the clamp belongs to `purge_and_bound`, where
     /// untrusted bytes arrive.
     ///
-    /// A store that cannot be serialized returns `Err` having created nothing
-    /// at all — no file, no directory or key — so whatever is already on disk
-    /// survives intact. Key creation and signing also complete before the
-    /// store rename; a newly-created key is removed when an ordinary save
-    /// failure occurs. `serialize_and_persist` is where serialization's
-    /// ordering lives.
+    /// A payload that cannot be serialized returns `Err` having created
+    /// nothing at all — no file, directory or key — so whatever is already on
+    /// disk survives intact. Key creation and signing complete before the
+    /// store rename. A key that has been fully written and synced is retained
+    /// when the later store persistence fails, because another concurrent
+    /// save may already have read and used that shared key; only partial key
+    /// creation is cleaned up by `ensure_integrity_key`. The atomic store
+    /// path keeps an existing destination intact on its own failures.
     ///
     /// # A save destroys the file a load reported on
     ///
@@ -1838,18 +1840,14 @@ impl Learning {
         let canonical = canonical_payload(&unsigned)?;
         ensure_parent_directory(path)?;
         let key_path = learning_key_path(path)?;
-        let (key, created) = ensure_integrity_key(&key_path)?;
+        let (key, _) = ensure_integrity_key(&key_path)?;
         let tag = encode_hex(&hmac_tag(&key, &canonical));
         let persisted = PersistedLearningStore {
             version: unsigned.version,
             global_frequency: unsigned.global_frequency,
             tag,
         };
-        let result = serialize_and_persist(path, &persisted);
-        if result.is_err() && created {
-            let _ = fs::remove_file(&key_path);
-        }
-        result
+        serialize_and_persist(path, &persisted)
     }
 
     /// Replaces the set of provider ids this store currently treats as safe
@@ -3004,6 +3002,48 @@ mod tests {
     }
 
     #[test]
+    fn save_emits_an_hmac_over_an_independently_canonicalized_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let item = ItemId::new("app:a").unwrap();
+        let mut store = Learning::default();
+        store.record_launch(APPS_PROVIDER_ID, "q", &item);
+        store.save(&path).unwrap();
+
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let version = envelope["version"].clone();
+        let entries = envelope["global_frequency"].as_object().unwrap();
+
+        // Rebuild the unsigned payload from generic JSON values. This test
+        // deliberately does not use the production envelope, payload,
+        // canonicalization, or hex helpers: it checks the bytes emitted by
+        // save against the wire contract independently.
+        let mut canonical_entries = BTreeMap::new();
+        for (key, value) in entries {
+            canonical_entries.insert(key.clone(), value.clone());
+        }
+        let canonical = format!(
+            r#"{{"version":{},"global_frequency":{}}}"#,
+            serde_json::to_string(&version).unwrap(),
+            serde_json::to_string(&canonical_entries).unwrap(),
+        )
+        .into_bytes();
+
+        let key = std::fs::read(dir.path().join("learning.key")).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        mac.update(&canonical);
+        let expected_tag: String = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        assert_eq!(envelope["tag"].as_str(), Some(expected_tag.as_str()));
+    }
+
+    #[test]
     fn editing_a_persisted_count_without_recomputing_the_tag_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
@@ -3112,13 +3152,20 @@ mod tests {
     }
 
     #[test]
-    fn a_store_write_failure_removes_a_newly_created_key() {
+    fn a_store_write_failure_leaves_a_synced_key_for_a_later_save() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("learning.json");
+        let key_path = dir.path().join("learning.key");
         std::fs::create_dir(&path).unwrap();
 
         assert!(Learning::default().save(&path).is_err());
-        assert!(!dir.path().join("learning.key").exists());
+        let first_key = std::fs::read(&key_path).unwrap();
+        assert_eq!(first_key.len(), INTEGRITY_KEY_BYTES);
+
+        std::fs::remove_dir(&path).unwrap();
+        Learning::default().save(&path).unwrap();
+        assert_eq!(std::fs::read(&key_path).unwrap(), first_key);
+        assert_eq!(Learning::load_reporting(&path).1, LoadReport::Loaded);
     }
 
     #[cfg(unix)]
