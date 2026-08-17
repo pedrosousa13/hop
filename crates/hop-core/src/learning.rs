@@ -169,9 +169,11 @@
 //! entry. Load verifies that tag before applying entry bounds, timestamp
 //! clamping, retention or returning any learning. A store-only writer and a
 //! store copied without its sibling `learning.key` therefore fail closed with
-//! an integrity report. The key is deliberately stored beside the store,
-//! generated only on the first successful save, and reused without rotation;
-//! a process that can also read that key remains outside this guarantee.
+//! an integrity report. The key is deliberately stored beside the store and
+//! initialized when the first save reaches key creation after parent
+//! creation. Once fully written and synced, it remains durable if the later
+//! store replacement fails, and later saves reuse it without rotation; a
+//! process that can also read that key remains outside this guarantee.
 //! This is integrity only: the store stays plaintext and no protection is
 //! claimed against a process that can read the state directory.
 
@@ -1483,9 +1485,12 @@ impl Learning {
     /// entry ahead of it in the eviction order rather than behind.
     ///
     /// Settling it means refusing the entry, and refusing needs a reason to
-    /// believe the rest of the store — an integrity check, which is issue
-    /// #38's out-of-scope half and is implemented nowhere here. The module
-    /// docs say what that leaves standing.
+    /// believe the rest of the store. The v2 HMAC supplies that reason: load
+    /// verifies the envelope before it trusts, bounds or clamps any entry. A
+    /// missing, malformed or unreadable sibling key and a mismatched tag fail
+    /// closed with separate integrity reports. A process that can read the
+    /// key can compute a valid tag and remains outside this guarantee; the
+    /// check is integrity only, not confidentiality or ownership validation.
     pub fn load(path: &Path) -> Learning {
         Self::load_reporting(path).0
     }
@@ -1761,11 +1766,13 @@ impl Learning {
     }
 
     /// Persist an authenticated v2 envelope to disk via a temp file + atomic
-    /// rename + directory fsync, mode 0600. Creates the fixed sibling
-    /// `learning.key` on the first successful save, using 32 bytes from the OS
-    /// CSPRNG and mode 0600 on Unix; existing keys are never overwritten or
-    /// rotated. Creates the parent directory if it doesn't exist yet, at
-    /// mode 0700 on unix —
+    /// rename + directory fsync, mode 0600. When the first save attempt
+    /// reaches key creation after parent-directory setup, it creates the fixed
+    /// sibling `learning.key`, using 32 bytes from the OS CSPRNG and mode 0600
+    /// on Unix; existing keys are never overwritten or rotated. A fully
+    /// written and synced key remains durable if the later store replacement
+    /// fails, so later saves reuse it. Creates the parent directory if it
+    /// doesn't exist yet, at mode 0700 on unix —
     /// but a parent that already exists is left exactly as found, whatever
     /// its mode. `persist_atomically`'s `DirBuilder` block says why that
     /// asymmetry is load-bearing.
