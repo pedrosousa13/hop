@@ -2101,14 +2101,15 @@ impl Learning {
     /// # What it does not bound
     ///
     /// Storage only. It is not an allocation guard, and this crate does not
-    /// have one: the key is normalized (allocating a lowercased copy) before
-    /// its size is known, and [`Learning::boost_for`] normalizes the query
-    /// again on every lookup with no bound at all — which
-    /// `Pipeline::assemble` invokes once per candidate item, so an over-long
-    /// term costs a lowercased copy *per item* on that keystroke. Refusing to
-    /// store the key does nothing about any of that. A caller that must bound
-    /// the memory a query can cost has to bound the query itself, upstream, as
-    /// the wire boundary does.
+    /// have one: the storage-bound normalization allocates a lowercased copy
+    /// once on record, before its size is known. A direct call to
+    /// [`Learning::boost_for`] normalizes its raw query once per call and has
+    /// no lookup bound; a direct embedder that must bound that cost owns the
+    /// upstream bound, as the wire boundary does. `Pipeline::assemble` calls
+    /// `prepare_query` once for the routed term and reuses that normalized
+    /// lookup across candidate items, so it does not make a lowercased copy per
+    /// item. Refusing to store the key does nothing about the separate lookup
+    /// cost.
     pub fn record_launch(&mut self, provider: &str, query: &str, item_id: &ItemId) {
         self.record(provider, query, item_id.as_str());
     }
