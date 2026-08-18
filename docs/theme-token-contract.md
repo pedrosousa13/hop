@@ -16,7 +16,7 @@ typography, spacing, shape, and other presentation details according to the
 token API available when `tokens.css` is implemented.
 
 The boundary is narrow. On honesty-critical elements, a user theme may still
-restyle the font family and accent, provided the result remains present and
+restyle the font family and accent, provided the element remains present and
 legible. Hop's locked values win whenever a requested style would violate the
 truthfulness guarantee below.
 
