@@ -33,6 +33,10 @@
 //!   bytes is now refused. [`Learning::record_launch`] says which caller that
 //!   bound is the *only* protection for, and what it deliberately does not
 //!   bound.
+//! - Query normalization is kept separate from per-item lookup. The lookup
+//!   path does not add a query-cost bound: direct embedders own that upstream,
+//!   while the daemon applies [`hop_protocol::limits::MAX_QUERY_TEXT`] at its
+//!   wire boundary.
 //! - The load path is bounded (issue #37). The salvage read the whole file
 //!   with `read_to_string` — whatever the path pointed at, however large —
 //!   and enforced `MAX_GLOBAL_ENTRIES` only in `record`, never on the way in.
@@ -1213,6 +1217,30 @@ fn bounded_query_key(query: &str) -> Option<String> {
     (normalized.len() <= MAX_QUERY_TEXT).then_some(normalized)
 }
 
+/// A normalized query retained for reuse across all candidate-item lookups in
+/// one assembly. The raw query never enters the per-item method, so the
+/// trim/lowercase allocation can happen at most once for a non-empty store.
+pub(crate) struct PreparedQuery<'a> {
+    learning: &'a Learning,
+    normalized: Option<String>,
+}
+
+impl<'a> PreparedQuery<'a> {
+    fn query_boost(&self, provider: &str, result_id: &str) -> i32 {
+        let Some(normalized) = self.normalized.as_deref() else {
+            return 0;
+        };
+        self.learning
+            .query_boost_normalized(provider, normalized, result_id)
+    }
+
+    pub(crate) fn boost_for(&self, provider: &str, item_id: &ItemId) -> f32 {
+        let total = self.query_boost(provider, item_id.as_str())
+            + self.learning.frequency_boost(provider, item_id.as_str());
+        (total as f32).clamp(0.0, LEARNING_BOOST_CAP)
+    }
+}
+
 /// Entries in `global_frequency` older than the retention cutoff, purged.
 /// Split out of `save` so it can be applied to a local clone rather than
 /// mutating `self` (see the module docs — `save` takes `&self`).
@@ -2023,6 +2051,14 @@ impl Learning {
         }
     }
 
+    pub(crate) fn prepare_query(&self, query: &str) -> PreparedQuery<'_> {
+        let normalized = (!self.selections.is_empty()).then(|| query.trim().to_lowercase());
+        PreparedQuery {
+            learning: self,
+            normalized,
+        }
+    }
+
     /// Record a launch: the user reached `item_id`, produced by `provider`,
     /// while typing `query`.
     ///
@@ -2065,14 +2101,15 @@ impl Learning {
     /// # What it does not bound
     ///
     /// Storage only. It is not an allocation guard, and this crate does not
-    /// have one: the key is normalized (allocating a lowercased copy) before
-    /// its size is known, and [`Learning::boost_for`] normalizes the query
-    /// again on every lookup with no bound at all — which
-    /// `Pipeline::assemble` invokes once per candidate item, so an over-long
-    /// term costs a lowercased copy *per item* on that keystroke. Refusing to
-    /// store the key does nothing about any of that. A caller that must bound
-    /// the memory a query can cost has to bound the query itself, upstream, as
-    /// the wire boundary does.
+    /// have one: the storage-bound normalization allocates a lowercased copy
+    /// once on record, before its size is known. A direct call to
+    /// [`Learning::boost_for`] normalizes its raw query at most once per call
+    /// and has no lookup bound; a direct embedder that must bound that cost
+    /// owns the upstream bound, as the wire boundary does. `Pipeline::assemble`
+    /// calls `prepare_query` once for the routed term and reuses that normalized
+    /// lookup across candidate items, so it does not make a lowercased copy per
+    /// item. Refusing to store the key does nothing about the separate lookup
+    /// cost.
     pub fn record_launch(&mut self, provider: &str, query: &str, item_id: &ItemId) {
         self.record(provider, query, item_id.as_str());
     }
@@ -2175,23 +2212,19 @@ impl Learning {
     /// `app:firefox` matched exactly the entries `apps` had earned on the
     /// same id, because the inner map was keyed on the bare id alone.
     ///
-    /// The `self.selections.is_empty()` guard below is checked before the
-    /// query is even normalized — a query text of any length still returns
-    /// `0` against an empty selections table, so there is nothing this
-    /// function could find, and no reason to allocate the lookup key
-    /// (`provider_scoped_key`, one `String` per call) or the lowercased
-    /// query to find it with. This is the same trade `rank::Boosts`'s own
-    /// scoring loop already makes for `by_provider_item` — skip the
-    /// allocation the empty case can never use — applied here for the
-    /// identical reason: a hostile or absent-minded caller cannot make this
-    /// function allocate more per call, only zero providers with any
-    /// recorded selection can make it allocate at all.
+    /// This test-only wrapper prepares the query once for compatibility with
+    /// tests that use the old private helper. `Pipeline::assemble` keeps the
+    /// prepared value across its candidate loop instead.
+    #[cfg(test)]
     fn query_boost(&self, provider: &str, query: &str, result_id: &str) -> i32 {
-        if self.selections.is_empty() {
+        self.prepare_query(query).query_boost(provider, result_id)
+    }
+
+    fn query_boost_normalized(&self, provider: &str, normalized: &str, result_id: &str) -> i32 {
+        if normalized.is_empty() {
             return 0;
         }
-        let normalized = query.trim().to_lowercase();
-        if normalized.is_empty() {
+        if self.selections.is_empty() {
             return 0;
         }
         let now = now_ms();
@@ -2202,7 +2235,7 @@ impl Learning {
             // Prefix match: either stored_query is a prefix of the current query
             // or the current query is a prefix of the stored_query.
             let is_prefix_match = normalized.starts_with(stored_query.as_str())
-                || stored_query.starts_with(&normalized);
+                || stored_query.starts_with(normalized);
             if !is_prefix_match {
                 continue;
             }
@@ -2274,10 +2307,12 @@ impl Learning {
     /// zero unless it too has launches recorded under the pairing — it does
     /// not "look up `item_id` under whichever provider has a boost for it";
     /// that conflation is exactly the vulnerability issue #72 closes.
+    ///
+    /// A direct `hop-core` embedder must bound query cost upstream. This method
+    /// does not enforce or add a query-length bound; `hopd` receives the wire
+    /// bound from [`hop_protocol::limits::MAX_QUERY_TEXT`] before assembly.
     pub fn boost_for(&self, provider: &str, query: &str, item_id: &ItemId) -> f32 {
-        let total = self.query_boost(provider, query, item_id.as_str())
-            + self.frequency_boost(provider, item_id.as_str());
-        (total as f32).clamp(0.0, LEARNING_BOOST_CAP)
+        self.prepare_query(query).boost_for(provider, item_id)
     }
 
     /// Return the most recently launched result IDs, sorted by last_ms descending.
@@ -3541,6 +3576,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepared_query_reuses_normalized_key_across_items_and_matches_public_boost() {
+        let mut l = Learning::empty();
+        let first = ItemId::new("app:first").unwrap();
+        let second = ItemId::new("app:second").unwrap();
+        l.record_launch(APPS_PROVIDER_ID, "firefox", &first);
+        l.record_launch(APPS_PROVIDER_ID, "firefox", &second);
+
+        let prepared = l.prepare_query("  FiReFoX  ");
+
+        assert_eq!(prepared.normalized.as_deref(), Some("firefox"));
+        assert_eq!(
+            prepared.boost_for(APPS_PROVIDER_ID, &first),
+            l.boost_for(APPS_PROVIDER_ID, "  FiReFoX  ", &first)
+        );
+        assert_eq!(
+            prepared.boost_for(APPS_PROVIDER_ID, &second),
+            l.boost_for(APPS_PROVIDER_ID, "  FiReFoX  ", &second)
+        );
+    }
+
+    #[test]
+    fn prepared_query_keeps_frequency_boost_when_selections_are_empty() {
+        let mut l = Learning::empty();
+        let item = ItemId::new("app:frequency-only").unwrap();
+        l.record_launch(APPS_PROVIDER_ID, "firefox", &item);
+        l.selections.clear();
+
+        let prepared = l.prepare_query("  FiReFoX  ");
+
+        assert!(prepared.normalized.is_none());
+        assert_eq!(
+            prepared.boost_for(APPS_PROVIDER_ID, &item),
+            l.frequency_boost(APPS_PROVIDER_ID, item.as_str()) as f32
+        );
+    }
+
     // --- The bound on a recorded query key (issue #22). ---
     //
     // `selections` is keyed by query text, and `MAX_QUERIES` bounds how many
@@ -3655,6 +3727,23 @@ mod tests {
         l.record_launch(APPS_PROVIDER_ID, &query, &ItemId::new("app:a").unwrap());
 
         assert!(l.selections.contains_key(&key));
+    }
+
+    #[test]
+    fn prepared_lookup_accepts_an_over_long_raw_query() {
+        let mut l = Learning::empty();
+        let item = ItemId::new("app:firefox").unwrap();
+        l.record_launch(APPS_PROVIDER_ID, "firefox", &item);
+        let query = format!("firefox{}", "x".repeat(MAX_QUERY_TEXT + 1));
+        assert!(query.trim().to_lowercase().len() > MAX_QUERY_TEXT);
+
+        let prepared = l.prepare_query(&query);
+
+        assert_eq!(
+            prepared.boost_for(APPS_PROVIDER_ID, &item),
+            l.boost_for(APPS_PROVIDER_ID, &query, &item)
+        );
+        assert!(prepared.boost_for(APPS_PROVIDER_ID, &item) > 0.0);
     }
 
     // --- Parent-directory permissions (issue #36). ---
