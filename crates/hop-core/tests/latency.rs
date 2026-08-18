@@ -89,7 +89,7 @@ use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::rank::MAX_TERM_CHARS;
 use hop_core::router::{Mode, RoutedQuery};
 use hop_protocol::limits::MAX_TITLE;
-use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, Kind};
+use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, ItemTitle, Kind};
 
 /// Ten fixed, distinct provider ids — one [`ProviderOutput`] per id, each
 /// answering with exactly [`MAX_ITEMS_PER_PROVIDER_ANSWER`] items, so the
@@ -209,7 +209,7 @@ fn formulaic_item(provider_id: &'static str, item_index: usize) -> Item {
     Item {
         id: ItemId::new(format!("{provider_id}:item-{item_index}")).unwrap(),
         kind,
-        title: formulaic_title(item_index),
+        title: ItemTitle::new(formulaic_title(item_index)).unwrap(),
         subtitle: None,
         icon: None,
         actions: vec![open_action()],
@@ -460,7 +460,7 @@ fn overlong_term_is_truncated_before_pattern_construction() {
     let item = Item {
         id: ItemId::new(format!("{provider_id}:item-0")).unwrap(),
         kind: Kind::App,
-        title: haystack,
+        title: ItemTitle::new(haystack).unwrap(),
         subtitle: None,
         icon: None,
         actions: vec![open_action()],
@@ -525,7 +525,7 @@ fn bounded_worst_case_completes_promptly_in_release_mode() {
             .map(|i| Item {
                 id: ItemId::new(format!("{provider_id}:item-{i}")).unwrap(),
                 kind: Kind::App,
-                title: pathological_title.clone(),
+                title: ItemTitle::new(pathological_title.clone()).unwrap(),
                 subtitle: None,
                 icon: None,
                 actions: vec![open_action()],
@@ -698,7 +698,7 @@ fn path_item(provider_id: &'static str, item_index: usize) -> Item {
     Item {
         id: ItemId::new(format!("{provider_id}:path-{item_index}")).unwrap(),
         kind: Kind::File,
-        title: path_title(item_index),
+        title: ItemTitle::new(path_title(item_index)).unwrap(),
         subtitle: None,
         icon: None,
         actions: vec![open_action()],
@@ -826,7 +826,7 @@ fn p95_query_latency_over_a_files_shaped_fixture_is_measured_in_release_mode() {
     let mean_title: usize = checked
         .items()
         .iter()
-        .map(|item| item.title.len())
+        .map(|item| item.title.as_str().len())
         .sum::<usize>()
         / checked.items().len();
     println!(

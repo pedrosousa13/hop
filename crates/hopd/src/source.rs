@@ -26,8 +26,8 @@ use hop_core::pipeline::{CheckedItems, FailedCheck, Pipeline, Rejection};
 use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery, route};
 use hop_protocol::{
-    Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, Kind, MAX_ITEMS_PER_QUERY,
-    MAX_ITEMS_PER_RESULTS_FRAME, QueryText,
+    Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, ItemSubtitle, ItemTitle, Kind,
+    MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, QueryText,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -50,25 +50,26 @@ use tokio::sync::{Mutex, mpsc};
 /// landing issue #56 settled all of them, because it did not.
 ///
 /// **Items must respect `hop_protocol::limits`' per-item field bounds.**
-/// [`Item`]'s fields are public, and those bounds are applied where an item is
-/// *parsed*, so an item handed back through this trait has passed nothing
-/// merely by virtue of implementing it. The daemon bounds its retained set by
+/// [`Item`]'s action fields are public, and those bounds are applied where an
+/// item is *parsed*, so an item handed back through this trait has passed
+/// nothing merely by virtue of implementing it. `ItemTitle` and
+/// `ItemSubtitle` enforce their own bounds and single-line content rule on
+/// every construction path. The daemon bounds its retained set by
 /// item *count*
 /// ([`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY)), and
 /// the byte figure that count is justified against is the count multiplied by
-/// those per-item bounds — so a source producing a 100 MB title makes that
-/// arithmetic, and the bound it justifies, meaningless. The only thing below
+/// those per-item bounds — so a source producing a 100 MB action label makes
+/// that arithmetic, and the bound it justifies, meaningless. The only thing below
 /// it is
 /// [`MAX_FRAME_BYTES`](hop_protocol::limits::MAX_FRAME_BYTES) at encode time,
 /// which surfaces as an `io::Error` that kills the connection with no error
 /// frame — a worse outcome than refusing the item would have been.
 /// [`HostSource`] closes this gap for the field-length half, as of issue
 /// #61: `ProviderHost::run_one`'s per-provider turn now calls
-/// [`CheckedItems::check`], which rejects an item whose `title`, `subtitle`,
-/// `copy_text`, an action's `label`, or action count is over the same bound
-/// this module already applies at the parse (see
+/// [`CheckedItems::check`], which rejects an item whose action label or action
+/// count is over the same bound this module already applies at the parse (see
 /// [`FailedCheck::FieldTooLong`]) — a provider that returns an oversized
-/// title is refused before it ever reaches this trait's channel. This is
+/// action field is refused before it ever reaches this trait's channel. This is
 /// still a property of [`HostSource`] specifically, not a guarantee this
 /// *trait*'s contract makes: it holds because [`HostSource`] happens to
 /// route every provider's answer through [`CheckedItems::check`] before
@@ -647,8 +648,10 @@ pub(crate) fn hardcoded_item() -> Item {
     Item {
         id: ItemId::new("hop:walking-skeleton").expect("within bounds by construction"),
         kind: Kind::Action,
-        title: "Hello from hopd".to_string(),
-        subtitle: Some("M2.2 walking skeleton".to_string()),
+        title: ItemTitle::new("Hello from hopd").expect("constant title is valid"),
+        subtitle: Some(
+            ItemSubtitle::new("M2.2 walking skeleton").expect("constant subtitle is valid"),
+        ),
         icon: None,
         actions: vec![Action {
             id: ActionId::new("open").expect("within bounds by construction"),
@@ -710,7 +713,7 @@ mod tests {
         let line = rejection_summary_line(
             "files",
             &[rejection(FailedCheck::FieldTooLong {
-                field: "Item.title",
+                field: "Action.label",
             })],
         );
         assert_eq!(
@@ -730,7 +733,7 @@ mod tests {
                 rejection(FailedCheck::Kind),
                 rejection(FailedCheck::Provenance),
                 rejection(FailedCheck::FieldTooLong {
-                    field: "Item.subtitle",
+                    field: "Action.label",
                 }),
                 rejection(FailedCheck::TooManyItems { excess: 10 }),
             ],
@@ -760,7 +763,7 @@ mod tests {
         let mut rx = source.start(QueryText::new("walking skeleton").unwrap());
         let batch = rx.recv().await.expect("one batch must arrive");
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].title, "Hello from hopd");
+        assert_eq!(batch[0].title.as_str(), "Hello from hopd");
         assert!(
             rx.recv().await.is_none(),
             "the channel closes once the one provider has finished"
@@ -818,7 +821,7 @@ mod tests {
             Ok(vec![Item {
                 id: ItemId::new("instant:item").expect("within bounds by construction"),
                 kind: Kind::Action,
-                title: "Instant".to_string(),
+                title: ItemTitle::new("Instant").expect("constant title is valid"),
                 subtitle: None,
                 icon: None,
                 actions: vec![],
@@ -871,7 +874,7 @@ mod tests {
             Ok(vec![Item {
                 id: ItemId::new("delayed:item").expect("within bounds by construction"),
                 kind: Kind::Action,
-                title: "Delayed".to_string(),
+                title: ItemTitle::new("Delayed").expect("constant title is valid"),
                 subtitle: None,
                 icon: None,
                 actions: vec![],
@@ -1040,7 +1043,7 @@ mod tests {
         Item {
             id: ItemId::new(id).unwrap(),
             kind,
-            title: title.to_string(),
+            title: ItemTitle::new(title).unwrap(),
             subtitle: None,
             icon: None,
             actions: vec![Action {
@@ -1381,7 +1384,9 @@ mod tests {
             .expect("the flooding provider's arrival must still send a frame");
         assert_eq!(frame.len(), MAX_RESULTS);
         assert!(
-            frame.iter().all(|i| i.title != "should-be-dropped"),
+            frame
+                .iter()
+                .all(|i| i.title.as_str() != "should-be-dropped"),
             "the item past MAX_ITEMS_PER_QUERY must be truncated away by the \
              accumulator before assembly ever sees it, even though its \
              Window weight would otherwise make it the single top-ranked \

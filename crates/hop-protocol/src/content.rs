@@ -135,7 +135,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::limits::{
-    self, BoundError, MAX_COPY_TEXT, MAX_ICON_NAME, MAX_ICON_PATH, MAX_OPEN_URL, check_len,
+    self, BoundError, MAX_COPY_TEXT, MAX_ICON_NAME, MAX_ICON_PATH, MAX_OPEN_URL, MAX_SUBTITLE,
+    MAX_TITLE, check_len,
 };
 
 /// The URL schemes an [`OpenUrl`] may carry.
@@ -260,6 +261,94 @@ pub enum ContentError {
         /// The offending character's Unicode code point.
         codepoint: u32,
     },
+}
+
+/// A single-line display title for an [`Item`](crate::item::Item).
+///
+/// The value is limited to [`MAX_TITLE`] bytes and cannot contain a Unicode
+/// control character (`Cc`), including C0, DEL, and C1 controls. Empty values
+/// are preserved. Characters outside `Cc` are not filtered or normalized. The
+/// private inner string and the sole fallible constructor make the invariant
+/// hold for both provider-built values and values parsed from the wire. The
+/// wire representation remains a bare JSON string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ItemTitle(String);
+
+impl<'de> Deserialize<'de> for ItemTitle {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        limits::validated(deserializer, Self::FIELD, MAX_TITLE, Self::new)
+    }
+}
+
+impl ItemTitle {
+    pub(crate) const FIELD: &'static str = "Item.title";
+
+    /// Builds a title, refusing over-long or control-bearing values.
+    pub fn new(value: impl Into<String>) -> Result<Self, ContentError> {
+        let value = value.into();
+        check_len(Self::FIELD, MAX_TITLE, value.len())?;
+        if let Some(refused) = value.chars().find(|c| c.is_control()) {
+            return Err(ContentError::ForbiddenChar {
+                field: Self::FIELD,
+                codepoint: refused as u32,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// The title as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the title, yielding its string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// A single-line display subtitle for an [`Item`](crate::item::Item).
+///
+/// The value is limited to [`MAX_SUBTITLE`] bytes and cannot contain a Unicode
+/// control character (`Cc`). Empty values are preserved, and Unicode outside
+/// `Cc` is not filtered or normalized. The wire representation remains a bare
+/// JSON string when present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ItemSubtitle(String);
+
+impl<'de> Deserialize<'de> for ItemSubtitle {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        limits::validated(deserializer, Self::FIELD, MAX_SUBTITLE, Self::new)
+    }
+}
+
+impl ItemSubtitle {
+    pub(crate) const FIELD: &'static str = "Item.subtitle";
+
+    /// Builds a subtitle, refusing over-long or control-bearing values.
+    pub fn new(value: impl Into<String>) -> Result<Self, ContentError> {
+        let value = value.into();
+        check_len(Self::FIELD, MAX_SUBTITLE, value.len())?;
+        if let Some(refused) = value.chars().find(|c| c.is_control()) {
+            return Err(ContentError::ForbiddenChar {
+                field: Self::FIELD,
+                codepoint: refused as u32,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// The subtitle as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the subtitle, yielding its string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
 }
 
 /// A URL that an [`ExecOutcome::OpenUrl`](crate::wire::ExecOutcome::OpenUrl)
@@ -1024,6 +1113,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn item_title_constructor_refuses_controls_after_length_check() {
+        let title = ItemTitle::new(format!("{}{}", "a".repeat(MAX_TITLE), '\u{1b}'))
+            .expect_err("an over-long title must be refused");
+        assert!(
+            title.to_string().contains("over its maximum"),
+            "got: {title}"
+        );
+
+        let title = ItemTitle::new("before\u{85}after").expect_err("a C1 control must be refused");
+        assert!(title.to_string().contains("U+0085"), "got: {title}");
+    }
+
+    #[test]
+    fn item_display_newtypes_preserve_empty_unicode_and_bare_string_wire_shape() {
+        let title = ItemTitle::new("").unwrap();
+        let subtitle = ItemSubtitle::new("普通").unwrap();
+        assert_eq!(title.as_str(), "");
+        assert_eq!(subtitle.as_str(), "普通");
+        assert_eq!(serde_json::to_string(&title).unwrap(), "\"\"");
+        assert_eq!(serde_json::to_string(&subtitle).unwrap(), "\"普通\"");
+    }
     use std::path::Path;
     #[cfg(unix)]
     use std::{

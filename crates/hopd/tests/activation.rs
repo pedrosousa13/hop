@@ -254,7 +254,9 @@ fn a_query_over_an_inherited_listener_is_served_without_hopd_rebinding_the_socke
     };
     assert_eq!(query_id, 1);
     assert!(
-        items.iter().any(|item| item.title == "Hello from hopd"),
+        items
+            .iter()
+            .any(|item| item.title.as_str() == "Hello from hopd"),
         "expected the skeleton item among the results, got {items:?}"
     );
     assert_eq!(recv(&mut stream), DaemonMsg::QueryDone { query_id: 1 });

@@ -33,7 +33,9 @@ use hop_core::host::{ProviderEvent, ProviderLog};
 use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery};
 use hop_protocol::framing::{FRAME_PREFIX_LEN, decode_payload, encode_frame, payload_len};
-use hop_protocol::{API_VERSION, ActionId, ClientMsg, DaemonMsg, ExecOutcome, Item, ItemId, Kind};
+use hop_protocol::{
+    API_VERSION, ActionId, ClientMsg, DaemonMsg, ExecOutcome, Item, ItemId, ItemTitle, Kind,
+};
 use hopd::server::serve_with;
 use hopd::source::ResultSource;
 
@@ -261,7 +263,7 @@ pub fn scripted_item(provider: &str, kind: Kind, id: &str, title: &str) -> Item 
     Item {
         id: ItemId::new(id).expect("within bounds by construction"),
         kind,
-        title: title.to_string(),
+        title: ItemTitle::new(title).expect("within bounds by construction"),
         subtitle: None,
         icon: None,
         actions: vec![],

@@ -87,7 +87,7 @@ fn a_query_over_the_socket_returns_a_real_installed_application() {
         }
     }
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].title, "hop-e2e-canary-27b4d0");
+    assert_eq!(items[0].title.as_str(), "hop-e2e-canary-27b4d0");
     assert_eq!(items[0].provider, hop_core::provider::APPS_PROVIDER_ID);
 }
 
@@ -134,7 +134,7 @@ fn the_a_prefix_reaches_the_apps_provider_exclusively() {
         1,
         "the `a ` prefix must still reach the apps provider"
     );
-    assert_eq!(items[0].title, "hop-e2e-canary-27b4d0");
+    assert_eq!(items[0].title.as_str(), "hop-e2e-canary-27b4d0");
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn installing_an_app_while_the_daemon_is_running_is_reflected_in_the_next_query(
                 DaemonMsg::Results { items, .. } => {
                     found = items
                         .iter()
-                        .any(|i| i.title == "hop-e2e-canary-newapp-71cd");
+                        .any(|i| i.title.as_str() == "hop-e2e-canary-newapp-71cd");
                 }
                 DaemonMsg::QueryRouted { .. } => {}
                 DaemonMsg::QueryDone { .. } => break,

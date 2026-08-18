@@ -516,7 +516,7 @@ mod tests {
             Ok(vec![Item {
                 id: ItemId::new("app:fake").unwrap(),
                 kind: Kind::App,
-                title: q.term.as_str().to_string(),
+                title: hop_protocol::ItemTitle::new(q.term.as_str()).unwrap(),
                 subtitle: None,
                 icon: None,
                 actions: vec![],
@@ -546,7 +546,7 @@ mod tests {
         let routed = Arc::new(route("firefox"));
         let items = provider.clone().query(routed, ctx).await.unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "firefox");
+        assert_eq!(items[0].title.as_str(), "firefox");
 
         let outcome = provider
             .execute(items[0].id.clone(), ActionId::new("open").unwrap())
@@ -610,7 +610,7 @@ mod tests {
         let handle = tokio::spawn(provider.query(routed, ctx));
         let items = handle.await.unwrap().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "firefox");
+        assert_eq!(items[0].title.as_str(), "firefox");
     }
 
     /// `ProviderManifest` has to be comparable for the host to detect a

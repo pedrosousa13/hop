@@ -23,8 +23,10 @@ use hop_core::provider::{
     CALCULATOR_PROVIDER_ID, Provider, ProviderError, ProviderManifest, QueryCtx,
 };
 use hop_core::router::{Mode, RoutedQuery};
+use hop_core::sanitize::sanitize_single_line;
 use hop_protocol::{
-    Action, ActionId, ActionKind, CopyText, ExecOutcome, Item, ItemId, Kind, limits::MAX_TITLE,
+    Action, ActionId, ActionKind, CopyText, ExecOutcome, Item, ItemId, ItemTitle, Kind,
+    limits::MAX_TITLE,
 };
 
 /// Evaluates `expr` as an arithmetic expression, folding every failure
@@ -178,7 +180,8 @@ pub(crate) fn build_item(term: &str) -> Option<Item> {
     let value = evaluate(term)?;
     let result = format_result(value);
     let id = ItemId::new(format!("calc:{term}")).ok()?;
-    let title = truncate_to_byte_boundary(&format!("{term} = {result}"), MAX_TITLE);
+    let display_title = format!("{term} = {result}");
+    let title = build_display_title(&display_title);
 
     Some(Item {
         id,
@@ -198,20 +201,9 @@ pub(crate) fn build_item(term: &str) -> Option<Item> {
     })
 }
 
-/// Truncates `s` to at most `max` bytes, never splitting a multi-byte
-/// character. Ported verbatim from `crates/hopd/src/apps.rs`'s function of
-/// the same name — not shared via a common module; see this plan's Design
-/// decision 7 for why `hopd/src/` stays flat rather than growing a shared
-/// module for one ten-line function.
-fn truncate_to_byte_boundary(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
+fn build_display_title(raw: &str) -> ItemTitle {
+    ItemTitle::new(sanitize_single_line(raw, MAX_TITLE))
+        .expect("sanitized calculator title must satisfy item bounds")
 }
 
 /// The calculator provider: turns a routed term into zero or one
@@ -326,7 +318,7 @@ mod item_tests {
     fn build_item_sets_the_calc_prefixed_id_and_the_expr_equals_result_title() {
         let item = build_item("2+2").expect("2+2 evaluates");
         assert_eq!(item.id.as_str(), "calc:2+2");
-        assert_eq!(item.title, "2+2 = 4");
+        assert_eq!(item.title.as_str(), "2+2 = 4");
         assert_eq!(item.kind, Kind::Calculator);
         assert_eq!(item.provider, CALCULATOR_PROVIDER_ID);
     }
@@ -356,6 +348,19 @@ mod item_tests {
     }
 
     #[test]
+    fn build_item_removes_control_whitespace_from_its_display_title() {
+        let item = build_item("2+\t2").expect("fasteval accepts tab as whitespace");
+        assert_eq!(item.title.as_str(), "2+2 = 4");
+        assert!(!item.title.as_str().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn build_display_title_removes_bidi_controls_without_losing_printable_text() {
+        let title = build_display_title("Before\u{202e}After");
+        assert_eq!(title.as_str(), "BeforeAfter");
+    }
+
+    #[test]
     fn an_overlong_title_is_truncated_rather_than_dropping_the_item() {
         // "1" then "+1" repeated 510 times is a valid, evaluable expression
         // 1021 bytes long — short of MAX_QUERY_TEXT (a real router-derived
@@ -365,8 +370,8 @@ mod item_tests {
         let term = format!("1{}", "+1".repeat(510));
         assert_eq!(term.len(), 1021);
         let item = build_item(&term).expect("a long chain of additions still evaluates");
-        assert!(item.title.len() <= MAX_TITLE);
-        assert!(std::str::from_utf8(item.title.as_bytes()).is_ok());
+        assert!(item.title.as_str().len() <= MAX_TITLE);
+        assert!(std::str::from_utf8(item.title.as_str().as_bytes()).is_ok());
     }
 }
 
@@ -467,7 +472,7 @@ mod provider_tests {
         let provider = Arc::new(CalculatorProvider);
         let items = provider.query(Arc::new(route("2+2")), ctx()).await.unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "2+2 = 4");
+        assert_eq!(items[0].title.as_str(), "2+2 = 4");
     }
 
     #[tokio::test]

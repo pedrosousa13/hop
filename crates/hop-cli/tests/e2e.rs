@@ -165,7 +165,9 @@ fn the_cli_query_round_trips_and_exits_zero() {
         .map(|line| serde_json::from_str(line).expect("each line must parse as an Item"))
         .collect();
     assert!(
-        items.iter().any(|item| item.title == "Hello from hopd"),
+        items
+            .iter()
+            .any(|item| item.title.as_str() == "Hello from hopd"),
         "expected the skeleton item among the results, got {stdout:?}"
     );
 }
@@ -414,7 +416,7 @@ fn tiny_item(n: usize, title: &str) -> Item {
     Item {
         id: ItemId::new(format!("test:{n}")).unwrap(),
         kind: Kind::Action,
-        title: title.to_string(),
+        title: hop_protocol::ItemTitle::new(title).unwrap(),
         subtitle: None,
         icon: None,
         actions: vec![Action {

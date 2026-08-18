@@ -73,7 +73,7 @@ impl Provider for RestartableProvider {
         Ok(vec![Item {
             id: ItemId::new("app:restartable:1").unwrap(),
             kind: Kind::Action,
-            title: "Restartable".to_string(),
+            title: hop_protocol::ItemTitle::new("Restartable").unwrap(),
             subtitle: None,
             icon: None,
             actions: vec![Action {

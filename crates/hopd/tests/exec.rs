@@ -30,8 +30,8 @@ use hop_core::provider::{
 };
 use hop_core::router::{Mode, RoutedQuery};
 use hop_protocol::{
-    Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ErrorCode, ExecOutcome, Item, ItemId, Kind,
-    ProtoError, QueryText,
+    Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ErrorCode, ExecOutcome, Item, ItemId,
+    ItemTitle, Kind, ProtoError, QueryText,
 };
 use hopd::source::{HostSource, ResultSource};
 use tokio::sync::mpsc;
@@ -43,7 +43,7 @@ fn item(id: &str, actions: &[&str]) -> Item {
     Item {
         id: ItemId::new(id).unwrap(),
         kind: Kind::Action,
-        title: id.to_string(),
+        title: ItemTitle::new(id).unwrap(),
         subtitle: None,
         icon: None,
         actions: actions
@@ -392,7 +392,7 @@ impl Provider for HangingExecProvider {
         Ok(vec![Item {
             id: ItemId::new("hang:1").unwrap(),
             kind: Kind::Action,
-            title: "hangapp".to_string(),
+            title: ItemTitle::new("hangapp").unwrap(),
             subtitle: None,
             icon: None,
             actions: vec![Action {
@@ -552,7 +552,7 @@ impl Provider for LaunchableProvider {
         Ok(vec![Item {
             id: ItemId::new("app:launchable:1").unwrap(),
             kind: Kind::Action,
-            title: "Launchable".to_string(),
+            title: ItemTitle::new("Launchable").unwrap(),
             subtitle: None,
             icon: None,
             actions: vec![Action {

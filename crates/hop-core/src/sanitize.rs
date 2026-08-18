@@ -1,21 +1,23 @@
 //! The one implementation of string sanitization this workspace has, per spec
 //! §9 ("string sanitization: one implementation in hop-core").
 //!
-//! What it sanitizes today is provider-supplied error text — the free-form
-//! `String` in [`ProviderError::Failed`](crate::provider::ProviderError::Failed),
-//! which is untrusted text a provider chooses and which is bound for a GTK
-//! label by way of
-//! [`ProtoError`](hop_protocol::ProtoError). Issue #34 is the finding: nothing
-//! capped it, nothing escaped it, and a provider failing every query with a
-//! 50 MB string prefixed by terminal escapes would have had all of it rendered.
+//! It sanitizes provider-supplied error text — the free-form `String` in
+//! [`ProviderError::Failed`](crate::provider::ProviderError::Failed), which is
+//! untrusted text a provider chooses and which is bound for a GTK label by way
+//! of [`ProtoError`](hop_protocol::ProtoError) — and display text built by
+//! in-process providers before it reaches the validating item newtypes. Issue
+//! #34 is the original finding: nothing capped error text, nothing escaped it,
+//! and a provider failing every query with a 50 MB string prefixed by terminal
+//! escapes would have had all of it rendered.
 //!
 //! # Why this is not in `hop-protocol`'s content rules
 //!
 //! [`content`](hop_protocol::content) *refuses* a value that breaks a rule —
 //! that is right for a value arriving off the wire, where a refusal names a
-//! peer's mistake. Here the value is a diagnostic about a failure that already
-//! happened, and refusing it would replace the reason a provider failed with
-//! the reason its explanation was unacceptable. So this module rewrites rather
+//! peer's mistake. In-process providers instead rewrite their own display
+//! text before constructing an item, while diagnostics are already a failure
+//! explanation and refusing one would replace the original reason with the
+//! reason its explanation was unacceptable. So this module rewrites rather
 //! than refuses, and the rewrite is lossy on purpose.
 
 /// The most bytes of provider-supplied text that may leave the daemon, after
@@ -69,10 +71,9 @@ pub const BIDI_CONTROLS: &[char] = &[
     '\u{2069}', // POP DIRECTIONAL ISOLATE
 ];
 
-/// Rewrites provider-supplied text into something safe to render: every
+/// Rewrites single-line text into something safe to render: every
 /// [`char::is_control`] character and every [`BIDI_CONTROLS`] character
-/// removed, then truncated to [`MAX_PROVIDER_MESSAGE`] bytes at a `char`
-/// boundary.
+/// removed, then truncated to `max` bytes at a `char` boundary.
 ///
 /// # Strip before truncate
 ///
@@ -84,21 +85,26 @@ pub const BIDI_CONTROLS: &[char] = &[
 /// Truncation stops at a `char` boundary, so the result is always valid UTF-8
 /// and is never a partial code point — which is what would otherwise happen at
 /// a byte cut through a multi-byte character.
-pub fn sanitize_provider_message(raw: &str) -> String {
+pub fn sanitize_single_line(raw: &str, max: usize) -> String {
     let stripped: String = raw
         .chars()
         .filter(|c| !c.is_control() && !BIDI_CONTROLS.contains(c))
         .collect();
 
-    if stripped.len() <= MAX_PROVIDER_MESSAGE {
+    if stripped.len() <= max {
         return stripped;
     }
 
-    let mut end = MAX_PROVIDER_MESSAGE;
+    let mut end = max;
     while end > 0 && !stripped.is_char_boundary(end) {
         end -= 1;
     }
     stripped[..end].to_string()
+}
+
+/// Rewrites provider-supplied text using the provider-message budget.
+pub fn sanitize_provider_message(raw: &str) -> String {
+    sanitize_single_line(raw, MAX_PROVIDER_MESSAGE)
 }
 
 #[cfg(test)]
@@ -194,5 +200,14 @@ mod tests {
         // Lossy on purpose: this module rewrites, it never refuses — see the
         // module docs on why a refusal would be the wrong answer here.
         assert_eq!(sanitize_provider_message("\u{1b}\u{7f}\u{202e}"), "");
+    }
+
+    #[test]
+    fn bounded_single_line_sanitization_strips_controls_and_truncates() {
+        assert_eq!(
+            sanitize_single_line("keep\u{202e}visible\ntext", 11),
+            "keepvisible"
+        );
+        assert_eq!(sanitize_single_line("語語語", 7), "語語");
     }
 }

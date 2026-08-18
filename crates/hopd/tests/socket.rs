@@ -197,7 +197,7 @@ fn the_round_trip_returns_one_item_end_to_end() {
     assert!(
         items
             .iter()
-            .any(|item| item.title == "Hello from hopd" && item.kind == Kind::Action),
+            .any(|item| item.title.as_str() == "Hello from hopd" && item.kind == Kind::Action),
         "expected the skeleton item among the results, got {items:?}"
     );
 

@@ -17,7 +17,8 @@ use common::{hello, recv, send, start_daemon};
 use hop_core::provider::ProviderError;
 use hop_protocol::limits::{MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME};
 use hop_protocol::{
-    Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ExecOutcome, Item, ItemId, Kind, QueryText,
+    Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ExecOutcome, Item, ItemId, ItemTitle, Kind,
+    QueryText,
 };
 use hopd::source::ResultSource;
 use tokio::sync::mpsc;
@@ -27,7 +28,7 @@ fn item(n: usize) -> Item {
     Item {
         id: ItemId::new(format!("test:{n}")).unwrap(),
         kind: Kind::Action,
-        title: format!("item {n}"),
+        title: ItemTitle::new(format!("item {n}")).unwrap(),
         subtitle: None,
         icon: None,
         actions: vec![Action {
