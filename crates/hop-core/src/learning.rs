@@ -28,9 +28,15 @@
 //!   `boost_for`'s property, and now is not.
 //! - `reset` no longer self-persists (it has no path to persist to); it only
 //!   clears in-memory state now.
-//! - Query normalization is kept separate from per-item lookup. A caller that
-//!   embeds `hop-core` directly owns the upstream query-cost bound; the daemon
-//!   applies [`hop_protocol::limits::MAX_QUERY_TEXT`] at its wire boundary.
+//! - The recorded query key is bounded (issue #22). The salvage accepted a
+//!   query of any size as a `selections` key; a key over [`MAX_QUERY_TEXT`]
+//!   bytes is now refused. [`Learning::record_launch`] says which caller that
+//!   bound is the *only* protection for, and what it deliberately does not
+//!   bound.
+//! - Query normalization is kept separate from per-item lookup. The lookup
+//!   path does not add a query-cost bound: direct embedders own that upstream,
+//!   while the daemon applies [`hop_protocol::limits::MAX_QUERY_TEXT`] at its
+//!   wire boundary.
 //! - The load path is bounded (issue #37). The salvage read the whole file
 //!   with `read_to_string` — whatever the path pointed at, however large —
 //!   and enforced `MAX_GLOBAL_ENTRIES` only in `record`, never on the way in.
@@ -187,7 +193,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use hop_protocol::{ItemId, MAX_ITEM_ID, MAX_PROVIDER_ID};
+use hop_protocol::{ItemId, MAX_ITEM_ID, MAX_PROVIDER_ID, MAX_QUERY_TEXT};
 
 use crate::provider::APPS_PROVIDER_ID;
 
@@ -1196,6 +1202,21 @@ fn rekeyed_legacy_key(id: &str) -> Option<String> {
     None
 }
 
+/// The `selections` key for `query`, or `None` if that key would be over
+/// [`MAX_QUERY_TEXT`] bytes. See [`Learning::record_launch`] for what the bound
+/// is for and which caller it protects.
+///
+/// The check is against the *normalized* key — the trimmed, lowercased string
+/// that actually lands in the map — and against nothing else. Checking the raw
+/// text as well would refuse queries whose key would have fit: trimming and
+/// lowercasing can both shrink a string (`ẞ` is three bytes and lowercases to
+/// two, and `  …  firefox` is mostly whitespace), and a refusal here is
+/// permanent and silent, so the exact test is the right one.
+fn bounded_query_key(query: &str) -> Option<String> {
+    let normalized = query.trim().to_lowercase();
+    (normalized.len() <= MAX_QUERY_TEXT).then_some(normalized)
+}
+
 /// A normalized query retained for reuse across all candidate-item lookups in
 /// one assembly. The raw query never enters the per-item method, so the
 /// trim/lowercase allocation can happen at most once for a non-empty store.
@@ -2049,11 +2070,45 @@ impl Learning {
     /// what gets folded in, on the same trust footing `query` and `item_id`
     /// already have.
     ///
-    /// The launch always counts toward `item_id`'s global launch frequency and
-    /// is learned against the trimmed, lowercased query key. No query-length
-    /// bound is enforced by `hop-core`: a direct embedder must bound query cost
-    /// upstream. The daemon's socket path applies
-    /// [`hop_protocol::limits::MAX_QUERY_TEXT`] at the wire boundary instead.
+    /// The launch always counts toward `item_id`'s global launch frequency.
+    /// It is additionally learned *against this query* only if the query's
+    /// normalized form — trimmed and lowercased, which is the key it would be
+    /// stored under — is at most [`MAX_QUERY_TEXT`] bytes. A longer one is
+    /// refused, never truncated: a shortened query is a different query, and
+    /// would collect launches that were never made under it.
+    ///
+    /// # The wire bound does not subsume this one
+    ///
+    /// `ClientMsg::Query.text` carries the same constant at `hop-protocol`'s
+    /// deserialization boundary (issue #22), but the two checks measure
+    /// different strings: the wire counts the raw bytes that arrived, this one
+    /// counts the normalized key and nothing else. Normalization can *grow* a
+    /// key past a length the wire already accepted — `İ` (U+0130) is two bytes
+    /// and lowercases to three, so 512 of them are 1 024 raw bytes, exactly on
+    /// the wire bound, and normalize to a 1 536-byte key that is refused here.
+    /// A wire-legal query can therefore reach this check and be refused by it,
+    /// silently dropping its per-query learning; only the global launch count
+    /// below survives. The test
+    /// `a_query_whose_key_grows_past_the_bound_when_normalized_is_refused` is
+    /// that counterexample, spelled out.
+    ///
+    /// The bound is also the *only* one for the other caller: `hop-core` is a
+    /// library, and something that builds a [`Learning`] and calls this method
+    /// directly never crossed the wire at all, so no upstream check of any kind
+    /// ran. `MAX_QUERIES` is no help either way, because it bounds how *many*
+    /// query keys the map holds, never how large one is.
+    ///
+    /// # What it does not bound
+    ///
+    /// Storage only. It is not an allocation guard, and this crate does not
+    /// have one: the key is normalized (allocating a lowercased copy) before
+    /// its size is known, and [`Learning::boost_for`] normalizes the query
+    /// again on every lookup with no bound at all — which
+    /// `Pipeline::assemble` invokes once per candidate item, so an over-long
+    /// term costs a lowercased copy *per item* on that keystroke. Refusing to
+    /// store the key does nothing about any of that. A caller that must bound
+    /// the memory a query can cost has to bound the query itself, upstream, as
+    /// the wire boundary does.
     pub fn record_launch(&mut self, provider: &str, query: &str, item_id: &ItemId) {
         self.record(provider, query, item_id.as_str());
     }
@@ -2082,24 +2137,29 @@ impl Learning {
         self.purge_expired();
         let ts = now_ms();
 
-        // Update per-query selections under the same normalized key the lookup
-        // path prepares. The map-size limits still apply; query length does not.
-        let normalized = query.trim().to_lowercase();
-        let inner = self.selections.entry(normalized).or_default();
-        let entry = inner
-            .entry(provider_scoped_key(provider, result_id))
-            .or_insert(LearningEntry {
-                count: 0,
-                last_ms: 0,
-            });
-        entry.count = entry.count.saturating_add(1);
-        entry.last_ms = ts;
+        // Update per-query selections, unless the key would be over its bound
+        // — see `Learning::record_launch` for what that bound is and is not.
+        // The launch is still counted globally below: that table is keyed by
+        // the item id, which `ItemId::new` bounds separately, so refusing it
+        // too would discard a real signal over a hazard belonging to this
+        // table alone.
+        if let Some(normalized) = bounded_query_key(query) {
+            let inner = self.selections.entry(normalized).or_default();
+            let entry = inner
+                .entry(provider_scoped_key(provider, result_id))
+                .or_insert(LearningEntry {
+                    count: 0,
+                    last_ms: 0,
+                });
+            entry.count = entry.count.saturating_add(1);
+            entry.last_ms = ts;
 
-        // Evict inner map if too large
-        evict_lru_map(inner, MAX_ITEMS_PER_QUERY);
+            // Evict inner map if too large
+            evict_lru_map(inner, MAX_ITEMS_PER_QUERY);
 
-        // Evict outer map if too large
-        evict_lru_outer(&mut self.selections, MAX_QUERIES);
+            // Evict outer map if too large
+            evict_lru_outer(&mut self.selections, MAX_QUERIES);
+        }
 
         // Update global frequency, keyed by the persistence key rather than
         // the raw id — see this function's doc comment for why here rather
@@ -3552,16 +3612,137 @@ mod tests {
         );
     }
 
+    // --- The bound on a recorded query key (issue #22). ---
+    //
+    // `selections` is keyed by query text, and `MAX_QUERIES` bounds how many
+    // keys there are, not how large one is. These pin the size bound on the key
+    // itself — see `Learning::record_launch` for how it relates to the wire
+    // bound on `ClientMsg::Query.text`, which caller each one protects, and
+    // what this one deliberately does not bound.
+    //
+    // The bound is measured on the normalized key and on nothing else, so the
+    // last two below are as load-bearing as the first two: they are what keeps
+    // a cheaper raw-text pre-check from being reintroduced, since such a check
+    // passes the refusal tests while silently refusing queries whose key would
+    // have fit.
+
     #[test]
-    fn direct_embedders_are_not_given_a_query_length_bound() {
+    fn an_over_long_query_does_not_become_a_selection_key() {
         let mut l = Learning::empty();
-        let query = "a".repeat(hop_protocol::limits::MAX_QUERY_TEXT + 1);
-        let item = ItemId::new("app:a").unwrap();
+        let query = "a".repeat(MAX_QUERY_TEXT + 1);
 
-        l.record_launch(APPS_PROVIDER_ID, &query, &item);
+        l.record_launch(APPS_PROVIDER_ID, &query, &ItemId::new("app:a").unwrap());
 
-        assert!(l.selections.contains_key(&query));
-        assert!(l.query_boost(APPS_PROVIDER_ID, &query, item.as_str()) > 0);
+        assert!(
+            l.selections.is_empty(),
+            "a query over the bound must not be stored as a key, not even truncated"
+        );
+    }
+
+    // The other side of the bound: a query of exactly `MAX_QUERY_TEXT` bytes
+    // is recorded as usual. Without this, refusing every query would satisfy
+    // the test above.
+    #[test]
+    fn a_query_exactly_on_the_bound_is_still_recorded() {
+        let mut l = Learning::empty();
+        let query = "a".repeat(MAX_QUERY_TEXT);
+
+        l.record_launch(APPS_PROVIDER_ID, &query, &ItemId::new("app:a").unwrap());
+
+        assert!(
+            l.selections.contains_key(&query),
+            "a query exactly on the bound is legitimate and must still be learned"
+        );
+        assert!(l.query_boost(APPS_PROVIDER_ID, &query, "app:a") > 0);
+    }
+
+    // Only the query key is refused. The launch itself still happened, and
+    // the table it lands in is keyed by the item id, which `ItemId::new` has
+    // already bounded — so there is no reason to discard that half, and doing
+    // so would lose real signal over a hazard that concerns the other table.
+    #[test]
+    fn an_over_long_query_still_counts_the_launch_in_global_frequency() {
+        let mut l = Learning::empty();
+        let query = "a".repeat(MAX_QUERY_TEXT + 1);
+
+        l.record_launch(APPS_PROVIDER_ID, &query, &ItemId::new("app:a").unwrap());
+
+        assert!(
+            l.frequency_boost(APPS_PROVIDER_ID, "app:a") > 0,
+            "the launch is real; only the query key is refused"
+        );
+    }
+
+    // Normalization can push a key *over* the bound: "İ" (U+0130) is two bytes
+    // and lowercases to three ("i" plus a combining dot). This query is within
+    // the bound as typed and over it once normalized, so a raw-text-only check
+    // would store an over-sized key.
+    #[test]
+    fn a_query_whose_key_grows_past_the_bound_when_normalized_is_refused() {
+        let query = "İ".repeat(MAX_QUERY_TEXT / 2);
+        assert!(query.len() <= MAX_QUERY_TEXT, "within bound as typed");
+        assert!(
+            query.trim().to_lowercase().len() > MAX_QUERY_TEXT,
+            "but normalizing grows it past the bound"
+        );
+
+        let mut l = Learning::empty();
+        l.record_launch(APPS_PROVIDER_ID, &query, &ItemId::new("app:a").unwrap());
+
+        assert!(l.selections.is_empty());
+    }
+
+    // And normalization can pull a key back *under* it, which is the case a
+    // raw-text pre-check gets wrong: trimming discards the padding entirely,
+    // so this query's key is seven bytes. Refusing it would drop a perfectly
+    // ordinary pasted query — silently, and for good, since nothing retries a
+    // launch that was already recorded.
+    #[test]
+    fn a_query_that_only_trimming_brings_within_the_bound_is_still_recorded() {
+        let query = format!("{}firefox", " ".repeat(MAX_QUERY_TEXT * 2));
+        assert!(query.len() > MAX_QUERY_TEXT, "over the bound as typed");
+
+        let mut l = Learning::empty();
+        l.record_launch(APPS_PROVIDER_ID, &query, &ItemId::new("app:a").unwrap());
+
+        assert!(
+            l.selections.contains_key("firefox"),
+            "the key is what is bounded, and this key is seven bytes"
+        );
+    }
+
+    // The same case for shrinking under lowercase rather than under trim, so
+    // the rule is pinned as "the normalized key, whatever normalization did to
+    // it" rather than as a special case for whitespace. "ẞ" (U+1E9E) is three
+    // bytes and lowercases to "ß" (U+00DF), two.
+    #[test]
+    fn a_query_that_only_lowercasing_brings_within_the_bound_is_still_recorded() {
+        let query = "ẞ".repeat(MAX_QUERY_TEXT / 2);
+        assert!(query.len() > MAX_QUERY_TEXT, "over the bound as typed");
+        let key = query.trim().to_lowercase();
+        assert!(key.len() <= MAX_QUERY_TEXT, "but its key fits");
+
+        let mut l = Learning::empty();
+        l.record_launch(APPS_PROVIDER_ID, &query, &ItemId::new("app:a").unwrap());
+
+        assert!(l.selections.contains_key(&key));
+    }
+
+    #[test]
+    fn prepared_lookup_accepts_an_over_long_raw_query() {
+        let mut l = Learning::empty();
+        let item = ItemId::new("app:firefox").unwrap();
+        l.record_launch(APPS_PROVIDER_ID, "firefox", &item);
+        let query = format!("firefox{}", "x".repeat(MAX_QUERY_TEXT + 1));
+        assert!(query.trim().to_lowercase().len() > MAX_QUERY_TEXT);
+
+        let prepared = l.prepare_query(&query);
+
+        assert_eq!(
+            prepared.boost_for(APPS_PROVIDER_ID, &item),
+            l.boost_for(APPS_PROVIDER_ID, &query, &item)
+        );
+        assert!(prepared.boost_for(APPS_PROVIDER_ID, &item) > 0.0);
     }
 
     // --- Parent-directory permissions (issue #36). ---

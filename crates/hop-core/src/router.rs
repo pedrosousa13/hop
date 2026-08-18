@@ -98,9 +98,9 @@ use regex::Regex;
 /// documents the two warnings a client needs when it reads the value out of a
 /// frame with none of this context.
 ///
-/// `hop-core` adds no query-length bound for direct embedders. A caller that
-/// invokes routing or assembly directly must bound query cost upstream;
-/// `hopd` gets the wire bound from [`hop_protocol::limits::MAX_QUERY_TEXT`].
+/// `hop-core`'s routing and assembly lookup paths add no query-cost bound. A
+/// direct embedder must bound that cost upstream; `hopd` gets the wire bound
+/// from [`hop_protocol::limits::MAX_QUERY_TEXT`].
 pub use hop_protocol::Mode;
 
 /// Query text carried by a [`RoutedQuery`]: both [`RoutedQuery::term`] and
@@ -130,9 +130,10 @@ pub use hop_protocol::Mode;
 /// one to make this type look more like `QueryText`; that is precisely the
 /// difference between them.
 ///
-/// This also means `hop-core` makes no query-length promise to direct
-/// embedders. They own the upstream bound on query cost; the daemon's wire
-/// path applies [`hop_protocol::limits::MAX_QUERY_TEXT`] before routing.
+/// This also means the `RoutedText`/routing/assembly lookup path makes no
+/// query-length promise to direct embedders. They own the upstream bound on
+/// query cost; the daemon's wire path applies
+/// [`hop_protocol::limits::MAX_QUERY_TEXT`] before routing.
 ///
 /// [`Pipeline::assemble`]: crate::pipeline::Pipeline::assemble
 ///
