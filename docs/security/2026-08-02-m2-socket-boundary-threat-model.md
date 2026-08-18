@@ -540,8 +540,10 @@ is what puts the sentence above where a plugin-tier implementer will read it.
 - A client does not trust the daemon: `DaemonMsg`'s fields are bounded for the
   same reason (`wire.rs`:135–140 [Amended 2026-08-10]).
 - The daemon does not fully trust a provider: `CheckedItems::check` holds each
-  item to its own producer's manifest, and `CONTEXT.md` names what survives
-  that check **checked items**. The residual is recorded in
+  item to its own producer's manifest, while `ItemTitle` and `ItemSubtitle`
+  enforce their own bounded single-line display invariants before an item can
+  exist. `CONTEXT.md` names what survives that check **checked items**. The
+  residual is recorded in
   [#72](https://github.com/pedrosousa13/hop/issues/72) — the learning store
   keys on a bare item id, so an honestly-declared hostile provider can still
   collect another provider's learned boosts.
@@ -924,9 +926,8 @@ to reconstruct them from `connection.rs`.
   bound on the daemon's memory.
   **[Amended 2026-08-10]** [#30](https://github.com/pedrosousa13/hop/issues/30)
   is now **closed** (`80b7ffd`): `CheckedItems::check` (`pipeline.rs`:592)
-  rejects an item whose `title`, `subtitle`, `copy_text`, an action's
-  `label`, or action count is over the same bound `limits.rs` applies at the
-  parse (`FailedCheck::FieldTooLong`), at the one seam every provider's
+  rejects an item whose action `label` or action count is over the same bound
+  `limits.rs` applies at the parse (`FailedCheck::FieldTooLong`), at the one seam every provider's
   answer must cross — `ProviderHost::run_one` calls it before an answer
   reaches assembly. The byte figure above is therefore a real bound on the
   daemon's memory for a provider's answer, not only an argument about the
@@ -942,9 +943,13 @@ to reconstruct them from `connection.rs`.
   value that exists, in-process or off the wire. There is no longer a state
   `CheckedItems::check` could catch that construction had not already
   refused, so checking it there again would be the second gate `limits.rs`'s
-  own docs on `validated` argue against. The rest of the claim above is
-  unchanged: `title`, `subtitle`, an action's `label`, and action count are
-  still rejected there on the same terms.
+  own docs on `validated` argue against. **[Amended 2026-08-18]** `ItemTitle`
+  and `ItemSubtitle` now enforce their byte bounds and single-line control
+  character rule on every construction path, while retaining bare-string wire
+  forms. `CheckedItems::check` therefore checks only action labels and action
+  count for field length; title and subtitle checks are no longer duplicated
+  there. Apps and calculator providers sanitize their display text before
+  constructing these types.
 - **Per connection or per daemon: per connection.** The retained set lives in
   the connection driver's own state (`connection.rs`, `Exchange`), and there
   is no cross-connection registry for a query id to reach into. Client-chosen

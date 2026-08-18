@@ -1262,7 +1262,7 @@ mod tests {
         Item {
             id: ItemId::new(id).unwrap(),
             kind,
-            title: title.to_string(),
+            title: hop_protocol::ItemTitle::new(title).unwrap(),
             subtitle: None,
             icon: None,
             actions: vec![],
@@ -2095,7 +2095,7 @@ mod tests {
 
         let items = run(Arc::new(host), "firefox").await;
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "Firefox");
+        assert_eq!(items[0].title.as_str(), "Firefox");
         assert_eq!(log.lines(), vec!["answered apps 1"]);
     }
 
@@ -2219,7 +2219,7 @@ mod tests {
             1,
             "the surviving provider's items still reach the client"
         );
-        assert_eq!(items[0].title, "Firefox");
+        assert_eq!(items[0].title.as_str(), "Firefox");
         assert!(
             log.lines()
                 .iter()
@@ -2267,7 +2267,7 @@ mod tests {
             .await
             .expect("the fast provider's batch must not wait on the slow one")
             .expect("a batch, not a close");
-        assert_eq!(first.items()[0].title, "Firefox");
+        assert_eq!(first.items()[0].title.as_str(), "Firefox");
     }
 
     #[tokio::test]

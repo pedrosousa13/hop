@@ -194,9 +194,10 @@ produces four of the five reasons `FailedCheck` distinguishes. Two are the
 **manifest checks**: the item's `kind` is not one its producer declared, or
 its `provider` string is not its producer's manifest id — the two ways an
 item's self-description can be a lie. A third, `FailedCheck::FieldTooLong`,
-is not a manifest check and not evidence of one: it means a field was over
-the same length bound `hop-protocol`'s own parse already applies, which says
-an item was too big, not that it claimed to be something it was not. A
+is not a manifest check and not evidence of one: it means an action label or
+the action count was over the same length bound `hop-protocol`'s own parse
+already applies. Item titles and subtitles cannot reach this check: their
+validating newtypes enforce their bounds on every construction path. A
 fourth, `FailedCheck::TooManyItems`, is not about any one item at all — it
 records a whole provider answer over the per-answer item cap, decided before
 any item in it was inspected. The fifth reason, `FailedCheck::PinBudget`, is
@@ -476,8 +477,8 @@ boundary, and the bound is applied first.
 **Validating newtype** — a type wrapping a private `String` whose only
 constructor applies every rule, and whose `Deserialize` hands the parsed string
 to that same constructor. One gate, not two: a value that exists has passed the
-rules however it was made. `ItemId`, `ActionId`, `CopyText`, `OpenUrl`,
-`IconName`, `IconPath` and `QueryText`.
+rules however it was made. `ItemId`, `ActionId`, `ItemTitle`, `ItemSubtitle`,
+`CopyText`, `OpenUrl`, `IconName`, `IconPath` and `QueryText`.
 
 **Allowed scheme** — a URL scheme an `OpenUrl` may carry, from the allow-list
 `ALLOWED_URL_SCHEMES`. An allow-list, never a deny-list: a scheme that is not on

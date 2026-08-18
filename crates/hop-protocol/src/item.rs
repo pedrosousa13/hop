@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::content::{CopyText, IconName, IconPath};
+use crate::content::{CopyText, IconName, IconPath, ItemSubtitle, ItemTitle};
 use crate::limits::{self, BoundError, MAX_ACTION_ID, MAX_COPY_TEXT, MAX_ITEM_ID, check_len};
 
 /// The stable identifier of an [`Item`], opaque to clients.
@@ -243,12 +243,15 @@ pub enum IconSpec {
 pub struct Item {
     pub id: ItemId,
     pub kind: Kind,
-    /// Bounded at [`MAX_TITLE`](crate::limits::MAX_TITLE) bytes on the way in.
-    #[serde(deserialize_with = "limits::de_title")]
-    pub title: String,
-    /// Bounded at [`MAX_SUBTITLE`](crate::limits::MAX_SUBTITLE) bytes on the way in.
-    #[serde(default, deserialize_with = "limits::de_subtitle")]
-    pub subtitle: Option<String>,
+    /// A validated single-line display title, bounded at
+    /// [`MAX_TITLE`](crate::limits::MAX_TITLE) bytes and free of control
+    /// characters.
+    pub title: ItemTitle,
+    /// An optional validated single-line display subtitle, bounded at
+    /// [`MAX_SUBTITLE`](crate::limits::MAX_SUBTITLE) bytes and free of control
+    /// characters.
+    #[serde(default)]
+    pub subtitle: Option<ItemSubtitle>,
     pub icon: Option<IconSpec>,
     /// Bounded at [`MAX_ACTIONS_PER_ITEM`](crate::limits::MAX_ACTIONS_PER_ITEM)
     /// actions on the way in.
@@ -332,14 +335,16 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::limits::{MAX_SUBTITLE, MAX_TITLE};
+
     use super::*;
 
     fn sample_item() -> Item {
         Item {
             id: ItemId::new("app:firefox").unwrap(),
             kind: Kind::App,
-            title: "Firefox".into(),
-            subtitle: Some("Web Browser".into()),
+            title: ItemTitle::new("Firefox").unwrap(),
+            subtitle: Some(ItemSubtitle::new("Web Browser").unwrap()),
             icon: Some(IconSpec::Name(IconName::new("firefox").unwrap())),
             actions: vec![Action {
                 id: ActionId::new("open").unwrap(),
@@ -402,6 +407,107 @@ mod tests {
             "append_to_end": false,
             "provider": "apps"
         })
+    }
+
+    #[test]
+    fn item_title_carrying_a_control_character_is_refused() {
+        let mut json = full_item_json();
+        json["title"] = json!("before\nafter");
+        let err =
+            serde_json::from_value::<Item>(json).expect_err("a multi-line title must not parse");
+        assert!(err.to_string().contains("Item.title"), "got: {err}");
+        assert!(err.to_string().contains("U+000A"), "got: {err}");
+    }
+
+    #[test]
+    fn item_subtitle_carrying_a_control_character_is_refused() {
+        let mut json = full_item_json();
+        json["subtitle"] = json!(format!("before{}after", '\u{1b}'));
+        let err = serde_json::from_value::<Item>(json)
+            .expect_err("a subtitle carrying ESC must not parse");
+        assert!(err.to_string().contains("Item.subtitle"), "got: {err}");
+        assert!(err.to_string().contains("U+001B"), "got: {err}");
+    }
+
+    #[test]
+    fn item_title_rejects_c1_controls() {
+        let mut json = full_item_json();
+        json["title"] = json!(format!("before{}after", '\u{85}'));
+        let err = serde_json::from_value::<Item>(json).expect_err("U+0085 must not parse");
+        assert!(err.to_string().contains("Item.title"), "got: {err}");
+        assert!(err.to_string().contains("U+0085"), "got: {err}");
+    }
+
+    #[test]
+    fn item_display_fields_accept_exact_byte_bounds_and_reject_one_byte_over() {
+        let mut title_at_bound = full_item_json();
+        title_at_bound["title"] = json!("t".repeat(MAX_TITLE));
+        assert!(serde_json::from_value::<Item>(title_at_bound).is_ok());
+
+        let mut title_over_bound = full_item_json();
+        title_over_bound["title"] = json!("t".repeat(MAX_TITLE + 1));
+        assert!(serde_json::from_value::<Item>(title_over_bound).is_err());
+
+        let mut subtitle_at_bound = full_item_json();
+        subtitle_at_bound["subtitle"] = json!("s".repeat(MAX_SUBTITLE));
+        assert!(serde_json::from_value::<Item>(subtitle_at_bound).is_ok());
+
+        let mut subtitle_over_bound = full_item_json();
+        subtitle_over_bound["subtitle"] = json!("s".repeat(MAX_SUBTITLE + 1));
+        assert!(serde_json::from_value::<Item>(subtitle_over_bound).is_err());
+    }
+
+    #[test]
+    fn item_display_field_length_error_precedes_control_error() {
+        let mut json = full_item_json();
+        json["title"] = json!(format!("{}\u{1b}", "t".repeat(MAX_TITLE)));
+        let err = serde_json::from_value::<Item>(json).expect_err("invalid title must be refused");
+        let text = err.to_string();
+        assert!(text.contains("Item.title"), "got: {text}");
+        assert!(text.contains("over its maximum"), "got: {text}");
+        assert!(
+            !text.contains("U+001B"),
+            "length must be reported first, got: {text}"
+        );
+    }
+
+    #[test]
+    fn item_display_fields_preserve_ordinary_and_empty_strings() {
+        let mut json = full_item_json();
+        json["title"] = json!("");
+        json["subtitle"] = json!("普通");
+        let item: Item = serde_json::from_value(json).expect("ordinary values must parse");
+        assert_eq!(item.title.as_str(), "");
+        assert_eq!(item.subtitle.as_ref().unwrap().as_str(), "普通");
+    }
+
+    #[test]
+    fn item_title_serializes_as_a_bare_string() {
+        let item = sample_item();
+        let json = serde_json::to_value(item).unwrap();
+        assert_eq!(json["title"], "Firefox");
+        assert!(json["title"].is_string());
+    }
+
+    #[test]
+    fn item_subtitle_is_none_when_explicitly_null() {
+        let mut json = full_item_json();
+        json["subtitle"] = serde_json::Value::Null;
+        let item: Item = serde_json::from_value(json).expect("null subtitle must parse");
+        assert_eq!(item.subtitle, None);
+    }
+
+    #[test]
+    fn item_display_field_wrong_types_name_the_correct_field() {
+        let mut title = full_item_json();
+        title["title"] = json!(42);
+        let err = serde_json::from_value::<Item>(title).expect_err("numeric title must fail");
+        assert!(err.to_string().contains("Item.title"), "got: {err}");
+
+        let mut subtitle = full_item_json();
+        subtitle["subtitle"] = json!(42);
+        let err = serde_json::from_value::<Item>(subtitle).expect_err("numeric subtitle must fail");
+        assert!(err.to_string().contains("Item.subtitle"), "got: {err}");
     }
 
     fn item_without(field: &str) -> Item {

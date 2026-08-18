@@ -15,7 +15,7 @@
 //! full reasoning behind each divergence from those sources.
 
 use hop_protocol::{
-    Action, ActionId, ActionKind, IconName, IconPath, IconSpec, Item, ItemId, Kind,
+    Action, ActionId, ActionKind, IconName, IconPath, IconSpec, Item, ItemId, ItemTitle, Kind,
     limits::MAX_TITLE,
 };
 
@@ -454,10 +454,11 @@ pub(crate) fn build_entry(app_id: String, parsed: ParsedEntry) -> Option<AppEntr
         }
     });
 
+    let title = sanitize_single_line(&parsed.title, MAX_TITLE);
     let item = Item {
         id,
         kind: Kind::App,
-        title: parsed.title,
+        title: ItemTitle::new(title).expect("sanitized desktop title must satisfy item bounds"),
         subtitle: None,
         icon,
         actions: vec![Action {
@@ -934,7 +935,8 @@ mod scan_tests {
             "the same app id from two roots must not duplicate"
         );
         assert_eq!(
-            entries[0].item.title, "User Override",
+            entries[0].item.title.as_str(),
+            "User Override",
             "the first root in the list must win — this is what makes root order a real precedence rule"
         );
     }
@@ -1009,7 +1011,7 @@ mod scan_tests {
 
         let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].item.title, "Valid");
+        assert_eq!(entries[0].item.title.as_str(), "Valid");
 
         // Restore permissions so `TempDir`'s own cleanup on drop can remove
         // the file without needing directory-only write access to do it.
@@ -1031,7 +1033,7 @@ mod scan_tests {
 
         let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].item.title, "Valid");
+        assert_eq!(entries[0].item.title.as_str(), "Valid");
     }
 
     #[test]
@@ -1050,7 +1052,7 @@ mod scan_tests {
 
         let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].item.title, "Valid");
+        assert_eq!(entries[0].item.title.as_str(), "Valid");
     }
 
     #[test]
@@ -1072,7 +1074,7 @@ mod scan_tests {
 
         let entries = scan_apps(&[higher.path().to_path_buf(), lower.path().to_path_buf()]);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].item.title, "Valid");
+        assert_eq!(entries[0].item.title.as_str(), "Valid");
     }
 
     #[test]
@@ -1649,6 +1651,18 @@ mod tests {
     }
 
     #[test]
+    fn build_entry_removes_control_characters_from_the_title_without_dropping_the_app() {
+        let source = format!(
+            "[Desktop Entry]\nName=Before{}{}After\nExec=x\n",
+            '\u{0085}', '\u{202e}'
+        );
+        let parsed = parsed(&source);
+        assert!(parsed.title.chars().any(char::is_control));
+        let entry = build_entry("x".to_string(), parsed).expect("the app must survive");
+        assert_eq!(entry.item.title.as_str(), "BeforeAfter");
+    }
+
+    #[test]
     fn a_slash_prefixed_icon_becomes_the_path_arm() {
         let parsed = parsed("[Desktop Entry]\nName=X\nExec=x\nIcon=/usr/share/pixmaps/x.png\n");
         let entry = build_entry("x".to_string(), parsed).unwrap();
@@ -1678,7 +1692,11 @@ mod tests {
         let parsed = parsed("[Desktop Entry]\nName=X\nExec=x\nIcon=bad\u{1b}name\n");
         let entry = build_entry("x".to_string(), parsed).unwrap();
         assert_eq!(entry.item.icon, None);
-        assert_eq!(entry.item.title, "X", "the item itself must still be built");
+        assert_eq!(
+            entry.item.title.as_str(),
+            "X",
+            "the item itself must still be built"
+        );
     }
 
     #[test]
@@ -1807,7 +1825,7 @@ mod index_tests {
         let index = AppIndex::new(vec![entry("firefox", "Firefox"), entry("files", "Files")]);
         let items = index.query("FIRE");
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "Firefox");
+        assert_eq!(items[0].title.as_str(), "Firefox");
     }
 
     #[test]
@@ -1868,7 +1886,7 @@ mod index_tests {
         index.replace(vec![entry("new-a", "New A"), entry("new-b", "New B")]);
         let items = index.query("");
         assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|i| i.title.starts_with("New")));
+        assert!(items.iter().all(|i| i.title.as_str().starts_with("New")));
     }
 
     #[test]
@@ -1896,7 +1914,7 @@ mod index_tests {
             1,
             "query must still answer from memory once the backing directory is gone"
         );
-        assert_eq!(items[0].title, "Firefox");
+        assert_eq!(items[0].title.as_str(), "Firefox");
     }
 }
 
@@ -2411,6 +2429,7 @@ use std::sync::Arc;
 
 use hop_core::provider::{APPS_PROVIDER_ID, Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery};
+use hop_core::sanitize::sanitize_single_line;
 
 /// The apps provider: answers a query from [`AppIndex`] with no disk
 /// access, and dispatches `execute` through [`focus_or_launch`].
@@ -2644,7 +2663,7 @@ mod provider_tests {
             .await
             .unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "Firefox");
+        assert_eq!(items[0].title.as_str(), "Firefox");
     }
 
     // --- execute(): dispatch through focus_or_launch. ---
@@ -3106,7 +3125,7 @@ mod watcher_tests {
         assert!(
             wait_until(&index, Duration::from_secs(5), |items| items
                 .iter()
-                .any(|i| i.title == "New App")),
+                .any(|i| i.title.as_str() == "New App")),
             "the new entry must appear without the daemon restarting"
         );
     }
@@ -3200,7 +3219,7 @@ mod watcher_tests {
         assert!(
             wait_until(&index, Duration::from_secs(5), |items| items
                 .iter()
-                .any(|i| i.title == "Later")),
+                .any(|i| i.title.as_str() == "Later")),
             "a change after construction must still be picked up by the watcher"
         );
     }
@@ -3272,7 +3291,7 @@ mod watcher_tests {
         assert!(
             wait_until(&index, Duration::from_secs(5), |items| items
                 .iter()
-                .any(|i| i.title == "Wake")),
+                .any(|i| i.title.as_str() == "Wake")),
             "sanity: dir_b's event must be processed before dir_a's rewatch can be checked"
         );
 
@@ -3286,7 +3305,7 @@ mod watcher_tests {
         assert!(
             wait_until(&index, Duration::from_secs(5), |items| items
                 .iter()
-                .any(|i| i.title == "Recovered")),
+                .any(|i| i.title.as_str() == "Recovered")),
             "a root re-created after being deleted must be re-watched, not left dark until a restart"
         );
     }
@@ -3328,7 +3347,7 @@ mod watcher_tests {
         assert!(
             wait_until(&index, Duration::from_secs(5), |items| items
                 .iter()
-                .any(|i| i.title == "Wake")),
+                .any(|i| i.title.as_str() == "Wake")),
             "sanity: dir_b's event must be processed before the missing root's rewatch can be checked"
         );
 
@@ -3340,7 +3359,7 @@ mod watcher_tests {
         assert!(
             wait_until(&index, Duration::from_secs(5), |items| items
                 .iter()
-                .any(|i| i.title == "Arrived")),
+                .any(|i| i.title.as_str() == "Arrived")),
             "a root that appeared after startup must be watched once another root's event nudges the loop"
         );
     }
@@ -3405,7 +3424,7 @@ mod watcher_tests {
         assert!(
             wait_until(&index, Duration::from_secs(5), |items| items
                 .iter()
-                .any(|i| i.title == "Recovered")),
+                .any(|i| i.title.as_str() == "Recovered")),
             "indexing must resume after the watcher recovers from a read error"
         );
     }

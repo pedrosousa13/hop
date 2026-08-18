@@ -279,14 +279,13 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// multiplied by bounds this module applies *at the parse*
 /// (`#[serde(deserialize_with = …)]`), so they hold for every item that
 /// arrived over a socket and for no item that did not. [`Item`](crate::item::Item)'s
-/// `title`, `subtitle`, `provider` and `actions` fields are plain `String`s
-/// and `Vec`s with no bound outside the parse — `id` and `default_action`
-/// are validated newtypes (`ItemId`/`ActionId`) bounded at construction
-/// regardless of origin, and `copy_text` joins them as of issue #78 (see
-/// below), but that leaves every other variable-length field uncovered. An
-/// item a daemon builds in-process — or takes from a result source
-/// in-process — has passed no *length* check on those: 5 000 items with a
-/// 100 MB title each are 5 000 items, and this cap admits them. The only
+/// action labels and action vectors remain plain `String`s and `Vec`s with no
+/// bound outside the parse — `id`, `default_action`, `title`, and `subtitle`
+/// are validating newtypes bounded at construction regardless of origin, and
+/// `copy_text` joins them as of issue #78 (see below). An item a daemon builds
+/// in-process — or takes from a result source in-process — has passed no
+/// *length* check on action fields: 5 000 items with 100 MB labels each are
+/// 5 000 items, and this cap admits them. The only
 /// backstop below that is [`MAX_FRAME_BYTES`]
 /// at encode time, which refuses the frame as an error rather than reporting
 /// an over-sized item.
@@ -304,9 +303,9 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// provider's answer must cross: `hop-core`'s
 /// `pipeline::CheckedItems::check`, called once per provider by
 /// `ProviderHost::run_one` before an answer reaches assembly. It now rejects
-/// an item whose `title`, `subtitle`, an action's `label`, or action count is
-/// over the same bound this module already applies to that same field on the
-/// wire (see `pipeline::FailedCheck::FieldTooLong`) — so the specific claim
+/// an item whose action label or action count is over the same bound this
+/// module already applies to that same field on the wire (see
+/// `pipeline::FailedCheck::FieldTooLong`) — so the specific claim
 /// above, "documented, not enforced... wherever an item is built in-process,"
 /// is no longer true of a provider's answer, which is where the overwhelming
 /// majority of in-process items originate.
@@ -462,11 +461,10 @@ pub fn check_len(field: &'static str, max: usize, actual: usize) -> Result<(), B
 /// `visit_string`. [`ClientMsg`](crate::wire::ClientMsg) and
 /// [`DaemonMsg`](crate::wire::DaemonMsg) are both `#[serde(tag = "type")]`, so
 /// **every escaped string in every real frame takes that path**. Its
-/// `check_len` is load-bearing, not a defensive duplicate of the other arm: a
-/// 5 KiB window title containing a single `\n` or `\"` reaches it and nothing
-/// else, and dropping the check there would let that title past [`MAX_TITLE`]
-/// untested. [`tests::an_over_long_escaped_title_is_refused_inside_a_tagged_frame`]
-/// pins it.
+/// `check_len` is load-bearing, not a defensive duplicate of the other arm: an
+/// over-long action label containing a single `\n` or `\"` reaches it and
+/// nothing else, and dropping the check there would let that label past
+/// [`MAX_ACTION_LABEL`] untested.
 ///
 /// The rows that land in [`BoundedString::visit_str`] do so for two different
 /// reasons, and neither is "the value is always borrowed". A `from_reader`
@@ -486,18 +484,6 @@ where
     D: Deserializer<'de>,
 {
     deserializer.deserialize_string(BoundedString { field, max })
-}
-
-/// Deserializes an `Option<String>`, refusing a `Some` over `max` bytes.
-fn opt_string<'de, D>(
-    deserializer: D,
-    field: &'static str,
-    max: usize,
-) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserializer.deserialize_option(BoundedOptString { field, max })
 }
 
 /// Deserializes a `Vec<T>`, refusing one holding more than `max` elements.
@@ -561,8 +547,7 @@ where
 
 /// The `Option` counterpart of [`validated`]: deserializes `Option<T>` for a
 /// validating newtype, refusing a `Some` that breaks `build`'s rules exactly
-/// as [`validated`] would, and mapping absence and explicit `null` to `None`
-/// exactly as [`opt_string`] does for a plain bounded string.
+/// as [`validated`] would, and mapping absence and explicit `null` to `None`.
 pub(crate) fn validated_opt<'de, D, T, B, F>(
     deserializer: D,
     field: &'static str,
@@ -589,7 +574,7 @@ where
 ///
 /// `expecting` below writes `self.field`, matching every other visitor in
 /// this module, but no parse this crate exercises today can actually reach
-/// it, for the same reason [`BoundedOptString`]'s cannot: `deserialize_option`
+/// it, for the same reason an optional visitor's cannot: `deserialize_option`
 /// only ever calls one of this visitor's other three methods, never falls
 /// through to the default `invalid_type` that would format a message from
 /// `expecting` at all. `visit_none` and `visit_unit` answer `null` and
@@ -605,8 +590,8 @@ where
 /// to `expecting`.
 ///
 /// Leaving `expecting` fieldless anyway was considered, on the strength of
-/// that unreachability, and rejected, for the same reason it was rejected on
-/// [`BoundedOptString`]: `field` is already in scope on this struct, matching
+/// that unreachability, and rejected because `field` is already in scope on
+/// this struct, matching
 /// it costs nothing here, and a future `Deserializer` — or a future serde
 /// version — is free to route `deserialize_option` differently for a type it
 /// cannot special-case. An `expecting` that stayed fieldless would then
@@ -719,64 +704,6 @@ impl Visitor<'_> for BoundedString {
     }
 }
 
-/// The visitor `opt_string` drives to deserialize an `Option<String>`.
-///
-/// # `expecting`'s field name is currently unreachable
-///
-/// `expecting` below writes `self.field`, matching every other visitor in
-/// this module, but no parse this crate exercises today can actually reach
-/// it: `deserialize_option` only ever calls one of this visitor's other three
-/// methods, never falls through to the default `invalid_type` that would
-/// format a message from `expecting` at all. `visit_none` and `visit_unit`
-/// answer `null` and absence, and `visit_some` hands anything else straight
-/// to [`string`], which drives `BoundedString` over the same `field` instead
-/// — so a present, wrong-typed value is judged (and named) there, not here.
-/// Both deserializers this crate drives an `Option<String>` field through —
-/// serde_json's own, and the internally-tagged `ContentDeserializer` that
-/// [`ClientMsg`](crate::wire::ClientMsg) and
-/// [`DaemonMsg`](crate::wire::DaemonMsg) buffer into — agree on that
-/// null-or-`visit_some` split, so there is no parse in this codebase today
-/// that would make `deserialize_option` reach for a fourth arm and fall back
-/// to `expecting`.
-///
-/// Leaving `expecting` fieldless anyway was considered, on the strength of
-/// that unreachability, and rejected: `field` is already in scope on this
-/// struct, matching it costs nothing here, and a future `Deserializer` — or a
-/// future serde version — is free to route `deserialize_option` differently
-/// for a type it cannot special-case. An `expecting` that stayed fieldless
-/// would then silently reopen the exact gap issue #82 closed elsewhere,
-/// discovered only if somebody thought to check this one arm again. Naming
-/// the field costs one comparison against a constant; leaving it unnamed bets
-/// against every future deserializer keeping today's shape.
-struct BoundedOptString {
-    field: &'static str,
-    max: usize,
-}
-
-impl<'de> Visitor<'de> for BoundedOptString {
-    type Value = Option<String>;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} to be null or a string of at most {} bytes",
-            self.field, self.max
-        )
-    }
-
-    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        string(deserializer, self.field, self.max).map(Some)
-    }
-}
-
 struct BoundedVec<T> {
     field: &'static str,
     max: usize,
@@ -833,14 +760,6 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
 // `content::CopyText::new_named` so the refusal names `Item.copy_text`
 // instead. See `crate::content`'s module docs for why that field name has to
 // differ from `CopyText::FIELD`'s.
-
-pub(crate) fn de_title<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    string(d, "Item.title", MAX_TITLE)
-}
-
-pub(crate) fn de_subtitle<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    opt_string(d, "Item.subtitle", MAX_SUBTITLE)
-}
 
 pub(crate) fn de_provider<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string(d, "Item.provider", MAX_PROVIDER_ID)
@@ -1214,11 +1133,9 @@ mod tests {
     }
 
     #[test]
-    fn a_type_mismatch_on_a_bounded_string_field_names_its_field() {
-        // `Item.title` has no `FIELD` constant of its own — `de_title` passes
-        // a literal to `string` — but `BoundedString::expecting` has the same
-        // defect `Validated::expecting` does, for the same reason: the
-        // struct holds `field`, and the old `expecting` never wrote it.
+    fn a_type_mismatch_on_item_title_names_its_field() {
+        // `ItemTitle` carries its own field name through `limits::validated`,
+        // so serde's wrong-type error must name the item field.
         let mut item = item_json();
         item["title"] = json!(42);
         let err = serde_json::from_str::<Item>(&item.to_string()).unwrap_err();
@@ -1226,15 +1143,10 @@ mod tests {
     }
 
     #[test]
-    fn a_type_mismatch_on_an_optional_bounded_string_field_names_its_field() {
-        // `subtitle` is `Option<String>`, deserialized through
-        // `BoundedOptString`. A JSON value that is present and non-null still
-        // routes through `visit_some` into the very same `BoundedString`
-        // `de_subtitle` hands off to for the inner value — so this exercises
-        // `BoundedString::expecting` again, under a different field name, not
-        // `BoundedOptString::expecting`. See that struct's own doc comment,
-        // above in this file, for why its `expecting` cannot be reached this
-        // way at all.
+    fn a_type_mismatch_on_an_optional_item_subtitle_names_its_field() {
+        // `subtitle` is `Option<ItemSubtitle>`, and the validating option
+        // visitor routes a present value through `ItemSubtitle`'s own field
+        // name.
         let mut item = item_json();
         item["subtitle"] = json!(true);
         let err = serde_json::from_str::<Item>(&item.to_string()).unwrap_err();
@@ -1367,17 +1279,17 @@ mod tests {
     // the routing table on `string` all of those reach `BoundedString` through
     // `visit_str` — including the ones that go through a tagged frame. That
     // leaves the `visit_string` arm, and the only way in is an escaped string
-    // inside a tagged frame. This is not an exotic input: a window title
-    // holding a quote or a newline is ordinary traffic, and without these two
+    // inside a tagged frame. This is not an exotic input: a display title
+    // holding a quote is ordinary traffic, and without these two
     // cases the check on that arm could be deleted with every test still
     // green.
 
     #[test]
     fn an_over_long_escaped_title_is_refused_inside_a_tagged_frame() {
         let mut item = item_json();
-        // The trailing newline is what serde escapes on the way out, which is
+        // The trailing quote is what serde escapes on the way out, which is
         // what forces the buffered content to be owned rather than borrowed.
-        item["title"] = json!(format!("{}\n", "a".repeat(MAX_TITLE)));
+        item["title"] = json!(format!("{}\"", "a".repeat(MAX_TITLE)));
 
         let err = serde_json::from_str::<DaemonMsg>(&results_frame(item))
             .expect_err("an over-long title must be refused however it is encoded");
@@ -1386,7 +1298,10 @@ mod tests {
 
     #[test]
     fn an_escaped_title_on_the_bound_still_parses_whole_inside_a_tagged_frame() {
-        let title = format!("{}\n", "a".repeat(MAX_TITLE - 1));
+        // A quote is escaped in JSON while remaining valid single-line title
+        // content, so this exercises the owned tagged-frame path without
+        // violating ItemTitle's control-character rule.
+        let title = format!("{}\"", "a".repeat(MAX_TITLE - 1));
         assert_eq!(title.len(), MAX_TITLE);
         let mut item = item_json();
         item["title"] = json!(title);
@@ -1397,7 +1312,8 @@ mod tests {
             panic!("expected a results frame");
         };
         assert_eq!(
-            items[0].title, title,
+            items[0].title.as_str(),
+            title,
             "the escape must be decoded and the value must survive whole"
         );
     }

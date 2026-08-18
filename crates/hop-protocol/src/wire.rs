@@ -449,21 +449,17 @@ pub enum ExecOutcome {
 /// # A gap this decision does not close (criterion 3)
 ///
 /// `message` is not the only free-form text a `DaemonMsg` frame carries.
-/// [`Item`]'s `title` and `subtitle`, its `copy_text`, and — walking one
-/// level further, into `items`' own `actions` —
+/// [`Item`]'s `copy_text`, and — walking one level further, into `items`' own
+/// `actions` —
 /// [`Action`](crate::item::Action)'s `label`
-/// ([`limits::MAX_TITLE`], [`limits::MAX_SUBTITLE`],
-/// [`limits::MAX_COPY_TEXT`], [`limits::MAX_ACTION_LABEL`]), all travel
-/// inside every [`DaemonMsg::Results`] frame as provider-authored,
-/// bounded-in-length-only strings — the exact same shape of problem this
-/// issue closes for `ProtoError.message`, just authored by a provider
-/// rather than by a `hopd` error site. This issue does not fix that: an
-/// item's display fields are free text *by design* — that is what a title
-/// or a context-menu label is — so "derive it from a closed set of typed
-/// values" is not a fit the way it is here, and a misbehaving provider
-/// putting a path or an internal detail into any of the four is a real,
-/// un-closed instance of the same class of risk this issue's own body
-/// describes. Named rather than silently left implied-closed.
+/// ([`limits::MAX_COPY_TEXT`], [`limits::MAX_ACTION_LABEL`]) travel inside
+/// every [`DaemonMsg::Results`] frame as provider-authored strings. Titles
+/// and subtitles are different: [`ItemTitle`](crate::ItemTitle) and
+/// [`ItemSubtitle`](crate::ItemSubtitle) are validating newtypes, so their
+/// byte bounds and single-line control-character rule apply on every
+/// construction path while their wire form remains a bare string. The
+/// action label remains a bounded plain string and is checked at the
+/// `hop-core` checked-items boundary.
 ///
 /// `Item`'s other string-shaped fields — `id`, `default_action`, `provider`,
 /// and each action's own `id` — are deliberately not on this list: they are
@@ -632,15 +628,15 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::content::IconName;
+    use crate::content::{IconName, ItemSubtitle, ItemTitle};
     use crate::item::*;
 
     fn sample_item() -> Item {
         Item {
             id: ItemId::new("app:firefox").unwrap(),
             kind: Kind::App,
-            title: "Firefox".into(),
-            subtitle: Some("Web Browser".into()),
+            title: ItemTitle::new("Firefox").unwrap(),
+            subtitle: Some(ItemSubtitle::new("Web Browser").unwrap()),
             icon: Some(IconSpec::Name(IconName::new("firefox").unwrap())),
             actions: vec![Action {
                 id: ActionId::new("open").unwrap(),

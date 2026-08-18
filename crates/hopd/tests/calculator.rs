@@ -83,7 +83,7 @@ fn a_query_over_the_socket_returns_the_calculator_result() {
     let items = run_query(&mut stream, 1, "2+2");
 
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].title, "2+2 = 4");
+    assert_eq!(items[0].title.as_str(), "2+2 = 4");
     assert_eq!(
         items[0].provider,
         hop_core::provider::CALCULATOR_PROVIDER_ID
@@ -97,11 +97,11 @@ fn unary_minus_and_percent_are_handled_over_the_socket() {
 
     let minus = run_query(&mut stream, 1, "-5+2");
     assert_eq!(minus.len(), 1);
-    assert_eq!(minus[0].title, "-5+2 = -3");
+    assert_eq!(minus[0].title.as_str(), "-5+2 = -3");
 
     let percent = run_query(&mut stream, 2, "10%3");
     assert_eq!(percent.len(), 1);
-    assert_eq!(percent[0].title, "10%3 = 1");
+    assert_eq!(percent[0].title.as_str(), "10%3 = 1");
 }
 
 #[test]

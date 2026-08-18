@@ -707,6 +707,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use hop_protocol::ItemTitle;
 
     /// An item whose id names it, so a test can tell two lists' items apart
     /// by identity rather than by count alone.
@@ -714,7 +715,7 @@ mod tests {
         Item {
             id: hop_protocol::ItemId::new(id).unwrap(),
             kind: hop_protocol::Kind::Action,
-            title: id.to_string(),
+            title: ItemTitle::new(id).unwrap(),
             subtitle: None,
             icon: None,
             actions: vec![],
@@ -791,7 +792,7 @@ mod tests {
         Item {
             id: ItemId::new(id).unwrap(),
             kind: Kind::Action,
-            title: id.to_string(),
+            title: ItemTitle::new(id).unwrap(),
             subtitle: None,
             icon: None,
             actions: action_ids

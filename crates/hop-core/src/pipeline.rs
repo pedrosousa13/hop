@@ -21,7 +21,7 @@
 //! carries the [`FailedCheck`] that produced it precisely so the two are told
 //! apart.
 
-use hop_protocol::limits::{MAX_ACTION_LABEL, MAX_ACTIONS_PER_ITEM, MAX_SUBTITLE, MAX_TITLE};
+use hop_protocol::limits::{MAX_ACTION_LABEL, MAX_ACTIONS_PER_ITEM};
 use hop_protocol::{Item, ItemId, Kind};
 
 use crate::aliases::Aliases;
@@ -362,15 +362,12 @@ pub enum FailedCheck {
     /// [`ProviderManifest::id`]. The item claims to have come from somewhere
     /// it did not.
     Provenance,
-    /// One of the item's variable-length fields is over the bound
+    /// An action label or the number of actions is over the bound
     /// `hop_protocol::limits` already applies to that same field when it
-    /// arrives by socket — `title` ([`MAX_TITLE`]), `subtitle`
-    /// ([`MAX_SUBTITLE`]), an action's `label` ([`MAX_ACTION_LABEL`]), or the
-    /// number of `actions` ([`MAX_ACTIONS_PER_ITEM`]). `field` names which
-    /// one, as the same `Type.field` spelling `hop_protocol::limits`'s own
-    /// deserializers use (e.g. `"Item.title"`, `"Action.label"`) — not a new
-    /// naming scheme, so grepping a field name finds both layers that bound
-    /// it.
+    /// arrives by socket. Item titles and subtitles are validating newtypes,
+    /// so they enforce their own bounds on every construction path and never
+    /// reach this check. `field` names the action field using the same
+    /// `Type.field` spelling as the protocol deserializers.
     ///
     /// `copy_text` is not on that list even though
     /// [`hop_protocol::limits::MAX_COPY_TEXT`] still bounds it: since issue
@@ -546,12 +543,12 @@ impl CheckedItems {
     /// own item count to [`MAX_ITEMS_PER_PROVIDER_ANSWER`].
     ///
     /// An item is kept only if its `kind` is one its producer declared, its
-    /// `provider` string equals its producer's manifest `id`, and none of its
-    /// variable-length fields (`title`, `subtitle`, an action's `label`, or
-    /// the number of `actions`) is over the bound `hop_protocol::limits`
-    /// already applies to that same field on the wire — see
-    /// [`FailedCheck::FieldTooLong`]. `copy_text` needs no check of its own
-    /// here; see that variant's docs for why. Anything else becomes a
+    /// `provider` string equals its producer's manifest `id`, and its action
+    /// count and labels are within the bounds `hop_protocol::limits` already
+    /// applies to those fields on the wire — see
+    /// [`FailedCheck::FieldTooLong`]. Titles, subtitles, and `copy_text` need
+    /// no check of their own here because their validating newtypes enforce
+    /// their bounds on every value that exists. Anything else becomes a
     /// [`Rejection`] and never reaches boosts, dedupe, filtering or ranking.
     ///
     /// The truncation runs *before* this loop even starts, not as one more
@@ -577,7 +574,7 @@ impl CheckedItems {
     /// gain to the only consumer it has (a future logging seam that wants to
     /// say what was dropped and why). The same one-report-per-item rule this
     /// comment already stated for the two original checks extends unchanged
-    /// to the field-length check added alongside them: it is simply one more
+    /// to the action-field check added alongside them: it is simply one more
     /// condition in the same chain, checked after the two that were already
     /// there.
     ///
@@ -644,18 +641,6 @@ impl CheckedItems {
                     Some(FailedCheck::Kind)
                 } else if item.provider != output.manifest.id {
                     Some(FailedCheck::Provenance)
-                } else if item.title.len() > MAX_TITLE {
-                    Some(FailedCheck::FieldTooLong {
-                        field: "Item.title",
-                    })
-                } else if item
-                    .subtitle
-                    .as_ref()
-                    .is_some_and(|subtitle| subtitle.len() > MAX_SUBTITLE)
-                {
-                    Some(FailedCheck::FieldTooLong {
-                        field: "Item.subtitle",
-                    })
                 // `copy_text` has no branch here. It did until issue #78 made
                 // `Item.copy_text` an `Option<hop_protocol::content::CopyText>`
                 // rather than an `Option<String>`: `CopyText`'s own
@@ -1081,7 +1066,7 @@ mod tests {
     use super::*;
     use crate::provider::{APPS_PROVIDER_ID, ProviderError, QueryCtx};
     use hop_protocol::limits::MAX_ITEMS_PER_RESULTS_FRAME;
-    use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId};
+    use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId, ItemTitle};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1169,7 +1154,7 @@ mod tests {
         Item {
             id: ItemId::new(id).unwrap(),
             kind,
-            title: title.to_string(),
+            title: ItemTitle::new(title).unwrap(),
             subtitle: None,
             icon: None,
             actions: vec![Action {
@@ -1286,7 +1271,7 @@ mod tests {
             1,
             "ranking must behave as if \"firefox\" had been typed"
         );
-        assert_eq!(out[0].title, "Firefox");
+        assert_eq!(out[0].title.as_str(), "Firefox");
     }
 
     /// The second, non-interactive sink for the same bug the ranker fixes:
@@ -2689,65 +2674,6 @@ mod tests {
         assert!(MAX_ITEMS_PER_PROVIDER_ANSWER <= MAX_ITEMS_PER_RESULTS_FRAME);
     }
 
-    /// An item whose `title` is exactly [`MAX_TITLE`] bytes.
-    fn item_with_title(title: &str) -> Item {
-        item(Kind::App, "app:title", title)
-    }
-
-    #[test]
-    fn title_at_the_bound_passes_one_over_is_rejected() {
-        let at_bound = checked(vec![item_with_title(&"a".repeat(MAX_TITLE))]);
-        assert_eq!(
-            at_bound.items().len(),
-            1,
-            "exactly MAX_TITLE bytes must pass"
-        );
-
-        let over = CheckedItems::check(vec![output(
-            "test",
-            ALL_KINDS.to_vec(),
-            vec![item_with_title(&"a".repeat(MAX_TITLE + 1))],
-        )]);
-        assert!(over.items().is_empty());
-        assert_eq!(
-            over.rejections()[0].check,
-            FailedCheck::FieldTooLong {
-                field: "Item.title"
-            }
-        );
-    }
-
-    /// An item whose `subtitle` is exactly `len` bytes.
-    fn item_with_subtitle(len: usize) -> Item {
-        Item {
-            subtitle: Some("a".repeat(len)),
-            ..item(Kind::App, "app:subtitle", "Alpha")
-        }
-    }
-
-    #[test]
-    fn subtitle_at_the_bound_passes_one_over_is_rejected() {
-        let at_bound = checked(vec![item_with_subtitle(MAX_SUBTITLE)]);
-        assert_eq!(
-            at_bound.items().len(),
-            1,
-            "exactly MAX_SUBTITLE bytes must pass"
-        );
-
-        let over = CheckedItems::check(vec![output(
-            "test",
-            ALL_KINDS.to_vec(),
-            vec![item_with_subtitle(MAX_SUBTITLE + 1)],
-        )]);
-        assert!(over.items().is_empty());
-        assert_eq!(
-            over.rejections()[0].check,
-            FailedCheck::FieldTooLong {
-                field: "Item.subtitle"
-            }
-        );
-    }
-
     /// An item with one action whose `label` is exactly `len` bytes.
     fn item_with_action_label(len: usize) -> Item {
         Item {
@@ -2855,34 +2781,6 @@ mod tests {
             "the count check now runs before the label scan, so an item \
              over both bounds is reported against the count — the label \
              scan never runs at all"
-        );
-    }
-
-    /// The other half of the "ranks identically" argument Task 2 adds on top
-    /// of the existing suite continuing to pass unmodified: an item that
-    /// fails more than one check is reported once, against whichever check
-    /// runs first — here, a wrong `kind` *and* an over-long `title` on the
-    /// same item. `CheckedItems::check`'s loop runs the kind check before
-    /// any field-length check, so the single rejection this produces must be
-    /// [`FailedCheck::Kind`], not [`FailedCheck::FieldTooLong`].
-    #[test]
-    fn an_item_failing_both_a_manifest_check_and_a_field_length_check_is_reported_once() {
-        let mut evil = item_with_title(&"a".repeat(MAX_TITLE + 1));
-        evil.kind = Kind::Window;
-        evil.provider = "calc".into();
-
-        let checked = CheckedItems::check(vec![output("calc", vec![Kind::Calculator], vec![evil])]);
-        assert!(checked.items().is_empty());
-        assert_eq!(
-            checked.rejections().len(),
-            1,
-            "one failing item must be one rejection, however many checks it fails"
-        );
-        assert_eq!(
-            checked.rejections()[0].check,
-            FailedCheck::Kind,
-            "the kind check runs before any field-length check, so that is \
-             what the single rejection is reported against"
         );
     }
 

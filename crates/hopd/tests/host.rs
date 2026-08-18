@@ -126,7 +126,7 @@ fn a_panicking_provider_does_not_empty_the_frame_for_the_others() {
         }
     }
     assert_eq!(items.len(), 1, "the honest provider's item still arrives");
-    assert_eq!(items[0].title, "Firefox");
+    assert_eq!(items[0].title.as_str(), "Firefox");
     assert!(
         log.lines()
             .iter()
@@ -201,7 +201,7 @@ fn an_inferred_route_still_reaches_a_registered_general_search_provider() {
         1,
         "an inferred route must still reach a Mode::All provider"
     );
-    assert_eq!(items[0].title, "2+2 Notes");
+    assert_eq!(items[0].title.as_str(), "2+2 Notes");
 }
 
 #[test]
@@ -401,7 +401,7 @@ fn a_fast_providers_items_arrive_before_a_slow_providers_budget_expires() {
     match frame {
         DaemonMsg::Results { items, partial, .. } => {
             assert!(partial);
-            assert_eq!(items[0].title, "Firefox");
+            assert_eq!(items[0].title.as_str(), "Firefox");
         }
         other => panic!("expected a results frame first, got {other:?}"),
     }

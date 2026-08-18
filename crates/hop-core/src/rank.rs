@@ -486,7 +486,7 @@ impl Ranker {
                     kind_weight(weights, &b.item.kind)
                         .total_cmp(&kind_weight(weights, &a.item.kind))
                 })
-                .then_with(|| a.item.title.cmp(&b.item.title))
+                .then_with(|| a.item.title.as_str().cmp(b.item.title.as_str()))
         });
 
         dedupe(ranked)
@@ -614,12 +614,12 @@ fn haystack_of<'a>(item: &'a Item, scratch: &'a mut String) -> &'a str {
     match &item.subtitle {
         Some(subtitle) => {
             scratch.clear();
-            scratch.push_str(&item.title);
+            scratch.push_str(item.title.as_str());
             scratch.push(' ');
-            scratch.push_str(subtitle);
+            scratch.push_str(subtitle.as_str());
             scratch.trim()
         }
-        None => item.title.trim(),
+        None => item.title.as_str().trim(),
     }
 }
 
@@ -693,12 +693,12 @@ fn dedupe(ranked: Vec<Ranked>) -> Vec<Ranked> {
 
 fn dedupe_key(item: &Item) -> (Option<Kind>, Option<ItemId>, String) {
     if item.kind == Kind::App {
-        (None, None, item.title.clone())
+        (None, None, item.title.as_str().to_string())
     } else {
         (
             Some(item.kind.clone()),
             Some(item.id.clone()),
-            item.title.clone(),
+            item.title.as_str().to_string(),
         )
     }
 }
@@ -719,8 +719,8 @@ mod tests {
         Item {
             id: ItemId::new(id).unwrap(),
             kind,
-            title: title.to_string(),
-            subtitle: subtitle.map(str::to_string),
+            title: hop_protocol::ItemTitle::new(title).unwrap(),
+            subtitle: subtitle.map(|value| hop_protocol::ItemSubtitle::new(value).unwrap()),
             icon: None,
             actions: vec![Action {
                 id: ActionId::new("open").unwrap(),
@@ -757,7 +757,7 @@ mod tests {
             1,
             "\"crome\" has no valid subsequence alignment in \"Files\" at all"
         );
-        assert_eq!(ranked[0].item.title, "Chrome");
+        assert_eq!(ranked[0].item.title.as_str(), "Chrome");
     }
 
     // DIVERGENCE: nucleo is a strict left-to-right subsequence matcher —
@@ -831,7 +831,7 @@ mod tests {
         ];
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &Boosts::default());
-        assert_eq!(ranked[0].item.title, "Google Chrome");
+        assert_eq!(ranked[0].item.title.as_str(), "Google Chrome");
     }
 
     // DIVERGENCE: the JS suite's `recent` kind has no equivalent in this
@@ -977,7 +977,7 @@ mod tests {
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &Boosts::default());
         assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].item.title, "Firefox");
+        assert_eq!(ranked[0].item.title.as_str(), "Firefox");
     }
 
     /// Ports "ranking applies external item score boosts" directly, and
@@ -1132,7 +1132,8 @@ mod tests {
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &Boosts::default());
         assert_eq!(
-            ranked[0].item.title, "vscodium helper thing",
+            ranked[0].item.title.as_str(),
+            "vscodium helper thing",
             "documents the actual (undesired) behavior: nucleo currently \
              prefers the contiguous prefix match over the word-boundary one"
         );
@@ -1183,7 +1184,8 @@ mod tests {
             &Boosts::default(),
         );
         assert_eq!(
-            unboosted[0].item.title, "Google Chrome",
+            unboosted[0].item.title.as_str(),
+            "Google Chrome",
             "sanity check: without a boost, the genuinely better match wins"
         );
 
@@ -1462,7 +1464,7 @@ mod tests {
         let mut ranker = Ranker::new();
         let ranked = ranker.rank(items, &query, &Weights::default(), &Boosts::default());
         assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].item.title, "Alpha");
+        assert_eq!(ranked[0].item.title.as_str(), "Alpha");
     }
 
     #[test]
