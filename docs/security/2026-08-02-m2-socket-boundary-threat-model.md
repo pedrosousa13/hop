@@ -133,9 +133,12 @@ The store remains plaintext and this change does not claim confidentiality or
 protection from a process that can read the state directory.
 
 This document's remaining residual findings — #25, #34's provider-seam
-descendants, #72, #78, #85's wire-signal half, #93, #98, #104 — are
-unchanged by this pass: closing a stale note is not the same claim as
-closing a gap, and nothing here asserts the latter where the code does not.
+descendants, #72, #78, #85's wire-signal half, #93, #104 — are unchanged by
+this pass: closing a stale note is not the same claim as closing a gap, and
+nothing here asserts the latter where the code does not. **[Amended
+2026-08-18]** #98 is no longer a residual: the connection-level bounds below
+are implemented as same-uid robustness controls, not as a hostile-peer
+security boundary.
 
 **Amendment, 2026-08-10.** A second, later amendment sharing this document's
 date with the one above — issue #102's audit and this one are different
@@ -414,14 +417,15 @@ control is *which uid*, and there is no finer distinction available.
   refusing a length prefix over the cap (`ErrorCode::FrameTooLarge`) on the
   four prefix bytes alone, before this connection reads a byte of the
   payload it names.
-- **The connection itself.** Accept rate, concurrent connection count and
-  per-connection memory are unmodelled because no accept loop exists. They
-  belong to #54 and #55.
-  **[Amended 2026-08-10]** #54 (`ac782c7`) is closed and built the accept
-  loop (`server.rs`'s `serve_with`). The three bounds remain unmodelled all
-  the same, and belong to [#98](https://github.com/pedrosousa13/hop/issues/98),
-  not #55 — see T13, which #55 already corrected to say this; this bullet was
-  the third, uncorrected site.
+- **The connection itself.** The accept loop's connection-level resource
+  bounds are deliberate same-uid robustness controls, not a security boundary
+  against a hostile peer. **[Amended 2026-08-18]** #98 now enforces a 64-owned-
+  permit cap acquired before `accept`, a 64 KiB client-to-daemon pre-allocation
+  ceiling, and a 10-second timeout only for completing a payload after its
+  prefix. There is deliberately no idle timeout between frames and no
+  accept-rate limiter; the existing 50 ms accept-error sleep remains only a
+  hot-spin floor. The 64 admitted connections compose to at most 4 MiB of
+  inbound payload buffers plus 64,000 retained bounded items.
 - **The socket path.** Creating, binding to and unlinking a path inside a
   directory the daemon may not have created. #54.
   **[Amended 2026-08-10]** #54 (`ac782c7`) is closed: `acquire_listener`
@@ -753,7 +757,7 @@ exists yet.
 | T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the `version` is refused on mismatch and a future-dated timestamp clamped (#38, closed by `59fd5fe`); the version probe and the per-condition `LoadReport` are #43's (closed by `056893e`, which replaced #38's two per-branch checks); a persisted `count` is saturated at the boundary (#44, closed by `edb8258`). **Two residuals, one owner**: still no integrity check, so a plausible forged store passes all of it — and eviction still prefers a clamped future-dated entry, which `96d5713` left open and `59fd5fe` explicitly did not close (#88, open) **[Amended 2026-08-10]** #72 (`4f5acf9`, `0c50a98`, `9a595bb`) has since landed on this same load path — provider-scoped keys, manifest-gated plaintext — without touching either residual named here **[Amended 2026-08-17]** #88 has landed: the v2 envelope verifies an HMAC-SHA256 before bounds, clamping, retention or boosts, and unsigned v1 is refused as `UnrecognizedVersion`. The fixed sibling `learning.key` is initialized when the first save reaches key creation after parent setup; once fully written and synced, it remains durable across a later store-write failure and later saves reuse it. Missing, unreadable or wrong-length keys and mismatched tags fail closed with distinct integrity reports; option A detects store-only writes and stores copied without their key, while a process that can read the key remains outside this guarantee. | #88's integrity check, which is what lets a forged entry be *refused* rather than clamped, sequenced with #72 and with Decision 2 on the same load path. **[Amended 2026-08-10]** #72 has landed; #88's integrity check is still what's needed for either residual **[Amended 2026-08-17]** #88 has landed; this integrity-check requirement is satisfied. See the adjacent Today cell for the implemented envelope, key boundary and verification order. |
 | T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (`learning.rs`:737–751 [Amended 2026-08-10]). **[Amended 2026-08-10]** Decision 2's shape half has landed (#39, `193dc4d`, `e83c373`): `persistence_key` (`learning.rs`) now sits between that scrubbing and disk — an id outside the three known-safe shapes persists as `sha256:<hex>` rather than unchanged. **[Amended 2026-08-10]** The shape half described above is retired, not merely extended: issue #72 (`4f5acf9`, `0c50a98`, `9a595bb`) deleted the known-safe-shape check outright and made `ProviderManifest::ids_are_safe_to_persist_in_the_clear` the sole authority — an id from an opted-in provider persists in the clear regardless of its shape, and an id from any other provider, including one presenting an `app:`-shaped id, hashes. | Decision 2. **[Amended 2026-08-10]** Shape half done; the manifest opt-in half is still open, riding with #72 **[Amended 2026-08-10]** Landed: the field exists, required with no default, and every production manifest (`apps.rs`, `calculator.rs`, `hopd::source::SkeletonProvider`) states it explicitly |
 | T12 | Cross-provider boost theft | Provider seam | `CheckedItems::check` closes provenance forgery; the store keys on a bare id (#72) **[Amended 2026-08-10]** #72 (`4f5acf9`, `0c50a98`, `9a595bb`) is now **closed**: the store keys on `(provider, id)`, folded by `provider_scoped_key` into a composition proven injective in its own doc comment, so a provider cannot forge another provider's persisted key by choosing its own id or provider string; and `rank.rs`'s `Boosts::by_item_id` gained the identical provider dimension, closing the in-memory half of the same gap for a query where the genuine and impostor items both appear before anything is ever persisted | A provider dimension in the store key. **[Amended 2026-08-10]** Landed — see the Today column |
-| T13 | Connection flood / socket occupancy | Accept loop | An accept loop exists (#54) and spawns one unbounded task per peer (`server.rs`, `serve_with`); nothing caps concurrent connections, aggregate memory across them, or the accept rate, and `read_frame` has no read timeout, so a peer that sends a valid length prefix and then stalls holds a task and its payload buffer open indefinitely (`connection.rs` says so in place) | Belongs to [#98](https://github.com/pedrosousa13/hop/issues/98); this document does not settle it. #54 and #55 have both landed and neither took it: #55 bounded per-*query* retained state (T3) and deliberately left every connection-level bound to #98 |
+| T13 | Connection flood / socket occupancy | Accept loop | **[Amended 2026-08-18]** #98 enforces 64 concurrent connection tasks with an owned semaphore permit acquired before `accept`, so the 65th peer waits in the listener backlog. `hopd` rejects client-to-daemon prefixes over `MAX_INBOUND_FRAME_BYTES` = 65,536 before allocating, while the shared `MAX_FRAME_BYTES` = 268,435,456 ceiling remains available for daemon-to-client frames. After a complete prefix, the payload read has a 10-second completion timeout; the prefix read itself and idle time between frames are deliberately untimed. The existing 50 ms accept-error sleep is a hot-spin floor, not an accept-rate limiter. These controls provide same-uid robustness against buggy or runaway local clients, not a security boundary against a hostile peer. | **[Amended 2026-08-18]** The implemented controls compose to at most 4 MiB of inbound payload buffers and 64,000 retained bounded items across 64 admitted connections. The connection cap is the chosen backpressure; no token bucket or other accept-rate limiter is part of the design. |
 | T14 | A provider opts in to plaintext persistence for ids that carry user content | Manifest, under Decision 2's consequence | The opt-in field does not exist yet (`provider.rs`:85–121 [Amended 2026-08-10]). `CheckedItems::check` verifies an item's kind and provider id, and inspects nothing about what the id *contains* **[Amended 2026-08-10]** The field exists now: `ProviderManifest::ids_are_safe_to_persist_in_the_clear` (#72, `4f5acf9`, `0c50a98`, `9a595bb`), required with no default. `CheckedItems::check` still verifies only kind and provider id — the claim itself remains unverified, exactly as this row already said | Documentation a provider author reads before setting the field, and the extension store's PR review (spec §6) as the gate. No code check can verify the claim. **[Amended 2026-08-10]** Still true: the field's own doc comment (`provider.rs`) is that documentation, but nothing checks the claim it asks a provider author to make |
 
 ---
@@ -1342,10 +1346,11 @@ Two facts about that worth carrying into the implementing slice:
   bullet already said.
 - **Network providers.** None exist. A10 (SSRF) was recorded not-applicable by
   the M1 sweep for that reason and re-runs at M5 against real providers.
-- **Connection-level denial of service.** An accept loop exists now (#54), but
-  connection count, aggregate memory across connections, accept rate and read
-  timeouts are [#98](https://github.com/pedrosousa13/hop/issues/98)'s and are
-  modelled there, not here — T13 records the exposure and names the owner.
+- **Hostile-peer denial of service beyond the connection controls.** #98's
+  64-connection cap, inbound pre-allocation ceiling and payload-only timeout
+  are modelled above as same-uid robustness controls. They are not a security
+  boundary against a hostile peer; root-equivalent adversaries and inherited
+  open descriptors remain outside this model.
 - **A root-equivalent adversary**, and anything reachable by inheriting an open
   descriptor from the user's own processes.
 

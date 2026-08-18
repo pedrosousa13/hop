@@ -332,11 +332,26 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// consumed entirely outside that seam.
 pub const MAX_ITEMS_PER_QUERY: usize = 5_000;
 
-/// Maximum bytes of one frame's JSON payload, exclusive of the 4-byte length
-/// prefix [`framing`](crate::framing) puts in front of it.
+/// Maximum bytes of a client-to-daemon frame payload that `hopd` admits before
+/// allocating its inbound buffer.
+///
+/// This is deliberately narrower than [`MAX_FRAME_BYTES`], which remains the
+/// shared frame ceiling and the daemon-to-client results ceiling. The daemon
+/// checks this value after [`framing::payload_len`](crate::framing::payload_len)
+/// decodes the shared 4-byte prefix and before it allocates the payload, so a
+/// buggy or runaway same-uid local client can hold at most one 64 KiB inbound
+/// payload buffer per admitted connection. It is robustness against that
+/// local-client failure mode, not a security boundary against a hostile peer.
+/// With 64 admitted connections, this composes with each connection's
+/// retained set of at most [`MAX_ITEMS_PER_RESULTS_FRAME`] items to at most
+/// 4 MiB of inbound payload buffers plus 64,000 retained bounded items.
+pub const MAX_INBOUND_FRAME_BYTES: usize = 65_536;
+
+/// Maximum bytes of one shared frame's JSON payload, exclusive of the 4-byte
+/// length prefix [`framing`](crate::framing) puts in front of it.
 ///
 /// This is not one more field bound alongside [`MAX_TITLE`] and its
-/// neighbours above: it is the frame-level cap that "What these bounds do not
+/// neighbours above: it is the shared frame-level cap that "What these bounds do not
 /// close" promises, enforced by
 /// [`framing::payload_len`](crate::framing::payload_len) **before** a payload
 /// is allocated, closing issue #21 once a transport calls it — see the
@@ -359,7 +374,9 @@ pub const MAX_ITEMS_PER_QUERY: usize = 5_000;
 /// `\uXXXX`, six JSON bytes for one byte of content — which prices out to
 /// roughly 505 MB. A frame only reachable by encoding every field that way is
 /// exactly what this cap exists to refuse: it bounds what a peer can make the
-/// process allocate, not what an honest daemon would ever send.
+/// process allocate, not what an honest daemon would ever send. `hopd` layers
+/// [`MAX_INBOUND_FRAME_BYTES`] on client payloads only; it does not narrow this
+/// shared/outbound ceiling.
 pub const MAX_FRAME_BYTES: usize = 268_435_456;
 
 /// A value that broke the size budget in [`limits`](self).
