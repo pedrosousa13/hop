@@ -103,6 +103,15 @@ and `max_term_chars` against the ranker ceiling. No new deployment-default,
 account, service, permission, or unsafe configuration finding was distinct
 from #160's exceptional file-read behavior.
 
+The systemd user socket unit grants `DirectoryMode=0700` and
+`SocketMode=0600`, excluding ordinary other UIDs from the runtime directory
+and socket. A process already running as the session UID can still connect and
+can therefore trigger the user socket unit, including an unintended same-UID
+client. That is intentional under the declared boundary, not a new finding.
+Socket activation changes socket ownership and lifecycle: systemd creates and
+passes the listening descriptor while `hopd` does not bind, unlink, or chmod
+the activated path; it does not add peer identity or authentication.
+
 ### A03:2025 — Software Supply Chain Failures · applicable, no finding filed
 
 `deny.toml` denies advisories, yanked and unmaintained crates, wildcard
@@ -136,6 +145,11 @@ standalone path can therefore remove the first listener's name while its open
 listener remains alive, then bind a replacement at the expected path. Existing
 clients stay attached to the first listener while new clients reach the second.
 
+The primary Linux [`unlink(2)` documentation](https://man7.org/linux/man-pages/man2/unlink.2.html)
+describes the underlying behavior: removing the pathname does not invalidate an
+open object, so existing users of the listener can continue while a replacement
+pathname is bound.
+
 The filed [#158 — Preserve a live hopd socket when starting a second daemon](https://github.com/pedrosousa13/hop/issues/158)
 classifies this as a same-UID lifecycle and availability robustness defect,
 not authentication against another same-UID process. Its acceptance scope
@@ -146,11 +160,14 @@ and modes; #98 owns connection resources; none owns live-listener preservation.
 
 ### A07:2025 — Authentication Failures · applicable, no finding filed
 
-The daemon authenticates peers through Unix ownership and mode rather than
-protocol credentials. The handshake requires `Hello` before other frames and
-refuses version mismatch. A same-UID peer is intentionally accepted and cannot
-be distinguished by this contract. No new authentication or session failure
-was found within that declared boundary.
+Unix ownership and mode gate socket reachability; they do not identify the peer.
+Any peer that can open the socket is authorized to use this protocol, and the
+daemon performs no peer credential or identity check. The handshake requires
+`Hello` before other frames and refuses version mismatch. A same-UID peer is
+intentionally accepted and cannot be distinguished by this contract. Socket
+activation does not change that: systemd owns creation and passes the listener,
+but it adds no daemon-side peer identity or authentication. No new
+authentication or session failure was found within that declared boundary.
 
 ### A08:2025 — Software or Data Integrity Failures · applicable, no finding filed
 
