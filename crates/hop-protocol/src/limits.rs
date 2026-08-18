@@ -180,18 +180,18 @@ pub const MAX_OPEN_URL: usize = 8_192;
 /// receiving peer's parse. [`ProtoError::new`](crate::wire::ProtoError::new)
 /// applies **no** length check of its own — it is not a gate, it is a
 /// deterministic render over an [`ErrorDetail`](crate::wire::ErrorDetail).
-/// The sending side stays under this bound only because every
-/// `ErrorDetail` variant interpolates a value that is *itself* bounded well
-/// under it — [`MAX_ACTION_ID`], [`MAX_PROVIDER_ID`], a fixed-width integer,
-/// or a `&'static str` chosen at a call site — with one documented
-/// exception: `ErrorDetail::Item`'s bound is [`MAX_ITEM_ID`], which is
-/// nearly 4× this constant, so a legitimate, in-bound `ItemId` can make
-/// `ProtoError::new` build a message a receiving peer's own
-/// [`de_error_message`] would refuse. See `ProtoError`'s "A gap this
-/// decision does not close" for that case, named rather than fixed here, and
-/// `wire::tests::unknown_item_message_can_exceed_max_error_message_at_max_item_id`,
-/// which pins the current, overflowing behavior directly. What `message`
-/// may *contain* — as opposed to how long it is — is
+/// The sending side stays under this bound because each `ErrorDetail` renderer
+/// has a bounded output. Most variants interpolate values that are *themselves*
+/// bounded well under it — [`MAX_ACTION_ID`], [`MAX_PROVIDER_ID`], a
+/// fixed-width integer, or a `&'static str` chosen at a call site.
+/// `ErrorDetail::Item` is the deliberate exception to that input-size
+/// relationship: [`ItemId`](crate::item::ItemId)'s bound is
+/// [`MAX_ITEM_ID`], nearly 4× this constant, so its renderer keeps the
+/// complete message within this bound by retaining the longest UTF-8-safe id
+/// prefix that fits and appending a visible `… [truncated]` marker. See
+/// `wire::tests::unknown_item_message_at_max_item_id_stays_within_max_error_message`
+/// and the boundary tests beside it for that guarantee. What `message` may
+/// *contain* — as opposed to how long it is — is
 /// [`ErrorDetail`](crate::wire::ErrorDetail)'s decision (#84).
 pub const MAX_ERROR_MESSAGE: usize = 1_024;
 

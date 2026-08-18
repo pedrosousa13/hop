@@ -357,28 +357,19 @@ pub enum ExecOutcome {
 ///
 /// Three costs, all accepted:
 ///
-/// - **`ErrorDetail::Item` can render a message over [`MAX_ERROR_MESSAGE`].**
+/// - **`ErrorDetail::Item` visibly truncates an oversized id.**
 ///   [`ProtoError::new`] applies no length check of its own — see
 ///   [`MAX_ERROR_MESSAGE`]'s own docs for where the bound is actually
-///   enforced (the receiving peer's parse, nowhere else) — and it does not
-///   need to for five of `ErrorDetail`'s six variants, because what each one
-///   interpolates is already small: [`MAX_ACTION_ID`](crate::limits::MAX_ACTION_ID),
-///   [`MAX_PROVIDER_ID`](crate::limits::MAX_PROVIDER_ID), a fixed-width
-///   integer, or a `&'static str` chosen at a call site. `Item` is the
-///   exception: [`ItemId`]'s own bound is
-///   [`MAX_ITEM_ID`](crate::limits::MAX_ITEM_ID), nearly 4× this struct's
-///   message bound, so a legitimate, in-bound `ItemId` can make
-///   `ProtoError::new` build a `message` a client's own
-///   [`limits::de_error_message`] would refuse to parse. This is not new to
-///   #84 — the pre-#84 `format!("unknown item {item_id}")` had the identical
-///   overflow, just never pinned by a test — and it is not fixed here:
-///   `ProtoError::new` stays infallible on purpose (making it fallible would
-///   ripple a `Result` across every one of `hopd`'s nine call sites for a
-///   hazard this one variant creates), so this is named and pinned rather
-///   than silently carried forward. Pinned by
-///   `tests::unknown_item_message_can_exceed_max_error_message_at_max_item_id`;
-///   the other five variants staying in bound is pinned by
-///   `tests::error_detail_length_stays_within_max_error_message_for_the_other_variants`.
+///   enforced (the receiving peer's parse, nowhere else) — and remains
+///   infallible by design. `Item`'s renderer budgets the complete message,
+///   retaining the longest UTF-8-safe prefix of an in-bound
+///   [`ItemId`] (bounded by [`MAX_ITEM_ID`](crate::limits::MAX_ITEM_ID)) that
+///   fits before appending `… [truncated]`. This keeps the diagnostic visible
+///   and within the peer's parse bound without changing either wire limit. The
+///   behavior is pinned by
+///   `tests::unknown_item_message_at_max_item_id_stays_within_max_error_message`,
+///   its threshold and multi-byte boundary tests, and
+///   `tests::every_error_detail_message_stays_within_max_error_message`.
 /// - **`ErrorDetail::Fixed` still takes a string.** A `&'static str` is a
 ///   compile-time literal, not a runtime value, so nothing this daemon
 ///   *computes* — a path it opened, a peer's own bytes, an error it
@@ -559,7 +550,7 @@ impl ErrorDetail {
     fn render(&self) -> String {
         match self {
             ErrorDetail::Fixed(text) => (*text).to_string(),
-            ErrorDetail::Item(id) => format!("unknown item {id}"),
+            ErrorDetail::Item(id) => render_unknown_item(id),
             ErrorDetail::Action(id) => format!("unknown action {id}"),
             ErrorDetail::Provider(id) => format!("provider `{id}` failed to execute the action"),
             ErrorDetail::Version { expected, actual } => {
@@ -573,6 +564,27 @@ impl ErrorDetail {
             }
         }
     }
+}
+
+// `hop-core` and `hopd` each have a byte-boundary truncation helper, but this
+// protocol crate cannot depend on either downstream crate without inverting
+// the dependency graph (or creating a cycle). A public protocol utility would
+// unnecessarily widen the API for this one private message render.
+fn render_unknown_item(id: &ItemId) -> String {
+    const PREFIX: &str = "unknown item ";
+    const MARKER: &str = "… [truncated]";
+
+    let id = id.as_str();
+    if PREFIX.len() + id.len() <= limits::MAX_ERROR_MESSAGE {
+        return format!("{PREFIX}{id}");
+    }
+
+    let id_budget = limits::MAX_ERROR_MESSAGE - PREFIX.len() - MARKER.len();
+    let mut end = id_budget.min(id.len());
+    while end > 0 && !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{PREFIX}{}{MARKER}", &id[..end])
 }
 
 /// The category of a protocol-level error.
@@ -899,8 +911,8 @@ mod tests {
         );
     }
 
-    /// Pins the claim `MAX_ERROR_MESSAGE`'s doc makes: five of `ErrorDetail`'s
-    /// six variants render a message that stays within
+    /// Pins the claim `MAX_ERROR_MESSAGE`'s doc makes: every `ErrorDetail`
+    /// variant renders a message that stays within
     /// [`crate::limits::MAX_ERROR_MESSAGE`] even at their own maximum
     /// plausible input — `ActionId` and the provider string at their own
     /// wire bounds, the numeric fields at their type's maximum, and the
@@ -910,15 +922,16 @@ mod tests {
     /// what stands behind the claim instead: add a variant, or grow one of
     /// these bounds, in a way that pushes a rendered message over the limit,
     /// and this fails rather than the overflow going unnoticed until a
-    /// client refuses to parse it. `ErrorDetail::Item` is the sixth
-    /// variant and is deliberately not asserted here — see
-    /// `unknown_item_message_can_exceed_max_error_message_at_max_item_id`
-    /// just below, which pins the opposite fact about it.
+    /// client refuses to parse it.
     #[test]
-    fn error_detail_length_stays_within_max_error_message_for_the_other_variants() {
+    fn every_error_detail_message_stays_within_max_error_message() {
         use crate::limits::{MAX_ACTION_ID, MAX_ERROR_MESSAGE, MAX_PROVIDER_ID};
 
         let cases = [
+            ProtoError::new(
+                ErrorCode::UnknownItem,
+                ErrorDetail::Item(ItemId::new("a".repeat(crate::limits::MAX_ITEM_ID)).unwrap()),
+            ),
             ProtoError::new(
                 ErrorCode::UnknownAction,
                 ErrorDetail::Action(ActionId::new("a".repeat(MAX_ACTION_ID)).unwrap()),
@@ -957,32 +970,70 @@ mod tests {
         }
     }
 
-    /// The documented exception to the claim the test above pins:
-    /// `ErrorDetail::Item`'s bound is `ItemId`'s own `MAX_ITEM_ID` (4096
-    /// bytes), nearly 4× `MAX_ERROR_MESSAGE` (1024) — so a legitimate,
-    /// in-bound `ItemId` makes `ProtoError::new` build a message a
-    /// receiving peer's own `de_error_message` would refuse to parse. Not
-    /// new to #84 (the pre-#84 `format!("unknown item {item_id}")` had the
-    /// identical overflow, just never pinned by a test) and not fixed here
-    /// — `ProtoError::new` stays infallible on purpose, and a fix (truncate
-    /// the interpolated id? shrink the bound used in this one message?
-    /// something else?) is a call for whoever owns this gap next, not a
-    /// silent change riding in on this pin. See `ProtoError`'s "What
-    /// structuring the message costs" for the same point made in prose.
-    /// If this assertion ever starts failing, `ErrorDetail::Item` has been
-    /// bounded — update this test and both doc comments it stands beside
-    /// together, rather than deleting it.
+    /// A maximal legal `ItemId` is visibly truncated so its rendered error
+    /// remains a message a receiving peer can parse.
     #[test]
-    fn unknown_item_message_can_exceed_max_error_message_at_max_item_id() {
+    fn unknown_item_message_at_max_item_id_stays_within_max_error_message() {
         let max_id = ItemId::new("a".repeat(crate::limits::MAX_ITEM_ID)).unwrap();
         let err = ProtoError::new(ErrorCode::UnknownItem, ErrorDetail::Item(max_id));
         assert!(
-            err.message().len() > crate::limits::MAX_ERROR_MESSAGE,
-            "expected a max-length ItemId to overflow MAX_ERROR_MESSAGE, got \
-             {} bytes — if ErrorDetail::Item has been bounded, update this \
-             test (and the doc comments pointing at it) rather than deleting it",
-            err.message().len()
+            err.message().len() <= crate::limits::MAX_ERROR_MESSAGE,
+            "a max-length ItemId must stay within MAX_ERROR_MESSAGE, got {} bytes",
+            err.message().len(),
         );
+        assert!(err.message().ends_with("… [truncated]"));
+    }
+
+    #[test]
+    fn unknown_item_message_truncates_only_after_the_full_id_threshold() {
+        const PREFIX: &str = "unknown item ";
+        const MARKER: &str = "… [truncated]";
+        let full_id_bytes = crate::limits::MAX_ERROR_MESSAGE - PREFIX.len();
+
+        let below = "a".repeat(full_id_bytes - 1);
+        let below_err = ProtoError::new(
+            ErrorCode::UnknownItem,
+            ErrorDetail::Item(ItemId::new(below.clone()).unwrap()),
+        );
+        assert_eq!(below_err.message(), format!("{PREFIX}{below}"));
+
+        let exact = "a".repeat(full_id_bytes);
+        let exact_err = ProtoError::new(
+            ErrorCode::UnknownItem,
+            ErrorDetail::Item(ItemId::new(exact.clone()).unwrap()),
+        );
+        assert_eq!(exact_err.message(), format!("{PREFIX}{exact}"));
+
+        let over = "a".repeat(full_id_bytes + 1);
+        let over_err = ProtoError::new(
+            ErrorCode::UnknownItem,
+            ErrorDetail::Item(ItemId::new(over).unwrap()),
+        );
+        let retained_id_bytes = crate::limits::MAX_ERROR_MESSAGE - PREFIX.len() - MARKER.len();
+        assert_eq!(
+            over_err.message(),
+            format!("{PREFIX}{}{MARKER}", "a".repeat(retained_id_bytes))
+        );
+        assert!(over_err.message().len() <= crate::limits::MAX_ERROR_MESSAGE);
+    }
+
+    #[test]
+    fn unknown_item_message_truncation_never_splits_a_multi_byte_id() {
+        const PREFIX: &str = "unknown item ";
+        const MARKER: &str = "… [truncated]";
+        let id = format!("{}語{}", "a".repeat(995), "a".repeat(20),);
+        let err = ProtoError::new(
+            ErrorCode::UnknownItem,
+            ErrorDetail::Item(ItemId::new(id).unwrap()),
+        );
+
+        assert_eq!(
+            err.message(),
+            format!("{PREFIX}{}{MARKER}", "a".repeat(995))
+        );
+        assert!(err.message().ends_with(MARKER));
+        assert!(err.message().len() <= crate::limits::MAX_ERROR_MESSAGE);
+        assert!(std::str::from_utf8(err.message().as_bytes()).is_ok());
     }
 
     /// The asymmetry constraint #84 settles: [`ProtoError::new`] can only ever
