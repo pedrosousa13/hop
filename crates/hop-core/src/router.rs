@@ -97,6 +97,10 @@ use regex::Regex;
 /// property of this module rather than of the wire. `hop-protocol`'s copy
 /// documents the two warnings a client needs when it reads the value out of a
 /// frame with none of this context.
+///
+/// `hop-core` adds no query-length bound for direct embedders. A caller that
+/// invokes routing or assembly directly must bound query cost upstream;
+/// `hopd` gets the wire bound from [`hop_protocol::limits::MAX_QUERY_TEXT`].
 pub use hop_protocol::Mode;
 
 /// Query text carried by a [`RoutedQuery`]: both [`RoutedQuery::term`] and
@@ -125,6 +129,10 @@ pub use hop_protocol::Mode;
 /// therefore infallible — there is no refusal to report, ever. Do not add
 /// one to make this type look more like `QueryText`; that is precisely the
 /// difference between them.
+///
+/// This also means `hop-core` makes no query-length promise to direct
+/// embedders. They own the upstream bound on query cost; the daemon's wire
+/// path applies [`hop_protocol::limits::MAX_QUERY_TEXT`] before routing.
 ///
 /// [`Pipeline::assemble`]: crate::pipeline::Pipeline::assemble
 ///
@@ -228,6 +236,10 @@ impl std::fmt::Debug for RoutedText {
 /// says nothing whatever about what it may contain — and [`route`] takes a
 /// `&str`, so even that much is a fact about one caller rather than a
 /// guarantee this struct carries.
+///
+/// Direct embedders of `hop-core` do not receive a query-length bound from
+/// this type or from routing. They must bound query cost upstream; `hopd`
+/// relies on [`hop_protocol::limits::MAX_QUERY_TEXT`] at the wire boundary.
 ///
 /// Treat `term` and `raw` alike as hostile text: the input box takes pastes,
 /// so what lands in it was not necessarily composed by the person sitting in

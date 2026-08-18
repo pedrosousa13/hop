@@ -850,7 +850,8 @@ impl Pipeline {
     /// 2. Apply aliases to the routed term, producing `effective_term`
     ///    (what ranking uses) and any alias boosts.
     /// 3. Collect boosts: the alias boosts plus a learning boost for every
-    ///    candidate item, summed into one [`Boosts`] map.
+    ///    candidate item, summed into one [`Boosts`] map. Learning normalizes
+    ///    the routed term once, then reuses that prepared lookup per item.
     /// 4. Split off the `append_to_end` items — the ones *requesting* the
     ///    pinned tail, never ranked (`Ranker::rank` drops them itself, so
     ///    this split is what keeps them alive at all) — and spend the **pin
@@ -881,6 +882,7 @@ impl Pipeline {
 
         // Step 1: route.
         let routed = route(raw_query);
+        let prepared_learning = self.learning.prepare_query(routed.term.as_str());
 
         // Step 2: apply aliases to the routed term.
         let alias_effect = self.aliases.apply(routed.term.as_str());
@@ -926,9 +928,7 @@ impl Pipeline {
         // `Learning` itself. See `Boosts::by_item_id`'s doc comment and
         // `tests::learning_boost_does_not_land_on_an_identically_id_item_from_a_different_provider`.
         for item in &provider_items {
-            let learned = self
-                .learning
-                .boost_for(&item.provider, routed.term.as_str(), &item.id);
+            let learned = prepared_learning.boost_for(&item.provider, &item.id);
             if learned != 0.0 {
                 *boosts
                     .by_item_id
@@ -1386,6 +1386,28 @@ mod tests {
             ItemId::new("app:winner").unwrap(),
             "an alias boost on a competing item must still win over learning"
         );
+    }
+
+    #[test]
+    fn learning_boost_uses_trimmed_mixed_case_query_for_multiple_candidates() {
+        let mut pipeline = Pipeline::default();
+        for _ in 0..10 {
+            pipeline.learning.record_launch(
+                "test",
+                "firefox",
+                &ItemId::new("app:learned").unwrap(),
+            );
+        }
+        let items = vec![
+            item(Kind::App, "app:other", "Firefox alternative"),
+            item(Kind::App, "app:learned", "Firefox"),
+        ];
+
+        let assembly = pipeline.assemble("  FiReFoX  ", checked(items), 10);
+
+        assert!(assembly.rejections.is_empty());
+        assert_eq!(assembly.items.len(), 2);
+        assert_eq!(assembly.items[0].id, ItemId::new("app:learned").unwrap());
     }
 
     #[test]

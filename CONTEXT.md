@@ -526,7 +526,9 @@ overlay and enforces `MAX_QUERY_TEXT`. `hop-core`'s `RoutedText`, the type of
 `RoutedQuery`'s `term` and `raw`, redacts without validating — it carries those
 same keystrokes past the wire and asserts no bound, because `Pipeline::assemble`
 builds one from an alias rewrite target, which is config-file text and not
-wire-bound (#83).
+wire-bound (#83). `hop-core` adds no query-length bound for direct embedders;
+they own the upstream query-cost bound. `hopd` gets the wire bound from
+`hop_protocol::limits::MAX_QUERY_TEXT` before routing.
 
 ## Conventions
 
