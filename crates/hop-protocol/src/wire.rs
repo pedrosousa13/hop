@@ -357,7 +357,7 @@ pub enum ExecOutcome {
 ///
 /// Three costs, all accepted:
 ///
-/// - **`ErrorDetail::Item` visibly truncates an oversized id.**
+/// - **`ErrorDetail::Item` visibly shortens an oversized id.**
 ///   [`ProtoError::new`] applies no length check of its own — see
 ///   [`MAX_ERROR_MESSAGE`]'s own docs for where the bound is actually
 ///   enforced (the receiving peer's parse, nowhere else) — and remains
@@ -970,7 +970,7 @@ mod tests {
         }
     }
 
-    /// A maximal legal `ItemId` is visibly truncated so its rendered error
+    /// A maximal legal `ItemId` is visibly shortened so its rendered error
     /// remains a message a receiving peer can parse.
     #[test]
     fn unknown_item_message_at_max_item_id_stays_within_max_error_message() {
@@ -985,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_item_message_truncates_only_after_the_full_id_threshold() {
+    fn unknown_item_message_shortens_only_after_the_full_id_threshold() {
         const PREFIX: &str = "unknown item ";
         const MARKER: &str = "… [truncated]";
         let full_id_bytes = crate::limits::MAX_ERROR_MESSAGE - PREFIX.len();
@@ -1018,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_item_message_truncation_never_splits_a_multi_byte_id() {
+    fn unknown_item_message_shortening_never_splits_a_multi_byte_id() {
         const PREFIX: &str = "unknown item ";
         const MARKER: &str = "… [truncated]";
         let id = format!("{}語{}", "a".repeat(995), "a".repeat(20),);

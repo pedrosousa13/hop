@@ -187,8 +187,8 @@ pub const MAX_OPEN_URL: usize = 8_192;
 /// `ErrorDetail::Item` is the deliberate exception to that input-size
 /// relationship: [`ItemId`](crate::item::ItemId)'s bound is
 /// [`MAX_ITEM_ID`], nearly 4× this constant, so its renderer keeps the
-/// complete message within this bound by retaining the longest UTF-8-safe id
-/// prefix that fits and appending a visible `… [truncated]` marker. See
+/// complete message within this bound by visibly shortening it to the longest
+/// UTF-8-safe id prefix that fits and appending a `… [truncated]` marker. See
 /// `wire::tests::unknown_item_message_at_max_item_id_stays_within_max_error_message`
 /// and the boundary tests beside it for that guarantee. What `message` may
 /// *contain* — as opposed to how long it is — is
@@ -381,10 +381,14 @@ pub const MAX_FRAME_BYTES: usize = 268_435_456;
 /// A value that broke the size budget in [`limits`](self).
 ///
 /// Deserialization turns this into a serde error, so a transport reports an
-/// over-long field as a protocol error instead of proceeding with a truncated
-/// or oversized value. Nothing in this crate truncates: a value that does not
-/// fit is refused, because silently shortening an id would produce a different
-/// id and silently dropping items would produce a wrong item list.
+/// over-long field as a protocol error instead of proceeding with a shortened
+/// or oversized wire value. Bound enforcement never silently shortens a
+/// validated wire value: one that does not fit is refused, because silently
+/// shortening an id would produce a different id and silently dropping items
+/// would produce a wrong item list. The private `ErrorDetail::Item` renderer
+/// is separate: it may visibly shorten an id only in the human-facing
+/// diagnostic, where the `… [truncated]` marker reports what happened; the
+/// `ItemId` and all wire values remain whole.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BoundError {
     /// A string field longer than its byte maximum.
