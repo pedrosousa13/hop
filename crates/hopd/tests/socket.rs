@@ -289,11 +289,13 @@ fn an_inbound_frame_one_byte_over_64_kib_is_refused_from_prefix_alone() {
         .write_all(&over_cap_len.to_be_bytes())
         .expect("writing the oversize prefix must succeed");
     // Deliberately nothing else is written: the daemon must refuse on the
-    // prefix alone, never asking for the payload that would follow it. That
-    // it never allocates for that payload is enforced by construction —
-    // `payload_len` runs before any read of it — and is a property this test
-    // cannot observe directly; what it can and does observe is that the
-    // connection is refused and closed without hanging on a payload read.
+    // prefix alone, never asking for the payload that would follow it. The
+    // shared `payload_len` gate runs first, and the hopd-only inbound gate
+    // then refuses this 65,537-byte value before allocation; the former's
+    // 256 MiB ceiling alone would admit this prefix. The allocation itself is
+    // a property this test cannot observe directly; what it can and does
+    // observe is that the connection is refused and closed without hanging on
+    // a payload read.
 
     stream
         .set_read_timeout(Some(Duration::from_millis(250)))
@@ -344,7 +346,8 @@ fn a_payload_that_is_not_valid_json_is_refused_as_malformed_not_internal() {
 
     // A correct length prefix in front of a payload that is not JSON at all:
     // this is a peer-fault failure at `decode_payload`, distinct from the
-    // prefix-only refusal `an_oversize_length_prefix_is_refused...` covers,
+    // prefix-only refusal `an_inbound_frame_one_byte_over_64_kib_is_refused_from_prefix_alone`
+    // covers,
     // and it must not be reported as `Internal` — that code names a bug in
     // hopd itself, not bytes a peer sent that hopd was never obligated to
     // make sense of.
