@@ -73,27 +73,33 @@ jobs:
   # `ci`'s debug build), so unlike `supply-chain` it does want the
   # rustfmt/clippy-less toolchain and the build cache.
   #
-  # The three tests this job runs (`crates/hop-core/tests/latency.rs`) are
+  # The four tests this job runs (`crates/hop-core/tests/latency.rs`) are
   # `#[ignore]`d specifically so `ci`'s own `cargo test --workspace` — a
   # debug build — never runs them: debug-mode Rust is 10-50x slower than
   # release for CPU-bound fuzzy matching, so a 10ms p95 budget measured in
   # debug mode would flake on ordinary, unregressed code. `--release` is
   # therefore load-bearing here, not a performance nicety.
   #
-  # `--test-threads=1` keeps the three timing tests in this one small binary
+  # `--test-threads=1` keeps the four timing tests in this one small binary
   # from contending with each other for CPU during measurement, which
   # parallel test execution would otherwise do by default.
   #
-  # Not every test this job runs still gates it. The files-shaped p95 arm
+  # Not every test this job runs still gates it. Two of the four arms are
+  # report-only. The files-shaped p95 arm
   # (`p95_query_latency_over_a_files_shaped_fixture_is_measured_in_release_mode`,
   # issue #134) is report-only: it still builds in `--release`, still runs
   # under `--ignored`, and still prints its p95, but no longer asserts
-  # against the 10ms budget — see that test's own doc comment for why. A red
-  # "Latency gate" check here still means a real regression in one of the
-  # arms that does assert (`p95_query_latency_is_under_10ms_in_release_mode`
-  # and the adversarial worst-case arm); it does not mean the files-shaped
-  # arm crossed its line, since that arm can no longer fail the build on its
-  # own.
+  # against the 10ms budget — see that test's own doc comment for why. The
+  # populated learning-store p95 arm
+  # (`p95_query_latency_over_a_populated_learning_store_is_measured_in_release_mode`,
+  # issue #149) is likewise report-only: it prints its figure and margin
+  # against the reference without asserting a threshold, because no budget
+  # exists yet. A red "Latency gate" check here still means a real regression
+  # in one of the two arms that does assert
+  # (`p95_query_latency_is_under_10ms_in_release_mode` and
+  # `bounded_worst_case_completes_promptly_in_release_mode`); it does not mean
+  # either report-only arm crossed its line, since neither can fail the build
+  # on its own.
   latency-gate:
     name: Latency gate
     runs-on: ubuntu-latest
