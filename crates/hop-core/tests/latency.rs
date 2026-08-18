@@ -3,17 +3,19 @@
 //! proves the caps Task 1 (`rank::MAX_TERM_CHARS`) and Task 2
 //! (`pipeline::MAX_ITEMS_PER_PROVIDER_ANSWER`) added actually bound the work
 //! — not merely that they exist. A second fixture and p95 arm, over
-//! files-shaped (path-like) titles, was added by issue #128; as of issue
-//! #134 that second arm is report-only — it measures and prints but no
-//! longer asserts against the budget — while the first p95 arm above and
-//! the adversarial arm both still gate. See
-//! [`p95_query_latency_over_a_files_shaped_fixture_is_measured_in_release_mode`]'s
-//! own doc comment for why.
+//! files-shaped (path-like) titles, was added by issue #128; issue #149 adds
+//! a fourth arm over the same short-title fixture with a populated learning
+//! store. Both added arms are report-only: they measure and print but do not
+//! assert against the budget, while the first p95 arm and the adversarial arm
+//! still gate. See
+//! [`p95_query_latency_over_a_files_shaped_fixture_is_measured_in_release_mode`]
+//! and [`p95_query_latency_over_a_populated_learning_store_is_measured_in_release_mode`]'s
+//! own doc comments for why.
 //!
 //! ## Why this file, and not `#[cfg(test)] mod tests`
 //!
 //! This is `hop-core`'s first integration test file. It needs to be one: the
-//! two timing tests below must run under `cargo test --release`, isolated
+//! four release-only timing tests below must run under `cargo test --release`, isolated
 //! from every other test in the crate (`--test-threads=1`, its own binary),
 //! and `cargo test --workspace` — the always-required, debug-mode gate —
 //! must never pay for them. `#[ignore]` on an in-module test would satisfy
@@ -82,6 +84,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hop_core::learning::Learning;
 use hop_core::pipeline::{
     CheckedItems, FailedCheck, MAX_ITEMS_PER_PROVIDER_ANSWER, Pipeline, ProviderOutput,
 };
@@ -244,6 +247,36 @@ fn ten_thousand_item_fixture() -> CheckedItems {
     CheckedItems::check(outputs)
 }
 
+/// Populate a deterministic used-install learning store from the first 1,000
+/// items of the existing fixture, exactly the production cap for retained
+/// global-frequency entries. Each item is recorded under one of the fixed
+/// [`QUERIES`], so the helper exercises both the query-specific and global
+/// learning lookups without introducing randomness, I/O or a mock store.
+///
+/// `Learning::default()` deliberately leaves its plaintext-provider set empty.
+/// The fixture providers all declare that their ids are not safe to persist in
+/// the clear, and no provider is synced into the set here, so every lookup
+/// computes the hashed persistence key. That is the conservative, more
+/// expensive disposition: it includes the SHA-256 work a provider that has
+/// not opted into plaintext persistence makes every time the populated store
+/// is consulted.
+fn populated_learning_store(checked: &CheckedItems) -> Learning {
+    let mut learning = Learning::default();
+    for (index, item) in checked
+        .items()
+        .iter()
+        .take(POPULATED_LEARNING_ENTRIES)
+        .enumerate()
+    {
+        learning.record_launch(
+            item.provider.as_str(),
+            QUERIES[index % QUERIES.len()],
+            &item.id,
+        );
+    }
+    learning
+}
+
 /// A minimal FNV-1a 64-bit hash, dependency-free and fixed by the
 /// algorithm's own published constants rather than by any Rust
 /// implementation detail. Deliberately not
@@ -286,9 +319,36 @@ fn id_sequence_digest(items: &[Item]) -> u64 {
 const EXPECTED_ID_SEQUENCE_DIGEST: u64 = 0x316b_08a5_e81b_cf5f;
 
 /// A small, fixed set of realistic query strings — used (cycled through) by
-/// both timing arms so measurement isn't gamed by favorable cache/branch-
+/// all timing arms so measurement isn't gamed by favorable cache/branch-
 /// prediction reuse a single repeated query would enjoy (Decision 4).
 const QUERIES: [&str; 6] = ["firefox", "chrome", "term", "calc", "files", "edit"];
+
+const POPULATED_LEARNING_ENTRIES: usize = 1_000;
+
+#[test]
+fn populated_learning_fixture_has_production_cap_and_nonzero_boost() {
+    let checked = ten_thousand_item_fixture();
+    let learning = populated_learning_store(&checked);
+
+    assert_eq!(
+        learning
+            .recent_launches(POPULATED_LEARNING_ENTRIES + 1)
+            .len(),
+        POPULATED_LEARNING_ENTRIES,
+        "the populated fixture must retain exactly the production global-frequency cap"
+    );
+
+    let representative = &checked.items()[0];
+    assert!(!learning.is_empty());
+    assert!(
+        learning.boost_for(
+            representative.provider.as_str(),
+            QUERIES[0],
+            &representative.id,
+        ) > 0.0,
+        "a representative populated fixture item must receive a non-zero learned boost"
+    );
+}
 
 /// p95 query latency over the 10 000-item fixture, asserted under 10ms.
 ///
@@ -366,6 +426,86 @@ fn p95_query_latency_is_under_10ms_in_release_mode() {
         "p95 query latency over the 10 000-item fixture was {p95:?} \
          (release mode only — see this test's doc comment); expected \
          comfortably under 10ms"
+    );
+}
+
+/// p95 query latency over the same deterministic 10 000-item short-title
+/// fixture as the gated arm above, with the learning store populated to the
+/// production cap of 1,000 retained global-frequency entries.
+///
+/// **Report-only; does not gate CI (issue #149).** The populated-store case
+/// has no established latency budget yet. Adding a threshold now would invent
+/// one from an unknown baseline and could fail the build on a figure this arm
+/// exists to measure. The release latency-gate job prints this arm's p95,
+/// minimum, maximum and margin against the existing 10ms reference so a later
+/// budget can be chosen from observed data.
+///
+/// The fixture providers do not opt into plaintext persistence, and the
+/// helper leaves the plaintext-provider set empty. This deliberately measures
+/// the conservative, more expensive disposition: each populated-store
+/// lookup computes a hashed persistence key, including its SHA-256 work,
+/// rather than taking the cheaper clear-id path.
+///
+/// Population is completed before the 50 warm-ups and before every timed
+/// Instant span. It is a fixture-construction cost, not assembly latency;
+/// the timed calls only measure Pipeline::assemble against the already
+/// populated store. The 50 untimed calls and 500 samples use the same fixed
+/// query cycle and nearest-rank p95 methodology as the gated arm.
+#[test]
+#[ignore]
+fn p95_query_latency_over_a_populated_learning_store_is_measured_in_release_mode() {
+    let checked = ten_thousand_item_fixture();
+    let learning = populated_learning_store(&checked);
+    assert_eq!(
+        learning
+            .recent_launches(POPULATED_LEARNING_ENTRIES + 1)
+            .len(),
+        POPULATED_LEARNING_ENTRIES,
+        "the populated latency fixture must retain exactly 1,000 global-frequency entries"
+    );
+
+    let mut pipeline = Pipeline {
+        learning,
+        ..Pipeline::default()
+    };
+
+    // Warm-up: 50 untimed calls, after the learning store was populated.
+    for i in 0..50 {
+        let term = QUERIES[i % QUERIES.len()];
+        let _ = pipeline.assemble(term, checked.clone(), 50);
+    }
+
+    // 500 timed calls. Cloning the checked fixture happens outside each
+    // Instant span; only Pipeline::assemble against the populated store
+    // is part of the reported latency.
+    let mut samples: Vec<Duration> = Vec::with_capacity(500);
+    for i in 0..500 {
+        let term = QUERIES[i % QUERIES.len()];
+        let call_input = checked.clone();
+        let start = Instant::now();
+        let _ = pipeline.assemble(term, call_input, 50);
+        samples.push(start.elapsed());
+    }
+
+    assert_eq!(samples.len(), 500);
+    samples.sort();
+    // Nearest-rank p95: rank = ceil(0.95 * n), 1-indexed into the sorted list.
+    let rank = (0.95_f64 * samples.len() as f64).ceil() as usize;
+    let p95 = samples[rank - 1];
+    let ten_ms = Duration::from_millis(10);
+    let margin = if p95 <= ten_ms {
+        format!("{:?} under", ten_ms - p95)
+    } else {
+        format!("{:?} over", p95 - ten_ms)
+    };
+    println!(
+        "p95_query_latency_over_a_populated_learning_store_is_measured_in_release_mode: \
+         p95 = {p95:?}, min = {:?}, max = {:?}, learning entries = {}, \
+         plaintext providers = 0 (hashed persistence keys), margin vs 10ms \
+         reference = {margin}",
+        samples.first().unwrap(),
+        samples.last().unwrap(),
+        POPULATED_LEARNING_ENTRIES,
     );
 }
 
