@@ -58,9 +58,11 @@ pub(crate) struct ParsedEntry {
     /// [`IconName::new`] or [`IconPath::new`].
     pub(crate) icon: Option<String>,
     /// Lowercased title, `Exec=`, `GenericName=`, `Comment=` and
-    /// `Keywords=`, space-joined — with general-string escapes resolved in
-    /// the four supported fields — what [`AppIndex::query`]'s filter matches
-    /// against. Never sent to a client; [`Item`] carries no such field.
+    /// `Keywords=`, space-joined — with the title sanitized to the same
+    /// single-line form [`build_entry`] displays in its [`Item`], and the
+    /// other supported general-string fields unescaped — what
+    /// [`AppIndex::query`]'s filter matches against. Never sent to a client;
+    /// [`Item`] carries no such field.
     pub(crate) haystack: String,
 }
 
@@ -221,9 +223,10 @@ pub(crate) fn parse_desktop_entry(content: &str) -> DesktopEntryOutcome {
     // string to search, exactly as it did when `exec` itself was a String.
     let exec = exec.unwrap_or_default();
     let exec_haystack = exec.join(" ");
+    let searchable_title = sanitize_single_line(&title, MAX_TITLE);
 
     let merged_keywords = [
-        title.as_str(),
+        searchable_title.as_str(),
         exec_haystack.as_str(),
         keywords.as_str(),
         generic_name.as_str(),
@@ -1864,6 +1867,18 @@ mod index_tests {
         let items = index.query("my app");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title.as_str(), "My App");
+    }
+
+    #[test]
+    fn query_matches_the_displayed_title_after_control_sanitization() {
+        let parsed = parsed("[Desktop Entry]\nName=Foo\\nBar\nExec=foo\n");
+        let entry = build_entry("foo".to_string(), parsed).unwrap();
+        assert_eq!(entry.item.title.as_str(), "FooBar");
+
+        let index = AppIndex::new(vec![entry]);
+        let items = index.query("foobar");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title.as_str(), "FooBar");
     }
 
     #[test]
