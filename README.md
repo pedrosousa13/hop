@@ -14,6 +14,8 @@ installed `.desktop` files), and a `hop` CLI that speaks to it (`hop query`,
 
 The full design is at
 [`docs/superpowers/specs/2026-07-30-hop-launcher-v1-design.md`](docs/superpowers/specs/2026-07-30-hop-launcher-v1-design.md).
+The normative [v1 theme token contract](docs/theme-token-contract.md) defines
+the author-facing theme boundary.
 
 ## Crates
 
