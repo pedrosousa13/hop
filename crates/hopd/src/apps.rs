@@ -58,7 +58,8 @@ pub(crate) struct ParsedEntry {
     /// [`IconName::new`] or [`IconPath::new`].
     pub(crate) icon: Option<String>,
     /// Lowercased title, `Exec=`, `GenericName=`, `Comment=` and
-    /// `Keywords=`, space-joined — what [`AppIndex::query`]'s filter matches
+    /// `Keywords=`, space-joined — with general-string escapes resolved in
+    /// the four supported fields — what [`AppIndex::query`]'s filter matches
     /// against. Never sent to a client; [`Item`] carries no such field.
     pub(crate) haystack: String,
 }
@@ -135,13 +136,13 @@ pub(crate) fn parse_desktop_entry(content: &str) -> DesktopEntryOutcome {
 
         if let Some(value) = line.strip_prefix("Name=") {
             if name.is_empty() {
-                name = value.trim().to_string();
+                name = unescape_general_string(value.trim());
             }
         } else if line.starts_with("Name[") {
             if let Some((_, value)) = line.split_once('=')
                 && localized_name.is_empty()
             {
-                localized_name = value.trim().to_string();
+                localized_name = unescape_general_string(value.trim());
             }
         } else if let Some(value) = line.strip_prefix("Exec=") {
             if exec.is_none() {
@@ -172,15 +173,15 @@ pub(crate) fn parse_desktop_entry(content: &str) -> DesktopEntryOutcome {
             }
         } else if let Some(value) = line.strip_prefix("Keywords=") {
             if keywords.is_empty() {
-                keywords = value.replace(';', " ");
+                keywords = unescape_general_string(value).replace(';', " ");
             }
         } else if let Some(value) = line.strip_prefix("GenericName=") {
             if generic_name.is_empty() {
-                generic_name = value.trim().to_string();
+                generic_name = unescape_general_string(value.trim());
             }
         } else if let Some(value) = line.strip_prefix("Comment=") {
             if comment.is_empty() {
-                comment = value.trim().to_string();
+                comment = unescape_general_string(value.trim());
             }
         } else if let Some(value) = line.strip_prefix("Icon=") {
             if icon.is_empty() {
@@ -262,15 +263,12 @@ const FIELD_CODES: [&str; 13] = [
 /// `\\` itself, [`parse_exec`] resolves inside a quoted argument), and
 /// leaving them alone here is what lets that layer see them at all.
 ///
-/// **Deliberately wired into `Exec=` only.** The escaping described above is
-/// defined for every string-typed key, but [`parse_desktop_entry`] still
-/// hands `Name=`, `GenericName=`, `Comment=` and `Keywords=` through
-/// unescaped, so a `\s` in one of those reaches the client as the literal
-/// two characters. Fixing that changes displayed text rather than launch
-/// behavior, which is a different blast radius from this function's own
-/// reason for existing, and #109's brief scoped it out. Tracked separately;
-/// do not read this function's presence as evidence the other keys are
-/// handled.
+/// [`parse_desktop_entry`] applies this to the supported general-string
+/// fields: `Name=` (including a localized `Name[locale]=` fallback),
+/// `GenericName=`, and `Comment=`. It also applies it to `Keywords=` before
+/// replacing the existing semicolon separators with spaces. [`parse_exec`]
+/// applies it before its key-specific quoting rules. Unknown escape
+/// sequences remain literal, and do not make an entry malformed.
 fn unescape_general_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
@@ -1371,6 +1369,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn general_string_fields_are_unescaped_before_display_and_search() {
+        let parsed = parsed(
+            "[Desktop Entry]\nName=My\\sApp\nExec=my-app\nGenericName=Utility\\sTool\nComment=Launch\\tnow\nKeywords=quick\\slaunch;desktop\\snavigation;\n",
+        );
+        assert_eq!(parsed.title, "My App");
+        assert!(parsed.haystack.contains("utility tool"));
+        assert!(parsed.haystack.contains("launch\tnow"));
+        assert!(parsed.haystack.contains("quick launch desktop navigation"));
+        assert!(
+            !parsed.haystack.contains(';'),
+            "keyword separators must still become spaces"
+        );
+    }
+
+    #[test]
+    fn localized_name_is_unescaped_when_used_as_the_title_fallback() {
+        let parsed = parsed("[Desktop Entry]\nName[en_US]=Localized\\sApp\nExec=localized-app\n");
+        assert_eq!(parsed.title, "Localized App");
+        assert!(parsed.haystack.contains("localized app"));
+    }
+
+    #[test]
+    fn unknown_general_string_escapes_remain_literal_and_do_not_reject_entries() {
+        let parsed = parsed("[Desktop Entry]\nName=My\\qApp\nExec=my-app\n");
+        assert_eq!(parsed.title, r"My\qApp");
+        assert!(parsed.haystack.contains(r"my\qapp"));
+    }
+
     // --- New coverage: rules the salvaged suite didn't exercise. ---
 
     #[test]
@@ -1826,6 +1853,17 @@ mod index_tests {
         let items = index.query("FIRE");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title.as_str(), "Firefox");
+    }
+
+    #[test]
+    fn query_matches_the_unescaped_displayed_name() {
+        let parsed = parsed("[Desktop Entry]\nName=My\\sApp\nExec=my-app\n");
+        let entry = build_entry("my-app".to_string(), parsed).unwrap();
+        let index = AppIndex::new(vec![entry]);
+
+        let items = index.query("my app");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title.as_str(), "My App");
     }
 
     #[test]
