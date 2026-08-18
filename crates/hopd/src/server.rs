@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use hop_core::host::ProviderHost;
 use tokio::net::UnixListener;
+use tokio::sync::Semaphore;
 
 use crate::activation;
 use crate::connection::handle_connection;
@@ -22,6 +23,18 @@ use crate::source::{ResultSource, SkeletonProvider, StderrLog};
 /// The socket's file name inside the runtime directory
 /// [`crate::runtime_dir::resolve`] returns.
 const SOCKET_FILE_NAME: &str = "hopd.sock";
+
+/// Maximum number of connections whose tasks may run at once.
+///
+/// One permit is acquired before `accept`, so the 65th local peer waits in
+/// the listener backlog rather than allocating a connection task. The permit
+/// stays owned by that task until [`handle_connection`] returns. This bounds
+/// same-uid robustness exposure from buggy or runaway local clients: across
+/// 64 admitted connections, their one 64 KiB inbound payload buffer each sum
+/// to at most 4 MiB, alongside at most 64,000 retained bounded items. It is
+/// not a security boundary against a hostile peer, and it is the intentional
+/// connection backpressure; no accept-rate limiter is needed.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 /// Builds the daemon's provider host: the registry every query runs through.
 ///
@@ -129,6 +142,13 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
     let activation = activation::inherited_fd(|k| std::env::var(k).ok(), std::process::id());
     let listener = acquire_listener(runtime_dir, activation)?;
 
+    // The permit is acquired before every accept, so the connection cap is
+    // backpressure in the listener rather than a post-accept task limit. The
+    // 50 ms sleep below remains only a hot-spin floor for accept errors; it is
+    // not a rate policy. These bounds are robustness against buggy or runaway
+    // same-uid local clients, not a security boundary against hostile peers.
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
     // No accept-loop exit beyond an unrecoverable startup error above: a
     // per-connection failure is logged and the loop keeps accepting, so the
     // only way out of this loop is the process being killed. Signal handling
@@ -136,12 +156,16 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
     // `crate::run`'s own "# Shutdown" section) — issue #62 added
     // *activation* only, not lifecycle.
     loop {
+        let permit = Arc::clone(&connection_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("connection limiter closed"))?;
+
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                // One task per connection, per the brief's acceptance
-                // criterion that the runtime be multi-threaded: unbounded
-                // today, since a per-connection or per-daemon cap on
-                // concurrent connections is issue #98's, not this slice's.
+                // One owned permit and one task per connection. Binding the
+                // permit for the entire task makes the cap cover the full
+                // connection lifecycle, not only the accept operation.
                 //
                 // Every connection gets its own handle on the source rather
                 // than sharing one, which is why [`ResultSource`] is `Clone`:
@@ -149,6 +173,7 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
                 // whatever shared state it has, not the state itself.
                 let source = source.clone();
                 tokio::spawn(async move {
+                    let _connection_slot = permit;
                     if let Err(err) = handle_connection(stream, source).await {
                         // Issue #34's logging seam is `ProviderLog`
                         // (`hop_core::host::ProviderLog`), landed in this
@@ -166,6 +191,7 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
                 });
             }
             Err(err) => {
+                drop(permit);
                 eprintln!("hopd: accept error: {err}");
                 // A floor, not a policy: this sleep exists only so a
                 // persistent accept error (EMFILE, exhausted file

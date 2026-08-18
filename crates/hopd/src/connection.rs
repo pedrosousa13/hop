@@ -36,12 +36,13 @@
 //! neither.
 
 use std::io;
+use std::time::Duration;
 
 use hop_core::router::route;
 use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
 };
-use hop_protocol::limits::MAX_ITEMS_PER_RESULTS_FRAME;
+use hop_protocol::limits::{MAX_INBOUND_FRAME_BYTES, MAX_ITEMS_PER_RESULTS_FRAME};
 use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ErrorCode, ErrorDetail, Item, ProtoError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -49,6 +50,13 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
 use crate::source::ResultSource;
+
+/// Maximum time allowed to complete a client payload after its prefix arrives.
+///
+/// This is a same-uid robustness bound for a buggy or runaway local client,
+/// not a security boundary against a hostile peer. The prefix read remains
+/// untimed so an admitted connection may stay idle between frames.
+const INBOUND_PAYLOAD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connection's position in the handshake gate every frame passes through.
 ///
@@ -169,7 +177,7 @@ pub(crate) async fn handle_connection<S: ResultSource>(
 /// the peer is gone.
 async fn read_loop(mut read_half: OwnedReadHalf, events: mpsc::Sender<ReadEvent>) {
     loop {
-        let event = match read_frame(&mut read_half).await {
+        let event = match read_frame(&mut read_half, INBOUND_PAYLOAD_READ_TIMEOUT).await {
             Ok(Some(ReadOutcome::Message(msg))) => ReadEvent::Message(msg),
             Ok(Some(ReadOutcome::Refused { code, detail })) => ReadEvent::Refused { code, detail },
             Ok(None) => return, // EOF: the peer closed its end.
@@ -571,7 +579,10 @@ enum ReadOutcome {
 /// travels to the driver as [`ReadEvent::Failed`] and, from there, out of
 /// [`handle_connection`] to the `eprintln!` in [`crate::server::serve_with`]'s
 /// spawned task — the same "log and move on" path an accept error takes.
-async fn read_frame(read_half: &mut OwnedReadHalf) -> io::Result<Option<ReadOutcome>> {
+async fn read_frame(
+    read_half: &mut OwnedReadHalf,
+    payload_timeout: Duration,
+) -> io::Result<Option<ReadOutcome>> {
     let mut prefix = [0u8; FRAME_PREFIX_LEN];
     match read_half.read_exact(&mut prefix).await {
         Ok(_) => {}
@@ -610,16 +621,28 @@ async fn read_frame(read_half: &mut OwnedReadHalf) -> io::Result<Option<ReadOutc
         }
     };
 
-    // `len` is already checked against MAX_FRAME_BYTES by `payload_len`
-    // above, so this allocation is capped per frame — but nothing here caps
-    // how many such allocations one connection can rack up over its
-    // lifetime, or across every connection this daemon is serving at once,
-    // and `read_exact` below has no timeout, so a peer that sends a valid
-    // prefix and then never finishes the payload holds this buffer and this
-    // task open indefinitely. Aggregate memory bounds and read timeouts are
-    // issue #98's, not this slice's.
+    // `payload_len` is the shared 256 MiB frame gate, retained for daemon
+    // results and other outbound frames. This narrower hopd-only gate is for
+    // client-to-daemon payloads and runs before allocation, so a same-uid
+    // buggy or runaway local client cannot make this connection reserve more
+    // than its 64 KiB inbound buffer. It is not a hostile-peer security
+    // boundary; the socket's same-uid trust boundary remains unchanged.
+    if len > MAX_INBOUND_FRAME_BYTES {
+        return Ok(Some(ReadOutcome::Refused {
+            code: ErrorCode::FrameTooLarge,
+            detail: ErrorDetail::FrameTooLarge { len },
+        }));
+    }
+
     let mut payload = vec![0u8; len];
-    read_half.read_exact(&mut payload).await?;
+    tokio::time::timeout(payload_timeout, read_half.read_exact(&mut payload))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "client frame payload read timed out",
+            )
+        })??;
 
     match decode_payload::<ClientMsg>(&payload) {
         Ok(msg) => Ok(Some(ReadOutcome::Message(msg))),
@@ -756,6 +779,7 @@ mod tests {
     use std::future::Future;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use hop_core::provider::ProviderError;
     use hop_protocol::{Action, ActionId, ActionKind, ExecOutcome, ItemId, Kind, QueryText};
@@ -859,6 +883,45 @@ mod tests {
         let mut payload = vec![0u8; len];
         peer.read_exact(&mut payload).await.expect("read payload");
         decode_payload(&payload).expect("decode as DaemonMsg")
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_payload_times_out_after_its_prefix() {
+        let (mut peer, daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (mut read_half, _write_half) = daemon.into_split();
+        let payload_len = 8_u32;
+        peer.write_all(&payload_len.to_be_bytes()).await.unwrap();
+
+        let result = read_frame(&mut read_half, Duration::from_millis(25)).await;
+        let Err(err) = result else {
+            panic!("an incomplete payload must time out");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn idle_time_before_a_prefix_has_no_read_timeout() {
+        let (mut peer, daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (mut read_half, _write_half) = daemon.into_split();
+        let read_task =
+            tokio::spawn(
+                async move { read_frame(&mut read_half, Duration::from_millis(25)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let frame = encode_frame(&ClientMsg::Hello {
+            api_version: API_VERSION,
+        })
+        .unwrap();
+        peer.write_all(&frame).await.unwrap();
+
+        let outcome = read_task.await.unwrap().unwrap();
+        assert!(matches!(
+            outcome,
+            Some(ReadOutcome::Message(ClientMsg::Hello {
+                api_version: API_VERSION
+            }))
+        ));
     }
 
     #[tokio::test]

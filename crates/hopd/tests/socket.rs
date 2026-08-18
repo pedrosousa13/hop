@@ -16,8 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use hop_protocol::limits::MAX_FRAME_BYTES;
-use hop_protocol::{ClientMsg, DaemonMsg, ErrorCode, Kind, Mode, QueryText};
+use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ErrorCode, Kind, Mode, QueryText};
 
 /// A spawned `hopd`, and the path its socket should appear at.
 ///
@@ -230,7 +229,52 @@ fn a_query_before_the_handshake_is_refused() {
 }
 
 #[test]
-fn an_oversize_length_prefix_is_refused_without_the_payload_being_read() {
+fn a_65th_connection_waits_until_one_of_64_slots_is_released() {
+    const EXPECTED_CONNECTION_LIMIT: usize = 64;
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = spawn_daemon(runtime_dir.path());
+
+    let mut admitted = Vec::with_capacity(EXPECTED_CONNECTION_LIMIT);
+    for _ in 0..EXPECTED_CONNECTION_LIMIT {
+        let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
+        hello(&mut stream);
+        admitted.push(stream);
+    }
+
+    let mut waiting = UnixStream::connect(&daemon.socket_path).unwrap();
+    send(
+        &mut waiting,
+        &ClientMsg::Hello {
+            api_version: API_VERSION,
+        },
+    );
+    waiting
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut prefix = [0_u8; 4];
+    let blocked = waiting.read_exact(&mut prefix).unwrap_err();
+    assert!(matches!(
+        blocked.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+
+    drop(admitted.pop());
+    waiting
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(
+        recv(&mut waiting),
+        DaemonMsg::HelloAck {
+            api_version: API_VERSION,
+        }
+    );
+}
+
+#[test]
+fn an_inbound_frame_one_byte_over_64_kib_is_refused_from_prefix_alone() {
+    const EXPECTED_MAX_INBOUND_FRAME_BYTES: usize = 65_536;
+
     let runtime_dir = tempfile::tempdir().unwrap();
     let daemon = spawn_daemon(runtime_dir.path());
     let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
@@ -240,22 +284,54 @@ fn an_oversize_length_prefix_is_refused_without_the_payload_being_read() {
     // cap as the thing under test.
     hello(&mut stream);
 
-    let over_cap_len = (MAX_FRAME_BYTES as u32) + 1;
+    let over_cap_len = (EXPECTED_MAX_INBOUND_FRAME_BYTES as u32) + 1;
     stream
         .write_all(&over_cap_len.to_be_bytes())
         .expect("writing the oversize prefix must succeed");
     // Deliberately nothing else is written: the daemon must refuse on the
-    // prefix alone, never asking for the payload that would follow it. That
-    // it never allocates for that payload is enforced by construction —
-    // `payload_len` runs before any read of it — and is a property this test
-    // cannot observe directly; what it can and does observe is that the
-    // connection is refused and closed without hanging on a payload read.
+    // prefix alone, never asking for the payload that would follow it. The
+    // shared `payload_len` gate runs first, and the hopd-only inbound gate
+    // then refuses this 65,537-byte value before allocation; the former's
+    // 256 MiB ceiling alone would admit this prefix. The allocation itself is
+    // a property this test cannot observe directly; what it can and does
+    // observe is that the connection is refused and closed without hanging on
+    // a payload read.
 
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     let reply = recv(&mut stream);
     let DaemonMsg::Error { error, .. } = reply else {
         panic!("expected an error frame, got {reply:?}");
     };
     assert_eq!(error.code, ErrorCode::FrameTooLarge);
+
+    assert_eof(&mut stream);
+}
+
+#[test]
+fn an_inbound_frame_exactly_64_kib_is_read_then_refused_as_malformed() {
+    const EXPECTED_MAX_INBOUND_FRAME_BYTES: usize = 65_536;
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = spawn_daemon(runtime_dir.path());
+    let mut stream = UnixStream::connect(&daemon.socket_path).unwrap();
+
+    hello(&mut stream);
+
+    let payload = vec![b'x'; EXPECTED_MAX_INBOUND_FRAME_BYTES];
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .expect("writing the exact-boundary prefix must succeed");
+    stream
+        .write_all(&payload)
+        .expect("writing the exact-boundary payload must succeed");
+
+    let reply = recv(&mut stream);
+    let DaemonMsg::Error { error, .. } = reply else {
+        panic!("expected an error frame, got {reply:?}");
+    };
+    assert_eq!(error.code, ErrorCode::MalformedFrame);
 
     assert_eof(&mut stream);
 }
@@ -270,7 +346,8 @@ fn a_payload_that_is_not_valid_json_is_refused_as_malformed_not_internal() {
 
     // A correct length prefix in front of a payload that is not JSON at all:
     // this is a peer-fault failure at `decode_payload`, distinct from the
-    // prefix-only refusal `an_oversize_length_prefix_is_refused...` covers,
+    // prefix-only refusal `an_inbound_frame_one_byte_over_64_kib_is_refused_from_prefix_alone`
+    // covers,
     // and it must not be reported as `Internal` — that code names a bug in
     // hopd itself, not bytes a peer sent that hopd was never obligated to
     // make sense of.
