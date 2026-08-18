@@ -226,6 +226,8 @@ and assert the elements still render legibly. This is the honesty analogue of
 `CheckedItems::check` — a rule enforced at a seam rather than trusted to
 authors.
 
+The durable author-facing boundary is the [v1 theme token contract](../../theme-token-contract.md).
+
 ---
 
 ## D7 — A dev instance beside a real one is first-class
