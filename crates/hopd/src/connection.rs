@@ -121,10 +121,11 @@ enum ReadEvent {
 /// in one assignment, `delivered` included, so there is no window where a
 /// stale id is still technically resolvable and no separate cleanup step
 /// that could be skipped or delayed. `tests::an_execute_bound_against_a_superseded_query_is_refused_cleanly`
-/// pins this end to end: an `Execute` naming a superseded id and an item
-/// that id genuinely delivered is refused exactly as cleanly as one naming
-/// an id the daemon never emitted at all — see the `Execute` arm's own
-/// comment on why the two are honestly the same refusal.
+/// pins this end to end: an `Execute` naming the *live* query's id and an
+/// item only a query it superseded ever delivered is still refused cleanly,
+/// via the `delivered` lookup in the `Execute` arm rather than the id check
+/// above it — see that test's own docs for why it is built that way rather
+/// than naming the stale id.
 struct Exchange {
     /// The `query_id` every frame of this exchange carries.
     id: u64,
@@ -743,6 +744,16 @@ mod tests {
     use hop_core::router::{Mode, RoutedQuery};
     use hop_protocol::ItemTitle;
 
+    // `FixtureProvider` and `checked_items` below are a third copy of the
+    // fixture `crates/hopd/tests/common/mod.rs` now centralises for
+    // `exec.rs` and `lifecycle.rs` (see that module's doc comment). That is
+    // not drift: this `mod tests` is a unit-test module inside the `hopd`
+    // *library* crate, compiled as part of `src/`, so it cannot `mod common;`
+    // or otherwise reach into `tests/` — Cargo's integration-test harness
+    // exists on the other side of a crate boundary this module is inside of.
+    // A structurally forced duplicate, kept intentionally in sync with the
+    // shared helper rather than accidentally.
+
     /// A provider that exists only to be a provider: [`CheckedItems::check`]
     /// can be reached no other way, and this crate's test sources need a
     /// real one to build a fixture list of already-checked items — see
@@ -1311,20 +1322,47 @@ mod tests {
 
     // --- Retained-set lifetime (issue #85): next-query-only, no timer. ---
 
-    /// A source that streams exactly one item and finishes — enough to prove
-    /// the retained-set lifetime test below against a genuinely delivered
-    /// item (via a real `Query` frame through `handle_message`), rather than
-    /// an `Exchange` built by hand the way every other test in this module
-    /// does. `execute` and `record_launch` both panic if reached: the
-    /// scenario this source exists for ends in a refusal that must never
-    /// dispatch to the source at all.
+    /// A source that streams exactly one item per call to `start` and then
+    /// finishes, advancing through a fixed list — call `n` gets `items[n]` —
+    /// enough to prove the retained-set lifetime test below against
+    /// genuinely delivered items (via real `Query` frames through
+    /// `handle_message`), rather than an `Exchange` built by hand the way
+    /// every other test in this module does.
+    ///
+    /// Two calls answering two *different* items, rather than the same item
+    /// twice, is what the test below needs: it names query 2 (the live id)
+    /// against the item only query 1 ever delivered, and that distinction
+    /// only exists if query 1 and query 2 genuinely delivered different
+    /// items. A source that answered the same item both times could not
+    /// tell that scenario apart from "the item happens to still resolve",
+    /// which would prove nothing about whether the retained set was
+    /// actually replaced.
+    ///
+    /// `execute` and `record_launch` both panic if reached: the scenario
+    /// this source exists for ends in a refusal that must never dispatch to
+    /// the source at all.
     #[derive(Clone)]
-    struct OneShotSource(Item);
+    struct OneShotSource {
+        items: Arc<Vec<Item>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl OneShotSource {
+        fn sequence(items: Vec<Item>) -> Self {
+            OneShotSource {
+                items: Arc::new(items),
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
 
     impl ResultSource for OneShotSource {
         fn start(&self, _text: QueryText) -> mpsc::Receiver<CheckedItems> {
             let (tx, rx) = mpsc::channel(1);
-            let item = self.0.clone();
+            let mut call = self.calls.lock().expect("test lock");
+            let item = self.items[*call].clone();
+            *call += 1;
+            drop(call);
             tokio::spawn(async move {
                 let _ = tx.send(checked_items(vec![item])).await;
             });
@@ -1349,19 +1387,30 @@ mod tests {
     /// expires on the next query for that id, and on nothing else — no
     /// timer. Two real `Query` frames run through `handle_message` (not a
     /// hand-built `Exchange`, unlike every Execute test above), so
-    /// `Exchange::delivered` genuinely holds what query 1 streamed before
-    /// query 2 supersedes it wholesale — see `Exchange`'s own docs on why
-    /// supersession replaces `delivered` rather than merging into it. An
-    /// `Execute` naming query 1's id and the item it actually delivered must
-    /// then be refused cleanly (the same `UnknownItem` a stale or
-    /// never-emitted id gets — `Exchange`'s docs on `id` explain why the
-    /// three read as one honest refusal), not hang, not panic, and not
-    /// resolve against a set this connection has moved on from.
+    /// `Exchange::delivered` genuinely holds what each query streamed before
+    /// the next supersedes it wholesale — see `Exchange`'s own docs on why
+    /// supersession replaces `delivered` rather than merging into it.
+    ///
+    /// The Execute frame here names **query 2's id** — the *live* one — and
+    /// **query 1's item**, deliberately not the other way around. Naming the
+    /// stale id (query 1) would short-circuit on the Execute arm's own
+    /// `active.id == query_id` check before it ever consulted `delivered`
+    /// (see that arm's comment); that would only prove the id check works,
+    /// which `an_execute_for_a_stale_query_id_is_query_scoped_unknown_item`
+    /// already covers. Naming the live id is what forces execution past that
+    /// check and into the `delivered.iter().find(...)` lookup this test
+    /// exists to pin: an item that only a *superseded* set ever contained
+    /// must not resolve just because some query happens to be live, which is
+    /// the distinction that makes this a genuine test of the retained set's
+    /// replacement rather than a second copy of the id-mismatch test.
     #[tokio::test]
     async fn an_execute_bound_against_a_superseded_query_is_refused_cleanly() {
         let mut state = HandshakeState::Ready;
         let mut exchange: Option<Exchange> = None;
-        let source = OneShotSource(item_with_action("app:1", &["open"]));
+        let source = OneShotSource::sequence(vec![
+            item_with_action("app:1", &["open"]),
+            item_with_action("app:2", &["open"]),
+        ]);
         let (mut peer, mut write_half) = write_half_pair();
 
         // Query 1 starts the exchange. `handle_message`'s Query arm sends
@@ -1395,7 +1444,7 @@ mod tests {
             .expect("query 1's exchange must still have a live source")
             .recv()
             .await
-            .expect("OneShotSource must send its one batch");
+            .expect("OneShotSource must send query 1's item");
         forward_batch(&mut exchange, &mut write_half, Some(batch))
             .await
             .unwrap();
@@ -1429,16 +1478,45 @@ mod tests {
             DaemonMsg::QueryRouted { query_id: 2, .. }
         ));
 
-        // Execute names query 1's id and the very item it delivered — an id
-        // this connection actually showed the client, just not under the
-        // query that is now live. It must still be refused cleanly.
+        // Drive query 2's own batch — a *different* item from query 1's —
+        // so its `delivered` genuinely holds `app:2` and not `app:1`. Without
+        // this, `delivered` would just be empty, and an Execute naming
+        // `app:1` would fail for the boring reason "nothing was ever
+        // delivered" rather than the one this test is about: a superseded
+        // query's item specifically does not survive into the live set.
+        let batch = exchange
+            .as_mut()
+            .expect("query 2 must have started an exchange")
+            .source
+            .as_mut()
+            .expect("query 2's exchange must still have a live source")
+            .recv()
+            .await
+            .expect("OneShotSource must send query 2's item");
+        forward_batch(&mut exchange, &mut write_half, Some(batch))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Results { query_id: 2, .. }
+        ));
+        assert_eq!(
+            exchange.as_ref().unwrap().delivered.len(),
+            1,
+            "sanity: query 2 must have genuinely delivered its own item"
+        );
+
+        // Execute names query 2's id — the live one, so the id check passes
+        // — and query 1's item, which only the now-superseded set ever
+        // contained. It must reach the `delivered` lookup and be refused
+        // there, cleanly.
         let done = handle_message(
             &mut state,
             &mut exchange,
             &mut write_half,
             &source,
             ClientMsg::Execute {
-                query_id: 1,
+                query_id: 2,
                 item_id: ItemId::new("app:1").unwrap(),
                 action_id: ActionId::new("open").unwrap(),
             },
@@ -1446,18 +1524,21 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!done, "a stale-query refusal must not end the connection");
+        assert!(
+            !done,
+            "a superseded-item refusal must not end the connection"
+        );
         assert_eq!(
             read_daemon_msg(&mut peer).await,
             DaemonMsg::Error {
-                query_id: Some(1),
+                query_id: Some(2),
                 error: ProtoError::new(
                     ErrorCode::UnknownItem,
-                    ErrorDetail::Fixed("no such query or stale query id"),
+                    ErrorDetail::Item(ItemId::new("app:1").unwrap()),
                 ),
             },
-            "a superseded query's retained set must not be resolvable, even \
-             for an item it genuinely delivered"
+            "an item only a superseded query's retained set ever contained \
+             must not resolve against the query that replaced it"
         );
     }
 }

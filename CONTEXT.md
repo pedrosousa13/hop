@@ -398,10 +398,13 @@ and calculator ones, so what comes back is still a single hardcoded item — but
 it arrives through the host, having passed the **manifest checks**, rather than
 bypassing it. As of issue #85, the channel carries **checked items**
 (`hop_core::pipeline::CheckedItems`) rather than a bare item list: that type's
-only constructors are `CheckedItems::check` and combinators over values `check`
-already produced, so an implementation of this seam cannot hand the daemon an
-item that skipped the per-item field-bound check — the trait's own type is the
-enforcement, not a paragraph asking an implementor to remember it.
+mint sites — `CheckedItems::check`, `Pipeline::assemble_checked`, and the
+combinators over values `check` already produced — are all private to
+`hop-core`, and every one of them either runs `check` itself or repackages
+items that already went through it, so an implementation of this seam cannot
+hand the daemon an item that skipped the per-item field-bound check — the
+trait's own type is the enforcement, not a paragraph asking an implementor to
+remember it.
 
 **Retained set** — the **last assembled list** an exchange has sent, replaced
 whole by each `results` frame under the replacement-frames rule, kept so that

@@ -21,10 +21,10 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{hello, recv, send, start_daemon};
+use common::{checked_items, hello, recv, send, start_daemon};
 use hop_core::host::{HostPolicy, NoopLog, ProviderHost};
 use hop_core::learning::Learning;
-use hop_core::pipeline::{CheckedItems, Pipeline, ProviderOutput};
+use hop_core::pipeline::{CheckedItems, Pipeline};
 use hop_core::provider::{
     Provider, ProviderError, ProviderManifest, QueryCtx, plaintext_provider_ids,
 };
@@ -61,60 +61,6 @@ fn item(id: &str, actions: &[&str]) -> Item {
     }
 }
 
-/// A provider that exists only to be a provider: [`CheckedItems::check`] can
-/// be reached no other way, and [`ExecSource`] needs a real one to build its
-/// scripted item as a checked batch (issue #85) rather than reaching into
-/// `CheckedItems`'s private fields some other way. Never actually queried or
-/// executed — `ExecSource` scripts its own `query`-equivalent and `execute`.
-struct FixtureProvider(ProviderManifest);
-
-impl Provider for FixtureProvider {
-    fn manifest(&self) -> ProviderManifest {
-        self.0.clone()
-    }
-
-    async fn query(
-        self: Arc<Self>,
-        _q: Arc<RoutedQuery>,
-        _ctx: QueryCtx,
-    ) -> Result<Vec<Item>, ProviderError> {
-        unreachable!("FixtureProvider::query is never called by these tests")
-    }
-
-    async fn execute(
-        self: Arc<Self>,
-        _item_id: ItemId,
-        _action_id: ActionId,
-    ) -> Result<ExecOutcome, ProviderError> {
-        unreachable!("FixtureProvider::execute is never called by these tests")
-    }
-}
-
-/// Builds a [`CheckedItems`] out of `items`, all agreeing with `"script"` —
-/// [`item`]'s own `provider` string above — and [`Kind::Action`], the way
-/// [`ExecSource::start`] hands its scripted item to the daemon as a checked
-/// batch instead of a bare `Vec<Item>` (issue #85). Panics if `items` would
-/// not actually pass the check, since a fixture that does not is a bug in
-/// the fixture.
-fn checked_items(items: Vec<Item>) -> CheckedItems {
-    let manifest = ProviderManifest {
-        id: "script",
-        kinds: vec![Kind::Action],
-        modes: vec![Mode::All],
-        min_term_len: 0,
-        budget: Duration::from_millis(50),
-        ids_are_safe_to_persist_in_the_clear: false,
-    };
-    let output = ProviderOutput::from_provider(&FixtureProvider(manifest), items);
-    let checked = CheckedItems::check(vec![output]);
-    assert!(
-        checked.rejections().is_empty(),
-        "checked_items is for well-formed fixtures only — got {:?}",
-        checked.rejections()
-    );
-    checked
-}
-
 /// What [`ExecSource::execute`] does when the connection resolves far enough
 /// to dispatch to the source.
 #[derive(Clone)]
@@ -146,7 +92,7 @@ impl ResultSource for ExecSource {
         let (tx, rx) = mpsc::channel(1);
         let items: Vec<Item> = self.item.iter().cloned().collect();
         tokio::spawn(async move {
-            let _ = tx.send(checked_items(items)).await;
+            let _ = tx.send(checked_items("script", items)).await;
         });
         rx
     }

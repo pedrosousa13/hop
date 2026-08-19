@@ -13,10 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::{hello, recv, send, start_daemon};
-use hop_core::pipeline::{CheckedItems, MAX_ITEMS_PER_PROVIDER_ANSWER, ProviderOutput};
-use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
-use hop_core::router::{Mode, RoutedQuery};
+use common::{checked_items, hello, recv, send, start_daemon};
+use hop_core::pipeline::CheckedItems;
+use hop_core::provider::ProviderError;
 use hop_protocol::limits::{MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME};
 use hop_protocol::{
     Action, ActionId, ActionKind, ClientMsg, DaemonMsg, ExecOutcome, Item, ItemId, ItemTitle, Kind,
@@ -43,74 +42,6 @@ fn item(n: usize) -> Item {
         append_to_end: false,
         provider: "test".to_string(),
     }
-}
-
-/// A provider that exists only to be a provider: [`CheckedItems::check`] can
-/// be reached no other way, and this file's scripted sources need a real one
-/// to build their scripted batches as checked items (issue #85) rather than
-/// reaching into `CheckedItems`'s private fields some other way. Never
-/// actually queried — every source in this file scripts its own batches.
-struct FixtureProvider(ProviderManifest);
-
-impl Provider for FixtureProvider {
-    fn manifest(&self) -> ProviderManifest {
-        self.0.clone()
-    }
-
-    async fn query(
-        self: Arc<Self>,
-        _q: Arc<RoutedQuery>,
-        _ctx: QueryCtx,
-    ) -> Result<Vec<Item>, ProviderError> {
-        unreachable!("FixtureProvider::query is never called by these tests")
-    }
-
-    async fn execute(
-        self: Arc<Self>,
-        _item_id: ItemId,
-        _action_id: ActionId,
-    ) -> Result<ExecOutcome, ProviderError> {
-        unreachable!("FixtureProvider::execute is never called by these tests")
-    }
-}
-
-/// Builds a [`CheckedItems`] out of `items`, all agreeing with `"test"` —
-/// [`item`]'s own `provider` string above — and [`Kind::Action`], the way
-/// this file's scripted sources hand a batch to the daemon as checked items
-/// instead of a bare `Vec<Item>` (issue #85).
-///
-/// Chunked into pieces of at most [`MAX_ITEMS_PER_PROVIDER_ANSWER`] before
-/// calling [`CheckedItems::check`], rather than one `ProviderOutput` for the
-/// whole of `items`: `check` truncates any *one* output over that cap
-/// (issue #30/#61), and this file's over-the-frame-bound test deliberately
-/// builds a batch longer than that to exercise the *connection's* own
-/// [`MAX_ITEMS_PER_RESULTS_FRAME`] defense — see
-/// `a_list_over_the_frame_bound_is_truncated_and_terminates`. Splitting
-/// across chunks small enough that none is truncated on its own is what
-/// lets that scenario reach the connection intact, still by way of a
-/// genuine `check` call over every item.
-fn checked_items(items: Vec<Item>) -> CheckedItems {
-    let manifest = ProviderManifest {
-        id: "test",
-        kinds: vec![Kind::Action],
-        modes: vec![Mode::All],
-        min_term_len: 0,
-        budget: Duration::from_millis(50),
-        ids_are_safe_to_persist_in_the_clear: false,
-    };
-    let outputs = items
-        .chunks(MAX_ITEMS_PER_PROVIDER_ANSWER)
-        .map(|chunk| {
-            ProviderOutput::from_provider(&FixtureProvider(manifest.clone()), chunk.to_vec())
-        })
-        .collect();
-    let checked = CheckedItems::check(outputs);
-    assert!(
-        checked.rejections().is_empty(),
-        "checked_items is for well-formed fixtures only — got {:?}",
-        checked.rejections()
-    );
-    checked
 }
 
 /// Polls `rx` for up to `deadline` — a regression hangs for seconds, not
@@ -157,7 +88,7 @@ impl ResultSource for ScriptedSource {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                if tx.send(checked_items(batch)).await.is_err() {
+                if tx.send(checked_items("test", batch)).await.is_err() {
                     let _ = events.send("cancelled");
                     return;
                 }
@@ -314,7 +245,7 @@ impl ResultSource for EndlessSource {
             let mut n = 0;
             loop {
                 n += 1;
-                if tx.send(checked_items(vec![item(n)])).await.is_err() {
+                if tx.send(checked_items("test", vec![item(n)])).await.is_err() {
                     let _ = events.send(tag);
                     return;
                 }
@@ -553,13 +484,13 @@ impl ResultSource for FirstEndlessThenBoundedSource {
                 let mut n = 0;
                 loop {
                     n += 1;
-                    if tx.send(checked_items(vec![item(n)])).await.is_err() {
+                    if tx.send(checked_items("test", vec![item(n)])).await.is_err() {
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             } else {
-                let _ = tx.send(checked_items(vec![item(1), item(2)])).await;
+                let _ = tx.send(checked_items("test", vec![item(1), item(2)])).await;
                 // Dropping `tx` here (end of scope) closes the channel, which
                 // is what lets this call's exchange reach a natural QueryDone.
             }
