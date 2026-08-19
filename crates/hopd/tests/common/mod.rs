@@ -9,16 +9,34 @@
 //! rather than in the test files that use them so `lifecycle.rs` and
 //! `host.rs` share one harness instead of duplicating it.
 //!
+//! It also holds `checked_items`, the fixture that turns a bare `Vec<Item>`
+//! into a genuine [`CheckedItems`] via a real [`Provider`] and
+//! [`CheckedItems::check`] — what a [`ResultSource`] hands the daemon since
+//! issue #85 made the per-item field-bound check a compiler-enforced
+//! contract rather than a property `HostSource` merely happened to have.
+//! `exec.rs` and `lifecycle.rs` each grew their own copy of this and its
+//! backing `FixtureProvider` when #85 landed; they are one helper here
+//! instead, because two copies differing only in a provider id string is
+//! exactly the drift this module's fixtures exist to prevent. It always
+//! chunks its input at [`MAX_ITEMS_PER_PROVIDER_ANSWER`] before calling
+//! `check`, rather than building one `ProviderOutput` for the whole list:
+//! for a fixture short enough to need no chunking that is one chunk and
+//! behaves exactly as an unchunked call would, and for `lifecycle.rs`'s
+//! over-the-frame-bound scenarios it is what lets a batch longer than the
+//! per-provider cap reach the connection intact instead of being truncated
+//! by `check` itself — see `a_list_over_the_frame_bound_is_truncated_and_terminates`
+//! in `lifecycle.rs` for the test that needs that.
+//!
 //! `mod common;` compiles this whole module into each of the three test
 //! binaries in this crate (`lifecycle`, `socket`, `host`), and each binary
 //! uses only a subset of what is here: `socket.rs` drives a spawned `hopd`
 //! binary and never calls `start_daemon` or touches the provider fixture;
-//! `lifecycle.rs` uses the daemon harness but not the provider fixture. Every
-//! item below is genuinely used — by a sibling binary, if not by all three —
-//! so `dead_code` warnings here are false positives from per-binary
-//! compilation, not real dead code. Allowed at the module level, once, rather
-//! than scattered per item; no other module in this workspace carries this
-//! allow.
+//! `lifecycle.rs` uses the daemon harness but not the `ScriptedProvider`
+//! fixture. Every item below is genuinely used — by a sibling binary, if not
+//! by all three — so `dead_code` warnings here are false positives from
+//! per-binary compilation, not real dead code. Allowed at the module level,
+//! once, rather than scattered per item; no other module in this workspace
+//! carries this allow.
 #![allow(clippy::unwrap_used)]
 #![allow(dead_code)]
 
@@ -30,6 +48,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hop_core::host::{ProviderEvent, ProviderLog};
+use hop_core::pipeline::{CheckedItems, MAX_ITEMS_PER_PROVIDER_ANSWER, ProviderOutput};
 use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery};
 use hop_protocol::framing::{FRAME_PREFIX_LEN, decode_payload, encode_frame, payload_len};
@@ -272,4 +291,74 @@ pub fn scripted_item(provider: &str, kind: Kind, id: &str, title: &str) -> Item 
         append_to_end: false,
         provider: provider.to_string(),
     }
+}
+
+/// A provider that exists only to be a provider: [`CheckedItems::check`] can
+/// be reached no other way, and [`checked_items`] needs a real one to build
+/// a fixture batch as checked items (issue #85) rather than reaching into
+/// `CheckedItems`'s private fields some other way. `query` and `execute` are
+/// never called — every source built from [`checked_items`] scripts its own
+/// batches and its own `execute` instead of actually running this provider.
+struct FixtureProvider(ProviderManifest);
+
+impl Provider for FixtureProvider {
+    fn manifest(&self) -> ProviderManifest {
+        self.0.clone()
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        _q: Arc<RoutedQuery>,
+        _ctx: QueryCtx,
+    ) -> Result<Vec<Item>, ProviderError> {
+        unreachable!("FixtureProvider::query is never called by these tests")
+    }
+
+    async fn execute(
+        self: Arc<Self>,
+        _item_id: ItemId,
+        _action_id: ActionId,
+    ) -> Result<ExecOutcome, ProviderError> {
+        unreachable!("FixtureProvider::execute is never called by these tests")
+    }
+}
+
+/// Builds a [`CheckedItems`] out of `items`, all agreeing with `provider_id`
+/// and [`Kind::Action`] — the way a [`ResultSource`] hands a batch to the
+/// daemon as checked items instead of a bare `Vec<Item>` (issue #85).
+///
+/// Always chunked into pieces of at most [`MAX_ITEMS_PER_PROVIDER_ANSWER`]
+/// before calling [`CheckedItems::check`], rather than one `ProviderOutput`
+/// for the whole of `items`: `check` truncates any *one* output over that
+/// cap (issue #30/#61), so an unchunked call could not build the
+/// deliberately-over-the-frame-bound batches `lifecycle.rs`'s truncation
+/// tests need — see `a_list_over_the_frame_bound_is_truncated_and_terminates`
+/// there. For every shorter fixture this is exactly one chunk, so it behaves
+/// like an unchunked call and costs callers nothing.
+///
+/// Panics if `items` would not actually pass the check, since a fixture that
+/// does not is a bug in the fixture, not a case a test wants to construct
+/// silently.
+pub fn checked_items(provider_id: &'static str, items: Vec<Item>) -> CheckedItems {
+    let manifest = ProviderManifest {
+        id: provider_id,
+        kinds: vec![Kind::Action],
+        modes: vec![Mode::All],
+        min_term_len: 0,
+        budget: Duration::from_millis(50),
+        ids_are_safe_to_persist_in_the_clear: false,
+    };
+    let outputs = items
+        .chunks(MAX_ITEMS_PER_PROVIDER_ANSWER)
+        .map(|chunk| {
+            ProviderOutput::from_provider(&FixtureProvider(manifest.clone()), chunk.to_vec())
+        })
+        .collect();
+    let checked = CheckedItems::check(outputs);
+    assert!(
+        checked.rejections().is_empty(),
+        "checked_items is for well-formed fixtures only — got {:?}",
+        checked.rejections()
+    );
+    checked
 }

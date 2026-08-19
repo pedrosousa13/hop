@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::{hello, recv, send, start_daemon};
+use common::{checked_items, hello, recv, send, start_daemon};
+use hop_core::pipeline::CheckedItems;
 use hop_core::provider::ProviderError;
 use hop_protocol::limits::{MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME};
 use hop_protocol::{
@@ -77,7 +78,7 @@ struct ScriptedSource {
 }
 
 impl ResultSource for ScriptedSource {
-    fn start(&self, _text: QueryText) -> mpsc::Receiver<Vec<Item>> {
+    fn start(&self, _text: QueryText) -> mpsc::Receiver<CheckedItems> {
         let (tx, rx) = mpsc::channel(1);
         let batches = self.batches.clone();
         let events = self.events.clone();
@@ -87,7 +88,7 @@ impl ResultSource for ScriptedSource {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                if tx.send(batch).await.is_err() {
+                if tx.send(checked_items("test", batch)).await.is_err() {
                     let _ = events.send("cancelled");
                     return;
                 }
@@ -236,7 +237,7 @@ struct EndlessSource {
 }
 
 impl ResultSource for EndlessSource {
-    fn start(&self, _text: QueryText) -> mpsc::Receiver<Vec<Item>> {
+    fn start(&self, _text: QueryText) -> mpsc::Receiver<CheckedItems> {
         let (tx, rx) = mpsc::channel(1);
         let events = self.events.clone();
         let tag = self.query_tag.fetch_add(1, Ordering::SeqCst);
@@ -244,7 +245,7 @@ impl ResultSource for EndlessSource {
             let mut n = 0;
             loop {
                 n += 1;
-                if tx.send(vec![item(n)]).await.is_err() {
+                if tx.send(checked_items("test", vec![item(n)])).await.is_err() {
                     let _ = events.send(tag);
                     return;
                 }
@@ -475,7 +476,7 @@ struct FirstEndlessThenBoundedSource {
 }
 
 impl ResultSource for FirstEndlessThenBoundedSource {
-    fn start(&self, _text: QueryText) -> mpsc::Receiver<Vec<Item>> {
+    fn start(&self, _text: QueryText) -> mpsc::Receiver<CheckedItems> {
         let (tx, rx) = mpsc::channel(1);
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
@@ -483,13 +484,13 @@ impl ResultSource for FirstEndlessThenBoundedSource {
                 let mut n = 0;
                 loop {
                     n += 1;
-                    if tx.send(vec![item(n)]).await.is_err() {
+                    if tx.send(checked_items("test", vec![item(n)])).await.is_err() {
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             } else {
-                let _ = tx.send(vec![item(1), item(2)]).await;
+                let _ = tx.send(checked_items("test", vec![item(1), item(2)])).await;
                 // Dropping `tx` here (end of scope) closes the channel, which
                 // is what lets this call's exchange reach a natural QueryDone.
             }

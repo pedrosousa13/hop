@@ -340,16 +340,19 @@ pub const MAX_ITEMS_PER_PROVIDER_ANSWER: usize = 1_000;
 /// Which check an item failed, and so why assembly declined it. See
 /// [`Rejection`].
 ///
-/// Three of the five are checks [`CheckedItems::check`] runs against the
+/// Three of the six are checks [`CheckedItems::check`] runs against the
 /// item itself, and all three are about a claim the item made — its `kind`,
-/// its `provider`, or the size of one of its fields. The other two are not
+/// its `provider`, or the size of one of its fields. The other three are not
 /// about any one item's claim: [`FailedCheck::TooManyItems`] records that a
 /// provider's whole answer was over the item-count cap, decided before any
-/// item in it was individually inspected, and [`FailedCheck::PinBudget`]
-/// records an item assembly had no room to honor even though it passed
-/// every check above. Read the variant before treating a rejection as
-/// evidence that a provider lied — only [`FailedCheck::Kind`],
-/// [`FailedCheck::Provenance`] and [`FailedCheck::FieldTooLong`] are that.
+/// item in it was individually inspected; [`FailedCheck::TooManyItemsPerQuery`]
+/// is the same trade one layer up, for the daemon's whole-query cap rather
+/// than one provider's answer, and — unlike every other variant here — is
+/// never minted by `check` at all; and [`FailedCheck::PinBudget`] records an
+/// item assembly had no room to honor even though it passed every check
+/// above. Read the variant before treating a rejection as evidence that a
+/// provider lied — only [`FailedCheck::Kind`], [`FailedCheck::Provenance`]
+/// and [`FailedCheck::FieldTooLong`] are that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailedCheck {
     /// The item's `kind` is not among the producing provider's declared
@@ -415,6 +418,34 @@ pub enum FailedCheck {
         /// How many items were dropped: `output.items.len()` minus
         /// [`MAX_ITEMS_PER_PROVIDER_ANSWER`], not the answer's whole
         /// length.
+        excess: usize,
+    },
+    /// The daemon's own per-query accumulator (`hopd::source`) already held
+    /// [`hop_protocol::limits::MAX_ITEMS_PER_QUERY`] checked items for this
+    /// query when more arrived to be absorbed. `excess` is how many of the
+    /// newly-arrived batch did not fit — the amount past the room that was
+    /// left, not the accumulator's whole size and not
+    /// [`hop_protocol::limits::MAX_ITEMS_PER_QUERY`] itself.
+    ///
+    /// Issue #85. Unlike every other variant on this enum, never minted by
+    /// [`CheckedItems::check`] — it is minted by
+    /// [`CheckedItems::truncate_items_recording_overflow`], called once per
+    /// query at the daemon's accumulator, on items that already passed every
+    /// per-item check `check` runs and already survived (or were counted
+    /// into) a [`FailedCheck::TooManyItems`] decision at the layer below.
+    /// Follows that variant's own precedent (issue #30/#61) one layer up:
+    /// one aggregate rejection recording the excess, never one per dropped
+    /// item, the same trade the truncation itself makes — see
+    /// [`FailedCheck::TooManyItems`]'s docs for why, and issue #85's Agent
+    /// Brief for why the per-query cap gets the same treatment: overflow
+    /// must yield the surviving items plus a rejection naming what was
+    /// dropped, never a silent truncation and never a refusal of the whole
+    /// set.
+    TooManyItemsPerQuery {
+        /// How many items of the newly-arrived batch were dropped, read
+        /// after per-item checking and after the batch was absorbed into
+        /// the running total — not a count of everything the query has
+        /// received.
         excess: usize,
     },
     /// The item is flagged `append_to_end` and the **pin budget** had nothing
@@ -719,6 +750,22 @@ impl CheckedItems {
         &self.rejections
     }
 
+    /// Takes ownership of the items that passed every check, discarding
+    /// `self`'s rejections.
+    ///
+    /// For a caller that has already done everything it is going to do with
+    /// `self.rejections()` — logged them, folded them into a larger value,
+    /// or deliberately decided they are not its concern — and wants the
+    /// checked items themselves without paying [`CheckedItems::items`]'s
+    /// clone. Issue #85's `hopd::connection` is exactly that caller: a batch
+    /// arriving off [`crate::pipeline::CheckedItems`] became the connection's
+    /// own `Vec<Item>` retained set and wire payload, and the rejections
+    /// riding alongside it are not this connection's to forward — see
+    /// `hopd::connection::forward_batch`.
+    pub fn into_items(self) -> Vec<Item> {
+        self.items
+    }
+
     /// Appends `other`'s items and rejections onto the end of this value's
     /// own, both in order — the merge an accumulator needs to build the
     /// whole-query value [`Pipeline::assemble`] takes out of every
@@ -754,7 +801,59 @@ impl CheckedItems {
     /// the first place, it already recorded *why* a manifest check declined
     /// its item, and truncating it away here would misattribute that
     /// decision to this cap instead.
+    ///
+    /// This is the *items* cap, silent about what it drops — a caller that
+    /// wants the drop itself recorded, the way [`FailedCheck::TooManyItems`]
+    /// already records a provider-answer overflow, wants
+    /// [`CheckedItems::truncate_items_recording_overflow`] instead. Both
+    /// exist because they serve different callers: this one is what
+    /// `absorb`-and-cap uses inside a merge where the room already ran out
+    /// on an earlier batch (nothing new to say about *this* one), the other
+    /// is what a cap boundary itself uses, the moment room runs out.
     pub fn truncate_items(&mut self, max: usize) {
+        self.items.truncate(max);
+    }
+
+    /// Keeps at most `max` of `self`'s items, dropping the rest from the
+    /// end — the same trim [`CheckedItems::truncate_items`] performs — but
+    /// records the drop as one [`Rejection`]
+    /// ([`FailedCheck::TooManyItemsPerQuery`]) instead of leaving it
+    /// unrecorded. A no-op, and no rejection, when `self.items` already fits
+    /// within `max`.
+    ///
+    /// Issue #85's replacement for `hopd`'s old silent truncation at the
+    /// daemon's per-query cap
+    /// ([`hop_protocol::limits::MAX_ITEMS_PER_QUERY`]): overflow must yield
+    /// the surviving items plus a rejection naming what was dropped, never a
+    /// silent truncation and never a refusal of the whole set. Sampling and
+    /// cost follow [`FailedCheck::TooManyItems`]'s own precedent (issue
+    /// #30/#61) exactly: the dropped tail is never inspected item by item —
+    /// there is nothing about any one of them to reject it *for*, since
+    /// nothing here claims any one of them is individually at fault — so
+    /// this records one aggregate rejection, naming the first dropped item
+    /// as a real sample rather than a fabricated placeholder, read at the
+    /// fixed offset `max` rather than found by scanning the tail.
+    ///
+    /// `producer_id` and `claimed_provider` both read `sample.provider`
+    /// rather than a manifest, unlike [`FailedCheck::TooManyItems`]'s own
+    /// rejection: an item reaching this method is already a *checked* item
+    /// — `check` already held its `provider` field to its real producer's
+    /// manifest id — so there is no separate manifest to read the producer
+    /// from here, and none is needed; the field is already trustworthy.
+    pub fn truncate_items_recording_overflow(&mut self, max: usize) {
+        if self.items.len() <= max {
+            return;
+        }
+        let sample = &self.items[max];
+        self.rejections.push(Rejection {
+            item_id: sample.id.clone(),
+            claimed_kind: sample.kind.clone(),
+            claimed_provider: sample.provider.clone(),
+            producer_id: sample.provider.clone(),
+            check: FailedCheck::TooManyItemsPerQuery {
+                excess: self.items.len() - max,
+            },
+        });
         self.items.truncate(max);
     }
 }
@@ -1057,6 +1156,47 @@ impl Pipeline {
             rejections,
         }
     }
+
+    /// Runs the same nine-step contract as [`Pipeline::assemble`], but
+    /// returns the result as a [`CheckedItems`] rather than a plain
+    /// [`Assembly`].
+    ///
+    /// Issue #85's seam: `hopd`'s `ResultSource` trait carries `CheckedItems`
+    /// on its query-start channel rather than a bare `Vec<Item>`, precisely
+    /// so an implementation cannot hand the daemon items that bypassed
+    /// [`CheckedItems::check`] — see that trait's docs. `Assembly::items` is
+    /// exactly as trustworthy as what this returns: ranking only reorders,
+    /// filters and truncates the `checked` items handed in, it never
+    /// fabricates one, so every item leaving `assemble` already passed
+    /// `check`. But `Assembly`'s fields are public, which is right for
+    /// `Assembly` — nothing about it claims to be a checked-items seam — and
+    /// wrong for a value a caller outside this crate is going to treat as
+    /// proof of having gone through the check: public fields would let that
+    /// caller build a fake `Assembly` and hand it to `CheckedItems`-shaped
+    /// code with nothing checked at all.
+    ///
+    /// So this rebuilds a genuine [`CheckedItems`] instead, via the private
+    /// struct literal `CheckedItems { items, rejections }` — legitimate here
+    /// for the same reason [`CheckedItems::check`] itself is the only *other*
+    /// mint point: both are defined in this module, so both may reach
+    /// `CheckedItems`'s private fields directly, and neither is reachable
+    /// from outside it. This is not a second, looser way to build a
+    /// `CheckedItems` from arbitrary items — the only items this function
+    /// ever places in the struct literal are ones `assemble` derived from an
+    /// already-`CheckedItems` `checked` argument, never anything supplied
+    /// some other way.
+    pub fn assemble_checked(
+        &mut self,
+        raw_query: &str,
+        checked: CheckedItems,
+        max_results: usize,
+    ) -> CheckedItems {
+        let assembly = self.assemble(raw_query, checked, max_results);
+        CheckedItems {
+            items: assembly.items,
+            rejections: assembly.rejections,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1174,6 +1314,48 @@ mod tests {
             append_to_end: true,
             ..item(kind, id, title)
         }
+    }
+
+    // --- Issue #85: `assemble_checked` must answer exactly what `assemble`
+    // does, just packaged as a `CheckedItems` instead of an `Assembly`. ---
+
+    #[test]
+    fn assemble_checked_returns_the_same_items_and_rejections_as_assemble() {
+        // A pin-budget rejection alongside ordinary ranked items, so this
+        // exercises both halves of `Assembly` — not just the happy-path
+        // items a test could satisfy by accident even if `rejections` were
+        // dropped on the way into the rebuilt `CheckedItems`.
+        let items = vec![
+            item(Kind::App, "app:a", "Alpha"),
+            pinned(Kind::App, "app:b", "Bravo"),
+            pinned(Kind::App, "app:c", "Charlie"),
+            pinned(Kind::App, "app:d", "Delta"),
+            pinned(Kind::App, "app:e", "Echo"),
+        ];
+
+        let mut for_assemble = Pipeline::default();
+        let assembly = for_assemble.assemble("", checked(items.clone()), 10);
+
+        let mut for_assemble_checked = Pipeline::default();
+        let result = for_assemble_checked.assemble_checked("", checked(items), 10);
+
+        assert_eq!(
+            ids(result.items()),
+            ids(&assembly.items),
+            "assemble_checked's items must match assemble's, item for item"
+        );
+        assert_eq!(
+            result.rejections(),
+            assembly.rejections.as_slice(),
+            "assemble_checked's rejections must match assemble's too — \
+             including the pin-budget rejection assemble mints itself, not \
+             just the ones checked() already carried in"
+        );
+        assert!(
+            !result.rejections().is_empty(),
+            "sanity: MAX_PINNED_ITEMS_PER_QUERY is smaller than four pins, \
+             so this test actually exercises a rejection assemble mints"
+        );
     }
 
     // --- Named directly in the brief. ---
@@ -2564,6 +2746,124 @@ mod tests {
             3,
             "truncating items must not touch rejections, even when there are \
              more of them than the item cap"
+        );
+    }
+
+    // --- Issue #85: the daemon's per-query cap gets the same "excess
+    // recorded" treatment `truncate_items` deliberately withholds above —
+    // `truncate_items_recording_overflow` is the method that does it, and
+    // `FailedCheck::TooManyItemsPerQuery` is what it records. Mirrors Task 2
+    // (issue #61/#30) below, one layer up: that cap is one provider's
+    // answer, checked inside `CheckedItems::check`; this one is the whole
+    // query's accumulator, checked by `hopd::source` outside `check`
+    // entirely. ---
+
+    /// The counterpart to `truncate_items_keeps_the_first_n_and_leaves_rejections_alone`
+    /// above: same trim, but this method's whole reason to exist is to stop
+    /// leaving the drop unrecorded. A cap of 3 against 5 well-formed items —
+    /// deliberately starting from zero rejections (the `checked` helper
+    /// asserts that), so the one rejection this produces is demonstrably
+    /// this method's own, not a leftover from `check`.
+    #[test]
+    fn truncate_items_recording_overflow_keeps_the_first_n_and_records_one_rejection() {
+        let mut checked = checked(many_items(5));
+
+        checked.truncate_items_recording_overflow(3);
+
+        assert_eq!(
+            ids(checked.items()),
+            vec!["app:0", "app:1", "app:2"],
+            "keeps the first n, exactly like truncate_items"
+        );
+        assert_eq!(
+            checked.rejections().len(),
+            1,
+            "the whole excess is one aggregate rejection, not one per \
+             dropped item — the same trade FailedCheck::TooManyItems makes"
+        );
+        assert_eq!(
+            checked.rejections()[0].check,
+            FailedCheck::TooManyItemsPerQuery { excess: 2 },
+            "two of the five items did not fit"
+        );
+        assert_eq!(
+            checked.rejections()[0].item_id.as_str(),
+            "app:3",
+            "the rejection samples the first dropped item, read at the cap \
+             offset rather than found by scanning"
+        );
+        assert_eq!(
+            checked.rejections()[0].producer_id,
+            "test",
+            "an item this method drops was already checked, so its own \
+             provider field is already its real producer"
+        );
+    }
+
+    /// A cap the input already fits inside must change nothing: no items
+    /// dropped, so nothing to record — the same "no-op within the cap"
+    /// shape `truncate_items` itself has, just paired with the added
+    /// "and no rejection either" half this method owes.
+    #[test]
+    fn truncate_items_recording_overflow_is_a_no_op_within_the_cap() {
+        let mut checked = checked(many_items(3));
+
+        checked.truncate_items_recording_overflow(5);
+
+        assert_eq!(checked.items().len(), 3, "nothing was over the cap");
+        assert!(
+            checked.rejections().is_empty(),
+            "nothing was dropped, so nothing should be recorded"
+        );
+    }
+
+    /// Truncating an input that already carries a rejection from `check`
+    /// must append to that list, not replace it — the same "both survive"
+    /// property `absorb` already proves for merging two checked values,
+    /// exercised here for one value trimmed in place instead.
+    #[test]
+    fn truncate_items_recording_overflow_appends_to_existing_rejections() {
+        let mut checked = CheckedItems::check(vec![output(
+            "test",
+            vec![Kind::App],
+            vec![
+                item(Kind::App, "app:a", "Alpha"),
+                // Window is not among this producer's declared kinds — one
+                // rejection already present before the cap is ever applied.
+                item(Kind::Window, "window:bad", "Bad"),
+                item(Kind::App, "app:b", "Bravo"),
+                item(Kind::App, "app:c", "Charlie"),
+            ],
+        )]);
+        assert_eq!(
+            checked.rejections().len(),
+            1,
+            "sanity: one rejection going in"
+        );
+
+        checked.truncate_items_recording_overflow(2);
+
+        assert_eq!(
+            ids(checked.items()),
+            vec!["app:a", "app:b"],
+            "the cap counts only the items that passed check — the rejected \
+             window item was never a candidate for it"
+        );
+        assert_eq!(
+            checked.rejections().len(),
+            2,
+            "the pre-existing manifest-check rejection and the new \
+             overflow rejection must both survive"
+        );
+        assert_eq!(
+            checked.rejections()[0].check,
+            FailedCheck::Kind,
+            "the earlier rejection keeps its place, first"
+        );
+        assert_eq!(
+            checked.rejections()[1].check,
+            FailedCheck::TooManyItemsPerQuery { excess: 1 },
+            "the new one is appended after it"
         );
     }
 

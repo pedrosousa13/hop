@@ -44,39 +44,54 @@ use tokio::sync::{Mutex, mpsc};
 ///
 /// # What an implementation owes the daemon
 ///
-/// Four obligations, none of which this seam checks. [`HostSource`] is the
-/// first implementation with enough surface to break any of them, and here is
-/// where it actually stands against each — read this rather than assume
-/// landing issue #56 settled all of them, because it did not.
+/// Four obligations. Issue #85 promoted the first of them — the per-item
+/// field-bound check — from prose to a contract the type system enforces;
+/// the other three remain obligations this seam does not check, and
+/// [`HostSource`] is the first implementation with enough surface to break
+/// any of them. Read this rather than assume landing issue #56 settled all
+/// of them, because it did not.
 ///
-/// **Items must respect `hop_protocol::limits`' per-item field bounds.**
-/// [`Item`]'s action fields are public, and those bounds are applied where an
-/// item is *parsed*, so an item handed back through this trait has passed
-/// nothing merely by virtue of implementing it. `ItemTitle` and
+/// **Items must respect `hop_protocol::limits`' per-item field bounds — and,
+/// as of issue #85, this is no longer prose asking an implementation to
+/// remember it.** [`Item`]'s action fields are public, and those bounds are
+/// applied where an item is *parsed*, so an `Item` built in-process carries
+/// no proof of its own that it ever crossed that check. `ItemTitle` and
 /// `ItemSubtitle` enforce their own bounds and single-line content rule on
-/// every construction path. The daemon bounds its retained set by
-/// item *count*
+/// every construction path regardless of origin, but an item's `actions` —
+/// their count, and each label's length — are plain `String`s and `Vec`s
+/// with nothing enforcing either outside the parse. The daemon bounds its
+/// retained set by item *count*
 /// ([`MAX_ITEMS_PER_QUERY`](hop_protocol::limits::MAX_ITEMS_PER_QUERY)), and
 /// the byte figure that count is justified against is the count multiplied by
 /// those per-item bounds — so a source producing a 100 MB action label makes
-/// that arithmetic, and the bound it justifies, meaningless. The only thing below
-/// it is
+/// that arithmetic, and the bound it justifies, meaningless. The only thing
+/// below it is
 /// [`MAX_FRAME_BYTES`](hop_protocol::limits::MAX_FRAME_BYTES) at encode time,
 /// which surfaces as an `io::Error` that kills the connection with no error
 /// frame — a worse outcome than refusing the item would have been.
-/// [`HostSource`] closes this gap for the field-length half, as of issue
-/// #61: `ProviderHost::run_one`'s per-provider turn now calls
-/// [`CheckedItems::check`], which rejects an item whose action label or action
-/// count is over the same bound this module already applies at the parse (see
-/// [`FailedCheck::FieldTooLong`]) — a provider that returns an oversized
-/// action field is refused before it ever reaches this trait's channel. This is
-/// still a property of [`HostSource`] specifically, not a guarantee this
-/// *trait*'s contract makes: it holds because [`HostSource`] happens to
+///
+/// [`start`](Self::start) closes this gap by construction rather than by
+/// convention: the channel it returns carries
+/// [`CheckedItems`], not a bare
+/// `Vec<Item>`, and that type's only constructors are
+/// [`CheckedItems::check`] and the combinators
+/// ([`CheckedItems::absorb`], [`CheckedItems::truncate_items`],
+/// [`CheckedItems::truncate_items_recording_overflow`]) that only ever
+/// recombine values `check` already produced. There is no way to build a
+/// `CheckedItems` holding an item whose action label or action count is over
+/// [`FailedCheck::FieldTooLong`]'s bound — the compiler refuses an
+/// implementation that tries, the same way it refuses one that tries to
+/// construct [`hop_core::pipeline::CheckedItems`]'s private fields directly.
+/// Before this issue, this held only because [`HostSource`] happened to
 /// route every provider's answer through [`CheckedItems::check`] before
-/// sending, not because implementing [`ResultSource`] requires it. A
-/// hypothetical future implementation that hands back items some other way —
-/// bypassing that check — would reach this trait exactly as unchecked as
-/// this paragraph used to describe for every implementation.
+/// sending; a hypothetical implementation that built its own `Vec<Item>` and
+/// handed it back some other way reached this trait exactly as unchecked as
+/// every other one. That escape no longer typechecks: an implementation can
+/// still hand back a *forged* item — the wrong `kind`, the wrong `provider`
+/// — nothing here catches a lie about content, only a bound. But it cannot
+/// hand back one whose action fields were never measured against the bound
+/// at all, because there is no route to this trait's channel that does not
+/// pass through the check that measures them.
 ///
 /// **What a source buffers is daemon memory the cap does not see.** The
 /// receiver returned here lives inside the connection's exchange for the life
@@ -93,11 +108,13 @@ use tokio::sync::{Mutex, mpsc};
 /// [`MAX_ITEMS_PER_PROVIDER_ANSWER`](hop_core::pipeline::MAX_ITEMS_PER_PROVIDER_ANSWER)
 /// (1 000 items) before anything is sent. So one `send` here can now park at
 /// most 1 000 items, not "however many a provider sent" — issue #30's gap,
-/// closed at the seam upstream of this trait rather than inside it. Nothing
-/// about *this* trait's contract enforces the cap, the same caveat the
-/// paragraph above ends on: it holds because [`HostSource`] happens to route
-/// through [`CheckedItems::check`], not because implementing [`ResultSource`]
-/// requires it.
+/// closed at the seam upstream of this trait rather than inside it. This
+/// half remains a property of [`HostSource`] specifically, not a guarantee
+/// the *trait*'s contract makes — unlike the field-bound obligation above,
+/// nothing about this trait's channel type stops an implementation from
+/// opening a deeper channel or sending an oversized batch; the source-side
+/// buffering obligation is related and still open (issue #85 is explicit
+/// that it is out of that issue's scope).
 ///
 /// **`send` points must be frequent enough for cancellation to be prompt.**
 /// The channel is the cancellation mechanism (see the module docs), and a
@@ -136,7 +153,21 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
     /// done; dropping the receiver cancels the work — subject to the
     /// obligations on this trait, which say what "cancels" costs an
     /// implementation that never sends.
-    fn start(&self, text: QueryText) -> mpsc::Receiver<Vec<Item>>;
+    ///
+    /// The channel carries [`CheckedItems`], not `Vec<Item>` — issue #85's
+    /// enforcement of this trait's per-item field-bound obligation (see this
+    /// trait's own docs, above). Building a `CheckedItems` with an item that
+    /// never crossed [`CheckedItems::check`] does not typecheck, so an
+    /// implementation reaches this return type only by constructing one for
+    /// real: call `check` over what a provider (or a test's own fixture)
+    /// returned, or combine values that already went through it
+    /// ([`CheckedItems::absorb`], [`CheckedItems::truncate_items`],
+    /// [`CheckedItems::truncate_items_recording_overflow`]). A source with
+    /// no `hop-core` [`Provider`] behind it — every scripted or test source
+    /// in this crate — still owes the check; see [`HostSource::start`]'s own
+    /// implementation for the production path, and any test source in this
+    /// crate for the pattern a fixture-driven one uses instead.
+    fn start(&self, text: QueryText) -> mpsc::Receiver<CheckedItems>;
 
     /// Executes `action_id` on `item_id`, which the connection has already
     /// resolved against the items `provider` produced in a prior `start`.
@@ -374,16 +405,54 @@ impl HostSource {
     }
 }
 
+/// Applies `cap` to `accumulated`'s running total before absorbing
+/// `checked`'s newly-arrived items into it, and reports whether doing so
+/// left the accumulator completely full.
+///
+/// Split out of [`HostSource::start`]'s accumulator loop as its own function
+/// so this cap-and-record step — the daemon's half of issue #85's ruling on
+/// overflow — is unit-testable directly, against plain [`CheckedItems`]
+/// values, without a [`ProviderHost`] or a `tokio` runtime behind it. See
+/// the tests below for exactly that.
+///
+/// `cap` bounds `accumulated.items().len()` after this call returns, never
+/// before: the newly-arrived `checked` is truncated to whatever room was
+/// left, not `accumulated` itself, so an item this daemon already delivered
+/// under an earlier arrival is never retroactively dropped — only ever an
+/// item from the batch that pushed the total over. Truncating with
+/// [`CheckedItems::truncate_items_recording_overflow`] rather than
+/// [`CheckedItems::truncate_items`] is issue #85's whole point here: the
+/// items that fit are kept exactly as before, but what did not fit is now
+/// named by a [`Rejection`] ([`FailedCheck::TooManyItemsPerQuery`]) riding
+/// along inside `accumulated` after `absorb`, never a silent truncation and
+/// never a refusal of the whole set.
+///
+/// Returns `true` when `checked`'s own length reached or passed the room
+/// that was left, `accumulated`'s cap included — filling the room exactly
+/// is still reported as capped even though nothing was dropped and no
+/// rejection was recorded, because an accumulator with no room left has
+/// nothing to give a later arrival: ending the query now is the same answer
+/// [`HostSource::start`]'s caller would reach one arrival later, at the cost
+/// of a round trip this saves.
+fn absorb_capped(accumulated: &mut CheckedItems, mut checked: CheckedItems, cap: usize) -> bool {
+    let room = cap.saturating_sub(accumulated.items().len());
+    let capped = checked.items().len() >= room;
+    if capped {
+        checked.truncate_items_recording_overflow(room);
+    }
+    accumulated.absorb(checked);
+    capped
+}
+
 impl ResultSource for HostSource {
-    fn start(&self, text: QueryText) -> mpsc::Receiver<Vec<Item>> {
+    fn start(&self, text: QueryText) -> mpsc::Receiver<CheckedItems> {
         // Two channels, each capacity 1 for the reason this trait's docs
         // give: what a source buffers is daemon memory the retained-set cap
         // does not see, so a deeper channel would only let providers park
-        // items the cap never counts. `ProviderHost::spawn_query` speaks
-        // `CheckedItems` — the only route to `Pipeline::assemble`, which
-        // nothing downstream of the host can build one of any other way —
-        // while this trait still promises a bare `Vec<Item>`, so the
-        // accumulator task below is what turns one into the other.
+        // items the cap never counts. Both now speak `CheckedItems` — issue
+        // #85 made this trait's own channel carry it too, so the accumulator
+        // task below no longer has to unwrap `ProviderHost::spawn_query`'s
+        // `CheckedItems` down to a bare `Vec<Item>` before it can send.
         let (host_tx, mut host_rx) = mpsc::channel(1);
         let (tx, rx) = mpsc::channel(1);
 
@@ -428,37 +497,35 @@ impl ResultSource for HostSource {
         tokio::spawn(async move {
             let mut accumulated = CheckedItems::check(Vec::new());
 
-            while let Some(mut checked) = host_rx.recv().await {
-                // `MAX_ITEMS_PER_QUERY` bounds what this task accumulates,
-                // not what any one frame carries — `MAX_RESULTS` already
-                // bounds that far lower. Filling the room exactly is still a
-                // cap: an accumulator with no room left has nothing to give a
-                // later batch, so ending the query now is the same answer
-                // arrived at one batch later, and it costs the client one
-                // fewer round trip to learn it.
-                let room = MAX_ITEMS_PER_QUERY.saturating_sub(accumulated.items().len());
-                let capped = checked.items().len() >= room;
-                if capped {
-                    checked.truncate_items(room);
-                }
-                accumulated.absorb(checked);
+            while let Some(checked) = host_rx.recv().await {
+                let capped = absorb_capped(&mut accumulated, checked, MAX_ITEMS_PER_QUERY);
 
-                // Locked only across `assemble` itself, never across the
-                // `send` below — `assemble` is synchronous, so holding the
+                // Locked only across `assemble_checked` itself, never across
+                // the `send` below — assembly is synchronous, so holding the
                 // guard past it would block every other query sharing this
                 // `Pipeline` for the length of an `.await` for no reason.
-                let assembly = {
+                let checked_assembly = {
                     let mut pipeline = pipeline.lock().await;
-                    pipeline.assemble(text.as_str(), accumulated.clone(), max_results)
+                    pipeline.assemble_checked(text.as_str(), accumulated.clone(), max_results)
                 };
-                // `Assembly::rejections` is discarded here: the host already
-                // logged the manifest-check half of it through its own log
-                // seam before this task ever saw the item
-                // (`ProviderHost::run_one`), and the pin-budget half —
-                // mintable only inside `assemble` — stays unlogged, as it is
-                // today (out of scope; see the design plan's Scope section).
+                // `checked_assembly`'s rejections travel out with it now
+                // (issue #85), rather than being discarded here the way the
+                // old `Assembly::rejections` was: `absorb_capped` folded in
+                // one `FailedCheck::TooManyItemsPerQuery` rejection whenever
+                // this arrival overflowed the per-query cap, and
+                // `assemble_checked` carries that straight through alongside
+                // anything `Pipeline::assemble`'s own pin-budget step minted.
+                // Nothing downstream of this `send` reads them yet — the
+                // host already logged the manifest-check half through its
+                // own log seam before this task ever saw the item
+                // (`ProviderHost::run_one`), and the pin-budget half stays
+                // unlogged, as it was before this issue (out of scope; see
+                // the design plan's Scope section) — but they are no longer
+                // thrown away either: a caller of this channel (a test, or a
+                // future log seam) can read `checked_assembly.rejections()`
+                // for itself.
 
-                if tx.send(assembly.items).await.is_err() {
+                if tx.send(checked_assembly).await.is_err() {
                     return;
                 }
 
@@ -630,6 +697,17 @@ fn rejection_summary_line(provider: &str, rejections: &[Rejection]) -> String {
                  only ever carries CheckedItems::check's own rejections — \
                  check() never produces PinBudget"
             ),
+            // Same reasoning as the `PinBudget` arm above, for the same
+            // reason: `TooManyItemsPerQuery` (issue #85) is minted by
+            // `CheckedItems::truncate_items_recording_overflow`, called only
+            // by this module's own per-query accumulator
+            // (`HostSource::start`) — never by `check()` itself, and so
+            // never by anything `ProviderEvent::Rejected` can carry.
+            FailedCheck::TooManyItemsPerQuery { .. } => unreachable!(
+                "a TooManyItemsPerQuery rejection reached ProviderEvent::Rejected, \
+                 which only ever carries CheckedItems::check's own rejections — \
+                 check() never produces TooManyItemsPerQuery"
+            ),
         }
     }
 
@@ -762,8 +840,8 @@ mod tests {
 
         let mut rx = source.start(QueryText::new("walking skeleton").unwrap());
         let batch = rx.recv().await.expect("one batch must arrive");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].title.as_str(), "Hello from hopd");
+        assert_eq!(batch.items().len(), 1);
+        assert_eq!(batch.items()[0].title.as_str(), "Hello from hopd");
         assert!(
             rx.recv().await.is_none(),
             "the channel closes once the one provider has finished"
@@ -1092,7 +1170,7 @@ mod tests {
             .recv()
             .await
             .expect("the fast provider's arrival must send a frame");
-        let first_ids: Vec<&str> = first.iter().map(|i| i.id.as_str()).collect();
+        let first_ids: Vec<&str> = first.items().iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
             first_ids,
             vec!["fast:item"],
@@ -1104,7 +1182,7 @@ mod tests {
             .recv()
             .await
             .expect("the slow provider's arrival must send a second frame");
-        let mut second_ids: Vec<&str> = second.iter().map(|i| i.id.as_str()).collect();
+        let mut second_ids: Vec<&str> = second.items().iter().map(|i| i.id.as_str()).collect();
         second_ids.sort_unstable();
         assert_eq!(
             second_ids,
@@ -1157,8 +1235,8 @@ mod tests {
                  provider — a gate on the slowest provider would time out here",
             )
             .expect("a frame must arrive");
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].id, ItemId::new("fast2:item").unwrap());
+        assert_eq!(first.items().len(), 1);
+        assert_eq!(first.items()[0].id, ItemId::new("fast2:item").unwrap());
     }
 
     #[tokio::test]
@@ -1240,12 +1318,16 @@ mod tests {
             .expect("the high provider's arrival must send a second frame");
 
         assert_eq!(
-            second.len(),
+            second.items().len(),
             MAX_RESULTS,
             "the assembled frame must hold exactly MAX_RESULTS items"
         );
 
-        let mut actual: Vec<String> = second.iter().map(|i| i.id.as_str().to_string()).collect();
+        let mut actual: Vec<String> = second
+            .items()
+            .iter()
+            .map(|i| i.id.as_str().to_string())
+            .collect();
         actual.sort_unstable();
         let mut expected: Vec<String> = (0..30)
             .map(|n| format!("high:{n:02}"))
@@ -1331,7 +1413,7 @@ mod tests {
             .expect("the high provider's arrival must send a frame");
 
         assert_eq!(
-            second.len(),
+            second.items().len(),
             25,
             "with_config must assemble to its configured 25 max_results, \
              not the MAX_RESULTS default of 50"
@@ -1340,57 +1422,140 @@ mod tests {
 
     #[tokio::test]
     async fn the_accumulator_caps_at_max_items_per_query_and_ends_the_query() {
-        // `MAX_ITEMS_PER_QUERY` items of low rank weight (`Kind::File`), plus
-        // one more of much higher weight (`Kind::Window`) appended last. If
-        // the accumulator's cap did not apply to the *incoming* batch before
-        // absorbing it, that last, highest-weight item would win the
-        // assembled top `MAX_RESULTS` outright — observing its absence is
-        // what proves truncation happened, rather than trusting a length
-        // assertion `assemble`'s own `max_results` truncation would satisfy
-        // either way.
-        let mut items: Vec<Item> = (0..MAX_ITEMS_PER_QUERY)
-            .map(|n| {
-                item(
-                    Kind::File,
-                    &format!("flood:{n:04}"),
-                    &format!("file-{n:04}"),
-                    "flood",
-                )
-            })
-            .collect();
-        items.push(item(
-            Kind::Window,
-            "flood:winner",
-            "should-be-dropped",
-            "flood",
-        ));
-
-        let flood = ItemsProvider {
-            id: "flood",
-            kinds: vec![Kind::File, Kind::Window],
-            items,
-            delay: Duration::ZERO,
-            budget: Duration::from_millis(50),
+        // Five providers of low rank weight (`Kind::File`, 999 items each —
+        // `4 995` total, each individually under
+        // `MAX_ITEMS_PER_PROVIDER_ANSWER` (1 000) so none of them is
+        // truncated by `CheckedItems::check` before this accumulator ever
+        // sees it), plus one more of much higher weight (`Kind::Window`, 10
+        // items) that arrives last, once only 5 slots of room remain.
+        //
+        // A single flooding provider does not exercise this cap honestly:
+        // `MAX_ITEMS_PER_PROVIDER_ANSWER` would already truncate one
+        // provider's answer to 1 000 items before this accumulator's own
+        // `MAX_ITEMS_PER_QUERY` (5 000) cap ever got a chance to matter,
+        // proving the wrong cap. Splitting the flood across providers, each
+        // under that inner cap, is what makes this genuinely about
+        // `MAX_ITEMS_PER_QUERY`.
+        fn filler(id: &'static str) -> ItemsProvider {
+            ItemsProvider {
+                id,
+                kinds: vec![Kind::File],
+                items: (0..999)
+                    .map(|n| {
+                        item(
+                            Kind::File,
+                            &format!("{id}:{n:03}"),
+                            &format!("{id}-{n:03}"),
+                            id,
+                        )
+                    })
+                    .collect(),
+                delay: Duration::ZERO,
+                budget: Duration::from_millis(50),
+            }
+        }
+        let fillers = [
+            filler("filler0"),
+            filler("filler1"),
+            filler("filler2"),
+            filler("filler3"),
+            filler("filler4"),
+        ];
+        // Ten Window items, well under MAX_ITEMS_PER_PROVIDER_ANSWER, so
+        // none of them is truncated before the accumulator's own cap gets a
+        // chance to run. Its 50 ms delay is long enough that every filler
+        // above (delay `Duration::ZERO`) has already been absorbed by the
+        // time this arrives, leaving exactly 5 of MAX_ITEMS_PER_QUERY's room.
+        let winner = ItemsProvider {
+            id: "winner",
+            kinds: vec![Kind::Window],
+            items: (0..10)
+                .map(|n| {
+                    item(
+                        Kind::Window,
+                        &format!("win:{n:03}"),
+                        &format!("win-{n:03}"),
+                        "winner",
+                    )
+                })
+                .collect(),
+            delay: Duration::from_millis(50),
+            budget: Duration::from_millis(100),
         };
-        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
-        host.register(flood).unwrap();
+
+        let policy = HostPolicy {
+            max_budget: Duration::from_millis(200),
+            ..HostPolicy::default()
+        };
+        let mut host = ProviderHost::new(policy, Arc::new(NoopLog));
+        for filler in fillers {
+            host.register(filler).unwrap();
+        }
+        host.register(winner).unwrap();
+
+        const {
+            assert!(
+                5 * 999 < MAX_ITEMS_PER_QUERY,
+                "the five fillers alone must not already reach the cap"
+            );
+            assert!(
+                5 * 999 + 10 > MAX_ITEMS_PER_QUERY,
+                "the winner's own 10 items must be what pushes the total over"
+            );
+        }
 
         let source = HostSource::new(Arc::new(host));
         let mut rx = source.start(QueryText::new("").unwrap());
 
-        let frame = rx
+        // Five frames for the five fillers, then the capped frame for the
+        // winner's arrival — order among the fillers is not asserted, only
+        // that the winner's is last and capped.
+        let mut frame = rx
             .recv()
             .await
-            .expect("the flooding provider's arrival must still send a frame");
-        assert_eq!(frame.len(), MAX_RESULTS);
-        assert!(
-            frame
-                .iter()
-                .all(|i| i.title.as_str() != "should-be-dropped"),
-            "the item past MAX_ITEMS_PER_QUERY must be truncated away by the \
-             accumulator before assembly ever sees it, even though its \
-             Window weight would otherwise make it the single top-ranked \
-             survivor"
+            .expect("the first filler's arrival must send a frame");
+        for _ in 0..4 {
+            frame = rx
+                .recv()
+                .await
+                .expect("each filler's arrival must send its own frame");
+        }
+        let final_frame = rx
+            .recv()
+            .await
+            .expect("the winner's arrival must still send a frame");
+        let _ = frame; // every frame but the last is superseded; only the last matters below.
+
+        assert_eq!(final_frame.items().len(), MAX_RESULTS);
+        let surviving_window_ids: Vec<&str> = final_frame
+            .items()
+            .iter()
+            .filter(|i| i.kind == Kind::Window)
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(
+            surviving_window_ids,
+            vec!["win:000", "win:001", "win:002", "win:003", "win:004"],
+            "only the first 5 of the winner's 10 items fit in the 5 slots \
+             left by the fillers — the accumulator truncates the incoming \
+             batch to the room left, not by picking winners after the fact"
+        );
+
+        assert_eq!(
+            final_frame.rejections().len(),
+            1,
+            "the overflow must be recorded as exactly one rejection, not \
+             left silent and not one per dropped item"
+        );
+        assert_eq!(
+            final_frame.rejections()[0].check,
+            FailedCheck::TooManyItemsPerQuery { excess: 5 },
+            "5 of the winner's 10 items did not fit in the room left"
+        );
+        assert_eq!(
+            final_frame.rejections()[0].item_id.as_str(),
+            "win:005",
+            "the rejection samples the first item that did not fit"
         );
 
         assert!(
@@ -1426,7 +1591,7 @@ mod tests {
             .await
             .expect("the provider's arrival must still trigger a frame");
         assert!(
-            frame.is_empty(),
+            frame.items().is_empty(),
             "the term matches nothing, so the assembled frame is empty"
         );
 

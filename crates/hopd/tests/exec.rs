@@ -21,10 +21,10 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{hello, recv, send, start_daemon};
+use common::{checked_items, hello, recv, send, start_daemon};
 use hop_core::host::{HostPolicy, NoopLog, ProviderHost};
 use hop_core::learning::Learning;
-use hop_core::pipeline::Pipeline;
+use hop_core::pipeline::{CheckedItems, Pipeline};
 use hop_core::provider::{
     Provider, ProviderError, ProviderManifest, QueryCtx, plaintext_provider_ids,
 };
@@ -88,11 +88,11 @@ struct ExecSource {
 }
 
 impl ResultSource for ExecSource {
-    fn start(&self, _text: QueryText) -> mpsc::Receiver<Vec<Item>> {
+    fn start(&self, _text: QueryText) -> mpsc::Receiver<CheckedItems> {
         let (tx, rx) = mpsc::channel(1);
         let items: Vec<Item> = self.item.iter().cloned().collect();
         tokio::spawn(async move {
-            let _ = tx.send(items).await;
+            let _ = tx.send(checked_items("script", items)).await;
         });
         rx
     }
