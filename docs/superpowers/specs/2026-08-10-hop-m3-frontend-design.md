@@ -200,6 +200,10 @@ non-stock where identity demands") stays, and this is the list it was missing.
   neutral scale, not the desktop accent. §8a treats this as the
   first-in-class-versus-AI-template separator.
 
+This list is operationalized as a reviewable, per-item checklist in
+[`docs/hig-conformance-checklist.md`](../../hig-conformance-checklist.md)
+(issue #183) — walk that document against a build rather than this one.
+
 ---
 
 ## D6 — Honesty-critical UI is not themeable
@@ -298,6 +302,8 @@ Enough to cut M3 issues from, in dependency order:
 4. **Frontend: view-tree renderer with `Row` as its only node** (D2).
 5. **Frontend: mode label and consumed-marker highlight** (D3), depends on 1.
 6. **Frontend: the HIG conformance list as a reviewable checklist** (D5).
+   Landed as [`docs/hig-conformance-checklist.md`](../../hig-conformance-checklist.md)
+   (issue #183).
 7. **Daemon + clients: constrained `--socket` override** (D7). Independent;
    pick it up whenever the dev loop starts hurting.
 
