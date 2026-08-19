@@ -131,24 +131,16 @@ function) but no such script exists in this repo. Not capture-verifiable on
 its own — see 2's overall status below for why a capture of the *running
 app* does not currently prove this.
 
-**Status: unknown whether it reaches the screen, though the numbers on paper
-check out.** The ratios recorded in `tokens.css`'s comments are consistent
-with the visual design spec's own account of the 2026-08-19 pass (two
-corrected failures, one false-positive investigated and dismissed, all
-documented in place) — I did not re-derive every ratio myself, but found no
-internal inconsistency between the two documents. Separately, and more
-important for a reviewer: **no `gtk::CssProvider` is installed anywhere in
-`hop-gtk`** (`apps/hop-gtk/src` has zero hits for `CssProvider`,
-`add_provider_for_display`, or `STYLE_PROVIDER_PRIORITY` outside of comments
-describing its absence). `tokens.rs`'s own doc comment confirms `tokens.css`
-is parsed today only for a handful of structural pixel values, not loaded as
-a stylesheet. The one place a token colour is actually painted —
-`ui/mode_label.rs`, via direct Pango attributes from `tokens::MODE_LABEL_RGB`
-— bypasses the stylesheet entirely, and that file's own comment names a real
-`CssProvider` as separately-scoped future work. So: the palette is
-contrast-checked on paper; whether the running window paints with it at all
-is a separate, mostly-open question — see item 6 below, which this
-duplicates rather than restates.
+**Status: partially satisfied.** The ratios recorded in `tokens.css`'s
+comments are consistent with the visual design spec's own account of the
+2026-08-19 pass (two corrected failures, one false-positive investigated and
+dismissed, all documented in place) — I did not re-derive every ratio
+myself, but found no internal inconsistency between the two documents. That
+half is plausible, not confirmed. The other half is confirmed, not
+plausible: **no `gtk::CssProvider` is installed anywhere in `hop-gtk`**, so
+the palette does not reach the screen today — see item 6 below for the full
+account and the issue tracking it; this item shares its cause exactly and
+does not repeat the evidence.
 
 #### 2b. Screen-reader labels on rows and actions
 
@@ -375,7 +367,10 @@ background, the selection indicator's fill — and only the mode label's
 colour and typography are token-derived, by a mechanism other than the one
 the contract eventually describes. This is a real, present conformance gap
 against this item, not a hypothetical one; recording it here per this
-issue's scope, not fixing it.
+issue's scope, not fixing it. Tracked as issue #193 ("hop-gtk installs no
+`CssProvider`, so `tokens.css` never paints the window"), filed from this
+finding — item 2a and item 7 fail on this same absent provider and are not
+separate causes.
 
 ---
 
@@ -423,13 +418,13 @@ committed accent colour at all. The commitment is real and precise in
 | # | Item | Kind | Status |
 | --- | --- | --- | --- |
 | 1 | Icon language | Binding | Not yet satisfied — no icons exist to check |
-| 2a | Contrast-checked palette | Binding | Unknown whether it reaches the screen (values check out on paper) |
+| 2a | Contrast-checked palette | Binding | Partially satisfied — paper values plausible, on-screen application confirmed absent (see 6) |
 | 2b | Screen-reader labels | Binding | Not yet satisfied |
 | 2c | System font scaling | Binding | Not yet satisfied — active conflict on record |
 | 3 | Reduced motion | Binding | Not yet satisfied — no motion exists to check |
 | 4 | Full keyboard operability | Binding | Likely satisfied — not independently verified end-to-end |
 | 5 | Window model | Deliberately broken | Satisfied, verified |
-| 6 | Stock widget styling | Deliberately broken | Not yet satisfied — no stylesheet installed |
+| 6 | Stock widget styling | Deliberately broken | Not yet satisfied — no stylesheet installed (#193) |
 | 7 | Accent colour | Deliberately broken | Partially satisfied — never follows the desktop; not yet rendered |
 
 None of the above is this issue's to fix — see #183's own scope. Recorded so
