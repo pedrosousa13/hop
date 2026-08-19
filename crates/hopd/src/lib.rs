@@ -201,6 +201,17 @@ fn pipeline_for(
 /// through the `Err(err) => eprintln!("hopd: {err}")` arm just below
 /// instead of unlinking it.
 pub fn run() -> ExitCode {
+    // Installed first, ahead of everything else `run` does: `hop-core` only
+    // *builds* the provider-panic hook (issue #104) — a library must not
+    // mutate process-global state, such as the panic hook, as a side effect
+    // of being constructed — so this is the one call that turns the
+    // guarantee on for this process. Nothing before it in `run` can panic on
+    // a provider's behalf (there is no provider host yet), so there is no
+    // earlier point that would matter, but installing it before even the
+    // config load keeps that true by construction rather than by reading
+    // the rest of this function to confirm it.
+    hop_core::host::install_provider_panic_hook();
+
     // Config is resolved first, ahead of even the runtime dir: a malformed
     // config must refuse to start the daemon before anything binds a socket
     // (issue #60 criterion 2). The error's `Display` names the config path
