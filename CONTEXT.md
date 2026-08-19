@@ -607,15 +607,19 @@ application, ranking, learning lookup, assembly. Nothing on it may touch disk,
 spawn a subprocess, or make a network call. Learning state moves to and from
 disk only on explicit `load` and `save`.
 
-**No `unsafe` in production code** — enforced rather than documented:
+**`unsafe`, declared rather than absent** — enforced rather than promised:
 `unsafe_code = "deny"` in the root `Cargo.toml`'s `[workspace.lints.rust]`,
 which each member inherits with `[lints] workspace = true`, so a new member that
 omits that line sits outside the gate. So do doc tests, which rustdoc compiles
 as crates of their own that the lint does not reach — the comment beside
 `unsafe_code` in the root `Cargo.toml` carries the detail, and it is the reason
-this rule is stated about compiled code rather than about the whole tree. In
-compiled code one exception exists: the `libc::mkfifo` call in `hop-protocol`'s
-`content.rs`, inside `#[cfg(test)] mod tests`. It carries
+this rule is stated about compiled code rather than about the whole tree. What
+the lint guarantees is not zero `unsafe`, but that every block is declared: as
+of issue #160 there are four in the tree, one of them in production code —
+`hopd::server`'s `OwnedFd::from_raw_fd`, taking ownership of a
+systemd-activated socket descriptor (issue #62) — and three test-only
+`libc::mkfifo`/`pre_exec` calls, in `hop-protocol`, `hopd::config`, and
+`hopd`'s `tests/activation.rs`. Each carries its own narrow
 `#[expect(unsafe_code)]` on the statement rather than
 `#[allow]` on the module, so a second `unsafe` beside it still fails, and the
 exception warns itself out of existence once its call goes — which CI's
