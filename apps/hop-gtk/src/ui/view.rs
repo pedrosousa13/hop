@@ -142,26 +142,49 @@ pub fn bind(stack: &gtk::Stack, node: &Node) {
             Node::Row(item) => row::bind(&widget, item),
         }
     }
+    // Unconditional rather than nested inside the `if let` above: `setup`
+    // (`build_dispatch_container`) adds a page for every name
+    // `Node::page_name` can return — both are compiled from the same
+    // `Node::ROW_PAGE` constant, see that constant's doc comment — so
+    // `child_by_name` above cannot actually miss for any `node` this
+    // function is called with. Once that invariant holds there is nothing
+    // left for this line to guard.
     stack.set_visible_child_name(page_name);
 }
 
-/// Clears whatever [`bind`] most recently populated on `stack` — the direct
-/// analogue of `ui::row`'s pre-#181 `connect_unbind`, moved here because the
-/// widget being cleared is now the dispatch container's `Row` page rather
-/// than the slot's only possible child.
+/// The dispatch point's other half: clears whatever [`bind`] most recently
+/// populated on `node`'s page of `stack`. Called from [`build`]'s
+/// `connect_unbind` handler just before the slot's `item` property is
+/// unset for good — see below for why that timing means `node` is
+/// available here at all.
 ///
-/// This reaches for `Node::ROW_PAGE` directly rather than dispatching
-/// through a `Node` value the way [`bind`] does, because GTK's `unbind`
-/// signal hands the factory no item at all — there is nothing to match on.
-/// With one node type that is not a loss: the row page is the only page
-/// there is to clear. A second node type would need `unbind` to first read
-/// `stack.visible_child_name()` (the same name [`bind`] just set) to know
-/// *which* page's teardown to run before it could route to more than one —
-/// a real decision this seam does not have to make yet, and is not making
-/// here ahead of a second variant that would require it.
-pub fn unbind(stack: &gtk::Stack) {
-    if let Some(widget) = stack.child_by_name(Node::ROW_PAGE) {
-        row::unbind(&widget);
+/// # Why this takes `&Node`, symmetrically with `bind`
+///
+/// An earlier version of this function took only `&gtk::Stack`, on the
+/// premise that GTK's `unbind` signal hands the factory no item to build a
+/// `Node` from. That premise was checked directly against GTK's own
+/// documentation for `SignalListItemFactory::unbind`
+/// (`/usr/share/gir-1.0/Gtk-4.0.gir` on this machine) while addressing
+/// review, and it is wrong: unbind fires "when a listitem was removed from
+/// use in a list widget and its `item` is about to be unset" — *about to
+/// be*, not already gone. `list_item.item()` still returns the same item
+/// `bind` saw, at the moment `unbind` runs, exactly symmetrically with
+/// `bind`'s own `connect_bind` handler. [`build`]'s `connect_unbind`
+/// handler therefore reads it the same way `connect_bind` does and builds
+/// the same [`Node::Row`] `bind` was given for that slot.
+///
+/// That symmetry is what keeps this a real seam rather than half of one.
+/// Without it, a second node type would need new item-reading code added
+/// *inside* `build`'s `connect_unbind` closure to work out which teardown
+/// to run — a change to the factory's own structure, which acceptance
+/// criterion 3 rules out. With it, a second variant is one more match arm
+/// here, exactly like [`bind`], and the factory's own shape stays
+/// untouched either way.
+pub fn unbind(stack: &gtk::Stack, node: &Node) {
+    if let Some(widget) = stack.child_by_name(node.page_name()) {
+        match node {
+            Node::Row(_) => row::unbind(&widget),
+        }
     }
 }
 
@@ -209,13 +232,21 @@ pub fn build() -> gtk::SignalListItemFactory {
         let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
             return;
         };
+        // Still set here — see `unbind`'s own doc comment for why GTK's
+        // `unbind` signal fires before the slot's `item` property is
+        // actually cleared, not after, which is what makes reading it
+        // here (exactly as `connect_bind` above does) sound at all.
+        let Some(item_object) = list_item.item() else {
+            return;
+        };
         let Some(stack) = list_item
             .child()
             .and_then(|widget| widget.downcast::<gtk::Stack>().ok())
         else {
             return;
         };
-        unbind(&stack);
+        let item = model::item_of(&item_object);
+        unbind(&stack, &Node::Row(item));
     });
 
     factory

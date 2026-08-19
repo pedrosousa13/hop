@@ -207,7 +207,17 @@ fn run_assertions() {
         "the same recycled label must now show the second item's title"
     );
 
-    view::unbind(&stack);
+    // Pins the fix that came out of review: `unbind` takes the `&Node` it
+    // is clearing, dispatching on it exactly like `bind` does, rather than
+    // reaching for a hardcoded page name — the earlier shape assumed GTK's
+    // `unbind` signal carries no item to build a `Node` from, which
+    // `ui::view::unbind`'s doc comment now documents as having been wrong
+    // (checked against GTK's own `SignalListItemFactory::unbind`
+    // documentation). Passing `item_b` here — the item most recently
+    // bound, exactly what `list_item.item()` would still return inside a
+    // real `connect_unbind` handler at this point — is what this test can
+    // do to stand in for that handler's own call.
+    view::unbind(&stack, &Node::Row(item_b.clone()));
     assert_eq!(
         label_after_second_bind.text(),
         "",
