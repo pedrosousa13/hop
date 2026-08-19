@@ -34,11 +34,11 @@
 //!   a safe version of it. Issue #104 closes that: `CURRENT_PROVIDER_ID` is a
 //!   `tokio::task_local!` this module scopes around the provider's own
 //!   future at both spawn sites ([`ProviderHost::run_one`] and
-//!   [`ProviderHost::execute`]), and [`install_provider_panic_hook`] builds a
-//!   hook that reads it — readable because the hook runs synchronously
-//!   inside that future's own poll, so the scope is still active when it
-//!   runs — and, when it finds one, writes [`format_provider_panic`]'s
-//!   sanitized, bounded line instead of the raw payload. A panic the marker
+//!   [`ProviderHost::execute`]), and [`provider_panic_hook`] builds a hook
+//!   that reads it — readable because the hook runs synchronously inside
+//!   that future's own poll, so the scope is still active when it runs — and,
+//!   when it finds one, writes `format_provider_panic`'s sanitized, bounded
+//!   line instead of the raw payload. A panic the marker
 //!   does not recognize as a provider's — a bug in `hopd` itself, or in a
 //!   dependency — falls through to whatever hook ran before this one,
 //!   chained rather than replaced, so a first-party panic keeps its full,
@@ -1030,9 +1030,9 @@ tokio::task_local! {
 }
 
 /// Turns one panic's payload and location into the single-line, sanitized,
-/// bounded text [`install_provider_panic_hook`]'s hook writes to stderr in
-/// place of Rust's default, unbounded rendering, once it has recognized the
-/// panic as a provider's via [`CURRENT_PROVIDER_ID`].
+/// bounded text [`provider_panic_hook`]'s hook writes to stderr in place of
+/// Rust's default, unbounded rendering, once it has recognized the panic as
+/// a provider's via `CURRENT_PROVIDER_ID`.
 ///
 /// A pure function, deliberately, so it can be unit-tested without
 /// [`std::panic::set_hook`]: `std::panic::PanicHookInfo` cannot be
@@ -1040,6 +1040,15 @@ tokio::task_local! {
 /// test *can* build directly — `&dyn Any` from an ordinary value, and
 /// `Option<&Location<'_>>` from [`Location::caller`](std::panic::Location::caller),
 /// which is `pub` and callable from any `#[track_caller]` function.
+///
+/// `pub(crate)`, not `pub`: nothing outside this crate calls it directly —
+/// `hopd` only ever calls [`install_provider_panic_hook`], and the
+/// integration test that exercises the composed hook drives it through the
+/// host's own public API rather than calling this formatter by name — so the
+/// public surface issue #104 promises is exactly [`provider_panic_hook`] and
+/// [`install_provider_panic_hook`], not this helper as well. The `#[cfg(test)]`
+/// unit tests below keep access to it the same way any sibling item in this
+/// module would.
 ///
 /// # Payload handling cannot unwrap
 ///
@@ -1061,7 +1070,7 @@ tokio::task_local! {
 /// is what keeps the diagnostic useful even when the message half has been
 /// stripped down to nothing: the call site alone is often enough to find the
 /// bug in the provider's source.
-pub fn format_provider_panic(
+pub(crate) fn format_provider_panic(
     provider: &str,
     payload: &dyn std::any::Any,
     location: Option<&std::panic::Location<'_>>,
@@ -1080,45 +1089,79 @@ pub fn format_provider_panic(
     format!("provider `{provider}` panicked{location}: {message}")
 }
 
+/// Builds the panic hook that recognizes a provider's panic — via
+/// `CURRENT_PROVIDER_ID` — and writes `format_provider_panic`'s sanitized,
+/// bounded line for it, chaining to `previous` for every panic that marker
+/// does not recognize as a provider's. Does **not** install anything;
+/// [`install_provider_panic_hook`] is what calls `std::panic::set_hook` with
+/// what this returns.
+///
+/// # Why a constructor separate from the installer
+///
+/// The brief for issue #104 names both a "hook constructor" and "an explicit
+/// installer" as `hop-core`'s public surface, and it is tempting to read
+/// that as being about unit-testing the composed hook — it is not, and
+/// cannot be: `std::panic::PanicHookInfo` cannot be constructed outside
+/// `std`, so a test still cannot call what this function returns any more
+/// directly than it could reach into `install_provider_panic_hook`'s old
+/// inline closure. The real reason is composability. `hop-core` cannot know
+/// every consumer's startup order or every hook a consumer might already
+/// want underneath this one; splitting "build the hook" from "install it,
+/// once, guarded" lets a consumer that wants either of those choices under
+/// its own control — a test binary building the hook without touching the
+/// process-wide slot at all, say — make them, instead of this crate's
+/// `Once` deciding both for it. [`install_provider_panic_hook`] is the
+/// ordinary consumer of this function: `take_hook`, build via this
+/// function, `set_hook`, once.
+///
+/// # Chained, never replaced
+///
+/// `previous` runs for every panic `CURRENT_PROVIDER_ID` does not recognize
+/// as a provider's. Suppressing or reformatting it was considered and
+/// rejected: a first-party panic — a bug in `hopd` itself, or in one of its
+/// dependencies — is exactly the case this crate must not degrade, and
+/// chaining is what keeps its payload and location reaching the journal with
+/// the same fidelity as if this function had never been called.
+pub fn provider_panic_hook(
+    previous: Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>,
+) -> impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static {
+    move |info: &std::panic::PanicHookInfo<'_>| match CURRENT_PROVIDER_ID.try_with(|id| *id) {
+        Ok(provider) => eprintln!(
+            "{}",
+            format_provider_panic(provider, info.payload(), info.location())
+        ),
+        Err(_not_inside_a_provider_task) => previous(info),
+    }
+}
+
 /// Guards [`install_provider_panic_hook`] against installing itself more
 /// than once in a process. See that function's doc comment for why a second
 /// call must be a no-op rather than chaining again.
 static PROVIDER_PANIC_HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
 
-/// Installs the panic hook that recognizes a provider's panic — via
-/// [`CURRENT_PROVIDER_ID`] — and writes [`format_provider_panic`]'s
-/// sanitized, bounded line for it, in place of Rust's default hook's raw,
-/// unbounded rendering of the payload.
+/// Installs [`provider_panic_hook`]'s hook, chained onto whatever hook this
+/// process already has installed, in place of Rust's default hook's raw,
+/// unbounded rendering of a provider's panic payload.
 ///
-/// # `hop-core` builds this; only a consumer installs it
+/// # `hop-core` builds the hook; only a consumer installs it
 ///
 /// This is a library, and [`std::panic::set_hook`] mutates process-global
 /// state. Installing a hook as a side effect of constructing a
 /// [`ProviderHost`] — or of merely linking this crate — would reach every
 /// process that depends on `hop-core` for reasons that have nothing to do
-/// with running `hopd`, this crate's own test binary included. So the hook
-/// is built here, next to the task-local and the sanitizer it composes, and
-/// a consumer — `hopd::run`, in practice, once, during startup — calls this
-/// function explicitly to install it. A consumer that never calls this sees
-/// today's behavior, unsanitized panic payload and all: this module makes
-/// the guarantee available, not automatic.
-///
-/// # Chained, never replaced
-///
-/// [`std::panic::take_hook`] hands back whatever hook was installed before
-/// this call — the default hook, if nothing has run first — and the new
-/// hook falls through to it for every panic `CURRENT_PROVIDER_ID` does not
-/// recognize as a provider's. Replacing it outright was considered and
-/// rejected: a first-party panic — a bug in `hopd` itself, or in one of its
-/// dependencies — is exactly the case this crate must not degrade, and
-/// chaining is what keeps its payload and location reaching the journal with
-/// the same fidelity as if this function had never been called.
+/// with running `hopd`, this crate's own test binary included. So
+/// [`provider_panic_hook`] only builds the hook, next to the task-local and
+/// the sanitizer it composes, and a consumer — `hopd::run`, in practice,
+/// once, during startup — calls this function explicitly to install it. A
+/// consumer that never calls this sees today's behavior, unsanitized panic
+/// payload and all: this module makes the guarantee available, not
+/// automatic.
 ///
 /// # Safe to call more than once
 ///
 /// A test binary that exercises more than one [`ProviderHost`] may call this
 /// function several times in one process, and it must be safe to. Without
-/// [`PROVIDER_PANIC_HOOK_INSTALLED`] guarding the body, a second call would
+/// `PROVIDER_PANIC_HOOK_INSTALLED` guarding the body, a second call would
 /// `take_hook` *this* hook back as "previous" and wrap it a second time, so
 /// one real panic would run through the composed hook once per install
 /// rather than once per panic — a bug that stays silent, since the first
@@ -1128,15 +1171,7 @@ static PROVIDER_PANIC_HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
 pub fn install_provider_panic_hook() {
     PROVIDER_PANIC_HOOK_INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            match CURRENT_PROVIDER_ID.try_with(|id| *id) {
-                Ok(provider) => eprintln!(
-                    "{}",
-                    format_provider_panic(provider, info.payload(), info.location())
-                ),
-                Err(_not_inside_a_provider_task) => previous(info),
-            }
-        }));
+        std::panic::set_hook(Box::new(provider_panic_hook(previous)));
     });
 }
 
