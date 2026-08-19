@@ -75,6 +75,40 @@ impl Drop for DaemonProcess {
 /// unclosable risk, accepted rather than solved by inventing a seam
 /// `build_apps_provider`'s deliberately parameterless signature does not
 /// offer.
+/// Builds a `Command` for `hopd`, pinned to the same five isolated
+/// environment roots under `runtime_dir` both process-spawning helpers in
+/// this file need: `HOME`, `XDG_DATA_HOME`, `XDG_DATA_DIRS`,
+/// `XDG_CONFIG_HOME` and `XDG_STATE_HOME`, alongside `XDG_RUNTIME_DIR`
+/// itself — see [`spawn_daemon`]'s own doc comment for why each is pinned
+/// rather than left to whatever the developer or CI box running this suite
+/// happens to have set.
+///
+/// [`spawn_daemon`] and [`run_second_daemon_to_completion`] used to each
+/// build this same five-`env()` `Command` verbatim; a sixth variable added
+/// to one and not the other is exactly the drift this file's own
+/// `tests/common/mod.rs` sibling exists to prevent across files, and there
+/// is no reason to tolerate it within one. What genuinely differs between
+/// the two callers — stdio handling, and how each waits for the process —
+/// stays with each of them: only the command construction itself was ever
+/// duplicated, so only that is shared here.
+fn hopd_command(runtime_dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hopd"));
+    command
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("HOME", runtime_dir.join("isolated-home"))
+        .env("XDG_DATA_HOME", runtime_dir.join("isolated-xdg-data-home"))
+        .env("XDG_DATA_DIRS", "")
+        .env(
+            "XDG_CONFIG_HOME",
+            runtime_dir.join("isolated-xdg-config-home"),
+        )
+        .env(
+            "XDG_STATE_HOME",
+            runtime_dir.join("isolated-xdg-state-home"),
+        );
+    command
+}
+
 fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
     // `state_dir::resolve` treats a missing parent *base* directory as an
     // error — it creates only the `hop` dir inside it, not recursively — so
@@ -88,19 +122,7 @@ fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
     std::fs::create_dir_all(runtime_dir.join("isolated-xdg-state-home")).unwrap();
     std::fs::create_dir_all(runtime_dir.join("isolated-xdg-config-home")).unwrap();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_hopd"))
-        .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env("HOME", runtime_dir.join("isolated-home"))
-        .env("XDG_DATA_HOME", runtime_dir.join("isolated-xdg-data-home"))
-        .env("XDG_DATA_DIRS", "")
-        .env(
-            "XDG_CONFIG_HOME",
-            runtime_dir.join("isolated-xdg-config-home"),
-        )
-        .env(
-            "XDG_STATE_HOME",
-            runtime_dir.join("isolated-xdg-state-home"),
-        )
+    let child = hopd_command(runtime_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -135,20 +157,11 @@ fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
 /// `try_wait` at 100ms up to 50 times mirrors [`spawn_daemon`]'s own bound
 /// on the opposite wait (a socket that should appear); a refused daemon's
 /// connect probe is local and near-instant, so 5s is generous, not tight.
+/// The command itself is [`hopd_command`], shared with [`spawn_daemon`];
+/// only this wait shape — polling for exit instead of for a socket — is
+/// this helper's own.
 fn run_second_daemon_to_completion(runtime_dir: &Path) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hopd"))
-        .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env("HOME", runtime_dir.join("isolated-home"))
-        .env("XDG_DATA_HOME", runtime_dir.join("isolated-xdg-data-home"))
-        .env("XDG_DATA_DIRS", "")
-        .env(
-            "XDG_CONFIG_HOME",
-            runtime_dir.join("isolated-xdg-config-home"),
-        )
-        .env(
-            "XDG_STATE_HOME",
-            runtime_dir.join("isolated-xdg-state-home"),
-        )
+    let mut child = hopd_command(runtime_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -656,7 +669,25 @@ fn a_second_standalone_daemon_against_a_live_socket_is_refused_and_the_first_kee
 
     // A brand new client, connecting only after the second daemon's failed
     // attempt, must also reach the first daemon — not silently be routed to
-    // a second one that never actually bound anything.
+    // a second one that never actually bound anything. The inode check above
+    // already proves the listener at this path was never replaced; sending a
+    // real query here and asserting it is answered proves the further thing
+    // that check cannot: that a client reaching that unchanged listener is
+    // actually served by it, the same way the pre-existing client is checked
+    // just above, rather than a connection that completes a handshake and
+    // then goes nowhere.
     let mut new_client = UnixStream::connect(&daemon.socket_path).unwrap();
     hello(&mut new_client);
+    send(
+        &mut new_client,
+        &ClientMsg::Query {
+            id: 2,
+            text: QueryText::new("walking skeleton").unwrap(),
+        },
+    );
+    let routed = recv(&mut new_client);
+    assert!(
+        matches!(routed, DaemonMsg::QueryRouted { .. }),
+        "a brand new connection must also be answered by the original daemon, got {routed:?}"
+    );
 }

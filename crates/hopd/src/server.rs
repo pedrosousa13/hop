@@ -584,6 +584,67 @@ mod acquire_listener_tests {
         );
     }
 
+    /// #158's own pin of the brief's activation criterion ("does not unlink
+    /// or rebind the activated path"), distinct from the test just above.
+    /// That test predates #158 and only proves the runtime dir path is
+    /// never *created* by activation; it never puts anything live there, so
+    /// it cannot exercise the case #158 actually made interesting: a
+    /// runtime-dir path that already has a *live* listener on it — exactly
+    /// what the standalone branch's `probe_socket_liveness` exists to find
+    /// and refuse to disturb. Activation must never reach that probe at
+    /// all — `acquire_listener`'s `match activation` takes the `Some` arm
+    /// unconditionally and returns before `probe_socket_liveness` or
+    /// `remove_file` are ever called — so a live socket sitting at the
+    /// runtime path during activation must come out the other side
+    /// completely undisturbed, checked here the same two ways
+    /// `a_live_listener_is_refused_without_being_unlinked` checks the
+    /// standalone branch's own live-listener case: by inode, and by proving
+    /// it still accepts.
+    #[tokio::test]
+    async fn with_an_inherited_fd_a_live_socket_at_the_runtime_path_is_left_completely_alone() {
+        let backing = tempfile::tempdir().unwrap();
+        let std_listener =
+            std::os::unix::net::UnixListener::bind(backing.path().join("activated.sock")).unwrap();
+        let fd = std_listener.into_raw_fd();
+
+        // The runtime dir this activation call is handed also has a live,
+        // already-bound listener sitting at exactly the path the standalone
+        // branch would probe — and, finding it live, refuse to unlink.
+        // Nothing here ever calls `accept` on it before `acquire_listener`
+        // returns, because the point is proving the activation branch never
+        // reaches for it in the first place.
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let live_path = runtime_dir.path().join(SOCKET_FILE_NAME);
+        let live_listener = tokio::net::UnixListener::bind(&live_path).unwrap();
+        let original_inode = std::fs::metadata(&live_path).unwrap().ino();
+
+        let result = acquire_listener(runtime_dir.path(), Some(InheritedFd { fd, declared: 1 }));
+        assert!(
+            result.is_ok(),
+            "activation must succeed regardless of what sits at the runtime-dir path: {:?}",
+            result.err()
+        );
+
+        // The live socket must be untouched: same inode, and still able to
+        // accept — not merely present on disk, but actually the thing
+        // answering there, exactly as `probe_socket_liveness` would have
+        // found had the standalone branch run instead.
+        let inode_after = std::fs::metadata(&live_path).unwrap().ino();
+        assert_eq!(
+            original_inode, inode_after,
+            "activation must not unlink or rebind the live socket at the runtime-dir path"
+        );
+        let accept_task = tokio::spawn(async move { live_listener.accept().await });
+        let _client = tokio::net::UnixStream::connect(&live_path).await.unwrap();
+        let accepted = accept_task.await.unwrap();
+        assert!(
+            accepted.is_ok(),
+            "the live listener at the runtime-dir path must still accept, untouched by \
+             activation: {:?}",
+            accepted.err()
+        );
+    }
+
     #[tokio::test]
     async fn a_listener_built_from_an_inherited_fd_actually_accepts_connections() {
         let backing = tempfile::tempdir().unwrap();
