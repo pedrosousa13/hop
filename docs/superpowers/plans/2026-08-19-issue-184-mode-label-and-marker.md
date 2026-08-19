@@ -146,8 +146,18 @@ router's result; carry the new field through.
 unchanged — that is the guard for "reports, does not change". New tests for the
 span itself on a leading-marker route, a trailing-marker route, the
 alias-canonical timezone route that motivated D1, and a route that consumed
-nothing. On the wire: a round-trip, and a rejected out-of-bounds or
-mid-character range.
+nothing. On the wire: a round-trip, and a rejected out-of-bounds or inverted
+range.
+
+**Correction, made during Task 1's review.** An earlier draft of this line asked
+for a *mid-character* range to be rejected on the wire. That is unsatisfiable by
+construction, and the reason is D2's own choice: the frame carries offsets and
+not the text they index into, so character-boundary validity is a relationship
+between the span and a string that never travels with it. What the wire can and
+does check is `start <= end` and `end` within the query-text bound. The
+mid-character hazard is closed one layer down, where the text finally exists, by
+an accessor that returns nothing rather than panicking on a split. Recorded here
+so a later reader does not reopen it as a defect.
 
 ### Task 2 — the frontend
 
