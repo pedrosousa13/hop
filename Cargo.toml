@@ -43,11 +43,13 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # block declared rather than smuggled in: the lint covers normal compilation
 # of both members — `src/` and `#[cfg(test)]` code alike — so each one needs
 # its own narrow `#[expect(unsafe_code)]` at the statement to build at all.
-# As of issue #160 there are four: that one production block, plus three
+# As of issue #161 there are five: that one production block, plus four
 # test-only `libc::mkfifo`/`pre_exec` calls in `hop-protocol`, `hopd::config`,
-# and `hopd`'s `tests/activation.rs`. Each `expect` is itself the proof the
-# lint reaches where it's written: were it not firing there, the unfulfilled
-# expectation would warn, and CI's `-D warnings` would fail.
+# `hopd`'s `tests/activation.rs`, and `hopd::apps` (its own `mkfifo`, for the
+# identical FIFO-open hazard `hopd::config` closes for the config file,
+# closed here for a `.desktop` candidate). Each `expect` is itself the proof
+# the lint reaches where it's written: were it not firing there, the
+# unfulfilled expectation would warn, and CI's `-D warnings` would fail.
 #
 # What it does not cover is doc tests. Cargo hands `--deny=unsafe_code` to
 # rustdoc — visible in `cargo test -p hop-protocol --doc -v` — but rustdoc

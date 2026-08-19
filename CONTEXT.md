@@ -615,11 +615,11 @@ as crates of their own that the lint does not reach — the comment beside
 `unsafe_code` in the root `Cargo.toml` carries the detail, and it is the reason
 this rule is stated about compiled code rather than about the whole tree. What
 the lint guarantees is not zero `unsafe`, but that every block is declared: as
-of issue #160 there are four in the tree, one of them in production code —
+of issue #161 there are five in the tree, one of them in production code —
 `hopd::server`'s `OwnedFd::from_raw_fd`, taking ownership of a
-systemd-activated socket descriptor (issue #62) — and three test-only
-`libc::mkfifo`/`pre_exec` calls, in `hop-protocol`, `hopd::config`, and
-`hopd`'s `tests/activation.rs`. Each carries its own narrow
+systemd-activated socket descriptor (issue #62) — and four test-only
+`libc::mkfifo`/`pre_exec` calls, in `hop-protocol`, `hopd::config`,
+`hopd`'s `tests/activation.rs`, and `hopd::apps`. Each carries its own narrow
 `#[expect(unsafe_code)]` on the statement rather than
 `#[allow]` on the module, so a second `unsafe` beside it still fails, and the
 exception warns itself out of existence once its call goes — which CI's
