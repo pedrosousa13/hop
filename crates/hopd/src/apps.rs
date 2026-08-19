@@ -2052,6 +2052,91 @@ pub trait Launcher: Send + Sync + 'static {
 /// resolved quoting and stripped field codes at parse time. Standard streams
 /// are discarded and detached from the daemon's own terminal, if it has one;
 /// a launched app is not expected to write anything hopd should see.
+///
+/// # Reaping spawned children (#162)
+///
+/// A spawned process that exits is not gone until something reaps it — on
+/// Unix, an exited-but-unreaped child is a zombie, and it stays one until a
+/// parent calls `wait`/`waitpid` on it. Before this issue, `launch` spawned
+/// via `std::process::Command` and immediately dropped the returned `Child`
+/// by mapping it to `()`. Dropping a `std::process::Child` never waits — so
+/// a desktop entry like `Exec=/bin/true`, which exits essentially
+/// immediately, left a zombie behind on every launch, and repeated
+/// `Execute` traffic (legitimate or buggy) accumulated them without bound
+/// under a long-running daemon.
+///
+/// Two shapes were weighed:
+///
+/// - **A dedicated reaper task or thread**, owned by `SystemLauncher`,
+///   polling outstanding `std::process::Child` handles with `try_wait`.
+///   Fully explicit, and adds no new tokio feature — but it is a new
+///   component with its own lifetime that has to be started and stopped
+///   alongside the daemon (a channel or a shared list, a poll loop, a home
+///   in [`crate::server::build_host`] or [`crate::run`]), for a job the
+///   runtime this daemon already builds can do without it.
+/// - **`tokio::process::Command`** (chosen). On Unix, tokio's process
+///   driver reaps a spawned child on a best-effort basis as part of its
+///   normal park loop — no explicit `wait` call, task, or thread of ours is
+///   needed; dropping the `Child` is enough. This requires a `Handle` to a
+///   running Tokio runtime at spawn time, which [`Launcher::launch`] always
+///   has here: its only caller is [`focus_or_launch`], which
+///   [`AppsProvider::execute`] calls, which `ProviderHost::execute` always
+///   drives inside a `tokio::spawn`ed task (see that method's doc comment
+///   in `hop-core`'s `host.rs`) — so this is not a constraint callers have
+///   to remember, it is already true of the one call path that exists. It
+///   also needs no new wiring in [`crate::run`] or
+///   [`crate::server::build_host`]: [`crate::run`] already builds its
+///   runtime with `Builder::new_multi_thread().enable_all()`, and
+///   `enable_all` is what turns this reaping on (it enables the I/O driver
+///   the process driver rides on) — there is no separate component to
+///   start or stop.
+///
+/// That "best-effort... as part of its normal park loop" has a precondition
+/// worth being explicit about: tokio's process driver only drains its
+/// orphan queue from inside `Driver::park`/`park_timeout`, so reaping
+/// requires the runtime to *keep parking* after the `Child` drops, not just
+/// to have parked once in the past. A runtime that stopped being polled —
+/// shut down, or simply never driven again — would leave a dropped `Child`
+/// enqueued and unreaped indefinitely; the "no explicit wait, task, or
+/// thread of ours is needed" claim above is about steady-state operation,
+/// not a guarantee that holds regardless of whether anything keeps the
+/// runtime running. This is not a caveat hopd has to manage, though:
+/// [`crate::run`]'s runtime parks continuously for the daemon's entire
+/// life, so there is no window in normal operation where it stops polling
+/// while a child is still owed a reap. And on the one path where the
+/// runtime does stop — hopd itself exiting with an already-exited child
+/// still sitting unreaped in the orphan queue — that child is reparented to
+/// init exactly like the still-*running* orphans the section below
+/// describes, and init reaps its own children as a matter of course; this
+/// is the same "children outlive hopd" shutdown policy documented next,
+/// not a separate failure mode this precondition introduces.
+///
+/// `kill_on_drop(false)` is set explicitly rather than left at tokio's
+/// current default (also `false`) so a future tokio upgrade that changed
+/// that default could not silently start killing detached GUI apps out
+/// from under their users the moment [`focus_or_launch`] returns and this
+/// `Child` handle drops.
+///
+/// # Shutdown policy: children outlive hopd
+///
+/// What happens to a child still *running* — not yet exited — when hopd
+/// itself exits is a separate question from reaping, and this is the
+/// explicit answer: **nothing**. It is neither waited on nor signalled. On
+/// Unix, an orphaned running child is reparented to init (or a subreaper)
+/// and keeps running exactly as if it had been started with `nohup`. This
+/// is the only choice consistent with what a launcher for detached GUI
+/// applications is *for* — [`focus_or_launch`]'s whole contract is to
+/// detach an app from the request that launched it, so a browser or editor
+/// the user just opened must not be killed because hopd was restarted or
+/// crashed for a reason that has nothing to do with it. `hopd` today has no
+/// orderly shutdown sequence at all to hang a different policy off of (see
+/// [`crate::run`]'s "Shutdown" doc section); even if it grew one, killing
+/// every outstanding launched application on daemon restart would be a
+/// regression a GNOME Shell extension user restarting or updating hopd
+/// would not expect. The reaping this doc describes only ever acts on
+/// children that have *already exited* — it consumes their exit status so
+/// the process table does not accumulate zombies, and never touches one
+/// that is still running.
 pub struct SystemLauncher;
 
 impl Launcher for SystemLauncher {
@@ -2059,11 +2144,16 @@ impl Launcher for SystemLauncher {
         let [program, args @ ..] = argv else {
             return Err("desktop entry has an empty Exec= command".to_string());
         };
-        std::process::Command::new(program)
+        tokio::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            // See this struct's doc comment: explicit rather than relying
+            // on tokio's current default, and `false` because a detached
+            // app must survive this `Child` handle dropping, not be killed
+            // by it.
+            .kill_on_drop(false)
             .spawn()
             .map(|_child| ())
             .map_err(|err| format!("could not launch {program}: {err}"))
@@ -2464,6 +2554,42 @@ mod focus_or_launch_tests {
         );
     }
 
+    // --- Pinning #162's "substitutable-launcher test seam still works"
+    //     criterion ---
+
+    #[test]
+    fn focus_or_launch_dispatches_through_a_substituted_launcher_and_never_spawns_anything_real() {
+        // #162's brief lists "the substitutable-launcher test seam still
+        // works" as its own acceptance criterion, separate from the reaping
+        // behavior itself. Before this test, it was only ever satisfied
+        // implicitly — every fake-launcher test above continuing to compile
+        // and pass after SystemLauncher::launch's internals changed
+        // (std::process::Command -> tokio::process::Command). Nothing
+        // pinned it directly: a change that widened the Launcher trait or
+        // focus_or_launch's signature to require a live Tokio handle, for
+        // instance, would have broken every test in this module, but no
+        // single test's *purpose* was "prove this seam still substitutes
+        // cleanly". This one's purpose is exactly that. Asserting on the
+        // fake's recorded argv, not just that something was recorded,
+        // confirms the call actually reached the substitute intact.
+        let windows = FakeWindows::default();
+        let launcher = FakeLauncher::default();
+
+        focus_or_launch(
+            &windows,
+            &launcher,
+            "firefox",
+            &["firefox".to_string(), "--new-window".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            *launcher.launched.lock().unwrap(),
+            vec!["firefox --new-window".to_string()],
+            "focus_or_launch must dispatch through the substituted Launcher, unchanged"
+        );
+    }
+
     #[test]
     fn empty_window_source_answers_nothing_from_either_tier() {
         // Pins the M2 production default's whole contract: until the M5
@@ -2475,6 +2601,196 @@ mod focus_or_launch_tests {
         let launcher = FakeLauncher::default();
         focus_or_launch(&source, &launcher, "firefox", &["firefox".to_string()]).unwrap();
         assert_eq!(launcher.launched.lock().unwrap().len(), 1);
+    }
+}
+
+/// Tests for [`SystemLauncher`] itself that spawn real processes — the one
+/// deliberate exception to `focus_or_launch_tests`'s rule, stated on that
+/// module's own `FakeLauncher`, that no test in this file needs a real GUI
+/// application installed to run.
+///
+/// #162's acceptance criteria are about observable zombie-process behavior:
+/// quick-exit commands get reaped and don't accumulate zombies, a burst of
+/// launches doesn't leave the reaping falling behind, and a long-running
+/// launch returns without waiting for exit. None of that is something a
+/// fake `Launcher` — which never spawns anything — can produce evidence
+/// for; `zombie_child_count` below reads real state out of `/proc`, and
+/// `/proc` only has something to say about processes this test itself
+/// actually spawned. So this module spawns [`SystemLauncher`] directly
+/// instead of going through a fake.
+///
+/// That is a real exception to the file's rule in mechanism, but not in the
+/// spirit the rule is protecting: everything spawned here is coreutils —
+/// `/bin/true`, `sleep` — never a GUI application, so a machine with no
+/// desktop environment at all (exactly what `focus_or_launch_tests`'s
+/// invariant exists to keep working on) still runs this module cleanly.
+///
+/// Both zombie-counting tests below count zombies whose parent is this test
+/// binary's own pid, not some isolated subprocess — so they also see
+/// zombies left behind by *each other*, and by any other test in this
+/// binary that spawns and leaks a child. That makes the assertion stricter,
+/// not weaker: a reaping regression anywhere in this process's lifetime
+/// shows up as a nonzero count here, not just a regression local to the one
+/// test that triggered it.
+#[cfg(test)]
+mod system_launcher_reaping_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn spawn_failure_reports_the_program_name_and_the_underlying_error() {
+        // Issue #162 changes SystemLauncher's spawn call from
+        // std::process::Command to tokio::process::Command so successfully
+        // spawned children can be reaped (see SystemLauncher's doc comment).
+        // This pins that the *failure* path is untouched by that swap: the
+        // sanitized "could not launch <program>: <err>" shape is what
+        // reaches AppsProvider::execute's caller through the existing
+        // provider-failure path, unchanged.
+        let err = SystemLauncher
+            .launch(&["hop-issue-162-nonexistent-program".to_string()])
+            .unwrap_err();
+        assert!(
+            err.starts_with("could not launch hop-issue-162-nonexistent-program:"),
+            "unexpected message shape: {err}"
+        );
+    }
+
+    /// Counts `Z` (zombie) processes under `/proc` whose parent is
+    /// `parent_pid` — used only by the reaping tests below. hopd is a
+    /// Linux-only daemon (the GNOME Shell extension it replaces has no
+    /// other target), so reading `/proc` directly here is not a
+    /// test-specific compromise: it is the same evidence a real
+    /// zombie-accumulation incident (issue #162's whole premise) would be
+    /// diagnosed from.
+    ///
+    /// The two failures this function can hit are handled asymmetrically,
+    /// on purpose. `read_dir("/proc")` failing means the test has no way to
+    /// observe anything at all — silently treating that as "0 zombies", as
+    /// an earlier version of this helper did, would make both callers below
+    /// pass vacuously on any environment where `/proc` isn't readable, with
+    /// zero reaping actually verified. hopd only ever runs on Linux, so an
+    /// environment that can't read `/proc` can't run this test honestly;
+    /// panicking says so instead of reporting a false pass. A single
+    /// entry's `stat` failing to read, in contrast, is routine — the
+    /// process behind that entry can exit between the `read_dir` and this
+    /// read — so that failure stays lenient and the entry is just skipped.
+    fn zombie_child_count(parent_pid: u32) -> usize {
+        let entries = std::fs::read_dir("/proc")
+            .expect("hopd is Linux-only; a test that cannot read /proc cannot verify reaping");
+        entries
+            .flatten()
+            // Only numeric entries under /proc are processes; the rest
+            // (self, cpuinfo, ...) fail this parse and are filtered out.
+            .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
+            .filter(|entry| {
+                let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                    // Lenient on purpose, unlike the read_dir above: a
+                    // process can exit between the readdir and this read.
+                    return false;
+                };
+                // `/proc/<pid>/stat` is "pid (comm) state ppid ...". `comm`
+                // is whatever the process named itself and may itself
+                // contain spaces or parentheses, so only the text after the
+                // *last* ')' is safe to split on whitespace.
+                let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+                    return false;
+                };
+                let mut fields = after_comm.split_whitespace();
+                let state = fields.next();
+                let ppid = fields.next().and_then(|p| p.parse::<u32>().ok());
+                state == Some("Z") && ppid == Some(parent_pid)
+            })
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quick_exit_commands_are_reaped_and_leave_no_zombies() {
+        // Before #162, SystemLauncher::launch dropped the spawned
+        // std::process::Child by mapping it to `()`. On Unix, dropping a
+        // Child never waits on it, so a successfully spawned `/bin/true`
+        // (which exits essentially immediately) became a zombie owned by
+        // this process until something called wait/waitpid on it — which
+        // nothing here ever did. This launches several such commands and
+        // proves that, within a bounded drain period, none are left as
+        // zombies: the acceptance criterion "quick-exit desktop commands
+        // are reaped and do not accumulate zombies", pinned directly.
+        let launcher = SystemLauncher;
+        for _ in 0..10 {
+            launcher
+                .launch(&["/bin/true".to_string()])
+                .expect("launching /bin/true must succeed");
+        }
+
+        let own_pid = std::process::id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let zombies = zombie_child_count(own_pid);
+            if zombies == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "{zombies} zombie child(ren) of pid {own_pid} remained after the drain deadline"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stress_many_quick_exit_commands_leave_no_unreaped_child_growth() {
+        // The acceptance criterion's own stress test: repeated legitimate or
+        // buggy Execute traffic against a quick-exit desktop entry (the
+        // issue's own example) must not accumulate zombies under a
+        // long-running hopd, however many times it happens. 200 is enough
+        // to distinguish "reaps every child" from "reaps some children and
+        // falls behind" — a leak that only drops a fraction of exit statuses
+        // would still show a nonzero, and likely growing, count here.
+        let launcher = SystemLauncher;
+        for _ in 0..200 {
+            launcher
+                .launch(&["/bin/true".to_string()])
+                .expect("launching /bin/true must succeed");
+        }
+
+        let own_pid = std::process::id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let zombies = zombie_child_count(own_pid);
+            if zombies == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "{zombies} zombie child(ren) of pid {own_pid} remained after the drain deadline \
+                     — reaping is not keeping up with launch volume"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_running_commands_return_without_waiting_for_exit() {
+        // The acceptance criterion "long-running GUI commands remain
+        // launchable without blocking the connection until application
+        // exit." `sleep 2` stands in for a long-running GUI app; if `launch`
+        // ever grew a direct or indirect `child.wait()` on its own return
+        // path, this would time out waiting nearly 2 seconds instead of
+        // returning near-instantly. The spawned `sleep` is left running
+        // detached on purpose — see SystemLauncher's doc comment on why a
+        // still-running child is never waited on here.
+        let launcher = SystemLauncher;
+        let started = std::time::Instant::now();
+        launcher
+            .launch(&["sleep".to_string(), "2".to_string()])
+            .expect("launching sleep must succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "launch() must return immediately, not block until the child exits; took {elapsed:?}"
+        );
     }
 }
 
