@@ -123,6 +123,151 @@ fn spawn_daemon(hopd_path: &Path, runtime_dir: &Path) -> DaemonProcess {
     );
 }
 
+/// Like [`spawn_daemon`], but starts `hopd` with `--socket <path>` rather
+/// than letting it derive the default — issue #180's override, exercised
+/// here from the `hop` side of the wire rather than `hopd`'s own
+/// `crates/hopd/tests/socket.rs` (which already proves the daemon binds an
+/// override correctly and narrows it to 0700/0600). `socket_path` deliberately
+/// sits one level below `runtime_dir` at a name other than `hop`
+/// (`hop-dev`), the exact non-conflicting-dev-socket case design decision D2
+/// of this issue's plan is written around.
+fn spawn_daemon_with_socket(
+    hopd_path: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+) -> DaemonProcess {
+    std::fs::create_dir_all(runtime_dir.join("isolated-xdg-state-home")).unwrap();
+    std::fs::create_dir_all(runtime_dir.join("isolated-xdg-config-home")).unwrap();
+
+    let child = Command::new(hopd_path)
+        .arg("--socket")
+        .arg(socket_path)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("HOME", runtime_dir.join("isolated-home"))
+        .env("XDG_DATA_HOME", runtime_dir.join("isolated-xdg-data-home"))
+        .env("XDG_DATA_DIRS", "")
+        .env(
+            "XDG_CONFIG_HOME",
+            runtime_dir.join("isolated-xdg-config-home"),
+        )
+        .env(
+            "XDG_STATE_HOME",
+            runtime_dir.join("isolated-xdg-state-home"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn hopd with --socket");
+
+    let process = DaemonProcess {
+        child,
+        socket_path: socket_path.to_path_buf(),
+    };
+
+    for _ in 0..50 {
+        if process.socket_path.exists() {
+            return process;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    panic!(
+        "hopd socket did not appear at {:?} within 5s",
+        process.socket_path
+    );
+}
+
+/// Issue #180 criterion 2: `hop --socket <path>` connects to a daemon bound
+/// at that overridden path rather than the derived one. The flag goes
+/// *before* the subcommand (design decision D7) — `hop --socket <path>
+/// query <text>` — since anything after `query` becomes query text instead.
+#[test]
+fn the_cli_socket_flag_reaches_a_daemon_bound_there() {
+    let hopd_path = hopd_binary_path();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let socket_path = runtime_dir.path().join("hop-dev").join("hopd.sock");
+    let _daemon = spawn_daemon_with_socket(&hopd_path, runtime_dir.path(), &socket_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("--socket")
+        .arg(&socket_path)
+        .arg("query")
+        .arg("walking skeleton")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run hop --socket query");
+
+    assert!(
+        output.status.success(),
+        "hop --socket <path> query must exit 0 against a daemon bound there, got {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    let items: Vec<Item> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line must parse as an Item"))
+        .collect();
+    assert!(
+        items
+            .iter()
+            .any(|item| item.title.as_str() == "Hello from hopd"),
+        "expected the skeleton item among the results, got {stdout:?}"
+    );
+
+    // The default path was never touched by either binary: proof this ran
+    // against the override, not a daemon that happened to also be listening
+    // at the derived location.
+    assert!(
+        !runtime_dir.path().join("hop").join("hopd.sock").exists(),
+        "the default socket path must never come into existence for an override-only run"
+    );
+}
+
+/// Issue #180 criterion 3, from `hop`'s side: an override that resolves
+/// outside `$XDG_RUNTIME_DIR` is refused, naming the rule, and never falls
+/// back to the derived path. No daemon is spawned for this test — the
+/// refusal must happen before `hop` ever tries to connect.
+#[test]
+fn the_cli_socket_flag_outside_the_runtime_dir_is_refused() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside_path = elsewhere.path().join("hopd.sock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("--socket")
+        .arg(&outside_path)
+        .arg("query")
+        .arg("anything")
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run hop --socket");
+
+    assert!(
+        !output.status.success(),
+        "an out-of-runtime-dir override must be refused"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the refusal must exit with the same code Command::Usage does"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("XDG_RUNTIME_DIR"),
+        "stderr must name the rule that was broken, got: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a refused override must print nothing to stdout"
+    );
+    assert!(
+        !outside_path.exists(),
+        "a refused override must never cause a connection attempt that creates anything at the path"
+    );
+}
+
 #[test]
 fn the_cli_query_round_trips_and_exits_zero() {
     let hopd_path = hopd_binary_path();
@@ -364,6 +509,35 @@ fn the_version_subcommand_prints_both_versions() {
     assert!(
         stdout.contains(&expected),
         "stdout must contain {expected:?}, got: {stdout:?}"
+    );
+}
+
+/// Issue #180's own acceptance criterion 6: omitting `--socket` is
+/// unchanged behavior. `hop version` never opens a socket at all — it
+/// prints only compile-time constants — so it must keep working even in an
+/// environment with no `$XDG_RUNTIME_DIR`, exactly as it did before this
+/// issue. This is the regression the coordinator's review caught: an
+/// earlier version of `main.rs` resolved the socket path unconditionally
+/// before dispatching on the parsed command, which made `hop version`
+/// depend on a resolvable runtime directory it never uses.
+#[test]
+fn the_version_subcommand_works_with_no_xdg_runtime_dir_set() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("version")
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .expect("failed to run hop version");
+
+    assert!(
+        output.status.success(),
+        "hop version must succeed with no XDG_RUNTIME_DIR, got {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "stdout must still contain the CLI's own version, got: {stdout:?}"
     );
 }
 

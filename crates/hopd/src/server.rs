@@ -22,10 +22,6 @@ use crate::activation;
 use crate::connection::handle_connection;
 use crate::source::{ResultSource, SkeletonProvider, StderrLog};
 
-/// The socket's file name inside the runtime directory
-/// [`crate::runtime_dir::resolve`] returns.
-const SOCKET_FILE_NAME: &str = "hopd.sock";
-
 /// Maximum number of connections whose tasks may run at once.
 ///
 /// One permit is acquired before `accept`, so the 65th local peer waits in
@@ -60,12 +56,25 @@ pub(crate) fn build_host() -> ProviderHost {
     host
 }
 
-/// Binds `<runtime_dir>/hopd.sock` and serves connections until an error
-/// stops the accept loop or the process is killed — whichever comes first.
+/// Binds `socket_path` and serves connections until an error stops the
+/// accept loop or the process is killed — whichever comes first.
 ///
-/// `runtime_dir` is assumed already created at 0700 by
-/// [`crate::runtime_dir::resolve`]; this function does not create it, only
-/// the socket file inside it.
+/// `socket_path`'s parent directory is assumed already created at 0700 —
+/// by [`crate::runtime_dir::resolve`] on the no-override path, or by
+/// [`crate::runtime_dir::create_at_0700`] directly on the `--socket`
+/// override path (issue #180) — this function does not create it, only the
+/// socket file inside it. Before issue #180 this parameter was the runtime
+/// *directory*, and this function derived the file name itself by joining
+/// its own private `SOCKET_FILE_NAME` constant; #180 gave `hopd` a second
+/// possible socket location, so deriving the name here stopped being
+/// correct — the caller is the one that knows which path was asked for
+/// (D4 of this issue's plan), so it hands over the full path and this
+/// function binds exactly that.
+///
+/// `socket_overridden` is `true` when the caller resolved the path from a
+/// `--socket` flag rather than deriving it, and exists for exactly one
+/// reason: see "# Socket activation" below for why an inherited listener
+/// needs to know this to warn correctly.
 ///
 /// [`crate::run`] is this function's production caller: it builds a
 /// config-aware [`HostSource`](crate::source::HostSource) over
@@ -206,7 +215,7 @@ pub(crate) fn build_host() -> ProviderHost {
 /// process ([`activation::inherited_fd`]), the standalone bind above does
 /// not run at all: `acquire_listener` turns the inherited descriptor
 /// directly into a listener and never removes, binds, or `chmod`s anything
-/// at `runtime_dir`. The socket's mode is still 0600 and its directory
+/// at `socket_path`. The socket's mode is still 0600 and its directory
 /// still 0700 in this case too — carried by `contrib/systemd/hopd.socket`'s
 /// own `SocketMode=`/`DirectoryMode=` instead of by this function. See this
 /// crate's implementation plan
@@ -214,6 +223,23 @@ pub(crate) fn build_host() -> ProviderHost {
 /// Design decision 3) for why ownership of the socket file itself switches
 /// entirely to the service manager under activation, rather than this
 /// function reconciling two owners.
+///
+/// **An inherited listener wins over `--socket`, with a warning (issue
+/// #180, design decision D5).** When activation hands this process a
+/// descriptor, `socket_path` names a location nothing will bind — the
+/// listener is already open, on a file descriptor, not a path. Refusing to
+/// start outright would break a systemd unit the moment someone added the
+/// flag to it, one file changed with no code change behind it; silently
+/// ignoring the flag is exactly the failure #122 exists to end, just moved
+/// from "an argument was dropped" to "an argument was accepted and then
+/// quietly did nothing." So when `socket_overridden` is `true` and
+/// activation is in play, `acquire_listener` writes one line to stderr
+/// naming that the override is being ignored in favor of the inherited
+/// descriptor, in the same voice as the `LISTEN_FDS declared N descriptors`
+/// line just below it, and then serves on the inherited descriptor exactly
+/// as it would have with no override at all. No override at all —
+/// `socket_overridden: false` — prints nothing here: there is nothing to
+/// warn about when the flag was never given.
 ///
 /// # The integration seam
 ///
@@ -238,11 +264,12 @@ pub(crate) fn build_host() -> ProviderHost {
 /// `eprintln!("hopd: {err}")` and to the user — see
 /// [`ListenerError`]'s own doc comment.
 pub async fn serve_with<S: ResultSource>(
-    runtime_dir: &Path,
+    socket_path: &Path,
+    socket_overridden: bool,
     source: S,
 ) -> Result<(), ListenerError> {
     let activation = activation::inherited_fd(|k| std::env::var(k).ok(), std::process::id());
-    let listener = acquire_listener(runtime_dir, activation)?;
+    let listener = acquire_listener(socket_path, activation, socket_overridden)?;
 
     // The permit is acquired before every accept, so the connection cap is
     // backpressure in the listener rather than a post-accept task limit. The
@@ -389,15 +416,20 @@ fn probe_socket_liveness(socket_path: &Path) -> io::Result<SocketLiveness> {
     }
 }
 
-/// Turns either an inherited descriptor or `runtime_dir` into a working
+/// Turns either an inherited descriptor or `socket_path` into a working
 /// listener. See this crate's implementation plan
 /// (`docs/superpowers/plans/2026-08-09-issue-62-socket-activation.md`,
 /// Design decisions 1 and 3) for the full reasoning behind both branches,
-/// and `serve_with`'s "# A live listener's pathname is never replaced
-/// (#158)" doc section for the standalone branch's liveness check.
+/// `serve_with`'s "# A live listener's pathname is never replaced (#158)"
+/// doc section for the standalone branch's liveness check, and its "#
+/// Socket activation" section (issue #180, design decision D5) for why
+/// `socket_overridden` exists and what it is for: this function reads it
+/// only in the `Some` arm below, to decide whether the inherited-listener
+/// warning is worth printing.
 fn acquire_listener(
-    runtime_dir: &Path,
+    socket_path: &Path,
     activation: Option<activation::InheritedFd>,
+    socket_overridden: bool,
 ) -> Result<UnixListener, ListenerError> {
     match activation {
         Some(found) => {
@@ -406,6 +438,12 @@ fn acquire_listener(
                     "hopd: LISTEN_FDS declared {} descriptors; hopd listens on one \
                      socket, so only the first (fd {}) is used",
                     found.declared, found.fd
+                );
+            }
+            if socket_overridden {
+                eprintln!(
+                    "hopd: a socket-activated listener was inherited; the --socket override \
+                     names no listener of its own and is ignored in favor of it"
                 );
             }
 
@@ -452,21 +490,28 @@ fn acquire_listener(
             // below is new — see `serve_with`'s doc comment ("A live
             // listener's pathname is never replaced") for the stale-vs-live
             // decision and the mode/chmod reasoning that follows it.
-            let socket_path = runtime_dir.join(SOCKET_FILE_NAME);
-            match probe_socket_liveness(&socket_path)? {
+            //
+            // Issue #180: `socket_path` used to be built here by joining
+            // `SOCKET_FILE_NAME` onto a runtime *directory* this function
+            // received; it now arrives fully formed, since the caller is
+            // the one that knows whether it derived the name or resolved
+            // an override (`serve_with`'s own doc comment, D4).
+            match probe_socket_liveness(socket_path)? {
                 SocketLiveness::Live => {
-                    return Err(ListenerError::AlreadyListening { path: socket_path });
+                    return Err(ListenerError::AlreadyListening {
+                        path: socket_path.to_path_buf(),
+                    });
                 }
                 SocketLiveness::Stale | SocketLiveness::Absent => {
-                    match std::fs::remove_file(&socket_path) {
+                    match std::fs::remove_file(socket_path) {
                         Ok(()) => {}
                         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                         Err(err) => return Err(err.into()),
                     }
                 }
             }
-            let listener = UnixListener::bind(&socket_path)?;
-            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+            let listener = UnixListener::bind(socket_path)?;
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
             Ok(listener)
         }
     }
@@ -530,6 +575,8 @@ mod acquire_listener_tests {
     use std::os::fd::IntoRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    use hop_protocol::socket::SOCKET_FILE_NAME;
+
     use super::*;
     use crate::activation::InheritedFd;
 
@@ -547,7 +594,7 @@ mod acquire_listener_tests {
         let first = tokio::net::UnixListener::bind(&socket_path).unwrap();
         let original_inode = std::fs::metadata(&socket_path).unwrap().ino();
 
-        let result = acquire_listener(dir.path(), None);
+        let result = acquire_listener(&socket_path, None, false);
         let err = result.expect_err("a live listener at the path must be refused");
         assert!(
             matches!(&err, ListenerError::AlreadyListening { path } if path == &socket_path),
@@ -621,7 +668,7 @@ mod acquire_listener_tests {
             std::thread::yield_now();
         }
 
-        let listener = acquire_listener(dir.path(), None)
+        let listener = acquire_listener(&socket_path, None, false)
             .expect("a stale socket file must still be recoverable");
 
         let accept_task = tokio::spawn(async move { listener.accept().await });
@@ -637,9 +684,9 @@ mod acquire_listener_tests {
     #[tokio::test]
     async fn with_no_activation_it_binds_and_chmods_the_socket_path_exactly_as_before() {
         let dir = tempfile::tempdir().unwrap();
-        let _listener = acquire_listener(dir.path(), None).unwrap();
-
         let socket_path = dir.path().join(SOCKET_FILE_NAME);
+        let _listener = acquire_listener(&socket_path, None, false).unwrap();
+
         assert!(
             socket_path.exists(),
             "the standalone path must still bind the socket file"
@@ -666,7 +713,7 @@ mod acquire_listener_tests {
         let unrelated_dir = tempfile::tempdir().unwrap();
         let never_created = unrelated_dir.path().join("never-created-subdir");
 
-        let result = acquire_listener(&never_created, Some(InheritedFd { fd, declared: 1 }));
+        let result = acquire_listener(&never_created, Some(InheritedFd { fd, declared: 1 }), false);
         assert!(
             result.is_ok(),
             "acquire_listener must accept the inherited fd: {:?}",
@@ -675,6 +722,43 @@ mod acquire_listener_tests {
         assert!(
             !never_created.exists(),
             "activation must never create, bind inside, or otherwise touch the runtime dir path"
+        );
+    }
+
+    /// Issue #180, design decision D5: an inherited listener wins over
+    /// `--socket` unconditionally, not merely "usually" — activation must
+    /// never touch the overridden path even when `socket_overridden` is
+    /// `true`, the same guarantee the test just above pins for the
+    /// no-override case. The warning `acquire_listener` also prints in this
+    /// branch is not asserted here (this suite has no precedent for
+    /// capturing `eprintln!` output, and the behavior a caller can actually
+    /// depend on is this one: the override is ignored, not merely warned
+    /// about).
+    #[tokio::test]
+    async fn an_override_is_ignored_and_untouched_when_a_listener_is_inherited() {
+        let backing = tempfile::tempdir().unwrap();
+        let std_listener =
+            std::os::unix::net::UnixListener::bind(backing.path().join("preexisting.sock"))
+                .unwrap();
+        let fd = std_listener.into_raw_fd();
+
+        let unrelated_dir = tempfile::tempdir().unwrap();
+        let overridden_path = unrelated_dir.path().join("hop-dev").join(SOCKET_FILE_NAME);
+
+        let result = acquire_listener(
+            &overridden_path,
+            Some(InheritedFd { fd, declared: 1 }),
+            true,
+        );
+        assert!(
+            result.is_ok(),
+            "activation must succeed even though an override was also given: {:?}",
+            result.err()
+        );
+        assert!(
+            !overridden_path.exists() && !overridden_path.parent().unwrap().exists(),
+            "the overridden path — and even its would-be parent — must never be created \
+             once an inherited listener wins"
         );
     }
 
@@ -712,7 +796,7 @@ mod acquire_listener_tests {
         let live_listener = tokio::net::UnixListener::bind(&live_path).unwrap();
         let original_inode = std::fs::metadata(&live_path).unwrap().ino();
 
-        let result = acquire_listener(runtime_dir.path(), Some(InheritedFd { fd, declared: 1 }));
+        let result = acquire_listener(&live_path, Some(InheritedFd { fd, declared: 1 }), false);
         assert!(
             result.is_ok(),
             "activation must succeed regardless of what sits at the runtime-dir path: {:?}",
@@ -747,7 +831,7 @@ mod acquire_listener_tests {
         let fd = std_listener.into_raw_fd();
 
         let listener =
-            acquire_listener(backing.path(), Some(InheritedFd { fd, declared: 1 })).unwrap();
+            acquire_listener(&path, Some(InheritedFd { fd, declared: 1 }), false).unwrap();
 
         let accept_task = tokio::spawn(async move { listener.accept().await });
         let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
@@ -762,7 +846,7 @@ mod acquire_listener_tests {
 
 #[cfg(test)]
 mod systemd_unit_tests {
-    use super::*;
+    use hop_protocol::socket::SOCKET_FILE_NAME;
 
     const SOCKET_UNIT: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),

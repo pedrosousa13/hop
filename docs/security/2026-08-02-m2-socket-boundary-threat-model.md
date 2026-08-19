@@ -362,6 +362,52 @@ holds.
 Each changed passage below is marked **[Amended 2026-08-19]** in place, the
 same shape this document's other amendments already use.
 
+**Amendment, 2026-08-19.** A third amendment sharing this document's date —
+issue #180 gave `hopd`, `hop` and `hop-gtk` a `--socket <path>` override, so a
+development daemon can run alongside a session's own without the two
+colliding. Two passages change.
+
+First, "The boundary"'s opening line and its "`$XDG_RUNTIME_DIR` is an
+environment variable the user controls" bullet described the socket's
+location as fixed — `$XDG_RUNTIME_DIR/hop/hopd.sock`, with no operator
+choice in it. That stops being exactly true: an operator may now name a
+*different* path with `--socket`, most usefully a second socket
+(`$XDG_RUNTIME_DIR/hop-dev/hopd.sock` is the case the override's own design
+is written around) for a development `hopd` to bind without contending with
+a real session's daemon. What does not change is the constraint root: every
+override is resolved (`hop_protocol::socket::resolve_in`, following every
+symlink before comparing) and refused unless it lands inside
+`$XDG_RUNTIME_DIR` itself — never `$XDG_RUNTIME_DIR/hop` specifically, since
+`hop-dev` sits one level below `hop`, not inside it — so the operator gains a
+choice of *file*, not a way to point the socket somewhere `$XDG_RUNTIME_DIR`'s
+own 0700 mode does not already govern. A `..` escape, a symlink leading
+outside the root, or a root that itself does not resolve are all refused
+before a socket is ever bound, and an override that fails to resolve refuses
+outright rather than silently falling back to the derived path — the #122
+failure mode this issue was careful not to reintroduce with a second flag.
+The 0700 parent-directory and 0600 socket-file bounds "The boundary"'s other
+two bullets describe are unchanged on the override path: `hopd`'s override
+branch creates the override's own parent with the identical
+`DirBuilder::mode(0o700)` call the derived path already used
+(`runtime_dir::create_at_0700`, shared by both), and `acquire_listener`
+narrows whatever it binds to 0600 regardless of which path that is.
+
+Second, and worth stating plainly rather than leaving implicit: nothing about
+this override touches "Where peer trust comes from" above. That section's
+answer — a peer that can open the socket is fully authorized, and the only
+control is *which uid* — is a property of the directory a socket sits in and
+the mode the daemon narrows the socket file to after binding, neither of
+which `--socket` changes. An override lets an operator choose *where* inside
+`$XDG_RUNTIME_DIR` the socket lives; it does not, and structurally cannot,
+choose *who* may reach it once it is there, since `resolve_in` refuses
+anything that would land outside the one directory the whole trust boundary
+already rests on. The Actors table above is unaffected: the second row ("Any
+other process running as the same uid") describes the override path exactly
+as it describes the derived one.
+
+Each changed passage below is marked **[Amended 2026-08-19]** in place, the
+same shape this document's other amendments already use.
+
 ---
 
 ## What this is
@@ -407,6 +453,11 @@ is the contract that will travel over it.
 
 `$XDG_RUNTIME_DIR/hop/hopd.sock`, inside a directory at mode 0700 (spec §3).
 Persistent connections carrying length-prefixed JSON frames.
+**[Amended 2026-08-19]** That path is the *derived* one — issue #180 lets an
+operator override it with `--socket <path>` on all three binaries, resolved
+and refused unless it lands inside `$XDG_RUNTIME_DIR` itself. See this
+document's third 2026-08-19 amendment above for what that does and does not
+change.
 
 Neither the directory nor the socket is created by any code in the workspace
 yet. Three properties of the boundary are therefore *design intent* at this
@@ -438,6 +489,13 @@ only the "yet" above and the "should decide" below are what landed since.
   `learning.rs`'s `persist_atomically` [Amended 2026-08-10] [Amended 2026-08-18]
   about `XDG_STATE_HOME` — a path derived from user-controlled environment is
   not a path the process can reason about unaided.
+  **[Amended 2026-08-19]** Issue #180's `--socket` override is a second,
+  narrower way the same environment variable now shapes where the socket
+  ends up — narrower because `resolve_in` (`hop_protocol::socket`) checks the
+  *resolved* result against a canonicalized `$XDG_RUNTIME_DIR`, not the raw
+  override text, so the reasoning above (nothing about a user-controlled path
+  can be trusted unresolved) is exactly what the override's own constraint
+  check is built on rather than a new risk alongside it.
 
 ---
 
@@ -556,6 +614,23 @@ control is *which uid*, and there is no finer distinction available.
   bind a path neither has bound yet) and why this is a same-uid lifecycle
   and availability control rather than a change to "Where peer trust comes
   from" below.
+  **[Amended 2026-08-19]** "A path inside a directory the daemon may not have
+  created" is now, additionally, a path an *operator* may have named: #180
+  gives `hopd` a `--socket <path>` override, and its two clients
+  (`hop-cli`, `hop-gtk`) grow the matching flag alongside it. What this
+  bullet already describes —
+  the removal-before-bind sequence, the liveness probe, the 0600 narrowing —
+  applies identically to whichever path `hopd` was told to bind; `run`'s
+  override branch feeds `acquire_listener` the resolved override path in
+  place of the derived one and nothing downstream of that call can tell the
+  difference. The one thing the override branch does differently is upstream
+  of this bullet entirely: it creates the override's own parent directory at
+  0700 (`runtime_dir::create_at_0700`) instead of calling
+  `runtime_dir::resolve`, which would have created `<XDG_RUNTIME_DIR>/hop` as
+  a side effect the override never asked for — see "The boundary"'s own
+  2026-08-19 amendment for the constraint (`resolve_in`) that keeps an
+  override from landing anywhere the socket's 0700/0600 bounds do not already
+  govern.
 - **Socket activation.** systemd passes a listening descriptor the daemon did
   not create ([#62](https://github.com/pedrosousa13/hop/issues/62)). The unit
   file's socket mode becomes part of the boundary at that point.

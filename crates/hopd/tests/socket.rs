@@ -596,6 +596,130 @@ fn a_malformed_config_is_a_startup_error() {
     );
 }
 
+/// Issue #180 criterion 1 and 4, proven end to end: a `hopd` started with
+/// `--socket <path>` binds exactly that path rather than the derived one,
+/// still accepts a real client connection there, and the 0700
+/// parent-directory / 0600 socket-mode bounds hold on the override path
+/// exactly as they do on the derived one (`the_runtime_dir_is_created_at_mode_0700_and_the_socket_at_0600`,
+/// above, is that same check on the no-override path — criterion 6's
+/// "omitting the flag is unchanged behavior").
+///
+/// The override path deliberately sits one level below `runtime_dir` at a
+/// name other than `hop` (`hop-dev`, the exact case D2 of this issue's plan
+/// is written around) so this test also proves the negative half of the
+/// contract: `run`'s override branch must not call `runtime_dir::resolve`,
+/// which would create `<runtime_dir>/hop` as a side effect the override
+/// never asked for.
+#[test]
+fn an_overridden_socket_path_accepts_a_client_connection_and_is_narrowly_scoped() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(runtime_dir.path().join("isolated-xdg-state-home")).unwrap();
+    std::fs::create_dir_all(runtime_dir.path().join("isolated-xdg-config-home")).unwrap();
+
+    let socket_path = runtime_dir.path().join("hop-dev").join("hopd.sock");
+
+    let mut child = hopd_command(runtime_dir.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn hopd with --socket");
+
+    let mut appeared = false;
+    for _ in 0..50 {
+        if socket_path.exists() {
+            appeared = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !appeared {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the overridden hopd socket did not appear at {socket_path:?} within 5s");
+    }
+    // From here on, `process`'s `Drop` kills the daemon on any panic below —
+    // the same leak protection `spawn_daemon`'s own `DaemonProcess` gives
+    // the no-override tests in this file.
+    let process = DaemonProcess {
+        child,
+        socket_path: socket_path.clone(),
+    };
+
+    let mut stream = UnixStream::connect(&process.socket_path).unwrap();
+    hello(&mut stream);
+
+    let parent = socket_path.parent().unwrap();
+    let dir_mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        dir_mode, 0o700,
+        "the override's own parent directory must be born at 0700"
+    );
+
+    let socket_mode = std::fs::metadata(&socket_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        socket_mode, 0o600,
+        "the overridden socket must still be narrowed to 0600"
+    );
+
+    assert!(
+        !runtime_dir.path().join("hop").exists(),
+        "an override must not also create the default hop/ directory — that is exactly the \
+         directory runtime_dir::resolve creates, and the override branch must not call it"
+    );
+}
+
+/// Issue #180 criterion 3, at the binary boundary rather than
+/// `hop_protocol::socket::resolve_in`'s own unit tests: an override that
+/// resolves outside `$XDG_RUNTIME_DIR` must be refused by the `hopd` binary
+/// itself, through `Invocation::Usage`'s own exit code (criterion 5), and it
+/// must never silently fall back to the derived path — the #122 failure
+/// mode this whole issue exists not to reintroduce.
+#[test]
+fn a_socket_override_outside_the_runtime_dir_is_refused_and_never_falls_back() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(runtime_dir.path().join("isolated-xdg-state-home")).unwrap();
+    std::fs::create_dir_all(runtime_dir.path().join("isolated-xdg-config-home")).unwrap();
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside_path = elsewhere.path().join("hopd.sock");
+
+    let output = hopd_command(runtime_dir.path())
+        .arg("--socket")
+        .arg(&outside_path)
+        .output()
+        .expect("failed to run hopd");
+
+    assert!(
+        !output.status.success(),
+        "an out-of-runtime-dir override must be refused"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the refusal must exit with the same code Invocation::Usage does"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("XDG_RUNTIME_DIR"),
+        "stderr must name the rule that was broken, got: {stderr}"
+    );
+
+    assert!(
+        !outside_path.exists(),
+        "a refused override must never bind anywhere"
+    );
+    assert!(
+        !runtime_dir.path().join("hop").join("hopd.sock").exists(),
+        "a refused override must never silently fall back to the derived path"
+    );
+}
+
 /// Issue #158's central acceptance criterion, proven end to end with two
 /// real `hopd` processes rather than by asserting on `acquire_listener`'s
 /// return value alone: a second standalone daemon started against a

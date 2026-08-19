@@ -116,18 +116,24 @@ pub fn start_daemon<S: ResultSource>(source: S) -> TestDaemon {
         .build()
         .unwrap();
     let root = dir.path().to_path_buf();
-    // serve_with expects the runtime dir itself (hopd's runtime_dir::resolve
-    // is a binary-startup concern, not serve's); create the 0700 dir the
-    // way resolve() would.
+    // serve_with expects the socket path itself, not the runtime directory
+    // (hopd's runtime_dir::resolve, and the parent-creation issue #180 gave
+    // the `--socket` override, are both binary-startup concerns, not
+    // serve_with's own — see that function's doc comment, design decision
+    // D4); create the 0700 parent the way either startup path would.
     let runtime_dir = root.join("hop");
     std::fs::create_dir(&runtime_dir).unwrap();
     std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let serve_dir = runtime_dir.clone();
+    let socket_path = runtime_dir.join(hop_protocol::socket::SOCKET_FILE_NAME);
+    let serve_path = socket_path.clone();
     runtime.spawn(async move {
-        let _ = serve_with(&serve_dir, source).await;
+        // `false`: this harness never drives the `--socket` override, only
+        // the ordinary derived-path startup every other test here exercises
+        // — so there is nothing for the D5 inherited-listener warning to
+        // ever fire about.
+        let _ = serve_with(&serve_path, false, source).await;
     });
 
-    let socket_path = runtime_dir.join("hopd.sock");
     for _ in 0..50 {
         if socket_path.exists() {
             return TestDaemon {

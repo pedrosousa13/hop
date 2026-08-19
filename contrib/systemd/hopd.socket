@@ -4,7 +4,14 @@
 # service" section. `%t` is systemd's runtime-directory specifier — the
 # same $XDG_RUNTIME_DIR/hop that `runtime_dir::resolve()` computes, so this
 # path always matches what a standalone-started hopd would have bound
-# itself (crates/hopd/src/server.rs, SOCKET_FILE_NAME).
+# itself (crates/hopd/src/server.rs, SOCKET_FILE_NAME) — as long as that
+# standalone hopd was not given issue #180's `--socket <path>` override,
+# which binds a different path instead. A `--socket` on an activated unit's
+# ExecStart does not change what this file listens on either: an inherited,
+# socket-activated descriptor always wins over the flag, with a warning on
+# stderr rather than silence (`server.rs`'s "Socket activation" doc
+# section) — this pair is the one place a hop-dev-style override has no
+# effect at all.
 #
 # `Service=` is left unset: it defaults to the service unit with the same
 # name (hopd.service), which is what this pair uses.

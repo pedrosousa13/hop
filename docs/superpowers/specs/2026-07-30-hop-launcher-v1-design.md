@@ -1,7 +1,7 @@
 # Hop Launcher v1 — Design Spec
 
 Date: 2026-07-30
-Status: Approved; amended 2026-07-31, 2026-08-03, 2026-08-04, 2026-08-10
+Status: Approved; amended 2026-07-31, 2026-08-03, 2026-08-04, 2026-08-10, 2026-08-19
 Decisions by: Pedro Sousa
 
 **Amendment, 2026-07-31.** Amended after a grilling session over the milestone
@@ -31,6 +31,12 @@ changed: §3 (the latency contract now says what the 10 ms is measured over, and
 what it is not — decision D1). The change is marked **[Amended 2026-08-10]** in
 place. Nothing else in this document was re-opened: the grill found five of its
 eight questions already answered here, and treated them as settled.
+
+**Amendment, 2026-08-19.** Amended when issue #180 gave `hopd` and its two
+clients (`hop`, `hop-gtk`) a `--socket <path>` override. One section changed:
+the IPC protocol's socket-path bullet, which stated the path as fixed — it is
+now the *derived default*, overridable to any path that still resolves inside
+`$XDG_RUNTIME_DIR`. The change is marked **[Amended 2026-08-19]** in place.
 
 ## 1. What this is
 
@@ -95,7 +101,7 @@ Three processes at runtime, all salvage-validated as the right shape:
 
 ### IPC protocol (hop-protocol)
 
-- Unix socket `$XDG_RUNTIME_DIR/hop/hopd.sock` (0700 dir). Persistent connections, length-prefixed JSON frames (upgradeable to another encoding behind the same types).
+- Unix socket `$XDG_RUNTIME_DIR/hop/hopd.sock` (0700 dir). Persistent connections, length-prefixed JSON frames (upgradeable to another encoding behind the same types). **[Amended 2026-08-19]** That is the *derived* path — the default every process uses unless told otherwise. Issue #180 lets an operator override it with `--socket <path>` on `hopd`, `hop` and `hop-gtk` alike, resolved and refused unless the result still lands inside `$XDG_RUNTIME_DIR`; the 0700 directory / 0600 socket bounds this bullet's parenthetical names apply identically to the override.
 - Every message is a typed serde struct. `Hello { api_version }` handshake on connect; mismatch is an explicit error, never silent.
 - `Query { id, text }` → zero or more `Results { query_id, partial, items }` → terminal `QueryDone { query_id }`. **Query IDs on every frame; stale frames dropped by the client; a new query cancels the old one server-side** (tokio CancellationToken).
 - `Execute { query_id, item_id, action_id }` — Enter resolves against the item list of the *current* query id, never a stale one (fixes extension bug B3).

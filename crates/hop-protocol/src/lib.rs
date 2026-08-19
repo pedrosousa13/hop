@@ -1,4 +1,12 @@
-//! The typed IPC contract for hop: every type that crosses a process boundary.
+//! The typed IPC contract for hop: every type that crosses a process
+//! boundary. That is the crate's core and the rule for what belongs here —
+//! a type two or more of `hopd`, `hop-cli` and `hop-gtk` need to agree on
+//! the shape of, on either side of the socket. `socket` is the one module
+//! that does not fit that rule (nothing in it crosses the wire); it lives
+//! here anyway because this is the one crate all three binaries already
+//! depend on, so it is where deriving and resolving `hopd`'s socket path is
+//! shared rather than copied three times — see that module's own doc
+//! comment for the full case (issue #180).
 
 pub mod content;
 pub mod framing;
@@ -6,6 +14,7 @@ pub mod item;
 pub mod limits;
 pub mod mode;
 pub mod redaction;
+pub mod socket;
 pub mod wire;
 
 pub use content::*;

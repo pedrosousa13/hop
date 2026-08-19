@@ -137,8 +137,13 @@ impl EventReceiver {
 }
 
 /// Starts the IPC thread and returns the two channel halves the UI drives it
-/// with. `socket_path` is resolved once, by the caller — see `main.rs` for
-/// where that mirrors `hop-cli`'s own `socket_path()` (`crates/hop-cli/src/lib.rs`).
+/// with. `socket_path` is resolved once, by the caller: `app::run` calls
+/// `hop_protocol::socket::socket_path` right after `cli::parse` returns and
+/// passes the result in here already resolved — the same function `hop-cli`'s
+/// and `hopd`'s own entry points call, not a copy mirroring theirs (issue
+/// #180 promoted what used to be three separate derivations into that one
+/// shared `hop-protocol` function; see `app::run`'s own doc comment for the
+/// history).
 ///
 /// Spawning is fire-and-forget from the caller's point of view: the returned
 /// [`CommandSender`] is usable immediately, before the background thread has
