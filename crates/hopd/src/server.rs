@@ -454,17 +454,21 @@ fn acquire_listener(
             // check. That match is what makes the descriptor trustworthy:
             // it relies on a service manager honoring the same protocol
             // having already bound and listened on it, and handed over sole
-            // ownership. This is the only `unsafe` in this workspace's
-            // production code — not the only one in this crate, which also
-            // carries three test-only blocks (root `Cargo.toml`'s
-            // `[workspace.lints.rust] unsafe_code` doc comment counts five
-            // in the tree as of issue #161: this one, and four test-only
-            // `libc::mkfifo`/`pre_exec` calls, in `hop-protocol`'s
-            // `content.rs`, this crate's `config.rs`, this crate's own
-            // `tests/activation.rs`, and this crate's own `apps.rs`). See
-            // this crate's implementation plan, Design decision 1, for why
-            // this is taken directly rather than through a crate that hides
-            // the same call.
+            // ownership. This is one of two `unsafe` blocks in this
+            // workspace's production code — the other is `hop-gtk`'s
+            // `ui::window`, setting `XDG_ACTIVATION_TOKEN` immediately
+            // before the `present()` that reads it back (issue #179) — and
+            // not the only `unsafe` in this crate, which also carries three
+            // test-only blocks (root `Cargo.toml`'s
+            // `[workspace.lints.rust] unsafe_code` doc comment counts seven
+            // in the tree as of issue #182: the two production blocks
+            // above, and five test-only `libc::mkfifo`/`pre_exec` calls, in
+            // `hop-protocol`'s `content.rs`, `hop-protocol`'s own
+            // `config_file.rs` (issue #182), this crate's `config.rs`, this
+            // crate's own `tests/activation.rs`, and this crate's own
+            // `apps.rs`). See this crate's implementation plan, Design
+            // decision 1, for why this is taken directly rather than
+            // through a crate that hides the same call.
             #[expect(
                 unsafe_code,
                 reason = "sd_listen_fds(3) hands the daemon a raw fd; OwnedFd::from_raw_fd \
