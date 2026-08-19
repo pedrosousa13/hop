@@ -166,6 +166,22 @@ pub(crate) fn build_host() -> ProviderHost {
 /// outright, or it does not, and there was nothing live to unlink in the
 /// first place.
 ///
+/// **A ghost the probe can see, from `fork` rather than from a daemon.**
+/// `fork(2)` copies the whole descriptor table into the child, and the
+/// `CLOEXEC` flag Rust sets on every socket it opens closes those copies at
+/// `exec(2)` — not at `fork`. A child spawned in that window therefore holds
+/// a reference to this daemon's listener for the microseconds until it
+/// execs. If `hopd` exits inside that window, having just launched an
+/// application, its listener outlives it on the child's reference, and a
+/// replacement `hopd` starting immediately — a systemd restart, say — can
+/// probe that socket, find it answering, and refuse to start against a
+/// daemon that is already gone. The window is microseconds wide and closes
+/// itself, so a retry succeeds; it is recorded here because a refusal that
+/// names a daemon nobody can find is otherwise a deeply confusing thing to
+/// debug. Issue #172 is the same mechanism observed from the other side, in
+/// this module's own tests, where it made a deliberately-abandoned socket
+/// read as live.
+///
 /// # The socket's mode is decided, not inherited
 ///
 /// This section describes the standalone branch only — see
@@ -568,6 +584,41 @@ mod acquire_listener_tests {
         let socket_path = dir.path().join(SOCKET_FILE_NAME);
         {
             let _abandoned = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        }
+        // Dropping that listener closes this process's only descriptor for
+        // it, but that is not by itself enough to make the socket stale
+        // here, and issue #172 is what happens when a test assumes it is.
+        //
+        // `fork(2)` copies the whole descriptor table into the child, and
+        // `CLOEXEC` — which Rust sets on every socket it opens — closes the
+        // copies at `exec(2)`, not at `fork`. So for the microseconds
+        // between the two, a child spawned by *any other test in this
+        // binary* holds a reference to the listener above. Drop this
+        // process's reference inside that window and the socket object
+        // survives on the child's, which means `connect` succeeds and the
+        // probe below correctly reports a live listener at a path this test
+        // believes it has just abandoned. `apps.rs`'s launcher tests spawn
+        // real processes, so a `fork` is genuinely in flight often enough to
+        // matter: measured at roughly 1.6% of attempts against a thread
+        // spawning `/bin/true` in a loop, and 0 of 16 000 attempts with no
+        // spawning thread at all.
+        //
+        // Waiting for the window to pass is establishing this test's
+        // precondition, not retrying the thing under test. `acquire_listener`
+        // is still called exactly once, below, and still has to get it right
+        // first time. Failing here fails loudly, naming the cause, rather
+        // than letting the real assertion fail for a reason that has nothing
+        // to do with it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned listener at {} is still accepting connections long after \
+                 it was dropped — a fork/exec window (issue #172) should last microseconds, \
+                 so something else is holding this socket open",
+                socket_path.display()
+            );
+            std::thread::yield_now();
         }
 
         let listener = acquire_listener(dir.path(), None)
