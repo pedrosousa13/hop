@@ -8,7 +8,13 @@
 //! Issue #184 adds a third capture, of an exclusive route (`"=1+1"`), to the
 //! same test — its own criterion 7 asks for a headless capture covering both
 //! an exclusive and a non-exclusive route, and `"2+2"`'s existing capture
-//! already is the non-exclusive half.
+//! already is the non-exclusive half. The check on that third capture is a
+//! byte-diff against `"2+2"`'s own PNG, which proves the two captures were
+//! produced and differ — not that the mode label or marker highlight
+//! actually appear on screen, since the two captures' query text differs
+//! too and would make the bytes differ regardless. See that assertion's own
+//! comment, further down in this file, for exactly what it does and does
+//! not establish, and for where the stronger, widget-level proof lives.
 //!
 //! # Why a subprocess per screenshot rather than driving `hop_gtk::app` in-process
 //!
@@ -264,22 +270,40 @@ fn captures_the_empty_state_and_a_results_state_headless() {
         "the empty and results screenshots must not be byte-identical"
     );
 
-    // Issue #184, criterion 7: a headless capture of an *exclusive* route
-    // too, so this suite proves the mode label and marker highlight actually
-    // render somewhere, not only that the crate compiles them. `"=1+1"`
-    // routes through the `=` sigil (`hop_core::router::route`'s
-    // `Mode::Calculator` exclusive branch) rather than being inferred from
-    // shape — same deterministic, network-free calculator arithmetic as
-    // `"2+2"` above, but this time `exclusive: true` and a real
-    // `marker_span` over the leading `=`, so both of this issue's signals
-    // are on screen in this one capture.
+    // Issue #184, criterion 7: a headless capture of an *exclusive* route,
+    // alongside the non-exclusive `"2+2"` one above — criterion 7's literal
+    // ask, "a headless capture ... covers both an exclusive route and a
+    // non-exclusive one". `"=1+1"` routes through the `=` sigil
+    // (`hop_core::router::route`'s `Mode::Calculator` exclusive branch)
+    // rather than being inferred from shape — same deterministic,
+    // network-free arithmetic as `"2+2"` above, but `exclusive: true` and a
+    // real `marker_span` over the leading `=`.
     run_screenshot(&daemon, &broadway, &exclusive_route_png, Some("=1+1"));
     assert_is_a_png(&exclusive_route_png);
 
+    // What the assertion below does and does not establish, stated
+    // precisely rather than left to be over-read: `"=1+1"` and `"2+2"`
+    // differ in the query text itself, so a byte-diff between their two PNGs
+    // is guaranteed by the entry's own rendered text alone — it would still
+    // pass with `mode_label::apply` and `marker_highlight::apply` both
+    // stubbed out to no-ops. It proves the two captures were produced and
+    // are not byte-identical (satisfying criterion 7's literal ask, and
+    // ruling out `--screenshot` silently writing the same frame twice), not
+    // that the mode label or the marker highlight actually render on
+    // screen. That stronger proof — real visibility, real text, a real
+    // Pango attribute range over the reported span — lives in the
+    // widget-level, broadway-gated tests in `ui::window`'s own test module:
+    // `assert_mode_label_mirrors_exclusive_and_nothing_else` and
+    // `assert_marker_highlight_covers_exactly_the_reported_span`. A
+    // pixel-region check here would close that gap for the screenshot path
+    // specifically, but decoding a PNG needs an image-decoding dependency
+    // this task does not take on; unclosed, and named as such rather than
+    // implied closed.
     let exclusive_bytes = std::fs::read(&exclusive_route_png).unwrap();
     assert_ne!(
         exclusive_bytes, results_bytes,
-        "an exclusive route (mode label shown) must render differently from \
-         a non-exclusive one (mode label absent) with an otherwise similar query"
+        "the exclusive-route and non-exclusive-route screenshots must not be \
+         byte-identical — see the comment above for what this does and does \
+         not prove"
     );
 }
