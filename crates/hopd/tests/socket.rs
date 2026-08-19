@@ -10,7 +10,7 @@ mod common;
 use common::{hello, recv, send};
 
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -121,6 +121,53 @@ fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
     panic!(
         "hopd socket did not appear at {:?} within 5s",
         process.socket_path
+    );
+}
+
+/// Spawns a second `hopd` against `runtime_dir` — reusing the exact
+/// isolated env roots [`spawn_daemon`] already created there for a first
+/// daemon — and waits for it to exit, panicking after 5s if it never does.
+///
+/// `Command::output()` is not used here: it waits for the child
+/// unconditionally, and before issue #158's fix this second daemon would
+/// unlink the first daemon's socket and then bind and serve forever, so
+/// `output()` would hang the test suite rather than fail it. Polling
+/// `try_wait` at 100ms up to 50 times mirrors [`spawn_daemon`]'s own bound
+/// on the opposite wait (a socket that should appear); a refused daemon's
+/// connect probe is local and near-instant, so 5s is generous, not tight.
+fn run_second_daemon_to_completion(runtime_dir: &Path) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hopd"))
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("HOME", runtime_dir.join("isolated-home"))
+        .env("XDG_DATA_HOME", runtime_dir.join("isolated-xdg-data-home"))
+        .env("XDG_DATA_DIRS", "")
+        .env(
+            "XDG_CONFIG_HOME",
+            runtime_dir.join("isolated-xdg-config-home"),
+        )
+        .env(
+            "XDG_STATE_HOME",
+            runtime_dir.join("isolated-xdg-state-home"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the second hopd");
+
+    for _ in 0..50 {
+        if let Some(_status) = child.try_wait().expect("failed to poll the second hopd") {
+            return child
+                .wait_with_output()
+                .expect("failed to collect the second hopd's output after it exited");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!(
+        "the second hopd did not exit within 5s against a live socket under {runtime_dir:?} — \
+         a refused standalone daemon must exit almost immediately, not bind and serve"
     );
 }
 
@@ -534,4 +581,82 @@ fn a_malformed_config_is_a_startup_error() {
         !socket_path.exists(),
         "a malformed config must be refused before any socket is bound, found {socket_path:?}"
     );
+}
+
+/// Issue #158's central acceptance criterion, proven end to end with two
+/// real `hopd` processes rather than by asserting on `acquire_listener`'s
+/// return value alone: a second standalone daemon started against a
+/// still-live socket must not be able to take over its reachable name,
+/// existing clients of the first daemon must keep working straight through
+/// the second daemon's failed startup attempt, and a brand new client must
+/// still land on the first daemon rather than silently switching to a
+/// second one that never actually bound anything.
+#[test]
+fn a_second_standalone_daemon_against_a_live_socket_is_refused_and_the_first_keeps_serving() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let daemon = spawn_daemon(runtime_dir.path());
+
+    // A connection opened *before* the second daemon's startup attempt.
+    // If this stopped working afterward, that alone would prove the first
+    // listener's identity was disturbed — a stronger claim than a bare
+    // "bind failed" assertion could make.
+    let mut existing_client = UnixStream::connect(&daemon.socket_path).unwrap();
+    hello(&mut existing_client);
+
+    let original_inode = std::fs::metadata(&daemon.socket_path).unwrap().ino();
+
+    // A second standalone hopd, started against the exact same
+    // `XDG_RUNTIME_DIR` — and so the exact same socket path — as the first,
+    // which is still live. `spawn_daemon` itself is not used here: it polls
+    // for a socket to appear and panics if one never does, but a correctly
+    // refused daemon must never bind one; `run_second_daemon_to_completion`
+    // is this test's mirror-image wait, on the process exiting instead. The
+    // isolated env roots it reuses (`isolated-home`, `isolated-xdg-*`) are
+    // the exact ones `spawn_daemon` already created for the first daemon
+    // under this same `runtime_dir` — nothing about this test needs the
+    // second process's state or config roots to differ from the first's.
+    let output = run_second_daemon_to_completion(runtime_dir.path());
+
+    assert!(
+        !output.status.success(),
+        "a second standalone hopd against a live socket must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already listening"),
+        "stderr must diagnose the refusal as a daemon already listening, got: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("permission"),
+        "the refusal must read as its own diagnosis, not a permission or I/O failure, got: {stderr}"
+    );
+
+    // The first listener's socket path must be untouched by the refused
+    // second daemon: same inode as before the attempt.
+    let inode_after_attempt = std::fs::metadata(&daemon.socket_path).unwrap().ino();
+    assert_eq!(
+        original_inode, inode_after_attempt,
+        "the first listener's socket path must not have been unlinked or rebound"
+    );
+
+    // The connection opened before the second daemon's attempt must still
+    // work — proof the *first* daemon, not a replacement, is still serving.
+    send(
+        &mut existing_client,
+        &ClientMsg::Query {
+            id: 1,
+            text: QueryText::new("walking skeleton").unwrap(),
+        },
+    );
+    let routed = recv(&mut existing_client);
+    assert!(
+        matches!(routed, DaemonMsg::QueryRouted { .. }),
+        "the pre-existing connection must still be answered by the original daemon, got {routed:?}"
+    );
+
+    // A brand new client, connecting only after the second daemon's failed
+    // attempt, must also reach the first daemon — not silently be routed to
+    // a second one that never actually bound anything.
+    let mut new_client = UnixStream::connect(&daemon.socket_path).unwrap();
+    hello(&mut new_client);
 }

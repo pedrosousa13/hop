@@ -191,11 +191,15 @@ fn pipeline_for(
 /// already bound, instead of always binding one itself — not lifecycle: no
 /// signal handler exists, and nothing tears this process down when its
 /// `.socket` unit stops. Orderly shutdown remains unowned by any filed
-/// issue as of this writing. This daemon's only contribution to "restart
-/// works" is still the stale-socket removal `server::serve_with`'s
-/// standalone path documents in place — unreachable, now, on the activated
-/// path, which never touches the socket file at all (see
-/// [`server::acquire_listener`]).
+/// issue as of this writing. This daemon's contribution to "restart works"
+/// is still the stale-socket recovery `server::serve_with`'s standalone
+/// path documents in place — unreachable, now, on the activated path,
+/// which never touches the socket file at all (see
+/// [`server::acquire_listener`]). Issue #158 narrowed what "stale" means:
+/// the standalone path now refuses to recover a path a live listener still
+/// answers on, surfacing [`server::ListenerError::AlreadyListening`]
+/// through the `Err(err) => eprintln!("hopd: {err}")` arm just below
+/// instead of unlinking it.
 pub fn run() -> ExitCode {
     // Config is resolved first, ahead of even the runtime dir: a malformed
     // config must refuse to start the daemon before anything binds a socket
