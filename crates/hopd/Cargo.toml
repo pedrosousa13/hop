@@ -15,8 +15,15 @@ hop-protocol = { path = "../hop-protocol", version = "0.1.0" }
 # `net` and `rt-multi-thread` add the accept loop and the multi-threaded
 # runtime the brief requires on top of the workspace's `sync`, `time`,
 # `macros`, `rt` set; `io-util` adds `AsyncReadExt`/`AsyncWriteExt` for the
-# per-connection read/write loop.
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-util"] }
+# per-connection read/write loop. `process` is issue #162's: it swaps
+# `SystemLauncher` from `std::process::Command` to `tokio::process::Command`
+# so a spawned desktop-entry command has a reaping path instead of becoming
+# a zombie when its `Child` handle is dropped — see `SystemLauncher`'s own
+# doc comment in `apps.rs` for the full design decision. On Unix, `process`
+# pulls in tokio's `signal` feature too (it is what drives the SIGCHLD-based
+# fallback reaper `tokio::process` falls back to on kernels without pidfd
+# support), which this crate did not otherwise need.
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-util", "process"] }
 inotify.workspace = true
 fasteval.workspace = true
 # already a workspace dependency; ConfigError is thiserror-derived.
