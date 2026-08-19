@@ -58,8 +58,9 @@ file's honesty-critical members block:
 - opacity — `.hop-honesty { opacity: 1 }`
 - dimensions — the locked `min-width`/`min-height` on
   `.hop-honesty .hop-skeleton`
-- contrast — `--hop-fg` and `--hop-text-subtitle` on `.hop-honesty-text`;
-  `--hop-fg-2` and `--hop-text-timestamp` on `.hop-honesty-stamp`
+- contrast — `--hop-fg` and `--hop-text-subtitle` on
+  `.hop-honesty .hop-honesty-text`; `--hop-fg-2` and `--hop-text-timestamp`
+  on `.hop-honesty .hop-honesty-stamp`
 
 Presence, opacity, and dimensions are fixed declarations rather than
 overridable custom properties — that absence of a token is deliberate, since
@@ -84,11 +85,10 @@ operation can look successful.
 This document records the obligation; it does not claim that GTK enforcement
 exists today. The future renderer must apply `.hop-honesty` and install the
 locked styling above `GTK_STYLE_PROVIDER_PRIORITY_USER`, so user CSS cannot
-override the locked property categories. Today no `gtk::CssProvider` loads
-`assets/tokens.css` into the running window at all, a gap tracked as issue
-#193.
+override the locked property categories.
 
 Hostile-theme behavior and hot-reload behavior remain deferred under issue
 #126's narrowed decision. This v1 contract therefore makes no claim that
-hostile-theme checks, hot-reload enforcement, or the GTK renderer already
+hostile-theme checks, hot-reload enforcement, the GTK renderer, or a running
+`gtk::CssProvider` loading `assets/tokens.css` into the window already
 exist.
