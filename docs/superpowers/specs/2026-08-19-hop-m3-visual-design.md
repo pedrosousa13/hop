@@ -154,7 +154,11 @@ not fades.
 
 ## Accessibility floor
 
-Numbers, not adjectives — each is checkable against a build.
+Numbers, not adjectives — each is checkable against a build. D5's full HIG
+conformance list — this floor plus icon language, reduced motion, keyboard
+operability, and the three deliberately-broken rules — is walked item by item
+against a real build in
+[`docs/hig-conformance-checklist.md`](../../hig-conformance-checklist.md).
 
 | Element | Minimum | Criterion |
 | --- | --- | --- |
