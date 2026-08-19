@@ -2091,6 +2091,26 @@ pub trait Launcher: Send + Sync + 'static {
 ///   the process driver rides on) — there is no separate component to
 ///   start or stop.
 ///
+/// That "best-effort... as part of its normal park loop" has a precondition
+/// worth being explicit about: tokio's process driver only drains its
+/// orphan queue from inside `Driver::park`/`park_timeout`, so reaping
+/// requires the runtime to *keep parking* after the `Child` drops, not just
+/// to have parked once in the past. A runtime that stopped being polled —
+/// shut down, or simply never driven again — would leave a dropped `Child`
+/// enqueued and unreaped indefinitely; the "no explicit wait, task, or
+/// thread of ours is needed" claim above is about steady-state operation,
+/// not a guarantee that holds regardless of whether anything keeps the
+/// runtime running. This is not a caveat hopd has to manage, though:
+/// [`crate::run`]'s runtime parks continuously for the daemon's entire
+/// life, so there is no window in normal operation where it stops polling
+/// while a child is still owed a reap. And on the one path where the
+/// runtime does stop — hopd itself exiting with an already-exited child
+/// still sitting unreaped in the orphan queue — that child is reparented to
+/// init exactly like the still-*running* orphans the section below
+/// describes, and init reaps its own children as a matter of course; this
+/// is the same "children outlive hopd" shutdown policy documented next,
+/// not a separate failure mode this precondition introduces.
+///
 /// `kill_on_drop(false)` is set explicitly rather than left at tokio's
 /// current default (also `false`) so a future tokio upgrade that changed
 /// that default could not silently start killing detached GUI apps out
@@ -2534,6 +2554,90 @@ mod focus_or_launch_tests {
         );
     }
 
+    // --- Pinning #162's "substitutable-launcher test seam still works"
+    //     criterion ---
+
+    #[test]
+    fn focus_or_launch_dispatches_through_a_substituted_launcher_and_never_spawns_anything_real() {
+        // #162's brief lists "the substitutable-launcher test seam still
+        // works" as its own acceptance criterion, separate from the reaping
+        // behavior itself. Before this test, it was only ever satisfied
+        // implicitly — every fake-launcher test above continuing to compile
+        // and pass after SystemLauncher::launch's internals changed
+        // (std::process::Command -> tokio::process::Command). Nothing
+        // pinned it directly: a change that widened the Launcher trait or
+        // focus_or_launch's signature to require a live Tokio handle, for
+        // instance, would have broken every test in this module, but no
+        // single test's *purpose* was "prove this seam still substitutes
+        // cleanly". This one's purpose is exactly that. Asserting on the
+        // fake's recorded argv, not just that something was recorded,
+        // confirms the call actually reached the substitute intact.
+        let windows = FakeWindows::default();
+        let launcher = FakeLauncher::default();
+
+        focus_or_launch(
+            &windows,
+            &launcher,
+            "firefox",
+            &["firefox".to_string(), "--new-window".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            *launcher.launched.lock().unwrap(),
+            vec!["firefox --new-window".to_string()],
+            "focus_or_launch must dispatch through the substituted Launcher, unchanged"
+        );
+    }
+
+    #[test]
+    fn empty_window_source_answers_nothing_from_either_tier() {
+        // Pins the M2 production default's whole contract: until the M5
+        // GNOME shim replaces it, focus_or_launch must always launch.
+        let source = EmptyWindowSource;
+        assert!(source.windows_for_app("anything").is_empty());
+        assert!(source.all_windows().is_empty());
+
+        let launcher = FakeLauncher::default();
+        focus_or_launch(&source, &launcher, "firefox", &["firefox".to_string()]).unwrap();
+        assert_eq!(launcher.launched.lock().unwrap().len(), 1);
+    }
+}
+
+/// Tests for [`SystemLauncher`] itself that spawn real processes — the one
+/// deliberate exception to `focus_or_launch_tests`'s rule, stated on that
+/// module's own `FakeLauncher`, that no test in this file needs a real GUI
+/// application installed to run.
+///
+/// #162's acceptance criteria are about observable zombie-process behavior:
+/// quick-exit commands get reaped and don't accumulate zombies, a burst of
+/// launches doesn't leave the reaping falling behind, and a long-running
+/// launch returns without waiting for exit. None of that is something a
+/// fake `Launcher` — which never spawns anything — can produce evidence
+/// for; `zombie_child_count` below reads real state out of `/proc`, and
+/// `/proc` only has something to say about processes this test itself
+/// actually spawned. So this module spawns [`SystemLauncher`] directly
+/// instead of going through a fake.
+///
+/// That is a real exception to the file's rule in mechanism, but not in the
+/// spirit the rule is protecting: everything spawned here is coreutils —
+/// `/bin/true`, `sleep` — never a GUI application, so a machine with no
+/// desktop environment at all (exactly what `focus_or_launch_tests`'s
+/// invariant exists to keep working on) still runs this module cleanly.
+///
+/// Both zombie-counting tests below count zombies whose parent is this test
+/// binary's own pid, not some isolated subprocess — so they also see
+/// zombies left behind by *each other*, and by any other test in this
+/// binary that spawns and leaks a child. That makes the assertion stricter,
+/// not weaker: a reaping regression anywhere in this process's lifetime
+/// shows up as a nonzero count here, not just a regression local to the one
+/// test that triggered it.
+#[cfg(test)]
+mod system_launcher_reaping_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
     #[test]
     fn spawn_failure_reports_the_program_name_and_the_underlying_error() {
         // Issue #162 changes SystemLauncher's spawn call from
@@ -2559,10 +2663,21 @@ mod focus_or_launch_tests {
     /// test-specific compromise: it is the same evidence a real
     /// zombie-accumulation incident (issue #162's whole premise) would be
     /// diagnosed from.
+    ///
+    /// The two failures this function can hit are handled asymmetrically,
+    /// on purpose. `read_dir("/proc")` failing means the test has no way to
+    /// observe anything at all — silently treating that as "0 zombies", as
+    /// an earlier version of this helper did, would make both callers below
+    /// pass vacuously on any environment where `/proc` isn't readable, with
+    /// zero reaping actually verified. hopd only ever runs on Linux, so an
+    /// environment that can't read `/proc` can't run this test honestly;
+    /// panicking says so instead of reporting a false pass. A single
+    /// entry's `stat` failing to read, in contrast, is routine — the
+    /// process behind that entry can exit between the `read_dir` and this
+    /// read — so that failure stays lenient and the entry is just skipped.
     fn zombie_child_count(parent_pid: u32) -> usize {
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return 0;
-        };
+        let entries = std::fs::read_dir("/proc")
+            .expect("hopd is Linux-only; a test that cannot read /proc cannot verify reaping");
         entries
             .flatten()
             // Only numeric entries under /proc are processes; the rest
@@ -2570,8 +2685,8 @@ mod focus_or_launch_tests {
             .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
             .filter(|entry| {
                 let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                    // Common and harmless: a process can exit between the
-                    // readdir and this read.
+                    // Lenient on purpose, unlike the read_dir above: a
+                    // process can exit between the readdir and this read.
                     return false;
                 };
                 // `/proc/<pid>/stat` is "pid (comm) state ppid ...". `comm`
@@ -2676,19 +2791,6 @@ mod focus_or_launch_tests {
             elapsed < std::time::Duration::from_millis(500),
             "launch() must return immediately, not block until the child exits; took {elapsed:?}"
         );
-    }
-
-    #[test]
-    fn empty_window_source_answers_nothing_from_either_tier() {
-        // Pins the M2 production default's whole contract: until the M5
-        // GNOME shim replaces it, focus_or_launch must always launch.
-        let source = EmptyWindowSource;
-        assert!(source.windows_for_app("anything").is_empty());
-        assert!(source.all_windows().is_empty());
-
-        let launcher = FakeLauncher::default();
-        focus_or_launch(&source, &launcher, "firefox", &["firefox".to_string()]).unwrap();
-        assert_eq!(launcher.launched.lock().unwrap().len(), 1);
     }
 }
 
