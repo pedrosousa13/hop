@@ -37,14 +37,17 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # Every member crate opts in with `[lints] workspace = true`. A workspace lint no
 # crate inherits is a gate that does nothing, so any new member must do the same.
 [workspace.lints.rust]
-# Production code in this workspace contains no `unsafe`, and this is what keeps
-# it that way rather than a claim in a document that drifts. What the lint covers
-# is normal compilation of both members — `src/` and `#[cfg(test)]` code alike,
-# which is why the workspace's one `unsafe` block, a `libc::mkfifo` call inside
-# `#[cfg(test)] mod tests` in `hop-protocol`, needs a narrow
-# `#[expect(unsafe_code)]` at the statement to build at all. That `expect` is
-# itself the proof the lint reaches test code: were it not firing there, the
-# unfulfilled expectation would warn, and CI's `-D warnings` would fail.
+# This lint does not keep the workspace's production code free of `unsafe` —
+# `hopd::server`'s `OwnedFd::from_raw_fd` (issue #62) is one, taking ownership
+# of a systemd-activated socket descriptor. What it keeps is every `unsafe`
+# block declared rather than smuggled in: the lint covers normal compilation
+# of both members — `src/` and `#[cfg(test)]` code alike — so each one needs
+# its own narrow `#[expect(unsafe_code)]` at the statement to build at all.
+# As of issue #160 there are four: that one production block, plus three
+# test-only `libc::mkfifo`/`pre_exec` calls in `hop-protocol`, `hopd::config`,
+# and `hopd`'s `tests/activation.rs`. Each `expect` is itself the proof the
+# lint reaches where it's written: were it not firing there, the unfulfilled
+# expectation would warn, and CI's `-D warnings` would fail.
 #
 # What it does not cover is doc tests. Cargo hands `--deny=unsafe_code` to
 # rustdoc — visible in `cargo test -p hop-protocol --doc -v` — but rustdoc

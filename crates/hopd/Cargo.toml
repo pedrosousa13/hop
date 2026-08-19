@@ -36,8 +36,9 @@ toml.workspace = true
 # `hop-protocol`'s `IconPath::open_regular_file` uses for the same reason
 # (issue #131). This crate has no non-Unix target (it binds a Unix domain
 # socket unconditionally), so this is a plain dependency rather than a
-# `cfg(unix)`-scoped one the way `hop-protocol`'s is. Still used by the two
-# dev-only callers noted where they live in `tests/`.
+# `cfg(unix)`-scoped one the way `hop-protocol`'s is. Also used by two
+# dev-only callers, noted where they live: one in `tests/activation.rs`, the
+# other in `src/config.rs`'s own `#[cfg(test)] mod tests`.
 libc.workspace = true
 
 [dev-dependencies]

@@ -126,11 +126,16 @@ pub enum ConfigError {
     /// A config file exists but could not be read — most plausibly a
     /// permission error, the same class as an unreadable file anywhere else
     /// in this daemon, which is also never silently skipped. Also covers a
-    /// descriptor that opened but could not be inspected (`fstat` failing)
-    /// and a regular file whose bytes are not valid UTF-8 — three different
-    /// I/O failures, but all of them "this file could not be turned into
-    /// text", which is this variant's whole scope; what the text says once
-    /// it exists is [`ConfigError::Parse`]'s.
+    /// descriptor that opened but could not be inspected (`fstat` failing),
+    /// a regular file whose bytes are not valid UTF-8, and a Unix domain
+    /// socket at the config path: `open()` on a socket fails immediately
+    /// with `ENXIO`, before there is a descriptor for `fstat` to classify,
+    /// so it never reaches [`ConfigError::NotARegularFile`] the way a FIFO
+    /// or a device does — it lands here instead, alongside every other way
+    /// the open itself can fail. Four different failures, but all of them
+    /// "this file could not be turned into text", which is this variant's
+    /// whole scope; what the text says once it exists is
+    /// [`ConfigError::Parse`]'s.
     #[error("could not read config file {}: {err}", .path.display())]
     Read {
         /// The path that could not be read.
@@ -363,6 +368,14 @@ impl Config {
     /// because the `fstat` sees the character device on the other end of the
     /// link rather than the link itself.
     ///
+    /// A symlink whose target does not exist — dangling, because the file it
+    /// once pointed at was moved or removed — fails the open with `ENOENT`,
+    /// the identical error a config path that names nothing at all fails
+    /// with. It is therefore handled by the same `NotFound` arm below and
+    /// reads as an absent config: deliberately, since a link that resolves
+    /// to nothing is indistinguishable, from the daemon's point of view,
+    /// from no config having been placed there.
+    ///
     /// # Replacement between open and read
     ///
     /// The open and every read that follows act on one file descriptor, not
@@ -532,6 +545,7 @@ mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -853,6 +867,31 @@ mod tests {
     }
 
     #[test]
+    fn a_unix_socket_at_the_config_path_is_a_bounded_error() {
+        // A fourth way the config path can name something other than a
+        // regular file, beyond the directory/FIFO/device trio above: a Unix
+        // domain socket. `open()` on a socket fails immediately with
+        // `ENXIO` — before there is a descriptor for `fstat` to classify —
+        // so this lands in `ConfigError::Read` rather than
+        // `NotARegularFile` (see that variant's doc comment for why). Which
+        // variant it lands in matters less than that it lands in *some*
+        // bounded, diagnostic error: unlike opening a FIFO, opening a
+        // socket never blocks, so this test needs no timeout guard the way
+        // the FIFO test above does.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let err = Config::load_from_env(Some(dir.path().to_string_lossy().into_owned()), None)
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Read { .. }),
+            "expected Read, got {err:?}"
+        );
+    }
+
+    #[test]
     fn a_symlink_to_a_character_device_at_the_config_path_is_not_a_regular_file() {
         // The endless-read case the issue names by name: `/dev/zero` never
         // ends, so a decoder reading it to completion never returns. The
@@ -896,6 +935,26 @@ mod tests {
     }
 
     #[test]
+    fn a_dangling_symlink_at_the_config_path_reads_as_absent() {
+        // The other case the "Symlinks" doc section covers, beyond
+        // symlink-to-regular and symlink-to-device above: a symlink whose
+        // target has been moved or removed. `open()` fails with `ENOENT`,
+        // the same error a config path that names nothing at all produces,
+        // so this falls into the `NotFound` arm and yields the defaults —
+        // deliberately, since a link resolving to nothing looks, from here,
+        // exactly like no config having been placed at all.
+        let dir = tempfile::tempdir().unwrap();
+        let hop_dir = dir.path().join(CONFIG_DIR_NAME);
+        fs::create_dir_all(&hop_dir).unwrap();
+        let path = hop_dir.join(CONFIG_FILE_NAME);
+        symlink(hop_dir.join("gone-config.toml"), &path).unwrap();
+
+        let config =
+            Config::load_from_env(Some(dir.path().to_string_lossy().into_owned()), None).unwrap();
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
     fn a_config_file_over_the_byte_cap_is_refused() {
         // The bytes are never parsed, so their content does not matter here
         // — only their length disqualifies this file. One byte past
@@ -914,6 +973,61 @@ mod tests {
             ConfigError::TooLarge { path: p } => assert_eq!(*p, path),
             other => panic!("expected TooLarge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_realistically_commented_config_file_parses_well_under_the_cap() {
+        // `MAX_CONFIG_BYTES`'s doc comment justifies
+        // `CONFIG_COMMENT_BUDGET_BYTES` by claiming 8 KiB prices "a
+        // heavily-commented file in this repo's own prose-per-key doc
+        // style" (issue #160) — a claim nothing tested until now. The test
+        // above pins the `take(cap + 1)` boundary with a fabricated
+        // `x`-repeat pad, which proves the boundary is exactly where the
+        // constant says it is, but proves nothing about what a config
+        // actually written the way this module writes its own doc comments
+        // would cost. This test builds that file instead: every key
+        // `Config` supports, each preceded by a paragraph in this file's
+        // own commenting style, mirroring `hop-core::learning`'s
+        // `the_largest_store_save_can_write_still_reloads_intact` (issue
+        // #37) — close the loop with the actual maximal legitimate value,
+        // not a synthetic stand-in.
+        let text = "\
+# `max_results` controls how many rows the daemon assembles for a single
+# query — the count that flows end to end from the ranker's output through
+# to what the launcher UI renders. Must be a whole number from 1 up to the
+# maximum number of items one results frame may carry; anything outside
+# that range is refused at load time rather than silently clamped, so a
+# typo here is a startup error instead of a launcher that quietly behaves
+# differently. Unset, this defaults to the daemon's own compiled-in default.
+max_results = 10
+
+# `max_term_chars` caps how many characters of a query term reach the
+# ranker's pattern match — the same absolute ceiling
+# `hop_core::rank::MAX_TERM_CHARS` enforces everywhere else a term is
+# scored. Must be a whole number from 1 up to that ceiling; anything
+# outside that range is refused at load time, the same posture
+# `max_results` takes toward its own range. Unset, this defaults to the
+# ranker's own compiled-in ceiling.
+max_term_chars = 64
+";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, text).unwrap();
+
+        let config =
+            Config::load_from_env(Some(dir.path().to_string_lossy().into_owned()), None).unwrap();
+        assert_eq!(config.max_results, 10);
+        assert_eq!(config.max_term_chars, 64);
+        assert!(
+            (text.len() as u64) < MAX_CONFIG_BYTES,
+            "a realistically-commented config carrying every key came to {} bytes, against a \
+             {MAX_CONFIG_BYTES}-byte cap — a future key that pushes a real config past this \
+             cap must fail here, with a legible byte count, before it fails on somebody's \
+             actual config file",
+            text.len()
+        );
     }
 
     #[test]
