@@ -494,6 +494,8 @@ pub struct AppEntry {
 }
 
 use std::collections::HashSet;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// The XDG Base Directory roots a `.desktop` file may live under, in the
@@ -635,6 +637,181 @@ fn malformed_log_line(path: &Path, reason: &str) -> String {
     format!("hopd: apps provider: skipping {}: {reason}", path.display())
 }
 
+/// The boxed closure type [`PRE_ACQUIRE_HOOK`] stores, factored out purely to
+/// satisfy `clippy::type_complexity` — the inline `RefCell<Option<Box<dyn
+/// FnMut(&Path)>>>` it replaces is otherwise identical.
+#[cfg(test)]
+type PreAcquireHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam for issue #161's replacement test: invoked with a
+    /// candidate's path immediately before [`acquire_desktop_entry_content`]
+    /// opens it — the exact point a concurrent atomic replacement would need
+    /// to land at to reach the hazard this issue closes (a FIFO, device, or
+    /// larger file put at the path *after* `read_dir` handed back the name
+    /// but *before* the acquisition that follows).
+    ///
+    /// A production build never sees this: both the `thread_local!` and its
+    /// one call site are `#[cfg(test)]`, so the field does not exist, the
+    /// branch does not compile, and there is nothing here for a non-test
+    /// binary to pay for or observe. What makes the resulting test
+    /// *deterministic* rather than a repeat of issue #172's known
+    /// socket-test flake is that the hook runs synchronously, on the same
+    /// call stack, immediately before the `open()` call it precedes — a
+    /// test that swaps the file out from inside it is guaranteed to have
+    /// done so by the time `open()` runs, with no second thread and no
+    /// timing window to lose.
+    static PRE_ACQUIRE_HOOK: std::cell::RefCell<Option<PreAcquireHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Why [`acquire_desktop_entry_content`] could not produce content for the
+/// evaluator, and — via [`AcquireError::reason`] — the existing
+/// [`malformed_log_line`] reason string it maps to. No new vocabulary: the
+/// issue #161 brief is explicit that a replacement making acquisition fail
+/// is an ordinary bounded malformed-file outcome, not a distinct error
+/// class, so every variant here answers to one of the four reasons
+/// `scan_apps` already logged before this issue.
+enum AcquireError {
+    /// The open failed for a reason that says nothing was there to read —
+    /// most plausibly `ENOENT` (the path stat used to hit the same way:
+    /// `read_dir` found a name that was gone by the time the next syscall
+    /// ran), but also `ELOOP`/`ENOTDIR`/etc. Maps to "could not stat the
+    /// file", the reason the old `std::fs::metadata` failure used for
+    /// exactly this class of error.
+    ///
+    /// Also reached if the open itself succeeds but the subsequent `fstat`
+    /// (`File::metadata`) fails — the descriptor equivalent of the same
+    /// "could not learn anything about this object" failure.
+    CouldNotStat,
+    /// The descriptor's own `fstat` (not a prior path `stat`) says this is
+    /// not a regular file — a FIFO, device, socket, or directory. Maps to
+    /// "not a regular file" unchanged; only the object it now describes
+    /// changed, from "whatever the path names" to "whatever `open()`
+    /// actually returned a descriptor for".
+    NotARegularFile,
+    /// More than [`MAX_DESKTOP_FILE_BYTES`] bytes were available to read,
+    /// caught by `take(MAX_DESKTOP_FILE_BYTES + 1)` rather than inferred
+    /// from a size a prior `stat` observed — see that constant's doc
+    /// comment and `Config::from_path` (#160) for why the cap belongs on
+    /// the read. Maps to "over the size bound" unchanged.
+    OverSizeBound,
+    /// The open failed for a reason that says something *was* there but
+    /// could not be read — `PermissionDenied` and nothing else. Distinct
+    /// from `CouldNotStat` because that used to be the read's failure, not
+    /// the stat's: the old `std::fs::metadata` on a `0o000` file succeeds
+    /// (`stat(2)` needs search permission on the containing directories,
+    /// not read permission on the file itself), so an unreadable-but-
+    /// present file used to fail only at `read_to_string`, with reason
+    /// "could not be read". Since this scan's `read_dir` on `root` already
+    /// succeeded, this process already holds search permission on every
+    /// directory component up to the candidate — so a `PermissionDenied`
+    /// reaching this open can only be about the candidate file's own mode
+    /// bits, never a directory `stat` would have hit too, which is what
+    /// keeps this mapping equivalent to the old boundary rather than an
+    /// approximation of it.
+    ///
+    /// Also reached if the open and `fstat` both succeed but the read
+    /// itself fails partway (an I/O error, or non-UTF-8 content) — the
+    /// literal continuation of the old `read_to_string` failure this
+    /// replaces.
+    CouldNotBeRead(std::io::Error),
+}
+
+impl AcquireError {
+    /// The [`malformed_log_line`] reason this failure maps to — see this
+    /// enum's own doc comment and each variant's for which existing
+    /// `scan_apps` reason it continues.
+    fn reason(&self) -> String {
+        match self {
+            AcquireError::CouldNotStat => "could not stat the file".to_string(),
+            AcquireError::NotARegularFile => "not a regular file".to_string(),
+            AcquireError::OverSizeBound => "over the size bound".to_string(),
+            AcquireError::CouldNotBeRead(err) => format!("could not be read: {err}"),
+        }
+    }
+}
+
+/// Acquires one candidate's content through a single opened descriptor,
+/// replacing the pre-#161 sequence of `std::fs::metadata(&path)` followed
+/// by `std::fs::read_to_string(&path)` — two resolutions of the same
+/// pathname that were not guaranteed to reach the same object. A concurrent
+/// atomic replacement landing between them could put a FIFO, device, or
+/// large/growing regular file at the path after the stat succeeded, and the
+/// read that followed carried no cap of its own — it trusted the size the
+/// stat had seen on a possibly-different object.
+///
+/// The fix, mirroring `Config::from_path` (#160) and
+/// `IconPath::open_regular_file` (#131) — both already-landed instances of
+/// this exact open-then-fstat-the-descriptor shape in this workspace:
+///
+/// 1. Open with `O_NONBLOCK`. Without it, opening a FIFO with no writer on
+///    the other end blocks the calling thread forever — at startup that is
+///    before `hopd` ever binds its socket, and on a watcher rescan it wedges
+///    the index thread permanently. A regular file, directory, or character
+///    device such as `/dev/zero` is unaffected: `O_NONBLOCK` only changes
+///    behavior for a FIFO (and, on some platforms, certain block devices),
+///    never for the ordinary case this scan exists to serve.
+/// 2. `File::metadata` on the *descriptor* — `fstat`, not `stat` — so the
+///    type check describes what `open()` actually returned a handle to,
+///    which cannot change out from under this call the way a second
+///    pathname resolution could.
+/// 3. Read from that same descriptor through `take(MAX_DESKTOP_FILE_BYTES +
+///    1)`: the cap is enforced by the read itself, on the object already in
+///    hand, rather than inferred from a size observed on a — possibly
+///    different — object a moment earlier.
+///
+/// Every failure mode maps onto the reason vocabulary `scan_apps` already
+/// logged before this issue — see [`AcquireError`] and its `reason` method.
+/// A replacement that makes acquisition fail is therefore an ordinary
+/// bounded malformed-file outcome to the caller, logged and skipped like
+/// any other, never a distinct error class and never something that aborts
+/// the scan.
+fn acquire_desktop_entry_content(path: &Path) -> Result<String, AcquireError> {
+    #[cfg(test)]
+    PRE_ACQUIRE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                AcquireError::CouldNotBeRead(err)
+            } else {
+                AcquireError::CouldNotStat
+            }
+        })?;
+
+    // `File::metadata` is `fstat` on this descriptor: it reports the object
+    // `open()` actually returned, never the path — see this function's doc
+    // comment, point 2.
+    let metadata = file.metadata().map_err(|_| AcquireError::CouldNotStat)?;
+    if !metadata.is_file() {
+        return Err(AcquireError::NotARegularFile);
+    }
+
+    let mut data = Vec::new();
+    file.take(MAX_DESKTOP_FILE_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(AcquireError::CouldNotBeRead)?;
+    if data.len() as u64 > MAX_DESKTOP_FILE_BYTES {
+        return Err(AcquireError::OverSizeBound);
+    }
+
+    String::from_utf8(data).map_err(|err| {
+        AcquireError::CouldNotBeRead(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            err.utf8_error(),
+        ))
+    })
+}
+
 /// [`scan_apps`]'s actual body, with every malformed-file log line routed
 /// through `log` instead of going straight to stderr. Production code
 /// always passes a sink that `eprintln!`s the line; `scan_tests` below
@@ -675,25 +852,10 @@ fn scan_apps_with_log(roots: &[PathBuf], log: &mut dyn FnMut(&str)) -> Vec<AppEn
                 continue;
             }
 
-            let Ok(metadata) = std::fs::metadata(&path) else {
-                log(&malformed_log_line(&path, "could not stat the file"));
-                continue;
-            };
-            if !metadata.is_file() {
-                log(&malformed_log_line(&path, "not a regular file"));
-                continue;
-            }
-            if metadata.len() > MAX_DESKTOP_FILE_BYTES {
-                log(&malformed_log_line(&path, "over the size bound"));
-                continue;
-            }
-            let content = match std::fs::read_to_string(&path) {
+            let content = match acquire_desktop_entry_content(&path) {
                 Ok(content) => content,
                 Err(err) => {
-                    log(&malformed_log_line(
-                        &path,
-                        &format!("could not be read: {err}"),
-                    ));
+                    log(&malformed_log_line(&path, &err.reason()));
                     continue;
                 }
             };
@@ -745,11 +907,16 @@ fn scan_apps_with_log(roots: &[PathBuf], log: &mut dyn FnMut(&str)) -> Vec<AppEn
 /// corrupt user-level override no longer erases a working system-level entry
 /// beneath it.
 ///
-/// Every candidate is `stat`-ed before it is read: anything that is not a
-/// regular file (a symlink resolving to a FIFO or a character device such as
-/// `/dev/zero`, which has no EOF and would hang a `read_to_string` forever)
-/// or that exceeds [`MAX_DESKTOP_FILE_BYTES`] is skipped exactly like a
-/// missing or unreadable file, never read.
+/// Every candidate is acquired through [`acquire_desktop_entry_content`]
+/// (issue #161) before it is treated as content: opened with `O_NONBLOCK` so
+/// a FIFO with no writer cannot block this call, `fstat`-ed on that same
+/// descriptor so the type check cannot be raced by a replacement landing
+/// between discovery and acquisition, and read through an explicit byte cap
+/// enforced on the read itself. Anything that is not a regular file (a
+/// symlink resolving to a FIFO or a character device such as `/dev/zero`,
+/// which has no EOF and would hang an uncapped read forever) or that exceeds
+/// [`MAX_DESKTOP_FILE_BYTES`] is skipped exactly like a missing or
+/// unreadable file, never read.
 ///
 /// The only place in this module that performs disk I/O other than the
 /// inotify watcher itself (`open_watch`/`spawn_index_watcher`, Task 6) —
@@ -764,7 +931,11 @@ mod scan_tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use std::ffi::CString;
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn write_entry(dir: &Path, file_name: &str, name: &str) {
         fs::write(
@@ -1309,6 +1480,185 @@ mod scan_tests {
         assert!(
             lines.is_empty(),
             "a successfully indexed entry has nothing to log: {lines:?}"
+        );
+    }
+
+    // --- New coverage: issue #161. `evaluate_candidate`/`metadata`/
+    // `read_to_string` resolved the candidate's pathname twice — once to
+    // stat it, once to read it — so a replacement landing between those two
+    // resolutions was invisible to both the type check and the size check.
+    // The tests below exercise the descriptor-identity fix: acquisition now
+    // opens the path once, with `O_NONBLOCK`, and both checks run against
+    // the resulting descriptor (`fstat`, then a capped read) rather than
+    // against the path a second time. ---
+
+    /// Creates a FIFO at `path` via `mkfifo(3)`. No safe wrapper exists in
+    /// `libc` for this syscall, so every caller in this workspace that needs
+    /// one carries its own narrow `#[expect(unsafe_code)]` — this one, plus
+    /// `hop-protocol::content`'s (#131) and `hopd::config`'s (#160), both of
+    /// which exist for the identical FIFO-open hazard this issue closes in a
+    /// third place. `unsafe_code = "deny"` in the workspace root `Cargo.toml`
+    /// forces the attribute to exist at all, and `expect` (not `allow`) means
+    /// it self-deletes — turns into a build failure under `-D warnings` — the
+    /// day `mkfifo` grows a safe wrapper and the exception outlives its
+    /// reason.
+    fn make_fifo(path: &Path) {
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a live NUL-terminated string for the duration
+        // of the call, which is all `mkfifo(3)` requires of it. Test-only:
+        // production code never creates a FIFO, only ever refuses one it
+        // finds.
+        #[expect(
+            unsafe_code,
+            reason = "mkfifo(3) has no safe wrapper in libc; test-only, matching the identical \
+                      FIFO-open-hazard precedent in hop-protocol::content (#131) and \
+                      hopd::config (#160)"
+        )]
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[test]
+    fn a_fifo_candidate_is_not_opened_and_does_not_block_the_scan() {
+        // A FIFO present *at discovery time* (no replacement involved) —
+        // this pins the O_NONBLOCK half of the fix on its own, the same way
+        // `hopd::config`'s `a_fifo_at_the_config_path_is_not_opened_and_
+        // does_not_block_load` pins it for `Config::from_path` (#160).
+        // Before this issue, `scan_apps` stat-ed the path (which never
+        // blocks on a FIFO) and only then opened it with a plain
+        // `read_to_string` — an open with no `O_NONBLOCK` that blocks
+        // forever waiting for a writer that will never come, wedging
+        // startup or the watcher thread. The existing `/dev/zero`-based
+        // "not a regular file" test does not exercise this: a character
+        // device's open never blocks either way, so it cannot tell
+        // `O_NONBLOCK` apart from its absence. Only a FIFO with no writer
+        // can.
+        //
+        // Run on a worker thread and awaited with a timeout, exactly like
+        // `hopd::config`'s FIFO test: a test whose only defense against
+        // hanging is the guard it is testing is not a test of that guard.
+        let dir = tempfile::tempdir().unwrap();
+        make_fifo(&dir.path().join("app.desktop"));
+        write_entry(dir.path(), "normal.desktop", "Normal");
+
+        let dir_path = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan_and_capture_log(&[dir_path]));
+        });
+
+        let (entries, lines) = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "scanning a directory containing a FIFO must return rather than wait for a \
+             writer; timing out here means the open blocked",
+        );
+        let ids: Vec<&str> = entries.iter().map(|e| e.app_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["normal"],
+            "the FIFO must be skipped while a normal file beside it is still indexed"
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("app.desktop"), "{lines:?}");
+        assert!(lines[0].contains("not a regular file"), "{lines:?}");
+    }
+
+    /// RAII guard for [`super::PRE_ACQUIRE_HOOK`] (issue #161's test-only
+    /// seam, `#[cfg(test)]` in production so it costs nothing and is
+    /// unreachable outside this module): clears the hook on drop so a
+    /// panicking test cannot leak one onto whatever runs next on the same
+    /// OS thread. Not actually load-bearing for the one test below, which
+    /// installs its hook on a throwaway `std::thread::spawn` worker that
+    /// exits (and drops its thread-local storage) the moment the scan
+    /// returns — kept anyway because "clears itself even if the scan
+    /// panics partway through" is the correct default for a seam like this
+    /// one to have, not something worth re-deriving by hand at every call
+    /// site that ever uses it.
+    struct PreAcquireHookGuard;
+
+    impl Drop for PreAcquireHookGuard {
+        fn drop(&mut self) {
+            super::PRE_ACQUIRE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    /// Installs `hook` as [`super::PRE_ACQUIRE_HOOK`] *on the calling
+    /// thread*: thread-locals are per-thread, so this must be called from
+    /// whatever thread will actually run the scan, not from a test's main
+    /// thread if the scan itself runs on a spawned worker (see the
+    /// replacement test below, which does exactly that).
+    fn set_pre_acquire_hook(hook: impl FnMut(&Path) + 'static) -> PreAcquireHookGuard {
+        super::PRE_ACQUIRE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        PreAcquireHookGuard
+    }
+
+    #[test]
+    fn a_replacement_between_discovery_and_acquisition_is_caught_by_the_descriptor_fstat() {
+        // The test the issue brief calls the hard part: a **deterministic**
+        // exercise of a replacement landing between `read_dir` handing back
+        // a candidate's path (discovery) and `acquire_desktop_entry_content`
+        // opening it (acquisition) — not just the already-covered case
+        // where the stat and the read see the same object.
+        //
+        // A thread that races the scan and hopes to win would be exactly
+        // the kind of test issue #172 shows this repo cannot afford another
+        // of: a socket test that races two threads already flakes 2-8% of
+        // full-suite runs. So this test does not race anything. Instead,
+        // `acquire_desktop_entry_content` calls a `#[cfg(test)]`-only hook
+        // immediately before it opens the path — invisible to production
+        // callers, compiled out entirely outside `cfg(test)` — and this
+        // test's hook performs the replacement synchronously, in-line, on
+        // the same call stack that is about to open the file. There is no
+        // window for the open to race the replacement, because there is no
+        // concurrency at all: the replacement is guaranteed to have
+        // happened by the time `open()` runs, every single time this test
+        // executes.
+        //
+        // Run on a worker thread with a timeout regardless — the property
+        // under test is that the descriptor-typed open of the replacement
+        // FIFO does not block, and a regression there would hang exactly
+        // like the direct-FIFO test above.
+        let dir = tempfile::tempdir().unwrap();
+        write_entry(dir.path(), "app.desktop", "WillBeReplaced");
+        let target = dir.path().join("app.desktop");
+        write_entry(dir.path(), "normal.desktop", "Normal");
+
+        let dir_path = dir.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Installed on this worker thread, not the test's main thread —
+            // see `set_pre_acquire_hook`'s doc comment for why that
+            // distinction matters for a thread-local seam.
+            let _guard = set_pre_acquire_hook(move |path| {
+                if path == target {
+                    fs::remove_file(&target).unwrap();
+                    make_fifo(&target);
+                }
+            });
+            let _ = tx.send(scan_and_capture_log(&[dir_path]));
+        });
+
+        let (entries, lines) = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "acquiring a candidate replaced with a FIFO must return rather than wait for a \
+             writer; timing out here means the open blocked",
+        );
+
+        let ids: Vec<&str> = entries.iter().map(|e| e.app_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["normal"],
+            "the replaced candidate must not be indexed, while its unrelated sibling still is"
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("app.desktop"), "{lines:?}");
+        assert!(
+            lines[0].contains("not a regular file"),
+            "the descriptor's own fstat, not the path's earlier stat, must be what catches \
+             this: {lines:?}"
         );
     }
 }

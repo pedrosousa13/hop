@@ -395,14 +395,15 @@ fn acquire_listener(
             // having already bound and listened on it, and handed over sole
             // ownership. This is the only `unsafe` in this workspace's
             // production code — not the only one in this crate, which also
-            // carries two test-only blocks (root `Cargo.toml`'s
-            // `[workspace.lints.rust] unsafe_code` doc comment counts four
-            // in the tree as of issue #160: this one, and three test-only
+            // carries three test-only blocks (root `Cargo.toml`'s
+            // `[workspace.lints.rust] unsafe_code` doc comment counts five
+            // in the tree as of issue #161: this one, and four test-only
             // `libc::mkfifo`/`pre_exec` calls, in `hop-protocol`'s
-            // `content.rs`, this crate's `config.rs`, and this crate's own
-            // `tests/activation.rs`). See this crate's
-            // implementation plan, Design decision 1, for why this is taken
-            // directly rather than through a crate that hides the same call.
+            // `content.rs`, this crate's `config.rs`, this crate's own
+            // `tests/activation.rs`, and this crate's own `apps.rs`). See
+            // this crate's implementation plan, Design decision 1, for why
+            // this is taken directly rather than through a crate that hides
+            // the same call.
             #[expect(
                 unsafe_code,
                 reason = "sd_listen_fds(3) hands the daemon a raw fd; OwnedFd::from_raw_fd \
