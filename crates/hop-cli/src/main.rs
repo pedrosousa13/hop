@@ -12,9 +12,29 @@
 //! rather than inside `parse` (design decision D6 of that issue's plan):
 //! `parse` stays pure, with no env read and no filesystem access, and
 //! `main` is where an invocation actually starts doing things to the
-//! outside world. This mirrors `hopd`'s own `main.rs` exactly, down to
-//! resolving the override before anything else runs and sharing the
-//! refusal's exit code with the usage arm.
+//! outside world.
+//!
+//! # Resolved only for the commands that connect
+//!
+//! Unlike `hopd`'s `main.rs`, which resolves unconditionally because every
+//! successful invocation of that binary binds a socket, this function
+//! resolves only inside the `Query` and `Exec` arms below. `hop version`
+//! never opens a socket — `print_version` reads only `CARGO_PKG_VERSION`
+//! and `API_VERSION`, both compile-time constants — so making it depend on
+//! a resolvable `$XDG_RUNTIME_DIR` would be a regression `--socket` has no
+//! business causing: criterion 6 of issue #180 says omitting the flag is
+//! unchanged behavior, and `hop version` working in *any* environment,
+//! including a broken one, is exactly the unchanged behavior a user
+//! diagnosing that environment reaches for it to get. One consequence is
+//! worth naming rather than leaving for a reader to puzzle out: `hop
+//! --socket /nonsense version` prints the version and exits 0 rather than
+//! refusing. That is deliberate, not a missed check — the flag is inert for
+//! a command that never opens the socket it would have named, the same way
+//! a `--socket` given to `hopd` would be inert if `hopd` ever grew a
+//! subcommand that did not serve.
+//!
+//! `Command::Usage` resolves nothing either, for the same reason: there is
+//! no socket use on that path to resolve one for.
 
 use std::process::ExitCode;
 
@@ -24,34 +44,37 @@ fn main() -> ExitCode {
     let args = std::env::args().skip(1);
     let invocation = hop_cli::parse(args);
 
-    // Resolved unconditionally, ahead of dispatching on `command` — `None`
-    // derives the default path exactly as before this issue, `Some`
-    // resolves and constrains the override. A refusal here is reported and
-    // exits through the same code `Command::Usage` below returns, per
-    // criterion 5: refusal goes through the existing usage-exit channel
-    // rather than a new one.
-    let socket = match hop_protocol::socket::socket_path(invocation.socket.as_deref()) {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("hop: {err}");
-            return ExitCode::from(2);
-        }
-    };
-
     match invocation.command {
         Command::Version => {
             hop_cli::print_version();
             ExitCode::SUCCESS
         }
-        Command::Query(text) => hop_cli::run_query(&socket, &text),
+        Command::Query(text) => match resolve(invocation.socket.as_deref()) {
+            Ok(socket) => hop_cli::run_query(&socket, &text),
+            Err(code) => code,
+        },
         Command::Exec {
             query,
             item_id,
             action_id,
-        } => hop_cli::run_exec(&socket, &query, item_id, action_id),
+        } => match resolve(invocation.socket.as_deref()) {
+            Ok(socket) => hop_cli::run_exec(&socket, &query, item_id, action_id),
+            Err(code) => code,
+        },
         Command::Usage => {
             eprintln!("{}", hop_cli::USAGE);
             ExitCode::from(2)
         }
     }
+}
+
+/// Resolves `socket` (`None` derives the default, `Some` resolves and
+/// constrains the override) for the two command arms that actually connect.
+/// A refusal is reported here and mapped to `Command::Usage`'s own exit
+/// code (`ExitCode::from(2)`), per criterion 5 — no new error channel.
+fn resolve(socket: Option<&std::path::Path>) -> Result<std::path::PathBuf, ExitCode> {
+    hop_protocol::socket::socket_path(socket).map_err(|err| {
+        eprintln!("hop: {err}");
+        ExitCode::from(2)
+    })
 }

@@ -512,6 +512,35 @@ fn the_version_subcommand_prints_both_versions() {
     );
 }
 
+/// Issue #180's own acceptance criterion 6: omitting `--socket` is
+/// unchanged behavior. `hop version` never opens a socket at all — it
+/// prints only compile-time constants — so it must keep working even in an
+/// environment with no `$XDG_RUNTIME_DIR`, exactly as it did before this
+/// issue. This is the regression the coordinator's review caught: an
+/// earlier version of `main.rs` resolved the socket path unconditionally
+/// before dispatching on the parsed command, which made `hop version`
+/// depend on a resolvable runtime directory it never uses.
+#[test]
+fn the_version_subcommand_works_with_no_xdg_runtime_dir_set() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hop"))
+        .arg("version")
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .expect("failed to run hop version");
+
+    assert!(
+        output.status.success(),
+        "hop version must succeed with no XDG_RUNTIME_DIR, got {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be valid UTF-8");
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "stdout must still contain the CLI's own version, got: {stdout:?}"
+    );
+}
+
 /// A scripted daemon: binds the socket where `hop` will look, accepts one
 /// connection, answers the handshake, hands the accepted stream to `script`,
 /// and keeps listening so the CLI's whole exchange happens against bytes
