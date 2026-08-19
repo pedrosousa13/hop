@@ -219,16 +219,23 @@ pub static MODE_LABEL_RGB: LazyLock<(u8, u8, u8)> = LazyLock::new(|| hex_token("
 pub static MODE_LABEL_MARGIN_END_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-space-3"));
 
 /// `--hop-accent`, the consumed-marker highlight's foreground colour — the
-/// one deliberate use of the accent this issue's brief and the M3 visual
-/// spec both name explicitly ("`--hop-accent` is available here ... use it
-/// deliberately rather than decoratively"); every other reservation
-/// (selection indicator, focus ring, action hints) stays off limits. 8.85:1
-/// against the dark window ground, clearing the accessibility floor's
-/// "Accent as small text or glyph" row at 4.5:1 — chosen over the softer
-/// `--hop-accent-subdued` wash the selected-row fill uses, because D7 makes
-/// legibility, not subtlety, the point: `w ` vs `wx ` has to read as
-/// different at a glance, before the query is committed, not on close
-/// inspection.
+/// one deliberate exception to `assets/tokens.css`'s own header rule that the
+/// accent is "used ONLY for the selection indicator, the focus ring, and
+/// action hints ... Never for body text". Issue #184's own body is what
+/// authorizes this exception, verbatim: "The accent (`--hop-accent`) is
+/// available here, but note it is otherwise reserved for the selection
+/// indicator, focus ring and action hints, so use it deliberately rather
+/// than decoratively." (The M3 visual spec,
+/// `docs/superpowers/specs/2026-08-19-hop-m3-visual-design.md`, never
+/// mentions the marker or this highlight at all — the issue is the only
+/// source for this exception, not a second one alongside it.) Every other
+/// reservation (selection indicator, focus ring, action hints) stays off
+/// limits. 8.85:1 against the dark window ground, clearing the
+/// accessibility floor's "Accent as small text or glyph" row at 4.5:1 —
+/// chosen over the softer `--hop-accent-subdued` wash the selected-row fill
+/// uses, because D7 makes legibility, not subtlety, the point: `w ` vs
+/// `wx ` has to read as different at a glance, before the query is
+/// committed, not on close inspection.
 pub static ACCENT_RGB: LazyLock<(u8, u8, u8)> = LazyLock::new(|| hex_token("hop-accent"));
 
 /// Widens one 8-bit colour channel (this module's [`hex_token`] result) to
