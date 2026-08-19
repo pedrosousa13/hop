@@ -616,7 +616,7 @@ control is *which uid*, and there is no finer distinction available.
   from" below.
   **[Amended 2026-08-19]** "A path inside a directory the daemon may not have
   created" is now, additionally, a path an *operator* may have named: #180
-  (`c6cd356`) gives `hopd` a `--socket <path>` override, and its two clients
+  gives `hopd` a `--socket <path>` override, and its two clients
   (`hop-cli`, `hop-gtk`) grow the matching flag alongside it. What this
   bullet already describes —
   the removal-before-bind sequence, the liveness probe, the 0600 narrowing —
