@@ -32,7 +32,8 @@ pub mod server;
 pub mod source;
 pub mod state_dir;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -46,15 +47,26 @@ use crate::source::HostSource;
 
 /// What `hopd`'s argument list resolved to.
 ///
-/// hopd's contract is "no arguments", and this type exists so that contract
-/// is *enforced* rather than merely undocumented. Before issue #122 the
-/// binary read `argv` not at all: every argument was discarded in silence
-/// and the daemon started and served regardless, so
+/// Before issue #122 the binary read `argv` not at all: every argument was
+/// discarded in silence and the daemon started and served regardless, so
 /// `hopd --socket /some/where` bound the default path and reported success.
 /// Under systemd that is the worst shape a misconfiguration can take — the
 /// unit is green, the daemon is listening, and it is listening somewhere no
 /// client looks, because `hop` resolves only
-/// `$XDG_RUNTIME_DIR/hop/hopd.sock` (`hop_cli`'s `socket_path`).
+/// `$XDG_RUNTIME_DIR/hop/hopd.sock` (`hop_cli`'s `socket_path`). #122's fix
+/// was to make every argument, without exception, a refusal — hopd had no
+/// flags at the time, so "any argument at all" and "an unrecognized
+/// argument" were the same rule.
+///
+/// Issue #180 is the flag #122's own doc comment anticipated: `--socket
+/// <path>` binds a caller-chosen path instead of the derived one, most
+/// usefully a second, non-conflicting socket for a development `hopd`
+/// running alongside a session's own. `Serve`'s field carries the raw,
+/// **unvalidated** value straight off `argv` — `None` when the flag was not
+/// given, `Some` when it was — because [`parse`] stays pure (see its own doc
+/// comment for why) and cannot itself check the one rule that matters, that
+/// the path resolves inside `$XDG_RUNTIME_DIR`. `main.rs` is what turns that
+/// `Some` into a validated path, or a refusal, before [`run`] ever sees it.
 ///
 /// Kept separate from the code that acts on it — [`parse`] never touches a
 /// socket or prints anything — so the tests at the bottom of this module
@@ -62,48 +74,73 @@ use crate::source::HostSource;
 /// `hop_cli`'s `parse`/`Command` split deliberately: the client half of this
 /// workspace already treats unrecognized input as a usage error rather than
 /// a default, and the daemon half is the odd one out until it does too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: a `PathBuf` is not, and `Serve`'s field is one. `Debug,
+/// Clone, PartialEq, Eq` are enough for the tests below to build and compare
+/// values.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
-    /// No arguments: run the daemon. [`run`] is the whole of it.
-    Serve,
-    /// One or more arguments, whatever they were. hopd accepts none, so
-    /// there is nothing to distinguish here — a plausible-looking flag, a
-    /// typo and a bare word are the same refusal.
+    /// Run the daemon. `socket` is `None` when `--socket` was not given (the
+    /// derived path applies) and `Some(raw)` when it was, carrying whatever
+    /// bytes followed the flag, unvalidated — see this type's own doc
+    /// comment for why validation is not this function's job.
+    Serve { socket: Option<PathBuf> },
+    /// `--socket` with no value, a repeated `--socket`, or any argument this
+    /// function does not recognize — a plausible-looking flag, a typo, and a
+    /// bare word are all the same refusal.
     Usage,
 }
 
 /// The line `main` prints to stderr for [`Invocation::Usage`].
 ///
-/// Phrased as a statement rather than a synopsis (`usage: hopd`) because a
-/// synopsis listing no arguments reads like a truncated message. An operator
-/// who just passed `--socket` needs to be told the flag does not exist, not
-/// shown an empty grammar.
-pub const USAGE: &str = "hopd takes no arguments";
+/// A synopsis now, not a statement (`hopd takes no arguments`, its wording
+/// before issue #180): hopd has exactly one flag today, so a grammar naming
+/// it is the more useful message — an operator who typoed `--socket-path` or
+/// left off its value sees the flag hopd actually accepts, not just that
+/// something was wrong.
+pub const USAGE: &str = "usage: hopd [--socket <path>]";
 
 /// Parses `args` — the process's arguments with `argv[0]` already stripped —
 /// into an [`Invocation`].
 ///
-/// Any argument at all is [`Invocation::Usage`]. That is the entire rule, and
-/// it is deliberately total: hopd has no flags today, so there is no
-/// arm here that could silently accept one. If a real `--socket` override is
-/// ever wanted (the standalone-run gap issue #122 names and leaves open —
-/// `contrib/systemd/hopd.socket` already covers the activated case via
-/// `ListenStream`), it becomes a new arm of this function, and the failure
-/// mode it replaces is the silence this function exists to end.
+/// No arguments is [`Invocation::Serve`] with `socket: None`. Exactly
+/// `--socket` followed by one more argument is `Serve` with that argument as
+/// `socket`. Everything else — `--socket` with nothing after it, `--socket`
+/// given twice, or any argument this function does not recognize — is
+/// [`Invocation::Usage`]. This function does not read `$XDG_RUNTIME_DIR`,
+/// touch the filesystem, or validate the path in any way; it only recognizes
+/// the flag's *shape*. See [`Invocation`]'s doc comment for why that
+/// validation belongs to `main.rs` instead: briefly, doing it here would
+/// mean an env read and filesystem access inside a function this module
+/// documents as pure, and would force `std::env::set_var` into this
+/// function's own unit tests below, which edition 2024 makes `unsafe` and
+/// this workspace's `unsafe_code = "deny"` lint refuses.
 ///
 /// # `OsString`, not `String`
 ///
 /// Takes `OsString` so `main` can call `std::env::args_os()` rather than
 /// `std::env::args()`, which *panics* on an argument that is not valid
-/// Unicode. Nothing here inspects an argument's contents — the count is the
-/// whole decision — so requiring UTF-8 would buy nothing and add a panic
-/// path reachable from `argv`. `hop_cli::parse` does take `String`, because
-/// a query's text is its payload; hopd has no payload.
+/// Unicode. The flag name itself is compared as `OsStr`, never decoded, so a
+/// non-UTF-8 `--socket` lookalike still refuses cleanly rather than
+/// panicking — and a non-UTF-8 *value* following a genuine `--socket` is
+/// accepted outright, because a path is under no obligation to be valid
+/// Unicode either. `hop_cli::parse` does take `String`, because a query's
+/// text is its payload; hopd's payload, when it has one, is a path, not
+/// text meant to be read.
 pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Invocation {
-    if args.into_iter().next().is_some() {
-        Invocation::Usage
-    } else {
-        Invocation::Serve
+    let mut args = args.into_iter();
+    match args.next() {
+        None => Invocation::Serve { socket: None },
+        Some(flag) if flag == OsStr::new("--socket") => match args.next() {
+            Some(value) if args.next().is_none() => Invocation::Serve {
+                socket: Some(PathBuf::from(value)),
+            },
+            // Either no value followed `--socket`, or something followed the
+            // value too (most notably a second `--socket`) — both are
+            // refused rather than guessing which argument the caller meant.
+            _ => Invocation::Usage,
+        },
+        Some(_) => Invocation::Usage,
     }
 }
 
@@ -160,14 +197,47 @@ fn pipeline_for(
     }
 }
 
-/// Resolves the runtime directory, binds the socket inside it, and serves
-/// connections until an unrecoverable error occurs or the process is
-/// killed.
+/// Resolves the socket path, binds it, and serves connections until an
+/// unrecoverable error occurs or the process is killed.
 ///
-/// `main.rs` calls this once [`parse`] has confirmed the invocation carried
-/// no arguments, so every behavior described here is the whole of what
-/// running the `hopd` binary *successfully* does; the one other outcome is
-/// the [`USAGE`] refusal.
+/// `socket` is the **already-resolved** override, or `None` for the derived
+/// path — `main.rs` is what turns `Invocation::Serve`'s raw, unvalidated
+/// `Option<PathBuf>` into this one (issue #180, design decision D6): it
+/// calls [`hop_protocol::socket::runtime_dir`] and
+/// [`hop_protocol::socket::resolve_in`] immediately after [`parse`], before
+/// this function or anything else runs, and refuses on stderr with
+/// [`Invocation::Usage`]'s own exit code if the override does not resolve
+/// inside `$XDG_RUNTIME_DIR`. That split keeps this function's own job
+/// simple and total: given `None`, resolve the runtime directory and derive
+/// the socket path inside it, exactly as before issue #180; given `Some`,
+/// the path is already known-good, so the only work left is creating its
+/// parent directory.
+///
+/// # Why the override branch does not call `runtime_dir::resolve`
+///
+/// [`runtime_dir::resolve`] creates `<XDG_RUNTIME_DIR>/hop` — a directory an
+/// override may not use at all (`$XDG_RUNTIME_DIR/hop-dev/hopd.sock`, one
+/// level below `hop`, is the case this issue's plan is written around,
+/// design decision D2). Calling it anyway on the override branch would
+/// create that directory as an unwanted side effect of a flag that never
+/// asked for it. What the override branch needs instead is exactly the
+/// piece `resolve` itself is built from: create *this* path's own parent at
+/// 0700, born that way with no create-then-`chmod` window, left exactly as
+/// found if it already exists. [`runtime_dir::create_at_0700`] is that piece,
+/// factored out so both branches share the one `DirBuilder` call rather than
+/// duplicating it — its own doc comment carries the full reasoning for why
+/// the mode is born rather than set after the fact.
+///
+/// Config and the state directory still resolve before either branch, in
+/// the same order as before this issue: a malformed config must refuse to
+/// start before anything binds a socket (issue #60 criterion 2), and that
+/// ordering does not depend on which socket path is about to be used.
+///
+/// `main.rs` calls this once [`parse`] and the override resolution above
+/// have both succeeded, so every behavior described here is the whole of
+/// what running the `hopd` binary *successfully* does; the other outcome is
+/// the [`USAGE`] refusal, owned by `main.rs` for both a malformed flag and a
+/// refused override alike.
 ///
 /// # The runtime is built here, not on `main`
 ///
@@ -200,7 +270,7 @@ fn pipeline_for(
 /// answers on, surfacing [`server::ListenerError::AlreadyListening`]
 /// through the `Err(err) => eprintln!("hopd: {err}")` arm just below
 /// instead of unlinking it.
-pub fn run() -> ExitCode {
+pub fn run(socket: Option<PathBuf>) -> ExitCode {
     // Installed first, ahead of everything else `run` does: `hop-core` only
     // *builds* the provider-panic hook (issue #104) — a library must not
     // mutate process-global state, such as the panic hook, as a side effect
@@ -232,11 +302,29 @@ pub fn run() -> ExitCode {
         }
     };
 
-    let runtime_dir = match runtime_dir::resolve() {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("hopd: {err}");
-            return ExitCode::FAILURE;
+    let socket_overridden = socket.is_some();
+    let socket_path = match socket {
+        None => match runtime_dir::resolve() {
+            Ok(dir) => dir.join(hop_protocol::socket::SOCKET_FILE_NAME),
+            Err(err) => {
+                eprintln!("hopd: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Some(path) => {
+            // `main.rs` only ever hands this branch a path
+            // `hop_protocol::socket::resolve_in` has already accepted, and
+            // that function refuses any path with no file name (a path
+            // ending in `/`, `.` or `..`) before it can reach here — so
+            // `parent()` always has something to return. The fallback below
+            // is defensive, not a path this crate expects to exercise
+            // through `main.rs`.
+            let parent = path.parent().unwrap_or(std::path::Path::new("."));
+            if let Err(err) = runtime_dir::create_at_0700(parent) {
+                eprintln!("hopd: {err}");
+                return ExitCode::FAILURE;
+            }
+            path
         }
     };
 
@@ -268,7 +356,7 @@ pub fn run() -> ExitCode {
     let pipeline = Arc::new(Mutex::new(pipeline_for(&config, &store_path, &host)));
     let source = HostSource::with_config(host, pipeline, config.max_results, Some(store_path));
 
-    match runtime.block_on(server::serve_with(&runtime_dir, source)) {
+    match runtime.block_on(server::serve_with(&socket_path, socket_overridden, source)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("hopd: {err}");
@@ -289,7 +377,7 @@ mod tests {
 
     #[test]
     fn no_arguments_serves() {
-        assert_eq!(parse(args(&[])), Invocation::Serve);
+        assert_eq!(parse(args(&[])), Invocation::Serve { socket: None });
     }
 
     #[test]
@@ -297,20 +385,60 @@ mod tests {
         assert_eq!(parse(args(&["serve"])), Invocation::Usage);
     }
 
-    /// The regression issue #122 was actually filed for. This flag does not
-    /// exist, and before #122 hopd discarded it and bound its default socket
-    /// path anyway — a green systemd unit listening where no client looks.
+    /// Issue #122 established that hopd discarding *any* argument was itself
+    /// the bug: `hopd --socket /some/where` used to bind the default socket
+    /// path anyway and report success — a green systemd unit listening where
+    /// no client looked. At the time hopd had no flags, so #122's fix was to
+    /// refuse every argument without exception, this one included.
+    ///
+    /// Issue #180 gives hopd the real flag #122's fix could only refuse:
+    /// this exact argument list — `--socket` followed by one value — is now
+    /// the flag's ordinary accepted shape, not a refusal. #122's protection
+    /// against *silence* is unchanged: an override that fails to resolve
+    /// still refuses (see `main.rs`), it just no longer refuses at `parse`
+    /// for having been given at all.
     #[test]
-    fn a_plausible_but_nonexistent_socket_flag_is_usage() {
+    fn a_socket_flag_with_a_value_parses() {
         assert_eq!(
             parse(args(&["--socket", "/run/user/1000/hopd.sock"])),
+            Invocation::Serve {
+                socket: Some(PathBuf::from("/run/user/1000/hopd.sock"))
+            }
+        );
+    }
+
+    /// `--socket` with nothing after it names no path to resolve, so it is a
+    /// refusal rather than `Serve { socket: None }` — silently falling back
+    /// to the derived path would hide a caller's mistyped invocation instead
+    /// of reporting it.
+    #[test]
+    fn a_socket_flag_with_no_value_is_usage() {
+        assert_eq!(parse(args(&["--socket"])), Invocation::Usage);
+    }
+
+    /// A second `--socket` — whatever follows it — is refused rather than
+    /// silently letting the last one win: `parse` does not decide which of
+    /// two overrides the caller meant.
+    #[test]
+    fn a_repeated_socket_flag_is_usage() {
+        assert_eq!(
+            parse(args(&["--socket", "/run/user/1000/a.sock", "--socket"])),
+            Invocation::Usage
+        );
+        assert_eq!(
+            parse(args(&[
+                "--socket",
+                "/run/user/1000/a.sock",
+                "--socket",
+                "/run/user/1000/b.sock"
+            ])),
             Invocation::Usage
         );
     }
 
-    /// A near-miss of a flag hopd might one day have is still a refusal
-    /// today. Nothing in [`parse`] pattern-matches an argument's spelling,
-    /// so a typo cannot land in an accepting arm by accident.
+    /// A near-miss of the flag is still a refusal. Nothing in [`parse`]
+    /// pattern-matches on any spelling but `--socket` itself, so a typo
+    /// cannot land in the accepting arm by accident.
     #[test]
     fn a_typo_of_a_future_flag_is_usage() {
         assert_eq!(parse(args(&["--socket-path"])), Invocation::Usage);
@@ -342,6 +470,23 @@ mod tests {
         // 0x80 is a continuation byte with no lead byte: never valid UTF-8.
         let invalid = OsString::from_vec(vec![b'-', b'-', 0x80]);
         assert_eq!(parse(vec![invalid]), Invocation::Usage);
+    }
+
+    /// The flag *name* above must refuse non-UTF-8 cleanly, but a
+    /// non-UTF-8 *value* following a genuine `--socket` is a legitimate
+    /// path — nothing about a filesystem path requires valid Unicode — and
+    /// `parse` never decodes it, so it is accepted rather than refused.
+    #[test]
+    fn a_non_utf8_socket_value_is_accepted() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_value = OsString::from_vec(vec![b'/', b'x', 0x80, b'y']);
+        assert_eq!(
+            parse(vec![OsString::from("--socket"), invalid_value.clone()]),
+            Invocation::Serve {
+                socket: Some(PathBuf::from(invalid_value))
+            }
+        );
     }
 
     /// The regression `pipeline_for` exists to make impossible: a
