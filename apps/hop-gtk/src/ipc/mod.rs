@@ -47,7 +47,7 @@ mod client;
 
 use std::path::PathBuf;
 
-use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, Mode};
+use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, MarkerSpan, Mode};
 
 /// A request the UI sends to the IPC thread. Carries no wire-protocol id —
 /// [`client::run`] assigns and tracks the `Query`/`Execute` frame's `id`
@@ -85,7 +85,37 @@ pub enum IpcEvent {
     ConnectFailed(String),
     /// How the daemon routed the active query — see
     /// `DaemonMsg::QueryRouted`'s contract for what `exclusive` means.
-    Routed { mode: Mode, exclusive: bool },
+    ///
+    /// # `marker_span` is bound to `query_text`, not to whatever the entry
+    /// # currently holds (issue #184)
+    ///
+    /// `marker_span` is a [`MarkerSpan`] computed by the router against one
+    /// specific query's raw text — a byte range that is only meaningful
+    /// against *that* text, never against whatever the query entry happens
+    /// to display when this event is finally handled. `query_text` is that
+    /// exact text, not read back out of the UI: `client::run` binds it at
+    /// the same moment it assigns this query its wire `id` (see that
+    /// module's `IpcCommand::Query` and `QueryRouted` match arms), so by the
+    /// time this event is constructed, `query_text` and `marker_span` are
+    /// guaranteed to describe the same query — nothing else in `client::run`
+    /// mutates either one independently of the other.
+    ///
+    /// That guarantee covers *this* struct's own two fields; it does not by
+    /// itself prove the query entry's *current* text still matches
+    /// `query_text` by the time a UI event handler gets around to using it —
+    /// the user may have kept typing in the gap between this event being
+    /// sent on `client::run`'s side and it being handled on the GTK main
+    /// thread's side. Closing that second gap is `ui::marker_highlight`'s
+    /// job, immediately before it ever applies `marker_span` to a widget —
+    /// see that module's own doc comment for the full account and why a
+    /// plain string comparison, done right there, is what actually
+    /// closes it.
+    Routed {
+        mode: Mode,
+        exclusive: bool,
+        marker_span: Option<MarkerSpan>,
+        query_text: String,
+    },
     /// The complete current result list for the active query, replacing
     /// whatever the UI is holding — the same replace rule
     /// `DaemonMsg::Results` documents.

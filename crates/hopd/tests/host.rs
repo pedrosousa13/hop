@@ -240,6 +240,7 @@ fn a_hanging_provider_is_cut_off_and_the_query_still_terminates() {
             query_id: 7,
             mode: Mode::All,
             exclusive: false,
+            marker_span: None,
         }
     );
     let done = recv(&mut stream);
@@ -283,6 +284,7 @@ fn a_providers_hostile_error_text_never_reaches_the_client() {
             query_id: 2,
             mode: Mode::All,
             exclusive: false,
+            marker_span: None,
         }
     );
     let done = recv(&mut stream);
@@ -388,6 +390,7 @@ fn a_fast_providers_items_arrive_before_a_slow_providers_budget_expires() {
             query_id: 3,
             mode: Mode::All,
             exclusive: false,
+            marker_span: None,
         }
     );
 

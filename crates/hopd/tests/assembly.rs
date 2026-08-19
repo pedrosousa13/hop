@@ -141,6 +141,7 @@ fn routed_and_frames_for(stream: &mut UnixStream, query_id: u64) -> ((Mode, bool
             query_id: got,
             mode,
             exclusive,
+            ..
         } => {
             assert_eq!(got, query_id, "the routed frame must name this query");
             (mode, exclusive)
@@ -583,6 +584,7 @@ fn the_first_frame_arrives_before_the_slow_provider_finishes() {
             query_id: 6,
             mode: Mode::All,
             exclusive: false,
+            marker_span: None,
         }
     );
 

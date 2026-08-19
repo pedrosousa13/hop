@@ -160,6 +160,7 @@ fn input_that_is_not_an_expression_yields_a_clean_query_done_with_no_items() {
             query_id: 1,
             mode: Mode::All,
             exclusive: false,
+            marker_span: None,
         }
     );
     assert_eq!(recv(&mut stream), DaemonMsg::QueryDone { query_id: 1 });
@@ -188,6 +189,7 @@ fn an_inferred_math_query_reports_calculator_without_exclusivity() {
             query_id: 1,
             mode: Mode::Calculator,
             exclusive: false,
+            marker_span: None,
         }
     );
 }

@@ -4,6 +4,8 @@
 //! — whose `GtkListView` factory dispatches to [`row`] to build and
 //! populate that node's widget.
 
+pub mod marker_highlight;
+pub mod mode_label;
 pub mod model;
 pub mod row;
 pub mod view;

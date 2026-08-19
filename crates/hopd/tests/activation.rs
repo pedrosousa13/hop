@@ -242,6 +242,7 @@ fn a_query_over_an_inherited_listener_is_served_without_hopd_rebinding_the_socke
             query_id: 1,
             mode: Mode::All,
             exclusive: false,
+            marker_span: None,
         }
     );
 

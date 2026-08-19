@@ -71,7 +71,7 @@ use hop_protocol::{ExecOutcome, Item};
 use crate::ipc::{CommandSender, IpcCommand, IpcEvent};
 use crate::keymap::{Action, Keymap};
 use crate::tokens;
-use crate::ui::{model, view};
+use crate::ui::{marker_highlight, mode_label, model, view};
 
 /// Rows moved per [`Action::PageUp`]/[`Action::PageDown`]. A fixed step
 /// rather than one derived from the scrolled window's currently allocated
@@ -90,6 +90,7 @@ const PAGE_STEP: i64 = 5;
 pub struct HopWindow {
     pub window: adw::ApplicationWindow,
     entry: gtk::Entry,
+    mode_label: gtk::Label,
     store: gio::ListStore,
     selection: gtk::SingleSelection,
     // Kept mainly so this module's own `#[cfg(test)]` dispatch tests can
@@ -130,6 +131,16 @@ impl HopWindow {
         let entry = gtk::Entry::builder()
             .placeholder_text("Type to search")
             .build();
+
+        // The mode label (issue #184) sits as an overlay child over `entry`
+        // rather than a sibling beside it — see `ui::mode_label::build`'s own
+        // doc comment, "No layout shift", for why an overlay is what makes
+        // its appearing, disappearing, and its text changing length none of
+        // them ever move anything else in this window.
+        let mode_label = mode_label::build();
+        let entry_overlay = gtk::Overlay::new();
+        entry_overlay.set_child(Some(&entry));
+        entry_overlay.add_overlay(&mode_label);
 
         let store = model::new_store();
         let selection = gtk::SingleSelection::new(Some(store.clone()));
@@ -182,7 +193,7 @@ impl HopWindow {
         status.set_wrap(true);
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        content.append(&entry);
+        content.append(&entry_overlay);
         content.append(&status);
         content.append(&overlay);
 
@@ -199,6 +210,7 @@ impl HopWindow {
         let hop_window = HopWindow {
             window,
             entry,
+            mode_label,
             store,
             selection,
             list_view,
@@ -430,9 +442,24 @@ impl HopWindow {
             IpcEvent::Disconnected => {
                 self.set_status("Lost connection to hopd, reconnecting…");
             }
-            IpcEvent::Routed { .. } => {
-                // No mode label in this slice — issue #184's seam. See this
-                // crate's top-level doc comment's out-of-scope list.
+            IpcEvent::Routed {
+                mode,
+                exclusive,
+                marker_span,
+                query_text,
+            } => {
+                // D3's "mirrors `exclusive`, and nothing else" rule, made
+                // concrete right here: the mode label is shown only when
+                // `exclusive` is true, computed once and handed to
+                // `mode_label::apply` as the single `Option<Mode>` it acts
+                // on — that function has no `exclusive` of its own to
+                // consult. See `IpcEvent::Routed`'s own doc comment for how
+                // `marker_span` is bound to `query_text`, and
+                // `ui::marker_highlight`'s doc comment for what
+                // `marker_highlight::apply` still checks before trusting
+                // that binding against this window's *current* entry text.
+                mode_label::apply(&self.mode_label, exclusive.then_some(mode));
+                marker_highlight::apply(&self.entry, &query_text, marker_span);
             }
             IpcEvent::Results(items) => {
                 let has_results = !items.is_empty();
@@ -681,7 +708,9 @@ mod tests {
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
-    use hop_protocol::{Action as WireAction, ActionId, ActionKind, ItemId, ItemTitle, Kind};
+    use hop_protocol::{
+        Action as WireAction, ActionId, ActionKind, ItemId, ItemTitle, Kind, MarkerSpan, Mode,
+    };
 
     use super::*;
     use crate::keymap::{Action, Keymap};
@@ -835,6 +864,9 @@ mod tests {
 
         assert_dispatch_action_moves_selection_and_activates();
         assert_mouse_click_activates_the_clicked_row();
+        assert_mode_label_mirrors_exclusive_and_nothing_else();
+        assert_marker_highlight_covers_exactly_the_reported_span();
+        assert_stale_marker_span_is_never_applied_to_newer_text();
     }
 
     /// [`HopWindow::dispatch_action`] is the single place every keymap-
@@ -952,5 +984,150 @@ mod tests {
         }
 
         println!("mouse-click activation assertions passed");
+    }
+
+    /// Reads back the one attribute [`marker_highlight::apply`] would have
+    /// set on `entry`, if any — `(start, end)` byte offsets, or `None` if
+    /// nothing is currently highlighted. `gtk::Entry::attributes()` needs a
+    /// real display to be meaningful the same way constructing the entry
+    /// itself does, which is why this lives beside the broadway-gated
+    /// assertions below rather than in `ui::marker_highlight`'s own
+    /// (display-free) unit tests.
+    fn entry_highlighted_range(entry: &gtk::Entry) -> Option<(u32, u32)> {
+        let list = entry.attributes()?;
+        let attr = list.iterator().attrs().iter().next().cloned()?;
+        Some((attr.start_index(), attr.end_index()))
+    }
+
+    /// Issue #184, criterion 1 / D3: the mode label is shown, naming the
+    /// mode, exactly when a `Routed` frame reports an exclusive route, and
+    /// is entirely absent — hidden, not merely empty-text — otherwise.
+    ///
+    /// Reads `get_visible()` (the label's own `visible` property,
+    /// `gtk_widget_get_visible`), not `is_visible()`
+    /// (`gtk_widget_is_visible`) — the latter also asks whether every
+    /// *ancestor* is visible, and `build_test_window` never presents the
+    /// window (this check has nothing to do with on-screen presentation), so
+    /// it would read `false` regardless of what `mode_label::apply` actually
+    /// set.
+    fn assert_mode_label_mirrors_exclusive_and_nothing_else() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.ModeLabel");
+
+        assert!(
+            !window.mode_label.get_visible(),
+            "a freshly built window must show no mode label before any route arrives"
+        );
+
+        window.apply_event(IpcEvent::Routed {
+            mode: Mode::Weather,
+            exclusive: true,
+            marker_span: None,
+            query_text: String::new(),
+        });
+        assert!(
+            window.mode_label.get_visible(),
+            "an exclusive route must show the mode label"
+        );
+        assert_eq!(window.mode_label.text(), "Weather");
+
+        window.apply_event(IpcEvent::Routed {
+            mode: Mode::Weather,
+            exclusive: false,
+            marker_span: None,
+            query_text: String::new(),
+        });
+        assert!(
+            !window.mode_label.get_visible(),
+            "a non-exclusive route must show no label at all, mirroring `exclusive` exactly"
+        );
+        assert_eq!(
+            window.mode_label.text(),
+            "",
+            "the label's text must be cleared, not just hidden, once absent"
+        );
+
+        println!("mode label assertions passed");
+    }
+
+    /// Issue #184, criterion 2: the consumed-marker highlight covers exactly
+    /// the byte range a `Routed` frame reports, and a `None` span highlights
+    /// nothing.
+    fn assert_marker_highlight_covers_exactly_the_reported_span() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.MarkerHighlight");
+
+        window.entry.set_text("w firefox");
+        assert!(
+            entry_highlighted_range(&window.entry).is_none(),
+            "a freshly built entry must start with nothing highlighted"
+        );
+
+        window.apply_event(IpcEvent::Routed {
+            mode: Mode::Windows,
+            exclusive: true,
+            marker_span: Some(MarkerSpan::new(0, 2).unwrap()),
+            query_text: "w firefox".to_string(),
+        });
+        assert_eq!(
+            entry_highlighted_range(&window.entry),
+            Some((0, 2)),
+            "the highlight must cover exactly the reported span"
+        );
+
+        // A later route that consumed no marker (`marker_span: None`) clears
+        // whatever highlight the previous route left — the entry's own text
+        // is unchanged here, only what routed it.
+        window.apply_event(IpcEvent::Routed {
+            mode: Mode::All,
+            exclusive: false,
+            marker_span: None,
+            query_text: "w firefox".to_string(),
+        });
+        assert!(
+            entry_highlighted_range(&window.entry).is_none(),
+            "a `None` span must clear any previous highlight, not leave it stale"
+        );
+
+        println!("marker highlight assertions passed");
+    }
+
+    /// The stale-span risk Task 1's review handed to this task, and the one
+    /// this suite treats as its most important check: a `marker_span`
+    /// computed against a query's text must never be applied once the entry
+    /// has moved on to different text — see `ui::marker_highlight`'s module
+    /// doc comment and `IpcEvent::Routed`'s own doc comment for the full
+    /// argument this test is the executable form of.
+    ///
+    /// The scenario: the user typed `"w "` (routing exclusively to Windows,
+    /// with a marker span over the leading `"w "`), then kept typing before
+    /// that frame's response arrived, so by the time `apply_event` runs, the
+    /// entry already shows `"wx firefox"` — a *different* mode's territory
+    /// (`wx ` is the weather prefix; see D7's own confusability example).
+    /// Applying `"w "`'s span (`[0, 2)`) to `"wx firefox"` would not panic —
+    /// both offsets land on real character boundaries of the new text too —
+    /// it would just silently highlight the wrong two bytes. This must not
+    /// happen: the stale frame's own `query_text` no longer matches
+    /// `entry.text()`, and that mismatch is exactly what
+    /// `marker_highlight::apply` checks for.
+    fn assert_stale_marker_span_is_never_applied_to_newer_text() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.StaleSpan");
+
+        // The user has moved on: the entry now holds text a *later* query
+        // produced, not the one this (stale) frame was computed against.
+        window.entry.set_text("wx firefox");
+
+        window.apply_event(IpcEvent::Routed {
+            mode: Mode::Windows,
+            exclusive: true,
+            marker_span: Some(MarkerSpan::new(0, 2).unwrap()),
+            query_text: "w ".to_string(),
+        });
+
+        assert!(
+            entry_highlighted_range(&window.entry).is_none(),
+            "a span bound to superseded text must never be applied to newer text, \
+             even though its offsets also happen to be valid against the new text"
+        );
+
+        println!("stale marker span guard assertions passed");
     }
 }

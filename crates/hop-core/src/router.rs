@@ -26,6 +26,7 @@
 //! provider owing and why checking the sigil path was rejected.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -454,6 +455,49 @@ pub struct RoutedQuery {
     /// field, or it and `CONTEXT.md`'s **raw query** entry are retired
     /// together, as one change.
     pub raw: RoutedText,
+    /// The byte range within `raw` that this route's own matching consumed
+    /// as a marker — a prefix, a sigil, a trailing phrase, or (on
+    /// `infer_timezone`'s alias branches) the whole trimmed token. `None`
+    /// where nothing was consumed as a marker: the [`Mode::All`] fallback,
+    /// and the two inferred routes ([`looks_like_math`],
+    /// [`looks_like_currency`]) that matched a *shape* rather than a marker,
+    /// so there is nothing in `raw` this field could point at.
+    ///
+    /// Set by the same branch that decides the route, from the exact slice
+    /// it matched — never computed afterward by diffing `raw` against `term`.
+    /// That shortcut was considered and rejected: an alias-matched timezone
+    /// route's `term` carries the canonical form of the matched key
+    /// (lowercased, whitespace runs collapsed to `_`) rather than the
+    /// spelling that was typed, so `term` is not always a substring of `raw`
+    /// at all — see `infer_timezone`'s alias branches — and a diff would
+    /// silently misplace the span on exactly the routes hardest to check by
+    /// eye.
+    ///
+    /// The marker does not always lead: most explicit routes strip a prefix
+    /// or a sigil, so their span starts where `raw`'s leading whitespace
+    /// ends, but `zurich weather` and `infer_timezone`'s ` time` suffix
+    /// branch are routed by a *trailing* marker, so their span ends there
+    /// instead. On `infer_timezone`'s bare-alias-token branch the marker is
+    /// the entire trimmed query rather than a piece of it, because nothing
+    /// about that route strips a fixed-length literal from one end — the
+    /// whole token is what was checked against the alias set.
+    ///
+    /// # What reporting this span costs
+    ///
+    /// `marker_span` is two plain integers, so `RoutedQuery`'s derived
+    /// `Debug` prints it as-is rather than through a redacting type like
+    /// [`RoutedText`] — there is no character content here for a `Debug` to
+    /// hide. Printing it anyway still discloses something: `hop_protocol`'s
+    /// `MarkerSpan`, the type this field becomes on the wire, prices exactly
+    /// what — its own "What reporting this span costs" is the fuller
+    /// argument, and it holds unchanged one crate upstream of the wire: on
+    /// every route named by a fixed prefix, sigil or suffix, the span's
+    /// length is already public (it is a literal `route` spells out in its
+    /// own source, and `mode`/`exclusive` already say which one matched), and
+    /// on the one route where it is not — the bare-alias-token branch, where
+    /// the marker is the user's own typed text — its length is already
+    /// disclosed once over, by `RoutedText`'s own redacted `Debug` on `raw`.
+    pub marker_span: Option<Range<usize>>,
 }
 
 /// The timezone aliases known to the router. Ported from the previous
@@ -533,75 +577,108 @@ static CURRENCY_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub fn route(raw: &str) -> RoutedQuery {
     let q = raw.trim_start();
 
-    if let Some(rest) = strip_prefix_ci(q, "w ") {
-        return exclusive(Mode::Windows, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, "w ") {
+        return exclusive(Mode::Windows, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_prefix_ci(q, "a ") {
-        return exclusive(Mode::Apps, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, "a ") {
+        return exclusive(Mode::Apps, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_prefix_ci(q, "f ") {
-        return exclusive(Mode::Files, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, "f ") {
+        return exclusive(Mode::Files, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_prefix_ci(q, ":emoji ") {
-        return exclusive(Mode::Emoji, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, ":emoji ") {
+        return exclusive(Mode::Emoji, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_prefix_ci(q, "emoji ") {
-        return exclusive(Mode::Emoji, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, "emoji ") {
+        return exclusive(Mode::Emoji, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_prefix_ci(q, "tz ") {
-        return exclusive(Mode::Timezone, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, "tz ") {
+        return exclusive(Mode::Timezone, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_prefix_ci(q, "timezone ") {
-        return exclusive(Mode::Timezone, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, "timezone ") {
+        return exclusive(Mode::Timezone, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_prefix_ci(q, "weather ") {
-        return exclusive(Mode::Weather, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, "weather ") {
+        return exclusive(Mode::Weather, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_prefix_ci(q, "wx ") {
-        return exclusive(Mode::Weather, rest, raw);
+    if let Some((rest, marker)) = strip_prefix_ci(q, "wx ") {
+        return exclusive(Mode::Weather, rest, raw, Some(span_of(raw, marker)));
     }
-    if let Some(rest) = strip_suffix_ci(q, " weather") {
-        return exclusive(Mode::Weather, rest, raw);
+    if let Some((rest, marker)) = strip_suffix_ci(q, " weather") {
+        return exclusive(Mode::Weather, rest, raw, Some(span_of(raw, marker)));
     }
     if let Some(rest) = q.strip_prefix('$') {
-        return exclusive(Mode::Currency, rest, raw);
+        return exclusive(Mode::Currency, rest, raw, Some(span_of(raw, &q[..1])));
     }
     if let Some(rest) = q.strip_prefix('=') {
-        return exclusive(Mode::Calculator, rest, raw);
+        return exclusive(Mode::Calculator, rest, raw, Some(span_of(raw, &q[..1])));
     }
     if let Some(rest) = q.strip_prefix('>') {
-        return exclusive(Mode::Actions, rest, raw);
+        return exclusive(Mode::Actions, rest, raw, Some(span_of(raw, &q[..1])));
     }
 
     if looks_like_math(q) {
-        return inferred(Mode::Calculator, q, raw);
+        return inferred(Mode::Calculator, q, raw, None);
     }
     if looks_like_currency(q) {
-        return inferred(Mode::Currency, q, raw);
+        return inferred(Mode::Currency, q, raw, None);
     }
-    if let Some(term) = infer_timezone(q) {
-        return inferred(Mode::Timezone, &term, raw);
+    if let Some((term, marker)) = infer_timezone(q) {
+        return inferred(Mode::Timezone, &term, raw, Some(span_of(raw, marker)));
     }
 
-    inferred(Mode::All, q, raw)
+    inferred(Mode::All, q, raw, None)
 }
 
-fn exclusive(mode: Mode, term: &str, raw: &str) -> RoutedQuery {
+fn exclusive(mode: Mode, term: &str, raw: &str, marker_span: Option<Range<usize>>) -> RoutedQuery {
     RoutedQuery {
         mode,
         term: RoutedText::new(term.trim()),
         exclusive: true,
         raw: RoutedText::new(raw),
+        marker_span,
     }
 }
 
-fn inferred(mode: Mode, term: &str, raw: &str) -> RoutedQuery {
+fn inferred(mode: Mode, term: &str, raw: &str, marker_span: Option<Range<usize>>) -> RoutedQuery {
     RoutedQuery {
         mode,
         term: RoutedText::new(term.trim()),
         exclusive: false,
         raw: RoutedText::new(raw),
+        marker_span,
     }
+}
+
+/// The byte range `sub` occupies within `raw`, computed from where `sub`'s
+/// bytes actually sit rather than by searching for them.
+///
+/// Every caller passes a `sub` that is, by construction, a subslice of
+/// `raw`'s own buffer — obtained through a chain of `&str` slicing
+/// (`trim_start`, `trim`, `[..n]`, `[n..]`), never through an owned copy — so
+/// `sub`'s bytes are literally `raw`'s bytes at some offset, and that offset
+/// is recoverable from the two pointers alone. This is safe (no
+/// dereference, only address arithmetic on values already obtained from
+/// `as_ptr`) and it is the reason this file threads `raw` and matched slices
+/// through its call chain instead of re-deriving each branch's marker length
+/// by hand at the point it builds a [`RoutedQuery`]: hand-tracking a length
+/// through `trim_start`, then `trim`, then a prefix or suffix strip is
+/// exactly the kind of bookkeeping an off-by-one hides in, and every marker
+/// this file strips is already available as a real slice at the point it is
+/// recognized.
+///
+/// Debug-only, since a caller passing a `sub` that is not really a subslice
+/// of `raw` is this function's own contract broken, not bad input from a
+/// query — nothing here is untrusted.
+fn span_of(raw: &str, sub: &str) -> Range<usize> {
+    let raw_start = raw.as_ptr() as usize;
+    let sub_start = sub.as_ptr() as usize;
+    debug_assert!(
+        sub_start >= raw_start && sub_start + sub.len() <= raw_start + raw.len(),
+        "span_of called with `sub` that is not a subslice of `raw`'s own buffer"
+    );
+    let start = sub_start - raw_start;
+    start..start + sub.len()
 }
 
 /// Case-insensitive prefix strip. Safe against multi-byte input: `get`
@@ -609,16 +686,25 @@ fn inferred(mode: Mode, term: &str, raw: &str) -> RoutedQuery {
 /// would land mid-character, so this never panics on a slice boundary.
 /// Correct as a case-insensitive match because every `prefix` we call this
 /// with is a pure-ASCII literal.
-fn strip_prefix_ci<'a>(q: &'a str, prefix: &str) -> Option<&'a str> {
+///
+/// Returns `(rest, marker)`: `rest` is what follows the matched prefix,
+/// exactly as before this function grew a second return value, and `marker`
+/// is the exact slice of `q` the prefix matched — same bytes, same case as
+/// typed. Returning the matched slice rather than only its length lets a
+/// caller compute the marker's span with [`span_of`] instead of re-deriving
+/// `prefix.len()` a second time next to the call, which is one definition of
+/// "how long is this marker" rather than two that could drift apart.
+fn strip_prefix_ci<'a>(q: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
     let candidate = q.get(0..prefix.len())?;
     candidate
         .eq_ignore_ascii_case(prefix)
-        .then(|| &q[prefix.len()..])
+        .then(|| (&q[prefix.len()..], candidate))
 }
 
 /// Case-insensitive suffix strip. Same char-boundary safety as
-/// [`strip_prefix_ci`].
-fn strip_suffix_ci<'a>(q: &'a str, suffix: &str) -> Option<&'a str> {
+/// [`strip_prefix_ci`], and the same `(rest, marker)` shape: `rest` is what
+/// precedes the matched suffix, `marker` is the suffix as matched.
+fn strip_suffix_ci<'a>(q: &'a str, suffix: &str) -> Option<(&'a str, &'a str)> {
     let split_at = q.len().checked_sub(suffix.len())?;
     if !q.is_char_boundary(split_at) {
         return None;
@@ -626,7 +712,7 @@ fn strip_suffix_ci<'a>(q: &'a str, suffix: &str) -> Option<&'a str> {
     let candidate = &q[split_at..];
     candidate
         .eq_ignore_ascii_case(suffix)
-        .then(|| &q[..split_at])
+        .then(|| (&q[..split_at], candidate))
 }
 
 /// The trimmed query is non-empty, contains at least one digit, and
@@ -662,13 +748,17 @@ fn looks_like_currency(q: &str) -> bool {
     CURRENCY_RE.is_match(&q.trim().to_ascii_lowercase())
 }
 
-/// Returns the timezone term (prefix/suffix phrasing stripped) if `q` looks
-/// like a timezone query, or `None` otherwise. See the module-level routing
-/// table doc for the three conditions this checks, in order.
+/// Returns the timezone term (prefix/suffix phrasing stripped) and the exact
+/// slice of `q` that was consumed as the marker authorizing the route, if `q`
+/// looks like a timezone query, or `None` otherwise. See the module-level
+/// routing table doc for the three conditions this checks, in order.
 ///
 /// An alias match returns the alias key it matched, so the term can differ
 /// from what the user typed; the phrase-prefix forms return the term as
-/// typed. The comment on the alias branches says why.
+/// typed. The comment on the alias branches says why. The returned marker
+/// slice is always a genuine subslice of `q` — never the canonicalized term
+/// — so a caller can hand it to [`span_of`] regardless of which branch
+/// matched.
 ///
 /// Both alias branches normalize with full `to_lowercase` rather than
 /// `to_ascii_lowercase`, which folds U+212A KELVIN SIGN to an ASCII `k`: a
@@ -679,7 +769,7 @@ fn looks_like_currency(q: &str) -> bool {
 /// match carries — a different and larger question than the one this
 /// function was last edited to answer. [`CURRENCY_RE`]'s doc records this as
 /// the one place the file is not ASCII-folded.
-fn infer_timezone(q: &str) -> Option<String> {
+fn infer_timezone(q: &str) -> Option<(String, &str)> {
     let trimmed = q.trim();
     if trimmed.is_empty() {
         return None;
@@ -688,14 +778,14 @@ fn infer_timezone(q: &str) -> Option<String> {
     // `time in ` must be checked before `time ` — the latter is a prefix of
     // the former, so checking it first would wrongly leave "in " glued to
     // the term.
-    if let Some(rest) = strip_prefix_ci(trimmed, "time in ") {
-        return Some(rest.to_string());
+    if let Some((rest, marker)) = strip_prefix_ci(trimmed, "time in ") {
+        return Some((rest.to_string(), marker));
     }
-    if let Some(rest) = strip_prefix_ci(trimmed, "time ") {
-        return Some(rest.to_string());
+    if let Some((rest, marker)) = strip_prefix_ci(trimmed, "time ") {
+        return Some((rest.to_string(), marker));
     }
-    if let Some(rest) = strip_prefix_ci(trimmed, "now in ") {
-        return Some(rest.to_string());
+    if let Some((rest, marker)) = strip_prefix_ci(trimmed, "now in ") {
+        return Some((rest.to_string(), marker));
     }
 
     // Both alias branches forward the normalized token, not the spelling it
@@ -711,16 +801,26 @@ fn infer_timezone(q: &str) -> Option<String> {
     // else — so they have no matched representation to forward. The visible
     // asymmetry (`sao paulo` comes back canonical, `time in São Paulo` comes
     // back as typed) is that difference showing through, not an oversight.
-    if let Some(prefix_part) = strip_suffix_ci(trimmed, " time") {
+    //
+    // The marker returned here is the trailing `" time"` phrase as typed —
+    // the suffix that authorized the route — and not the token before it:
+    // this branch is trailing-marker-shaped, the same as the ` weather`
+    // suffix in `route`, not leading-marker-shaped like the phrase-prefix
+    // branches above.
+    if let Some((prefix_part, marker)) = strip_suffix_ci(trimmed, " time") {
         let token = collapse_whitespace(&prefix_part.trim().to_lowercase());
         if token.chars().count() >= 2 && TIMEZONE_ALIASES.contains(token.as_str()) {
-            return Some(token);
+            return Some((token, marker));
         }
     }
 
+    // No fixed-length literal to strip here: the whole trimmed query is what
+    // was checked against the alias set, so the whole of it is the marker —
+    // unlike every branch above, this one has no leftover text on either
+    // side that isn't part of what authorized the route.
     let whole = collapse_whitespace(&trimmed.to_lowercase());
     if whole.chars().count() >= 2 && TIMEZONE_ALIASES.contains(whole.as_str()) {
-        return Some(whole);
+        return Some((whole, trimmed));
     }
 
     None
@@ -1354,6 +1454,141 @@ mod tests {
         let routed = route(TYPED);
         let debug = format!("{routed:?}");
         assert!(!debug.contains(TYPED), "got: {debug}");
+    }
+
+    // --- Issue #184: `RoutedQuery::marker_span` reports what each branch
+    // consumed as a marker, set by that branch's own matching rather than
+    // computed afterward by diffing `raw` against `term`.
+
+    /// Small helper so each span test states what it means rather than
+    /// spelling out byte arithmetic: the span, read back out of `raw`, must
+    /// be exactly `expected_marker`.
+    fn assert_marker_span(raw: &str, expected_marker: &str) {
+        let routed = route(raw);
+        let span = routed
+            .marker_span
+            .clone()
+            .unwrap_or_else(|| panic!("{raw:?} must report a marker_span, got None"));
+        assert_eq!(
+            &raw[span.clone()],
+            expected_marker,
+            "{raw:?} routed with marker_span {span:?}, expected it to slice out {expected_marker:?}"
+        );
+    }
+
+    #[test]
+    fn leading_marker_span_covers_the_matched_prefix() {
+        // Most explicit routes are led by their marker: `w ` is stripped from
+        // the front, so the span starts at 0.
+        assert_marker_span("w terminal", "w ");
+    }
+
+    #[test]
+    fn leading_marker_span_accounts_for_raws_own_leading_whitespace() {
+        // `route` trims leading whitespace before matching, but the span is
+        // reported against `raw`, whitespace included — so the marker's
+        // start is not always 0 in `raw`'s own coordinates, only in the
+        // trimmed `q`'s.
+        assert_marker_span("  w fire", "w ");
+        let routed = route("  w fire");
+        assert_eq!(routed.marker_span, Some(2..4));
+    }
+
+    #[test]
+    fn trailing_marker_span_covers_the_matched_suffix() {
+        // `zurich weather` is routed by a *trailing* marker — the case named
+        // directly in the brief, and the one a diff of `raw` against `term`
+        // gets right only by accident: `term` is `"zurich"`, which happens to
+        // be a prefix of `raw` here, but the span this field reports is the
+        // suffix that actually authorized the route, not the leftover prefix.
+        assert_marker_span("zurich weather", " weather");
+        let routed = route("zurich weather");
+        assert_eq!(routed.marker_span, Some(6..14));
+        assert_eq!(routed.term.as_str(), "zurich");
+    }
+
+    #[test]
+    fn single_char_sigil_marker_span_is_one_byte() {
+        assert_marker_span("$100 usd to eur", "$");
+        assert_marker_span("=2+2", "=");
+        assert_marker_span(">empty trash", ">");
+    }
+
+    #[test]
+    fn phrase_prefix_marker_span_covers_the_matched_phrase() {
+        assert_marker_span("time in zurich", "time in ");
+        assert_marker_span("now in tokyo", "now in ");
+    }
+
+    #[test]
+    fn alias_time_suffix_marker_span_covers_the_trailing_phrase_not_the_city() {
+        // `infer_timezone`'s ` time` suffix branch is trailing-marker-shaped
+        // like ` weather`, not leading-marker-shaped like the phrase-prefix
+        // branches above: the marker is the suffix, not the city name before
+        // it.
+        assert_marker_span("berlin time", " time");
+        let routed = route("berlin time");
+        assert_eq!(routed.marker_span, Some(6..11));
+        assert_eq!(routed.term.as_str(), "berlin");
+    }
+
+    #[test]
+    fn alias_canonical_bare_token_marker_span_covers_the_whole_trimmed_query() {
+        // The route D1 exists to protect: an alias-matched bare token forwards
+        // the *canonical* key as `term` (lowercased here, since `PST` is
+        // typed uppercase), which is not the text at this span in `raw` —
+        // proof by construction that this field cannot have been produced by
+        // diffing `raw` against `term`. The marker itself is the whole
+        // trimmed query, because nothing about this branch strips a
+        // fixed-length literal from either end: the entire token is what was
+        // checked against the alias set.
+        assert_marker_span("PST", "PST");
+        let routed = route("PST");
+        assert_eq!(routed.term.as_str(), "pst");
+        assert_ne!(
+            &routed.raw.as_str()[routed.marker_span.clone().unwrap()],
+            routed.term.as_str(),
+            "the marker text and the canonical term must differ in case here, or this test \
+             is not exercising the alias-canonical case at all"
+        );
+    }
+
+    #[test]
+    fn alias_canonical_marker_span_survives_a_non_ascii_separator() {
+        // `sao\u{a0}paulo` (issue #184's other named example of the
+        // alias-canonical case): the marker is the whole typed token
+        // including the NBSP, and the term it produces (`sao_paulo`) is a
+        // different string entirely — different length, different bytes,
+        // built by `collapse_whitespace` rather than sliced from `raw`.
+        let raw = "sao\u{a0}paulo";
+        assert_marker_span(raw, raw);
+        let routed = route(raw);
+        assert_eq!(routed.term.as_str(), "sao_paulo");
+        assert_eq!(routed.marker_span, Some(0..raw.len()));
+    }
+
+    #[test]
+    fn shape_inferred_routes_consume_no_marker() {
+        // `looks_like_math` and `looks_like_currency` match a shape, not a
+        // marker: there is no prefix, sigil or phrase to report a span for.
+        assert_eq!(route("2+2").marker_span, None);
+        assert_eq!(route("100 usd to eur").marker_span, None);
+    }
+
+    #[test]
+    fn the_all_fallback_consumes_no_marker() {
+        assert_eq!(route("firefox").marker_span, None);
+        assert_eq!(route("").marker_span, None);
+        assert_eq!(route("   ").marker_span, None);
+    }
+
+    #[test]
+    fn single_char_token_below_alias_minimum_consumes_no_marker() {
+        // `route("x")` falls all the way through to `Mode::All` — pinned by
+        // `single_char_token_below_alias_minimum_routes_to_all` above — so it
+        // must report no marker either, for the same reason the fallback
+        // above does.
+        assert_eq!(route("x").marker_span, None);
     }
 
     /// Answers "does `T` implement [`fmt::Display`]?" as a value, the same

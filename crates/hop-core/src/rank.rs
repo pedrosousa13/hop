@@ -1285,6 +1285,7 @@ mod tests {
             term: crate::router::RoutedText::new(term),
             exclusive: false,
             raw: crate::router::RoutedText::new(term),
+            marker_span: None,
         }
     }
 

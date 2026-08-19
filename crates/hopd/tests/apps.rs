@@ -121,6 +121,7 @@ fn the_a_prefix_reaches_the_apps_provider_exclusively() {
                 query_id: 2,
                 mode,
                 exclusive,
+                ..
             } => {
                 assert_eq!(mode, Mode::Apps);
                 assert!(exclusive, "`a ` is an exclusive route");
@@ -165,6 +166,7 @@ fn a_query_that_matches_nothing_still_reaches_a_clean_query_done() {
             query_id: 3,
             mode: Mode::All,
             exclusive: false,
+            marker_span: None,
         }
     );
     assert_eq!(recv(&mut stream), DaemonMsg::QueryDone { query_id: 3 });

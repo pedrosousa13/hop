@@ -64,6 +64,16 @@ kind today, which is a fact about the current mapping and not a guarantee.
 
 **Routing** — deciding a raw query's mode. Pure, and runs on every keystroke.
 
+**Consumed marker** — the portion of the **raw query** the router matched to
+choose a **mode**, distinct from the **term** it left behind: a leading
+prefix (`w `), a sigil (`$`, `=`), a trailing phrase (` weather`), or, on an
+alias-matched route, the whole typed token. Reported on the wire as a byte
+range into the raw query rather than as text — the client already holds what
+it typed, so echoing the marker back would only disclose it a second time. A
+route can consume no marker at all: the `Mode::All` fallback and any inferred
+route that matched a shape rather than a marker (a bare sum, a bare currency
+amount) report none.
+
 ## Exclusive, inferred, and augment-not-hijack
 
 **Exclusive** — the query named its mode with an explicit prefix (`w `, `$`,

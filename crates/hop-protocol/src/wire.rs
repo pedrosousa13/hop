@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::content::{CopyText, OpenUrl};
 use crate::item::{ActionId, Item, ItemId};
 use crate::limits;
+use crate::marker_span::MarkerSpan;
 use crate::mode::Mode;
 use crate::redaction::QueryText;
 
@@ -194,10 +195,27 @@ pub enum DaemonMsg {
     /// something a client could infer. It is also the half that carries the
     /// user-facing meaning: `exclusive` is true exactly when results the user
     /// cannot see were withheld.
+    ///
+    /// # `marker_span` (issue #184)
+    ///
+    /// The byte range within the query's raw text that routing consumed as a
+    /// marker — a prefix, a sigil, a trailing phrase, or (on an
+    /// alias-matched timezone route) the whole typed token. `None` where
+    /// nothing was consumed as a marker: the [`Mode::All`] fallback, and an
+    /// inferred route that matched a *shape* (a bare sum, a bare currency
+    /// amount) rather than a marker.
+    ///
+    /// This exists so a client can highlight the consumed marker inside the
+    /// query field it is already rendering without re-parsing the query text
+    /// to find it — see [`MarkerSpan`]'s own docs for why it travels as
+    /// offsets into text the client already holds rather than as the
+    /// marker's characters, and for what those offsets do and do not
+    /// guarantee about landing on a real character boundary.
     QueryRouted {
         query_id: u64,
         mode: Mode,
         exclusive: bool,
+        marker_span: Option<MarkerSpan>,
     },
     /// One frame of a query's results.
     ///
@@ -720,6 +738,81 @@ mod tests {
             r#"{"type":"execute","query_id":7,"item_id":"app:firefox","action_id":"open"}"#
         );
         assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn daemon_msg_query_routed_round_trips_with_a_marker_span() {
+        let msg = DaemonMsg::QueryRouted {
+            query_id: 7,
+            mode: Mode::Weather,
+            exclusive: true,
+            marker_span: Some(MarkerSpan::new(0, 3).unwrap()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"query_routed","query_id":7,"mode":"weather","exclusive":true,"marker_span":{"start":0,"end":3}}"#
+        );
+        assert_eq!(serde_json::from_str::<DaemonMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn daemon_msg_query_routed_round_trips_with_no_marker_span() {
+        let msg = DaemonMsg::QueryRouted {
+            query_id: 7,
+            mode: Mode::All,
+            exclusive: false,
+            marker_span: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":null}"#
+        );
+        assert_eq!(serde_json::from_str::<DaemonMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn a_query_routed_frame_with_an_inverted_marker_span_is_refused() {
+        let json = r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":{"start":5,"end":2}}"#;
+        assert!(serde_json::from_str::<DaemonMsg>(json).is_err());
+    }
+
+    #[test]
+    fn a_query_routed_frame_with_an_out_of_bounds_marker_span_is_refused() {
+        let json = format!(
+            r#"{{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":{{"start":0,"end":{}}}}}"#,
+            limits::MAX_QUERY_TEXT + 1
+        );
+        assert!(serde_json::from_str::<DaemonMsg>(&json).is_err());
+    }
+
+    #[test]
+    fn a_query_routed_frame_missing_marker_span_parses_as_none() {
+        // A plain `Option<T>` field gets serde's ordinary missing-field
+        // default, even inside this crate's internally-tagged, buffered
+        // parse — no `#[serde(default)]` needed, unlike the fields in
+        // `crate::item` that pair a `deserialize_with` with one (see that
+        // module's docs for why those need it and this field does not).
+        //
+        // This is worth pinning precisely because it means the JSON shape
+        // itself is lenient: a frame missing `marker_span` is not, on its
+        // own, what the `API_VERSION` bump in this crate's docs protects
+        // against. What it protects against is a client built from a crate
+        // that does not compile against this shape at all — `DaemonMsg` is a
+        // Rust type a stale binary embeds at compile time, so the risk the
+        // bump closes is a stale *binary*, not a stale *frame*; this test is
+        // about the latter, and the two must not be conflated.
+        let json = r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false}"#;
+        assert_eq!(
+            serde_json::from_str::<DaemonMsg>(json).unwrap(),
+            DaemonMsg::QueryRouted {
+                query_id: 7,
+                mode: Mode::All,
+                exclusive: false,
+                marker_span: None,
+            }
+        );
     }
 
     #[test]

@@ -141,12 +141,26 @@ async fn serve_one_connection(
     // as `ClientMsg::Query`'s doc comment describes.
     let mut next_id: u64 = 1;
     let mut current_id: Option<u64> = None;
+    // The raw text that produced `current_id` — set in the same match arm
+    // that assigns `current_id`, and nowhere else, so the two never drift
+    // apart. This is what lets the `QueryRouted` arm below hand
+    // `IpcEvent::Routed` a `query_text` that is *provably* the text
+    // `marker_span` was computed against, rather than something the UI would
+    // otherwise have to reconstruct — see that event variant's own doc
+    // comment (`ipc::IpcEvent::Routed`) for why this binding is issue #184's
+    // central correctness requirement.
+    let mut current_query_text: Option<String> = None;
 
     let outcome = loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Ok(IpcCommand::Query(text)) => {
+                        // Cloned before `QueryText::new` consumes `text` for
+                        // the wire: this crate's own copy of exactly what was
+                        // sent, kept for `QueryRouted` to bind below —
+                        // see `current_query_text`'s own comment.
+                        let raw_text = text.clone();
                         let Ok(query_text) = QueryText::new(text) else {
                             let _ = evt_tx.send(IpcEvent::Error(
                                 "query text rejected locally (over bound)".to_string(),
@@ -156,6 +170,7 @@ async fn serve_one_connection(
                         let id = next_id;
                         next_id += 1;
                         current_id = Some(id);
+                        current_query_text = Some(raw_text);
                         if send_frame(&mut write_half, &ClientMsg::Query { id, text: query_text }).await.is_err() {
                             break true;
                         }
@@ -178,8 +193,23 @@ async fn serve_one_connection(
             }
             frame = reader_rx.recv() => {
                 match frame {
-                    Some(ReadEvent::Message(DaemonMsg::QueryRouted { query_id, mode, exclusive })) if Some(query_id) == current_id => {
-                        let _ = evt_tx.send(IpcEvent::Routed { mode, exclusive }).await;
+                    Some(ReadEvent::Message(DaemonMsg::QueryRouted { query_id, mode, exclusive, marker_span })) if Some(query_id) == current_id => {
+                        // `current_query_text` was set in the very same
+                        // `IpcCommand::Query` arm above that produced
+                        // `current_id`, and nothing else in this loop ever
+                        // assigns either one independently — so this guard
+                        // (`Some(query_id) == current_id`, identical to every
+                        // other stale-frame check below) guarantees
+                        // `current_query_text`, if present, is the exact text
+                        // that produced *this* frame's `query_id`. It is
+                        // always present by the time any `query_id` can equal
+                        // `current_id` at all (both are `Some` or `None`
+                        // together), so `unwrap_or_default` here is a
+                        // never-taken fallback, not a real possibility — kept
+                        // only to avoid an `unwrap()` this crate's lints warn
+                        // on for a case that cannot actually occur.
+                        let query_text = current_query_text.clone().unwrap_or_default();
+                        let _ = evt_tx.send(IpcEvent::Routed { mode, exclusive, marker_span, query_text }).await;
                     }
                     Some(ReadEvent::Message(DaemonMsg::Results { query_id, items, .. })) if Some(query_id) == current_id => {
                         let _ = evt_tx.send(IpcEvent::Results(items)).await;

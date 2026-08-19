@@ -20,6 +20,7 @@ pub mod content;
 pub mod framing;
 pub mod item;
 pub mod limits;
+pub mod marker_span;
 pub mod mode;
 pub mod redaction;
 pub mod socket;
@@ -29,6 +30,7 @@ pub use content::*;
 pub use framing::*;
 pub use item::*;
 pub use limits::*;
+pub use marker_span::*;
 pub use mode::*;
 pub use redaction::*;
 pub use wire::*;
@@ -69,4 +71,34 @@ pub use wire::*;
 /// so that clean failure is worth more than the "gate against a client that
 /// does not exist" cost the paragraph above weighed — the client does exist,
 /// on any machine where `cargo install` ran once.
-pub const API_VERSION: u32 = 2;
+///
+/// **[2026-08-19] Bumped again, though not for quite the same reason.** Issue
+/// #184 added a `marker_span` field to
+/// [`DaemonMsg::QueryRouted`](crate::DaemonMsg), so a conforming daemon now
+/// sends a field it did not before. Unlike #127's bump, this specific change
+/// is not one that would otherwise break a mismatched peer at the JSON level:
+/// this crate's frames already tolerate an unknown field — pinned by
+/// `wire::tests::unknown_fields_tolerated_for_forward_compat` — so a client
+/// built before this commit reads a `QueryRouted` frame from a new daemon by
+/// silently ignoring `marker_span`, not by failing to parse it, and
+/// `marker_span`'s own type is `Option`-shaped and takes serde's ordinary
+/// missing-field default, so a client built after this commit reads a
+/// `QueryRouted` frame from an old daemon as `marker_span: None`, not as a
+/// parse error either — pinned by
+/// `wire::tests::a_query_routed_frame_missing_marker_span_parses_as_none`.
+/// Both directions already degrade cleanly without this bump, which is a
+/// real difference from #127, where an unrecognized `type` value was a hard
+/// parse failure with no tolerant path around it.
+///
+/// The bump happens anyway, on a narrower rationale than #127's: every
+/// wire-visible change to this contract earns a version bump as a matter of
+/// policy, rather than each one being individually adjudicated for whether
+/// its particular failure mode happens to degrade gracefully. The
+/// alternative — bump only the changes proven unsafe to skip — turns every
+/// future change into a fresh argument for why *this one* is the safe kind,
+/// decided by whoever is making it and rarely revisited by whoever reads the
+/// diff later. `API_VERSION` still costs nothing to bump for the reason the
+/// paragraph above gives: no release exists yet, and a stale binary in
+/// `~/.cargo/bin` is ordinary regardless of whether the specific field it is
+/// missing would have degraded gracefully or not.
+pub const API_VERSION: u32 = 3;
