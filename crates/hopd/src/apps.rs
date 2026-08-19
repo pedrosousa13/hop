@@ -684,12 +684,39 @@ enum AcquireError {
     /// Also reached if the open itself succeeds but the subsequent `fstat`
     /// (`File::metadata`) fails — the descriptor equivalent of the same
     /// "could not learn anything about this object" failure.
+    ///
+    /// Deliberately not reached for `ENXIO` — see [`NotARegularFile`]'s doc
+    /// comment for why that one errno gets its own arm instead of falling
+    /// in here.
+    ///
+    /// [`NotARegularFile`]: AcquireError::NotARegularFile
     CouldNotStat,
     /// The descriptor's own `fstat` (not a prior path `stat`) says this is
-    /// not a regular file — a FIFO, device, socket, or directory. Maps to
-    /// "not a regular file" unchanged; only the object it now describes
-    /// changed, from "whatever the path names" to "whatever `open()`
-    /// actually returned a descriptor for".
+    /// not a regular file — a FIFO, device, or directory. Maps to "not a
+    /// regular file" unchanged; only the object it now describes changed,
+    /// from "whatever the path names" to "whatever `open()` actually
+    /// returned a descriptor for".
+    ///
+    /// Also reached — *without* an `fstat` ever running — when `open()`
+    /// itself fails with `ENXIO`. Pre-#161, `std::fs::metadata` (`stat(2)`)
+    /// on a Unix socket succeeds; `is_file()` on the result is false, so the
+    /// scan logged this same reason. Post-#161, `open()` on a socket fails
+    /// with `ENXIO` *before* any `fstat` can run — verified with a
+    /// standalone probe binding a real `UnixListener` at a path and opening
+    /// it — so routing that errno to [`CouldNotStat`] instead would have
+    /// been a silent regression: an accurate "this is a socket" reason
+    /// downgraded to "nothing could be learned about this object", which is
+    /// false — plenty was learned, just not through `fstat`. `open()`
+    /// returning `ENXIO` is itself already proof of non-regularity, for
+    /// either of the two things that errno means for a `.desktop`
+    /// candidate: a Unix socket, or a device special file with no backing
+    /// driver. `std::io::ErrorKind` has no dedicated variant for `ENXIO` on
+    /// the toolchain this crate builds with (`.kind()` reports
+    /// `Uncategorized`), so the open's error mapping checks
+    /// `raw_os_error() == Some(libc::ENXIO)` directly rather than matching
+    /// on `kind()`.
+    ///
+    /// [`CouldNotStat`]: AcquireError::CouldNotStat
     NotARegularFile,
     /// More than [`MAX_DESKTOP_FILE_BYTES`] bytes were available to read,
     /// caught by `take(MAX_DESKTOP_FILE_BYTES + 1)` rather than inferred
@@ -706,11 +733,25 @@ enum AcquireError {
     /// present file used to fail only at `read_to_string`, with reason
     /// "could not be read". Since this scan's `read_dir` on `root` already
     /// succeeded, this process already holds search permission on every
-    /// directory component up to the candidate — so a `PermissionDenied`
-    /// reaching this open can only be about the candidate file's own mode
-    /// bits, never a directory `stat` would have hit too, which is what
-    /// keeps this mapping equivalent to the old boundary rather than an
+    /// directory component up to the candidate — so in the ordinary case a
+    /// `PermissionDenied` reaching this open is about the candidate file's
+    /// own mode bits, never a directory `stat` would have hit too, which is
+    /// what keeps this mapping equivalent to the old boundary rather than an
     /// approximation of it.
+    ///
+    /// That "can only be" holds for `root` and the candidate directly inside
+    /// it, but not in general: a candidate that is a *symlink* pointing into
+    /// some other directory tree can have its own restricted intermediate
+    /// directory on the far side of that link — one `read_dir(root)` never
+    /// touched and grants no search permission on — and resolving the link
+    /// during `open()` raises `EACCES` there, about a directory this process
+    /// never proved it could search, not about the candidate's own mode
+    /// bits. The mapping is still the right one even then: "could not be
+    /// read" is not misleading for a candidate that is unreachable for
+    /// permission reasons either way, and every other variant here would
+    /// describe the failure worse — `CouldNotStat` claims nothing could be
+    /// learned about the object, `NotARegularFile` claims a type this errno
+    /// says nothing about.
     ///
     /// Also reached if the open and `fstat` both succeed but the read
     /// itself fails partway (an I/O error, or non-UTF-8 content) — the
@@ -783,6 +824,14 @@ fn acquire_desktop_entry_content(path: &Path) -> Result<String, AcquireError> {
         .map_err(|err| {
             if err.kind() == std::io::ErrorKind::PermissionDenied {
                 AcquireError::CouldNotBeRead(err)
+            } else if err.raw_os_error() == Some(libc::ENXIO) {
+                // A Unix socket, or a device special file with no backing
+                // driver, at the candidate path: `open()` fails with ENXIO
+                // for either before `fstat` ever gets a chance to run — see
+                // `AcquireError::NotARegularFile`'s doc comment for the
+                // pre-#161 behavior this preserves and why `CouldNotStat`
+                // would have been the wrong (less informative) reason here.
+                AcquireError::NotARegularFile
             } else {
                 AcquireError::CouldNotStat
             }
@@ -1376,6 +1425,38 @@ mod scan_tests {
     }
 
     #[test]
+    fn scan_apps_with_log_reports_a_socket_as_not_a_regular_file() {
+        // Pins the pre-#161 observable behavior a reviewer flagged this
+        // change as having silently broken: `std::fs::metadata` (`stat(2)`)
+        // on a Unix socket succeeds, so `scan_apps` used to reach
+        // `is_file() == false` and log "not a regular file". Post-#161,
+        // `open()` on a socket fails with `ENXIO` *before* `fstat` ever
+        // runs — verified separately with a standalone probe — so without
+        // the explicit `ENXIO` arm in `acquire_desktop_entry_content`'s
+        // open-error mapping, this candidate would fall through to the
+        // generic `CouldNotStat` and log "could not stat the file" instead:
+        // accurate that something failed, but wrong about what, and a
+        // silent downgrade of a message this codebase already got right
+        // once. A real `UnixListener` bound at the candidate path, not a
+        // symlink to one — the earlier `/dev/zero`-via-symlink test above
+        // exercises a different code path (a *target* `open()` can
+        // succeed on) and would not catch this.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("evil.desktop");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("evil.desktop"), "{lines:?}");
+        assert!(
+            lines[0].contains("not a regular file"),
+            "a socket must be reported the same way it was before #161, not folded into \
+             the generic \"could not stat\" reason: {lines:?}"
+        );
+    }
+
+    #[test]
     fn scan_apps_with_log_reports_a_file_over_the_size_bound() {
         let dir = tempfile::tempdir().unwrap();
         let header = "[Desktop Entry]\nName=Huge\nExec=huge\n";
@@ -1390,6 +1471,51 @@ mod scan_tests {
         assert!(entries.is_empty());
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("huge.desktop"), "{lines:?}");
+        assert!(lines[0].contains("over the size bound"), "{lines:?}");
+    }
+
+    #[test]
+    fn scan_apps_with_log_rejects_a_multi_gib_file_without_reading_it_whole() {
+        // The acceptance criterion for #161 is that reads "stop at the
+        // explicit cap and reject over-limit content without unbounded
+        // allocation" — the sibling test above only proves rejection (one
+        // byte over the bound is still a ~256 KiB file on disk and in
+        // memory either way). This test is the one that actually exercises
+        // the allocation bound: a candidate far larger than
+        // `MAX_DESKTOP_FILE_BYTES` that a naive `read_to_string` would have
+        // pulled into memory whole.
+        //
+        // Built as a *sparse* file — seek to the target length minus one
+        // byte, write a single byte there — so it costs no real disk or
+        // memory to create: the filesystem only allocates blocks for the
+        // one byte actually written, not for the gigabytes of implied
+        // zeroes in between. `TempDir` (via `tempfile::tempdir` for the
+        // containing directory) cleans it up like any other file in it.
+        //
+        // This is fast, not slow: `acquire_desktop_entry_content`'s
+        // `take(MAX_DESKTOP_FILE_BYTES + 1).read_to_end(..)` reads only
+        // ~256 KiB regardless of the file's apparent length, because the
+        // `take` cap is enforced by the read itself rather than inferred
+        // from a size observed up front (see that function's doc comment).
+        // Measured standalone: `take(262145).read_to_end` against a 2 GiB
+        // sparse file completes in about 253 microseconds. Nobody should
+        // ever "optimize" this test away as slow — it isn't, and that speed
+        // is itself evidence the bound works.
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("colossal.desktop");
+        let target_len: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB, apparent length only.
+        let mut file = fs::File::create(&path).unwrap();
+        file.seek(SeekFrom::Start(target_len - 1)).unwrap();
+        file.write_all(&[0u8]).unwrap();
+        drop(file);
+        assert_eq!(fs::metadata(&path).unwrap().len(), target_len);
+
+        let (entries, lines) = scan_and_capture_log(&[dir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("colossal.desktop"), "{lines:?}");
         assert!(lines[0].contains("over the size bound"), "{lines:?}");
     }
 

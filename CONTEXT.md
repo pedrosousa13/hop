@@ -619,7 +619,7 @@ of issue #161 there are five in the tree, one of them in production code —
 `hopd::server`'s `OwnedFd::from_raw_fd`, taking ownership of a
 systemd-activated socket descriptor (issue #62) — and four test-only
 `libc::mkfifo`/`pre_exec` calls, in `hop-protocol`, `hopd::config`,
-`hopd::apps`, and `hopd`'s `tests/activation.rs`. Each carries its own narrow
+`hopd`'s `tests/activation.rs`, and `hopd::apps`. Each carries its own narrow
 `#[expect(unsafe_code)]` on the statement rather than
 `#[allow]` on the module, so a second `unsafe` beside it still fails, and the
 exception warns itself out of existence once its call goes — which CI's
