@@ -388,6 +388,10 @@ impl Default for HostPolicy {
 #[derive(Debug, thiserror::Error)]
 pub enum RegistrationError {
     /// The provider's id exceeds [`MAX_PROVIDER_ID`] bytes.
+    ///
+    /// `id` is the bounded, single-line sanitized representation used for
+    /// typed callers and display. It may differ from the raw manifest id when
+    /// that id contains controls or exceeds the provider-message budget.
     #[error("provider id `{id}` exceeds the maximum length of {max} bytes")]
     IdTooLong { id: String, max: usize },
     /// Another provider is already registered under this
@@ -475,7 +479,7 @@ impl ProviderHost {
         let declared = Provider::manifest(&*provider);
         if declared.id.len() > MAX_PROVIDER_ID {
             return Err(RegistrationError::IdTooLong {
-                id: declared.id.to_string(),
+                id: sanitize_provider_message(declared.id),
                 max: MAX_PROVIDER_ID,
             });
         }
@@ -1617,6 +1621,33 @@ mod tests {
             0,
             "the rejected provider must never be invoked for execution"
         );
+    }
+
+    #[test]
+    fn a_hostile_overlong_provider_id_is_sanitized_in_registration_error() {
+        let raw_id: &'static str = Box::leak(
+            format!(
+                "{}\u{1b}{}\u{202e}",
+                "x".repeat(MAX_PROVIDER_MESSAGE),
+                "y".repeat(MAX_PROVIDER_MESSAGE)
+            )
+            .into_boxed_str(),
+        );
+        let mut host = host();
+
+        let err = host
+            .register(ScriptedProvider::new(raw_id, vec![Kind::App], vec![]))
+            .expect_err("a hostile overlong provider id must be refused");
+
+        let RegistrationError::IdTooLong { id, max } = &err else {
+            panic!("expected IdTooLong, got {err:?}");
+        };
+        assert_eq!(*max, MAX_PROVIDER_ID);
+        assert!(id.len() <= MAX_PROVIDER_MESSAGE);
+        assert!(!id.contains('\u{1b}'));
+        assert!(!id.contains('\u{202e}'));
+        assert!(!err.to_string().contains('\u{1b}'));
+        assert!(!err.to_string().contains('\u{202e}'));
     }
 
     #[test]
