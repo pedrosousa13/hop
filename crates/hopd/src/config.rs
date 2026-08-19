@@ -15,9 +15,7 @@
 //! `XDG_RUNTIME_DIR`, and `Aliases::from_json` toward invalid JSON.
 
 use std::env;
-use std::fs;
-use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -51,15 +49,39 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 /// fits without this constant needing to move.
 const CONFIG_KEY_LINE_BYTES: u64 = 128;
 
-/// Headroom, in key-lines, for scalar keys this file does not have yet — not
-/// a count of the two it has today. `max_term_chars` itself arrived after
-/// `max_results` (issue #46), and the point of budgeting ahead is that the
-/// next knob like it should not force [`MAX_CONFIG_BYTES`] to move along
-/// with it. Eight times today's key count is comfortably more than a config
-/// holding "a handful of scalar keys" — the shape issue #160 itself
-/// describes this file as having — will hold before this constant is worth
-/// revisiting on its own merits.
-const MAX_CONFIG_KEYS: u64 = 16;
+/// Headroom, in key-lines, for scalar keys this shared file does not have
+/// yet — not a literal count of the keys any config actually needs today.
+///
+/// # Re-priced for issue #182 (D3)
+///
+/// This was `16` — "eight times today's key count" of 2 (`max_results`,
+/// `max_term_chars`) — before issue #182 added `hop-gtk`'s `[keymap]`
+/// section to this same file. `Config::from_path` reads the *whole* file's
+/// bytes before it ever looks for its own two keys (see D1 in the plan this
+/// issue implements: each binary parses only the sections it cares about,
+/// but the byte bound below is a bound on the file this daemon opens, not
+/// on its own schema), so a key nobody but `hop-gtk` ever reads still
+/// counts against this budget the moment it is written into the file
+/// `hopd` has to read past to find its own two.
+///
+/// The §8 default keymap the issue documents is about nine bindings, so a
+/// user who writes the full default keymap out explicitly — a documented,
+/// invited config, not an abusive one — takes this shared file from
+/// `hopd`'s 2 keys to roughly 11 (2 + 9) before [`MAX_CONFIG_KEYS`] or
+/// [`MAX_CONFIG_BYTES`] enter the picture at all. Against that new
+/// baseline the old `16` no longer prices "several times" anything — it is
+/// barely 1.45x an ordinarily-invited file, which is exactly the situation
+/// the rule at the top of [`MAX_CONFIG_BYTES`]'s doc comment exists to
+/// prevent: [`ConfigError::TooLarge`] is a startup refusal, and a config a
+/// user is invited to write must never trigger one.
+///
+/// Re-priced at the same eight-times multiplier the original constant
+/// used, applied to the new 11-key baseline instead of the old 2-key one:
+/// `8 * 11 = 88`. That is still comfortably more than "a handful of scalar
+/// keys plus one nine-entry table" will hold before this constant is worth
+/// revisiting again on its own merits — the same margin the original
+/// reasoning aimed for, carried forward rather than abandoned.
+const MAX_CONFIG_KEYS: u64 = 88;
 
 /// Budget, in bytes, for what actually dominates a hand-written config in
 /// this repo's own commenting style: prose. A config file documented the way
@@ -68,20 +90,24 @@ const MAX_CONFIG_KEYS: u64 = 16;
 /// covers that comfortably while staying nowhere near "unbounded".
 const CONFIG_COMMENT_BUDGET_BYTES: u64 = 8 * 1024;
 
-/// The byte ceiling on a config file's contents, enforced in
-/// [`Config::from_path`] via [`std::io::Read::take`] before the bytes ever
-/// reach the TOML parser — the same shape `hop-core::learning`'s
-/// `MAX_STORE_BYTES` uses for the learning store (issue #37: a `take(cap +
-/// 1)` read, so an over-cap file is detected without ever allocating it),
-/// sized down for how much smaller this file's job is.
+/// The byte ceiling on a config file's contents, enforced by
+/// [`hop_protocol::config_file::read`] via [`std::io::Read::take`] before
+/// the bytes ever reach the TOML parser — the same shape
+/// `hop-core::learning`'s `MAX_STORE_BYTES` uses for the learning store
+/// (issue #37: a `take(cap + 1)` read, so an over-cap file is detected
+/// without ever allocating it), sized down for how much smaller this
+/// file's job is.
 ///
 /// `CONFIG_KEY_LINE_BYTES * MAX_CONFIG_KEYS` prices a config built from
-/// several times today's key count; `CONFIG_COMMENT_BUDGET_BYTES` prices the
-/// prose around them, which is what a config in this repo's style would
-/// actually spend most of its bytes on. The total — a little over ten
-/// KiB — is nowhere near enough to trouble memory even fully buffered, and
-/// nowhere near small enough to reject an ordinarily-commented config that
-/// only sets these two knobs.
+/// several times the key count this shared file now documents as ordinary
+/// — `hopd`'s own 2 keys plus the roughly nine-entry `[keymap]` table
+/// issue #182 adds; see [`MAX_CONFIG_KEYS`]'s doc comment for the
+/// arithmetic. `CONFIG_COMMENT_BUDGET_BYTES` prices the prose around them,
+/// which is what a config in this repo's style would actually spend most
+/// of its bytes on. The total — 19 KiB — is nowhere near enough to trouble
+/// memory even fully buffered, and nowhere near small enough to reject an
+/// ordinarily-documented config that sets `hopd`'s two knobs and writes
+/// out the full default keymap.
 const MAX_CONFIG_BYTES: u64 = CONFIG_KEY_LINE_BYTES * MAX_CONFIG_KEYS + CONFIG_COMMENT_BUDGET_BYTES;
 
 /// hopd's configuration, loaded once at startup and never written.
@@ -320,134 +346,67 @@ impl Config {
 
     /// Loads from a concrete config file path.
     ///
-    /// # Open, classify, read — in that order (issue #160)
+    /// # The bounded, hazard-aware read is `hop-protocol`'s, not this
+    /// function's own
     ///
-    /// Before this issue this was `fs::read_to_string(path)`: unbounded, and
+    /// Before issue #160 this was `fs::read_to_string(path)`: unbounded, and
     /// with no check that the thing it opened was even a regular file.
     /// `run()` in `lib.rs` calls the config loader before it creates the
     /// runtime directory or binds the socket, so anything that stalled here
     /// stalled the whole daemon with no socket and no diagnostic anywhere a
-    /// user could see it.
+    /// user could see it. Issue #160 fixed that in place, with three
+    /// protections — `O_NONBLOCK` on the open so a FIFO cannot block
+    /// startup, classifying the opened *descriptor* rather than the path so
+    /// the check and the read that follows always agree on which file they
+    /// mean, and a read bounded through [`std::io::Read::take`] so an
+    /// endless device like `/dev/zero` cannot be read to completion.
     ///
-    /// **The open carries `O_NONBLOCK`.** Opening a FIFO for reading
-    /// otherwise blocks until a writer appears — forever, for a FIFO nobody
-    /// is writing to. `O_NONBLOCK` on a read-only open of a FIFO returns a
-    /// descriptor immediately instead of waiting, which is what lets the
-    /// next step classify and refuse it rather than hang on it. On a regular
-    /// file the flag has no effect at all, so an ordinary config opens and
-    /// reads exactly as before. This is the same flag
-    /// `hop-protocol::content::IconPath::open_regular_file` carries for the
-    /// identical hazard on the icon-open path (issue #131), the closest
-    /// precedent in this workspace for "open under a policy that cannot
-    /// block acquiring a special-file descriptor."
-    ///
-    /// **What is classified is the descriptor, not the path.**
-    /// [`std::fs::File::metadata`] is `fstat` on the file this call already
-    /// has open — it reports the object the open actually returned, not
-    /// whatever the path names by the time this line runs. `fs::metadata`
-    /// on the path instead would stat a second, possibly different, object
-    /// (see "Replacement", below); classifying the descriptor is what
-    /// guarantees the check and the read that follows name the same file.
-    /// A directory, device, socket or FIFO fails
-    /// `metadata.is_file()` and is never read from — reported as
-    /// [`ConfigError::NotARegularFile`].
-    ///
-    /// **The read is bounded through [`MAX_CONFIG_BYTES`]**, via
-    /// [`std::io::Read::take`] — see that constant's doc comment for why the
-    /// number is what it is. This is `hop-core::learning`'s bounded-read
-    /// precedent (issue #37), followed rather than reinvented:
-    /// `take(MAX_CONFIG_BYTES + 1)` rather than `take(MAX_CONFIG_BYTES)` is
-    /// what tells a file sitting exactly on the cap (accepted) apart from
-    /// one a single byte over it (refused) without the read — or the
-    /// `Vec<u8>` it fills — ever growing past `MAX_CONFIG_BYTES + 1` bytes to
-    /// find out. Measured before decoding, for the same reason
-    /// `learning.rs` measures before decoding: `take` cuts at a byte offset
-    /// and can land inside a multibyte character, so decoding first would
-    /// report an unrelated UTF-8 failure for a file that was really refused
-    /// for its size.
-    ///
-    /// # Symlinks
-    ///
-    /// The open follows a symlink at the config path, exactly as
-    /// `fs::read_to_string` did before this change: pointing
-    /// `~/.config/hop/config.toml` at a config that lives elsewhere is
-    /// ordinary and must keep working, the same reasoning
-    /// `IconPath::open_regular_file`'s docs give for not adding
-    /// `O_NOFOLLOW`. What is classified is what the link *resolves to* — a
-    /// symlink to a regular file loads, a symlink to `/dev/zero` does not,
-    /// because the `fstat` sees the character device on the other end of the
-    /// link rather than the link itself.
-    ///
-    /// A symlink whose target does not exist — dangling, because the file it
-    /// once pointed at was moved or removed — fails the open with `ENOENT`,
-    /// the identical error a config path that names nothing at all fails
-    /// with. It is therefore handled by the same `NotFound` arm below and
-    /// reads as an absent config: deliberately, since a link that resolves
-    /// to nothing is indistinguishable, from the daemon's point of view,
-    /// from no config having been placed there.
-    ///
-    /// # Replacement between open and read
-    ///
-    /// The open and every read that follows act on one file descriptor, not
-    /// on the path a second time, so once the open succeeds this function
-    /// reads the object it opened even if the path is unlinked, replaced, or
-    /// repointed at something else immediately afterward — the classic
-    /// TOCTOU window is closed by construction here, because there is only
-    /// ever one path lookup. What remains is the window *before* that one
-    /// lookup: nothing stops a concurrent write from finishing, or a
-    /// replacement from landing, in the instant before the open runs, and
-    /// the open simply reads whatever was there then. Nothing after the open
-    /// can change which object gets classified or read.
+    /// Issue #182 promoted that exact logic into
+    /// [`hop_protocol::config_file::read`], because `hop-gtk` gained a
+    /// second reader of this same attacker-influencable path and copying
+    /// those three protections into a second crate is how the two copies
+    /// drift apart. This function now only supplies the two things that are
+    /// still `hopd`'s own to choose — the path, and [`MAX_CONFIG_BYTES`],
+    /// this daemon's own byte cap (see that constant's doc comment for the
+    /// budget's reasoning) — and maps the shared function's refusal back
+    /// into this module's own [`ConfigError`], preserving every message
+    /// this daemon has always produced. See
+    /// [`hop_protocol::config_file`]'s module doc comment for the full case
+    /// for the open/classify/read protections themselves, including why
+    /// symlinks are followed rather than refused and how the TOCTOU window
+    /// between open and read is closed by construction.
     ///
     /// # Errors
     ///
-    /// A `NotFound` on the open is *not* an error: an absent config is the
-    /// documented default, so a missing file maps to `Ok(Config::default())`.
-    /// Any other open or inspection failure, or bytes that are not valid
-    /// UTF-8, is [`ConfigError::Read`]. Something other than a regular file
-    /// is [`ConfigError::NotARegularFile`]. A file over [`MAX_CONFIG_BYTES`]
-    /// is [`ConfigError::TooLarge`]. A file that is both a regular file and
+    /// A missing file is *not* an error: an absent config is the documented
+    /// default, so [`hop_protocol::config_file::read`] returning `Ok(None)`
+    /// maps to `Ok(Config::default())`. Any other open or inspection
+    /// failure, or bytes that are not valid UTF-8, is [`ConfigError::Read`].
+    /// Something other than a regular file is
+    /// [`ConfigError::NotARegularFile`]. A file over [`MAX_CONFIG_BYTES`] is
+    /// [`ConfigError::TooLarge`]. A file that is both a regular file and
     /// within the cap goes through the TOML parse.
     fn from_path(path: &Path) -> Result<Config, ConfigError> {
-        let file = match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
-            Err(err) => {
+        let data = match hop_protocol::config_file::read(path, MAX_CONFIG_BYTES) {
+            Ok(Some(data)) => data,
+            Ok(None) => return Ok(Config::default()),
+            Err(hop_protocol::config_file::ConfigFileError::Read { source, .. }) => {
                 return Err(ConfigError::Read {
                     path: path.to_owned(),
-                    err,
+                    err: source,
+                });
+            }
+            Err(hop_protocol::config_file::ConfigFileError::NotARegularFile { .. }) => {
+                return Err(ConfigError::NotARegularFile {
+                    path: path.to_owned(),
+                });
+            }
+            Err(hop_protocol::config_file::ConfigFileError::TooLarge { .. }) => {
+                return Err(ConfigError::TooLarge {
+                    path: path.to_owned(),
                 });
             }
         };
-
-        // `File::metadata` is `fstat` on this descriptor: it reports the
-        // object that was actually opened, never the path.
-        let metadata = file.metadata().map_err(|err| ConfigError::Read {
-            path: path.to_owned(),
-            err,
-        })?;
-        if !metadata.is_file() {
-            return Err(ConfigError::NotARegularFile {
-                path: path.to_owned(),
-            });
-        }
-
-        let mut data = Vec::new();
-        file.take(MAX_CONFIG_BYTES + 1)
-            .read_to_end(&mut data)
-            .map_err(|err| ConfigError::Read {
-                path: path.to_owned(),
-                err,
-            })?;
-        if data.len() as u64 > MAX_CONFIG_BYTES {
-            return Err(ConfigError::TooLarge {
-                path: path.to_owned(),
-            });
-        }
 
         let text = String::from_utf8(data).map_err(|err| ConfigError::Read {
             path: path.to_owned(),

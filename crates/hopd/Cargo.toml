@@ -29,16 +29,25 @@ fasteval.workspace = true
 # already a workspace dependency; ConfigError is thiserror-derived.
 thiserror.workspace = true
 toml.workspace = true
-# Moved here from `[dev-dependencies]` by issue #160: `config.rs`'s
-# `Config::from_path` now opens the config file with `O_NONBLOCK`
-# (`std::os::unix::fs::OpenOptionsExt::custom_flags`) so a FIFO at the
-# config path cannot block startup — the same flag constant
-# `hop-protocol`'s `IconPath::open_regular_file` uses for the same reason
-# (issue #131). This crate has no non-Unix target (it binds a Unix domain
-# socket unconditionally), so this is a plain dependency rather than a
-# `cfg(unix)`-scoped one the way `hop-protocol`'s is. Also used by two
-# dev-only callers, noted where they live: one in `tests/activation.rs`, the
-# other in `src/config.rs`'s own `#[cfg(test)] mod tests`.
+# Moved here from `[dev-dependencies]` by issue #160, for a reason that has
+# since moved crates: `config.rs`'s `Config::from_path` used to open the
+# config file with `O_NONBLOCK` (`std::os::unix::fs::OpenOptionsExt::custom_flags`)
+# directly, so a FIFO at the config path could not block startup. Issue #182
+# promoted that open/classify/read logic into `hop-protocol::config_file`,
+# so `config.rs` itself no longer calls `libc` in production — but `apps.rs`
+# does, unconditionally, for the identical `O_NONBLOCK` reason on a
+# `.desktop` candidate's path (see `AcquireError::NotARegularFile`'s doc
+# comment), which is what keeps this a plain dependency rather than a
+# `cfg(unix)`-scoped one the way `hop-protocol`'s is — the same flag
+# constant `hop-protocol`'s `IconPath::open_regular_file` uses for the same
+# reason (issue #131). This crate has no non-Unix target (it binds a Unix
+# domain socket unconditionally), so a `cfg(unix)` scope would buy nothing
+# here anyway. Also used by three dev-only callers, noted where they live:
+# one in `tests/activation.rs`, one in `src/apps.rs`'s own
+# `#[cfg(test)] mod tests`, and one in `src/config.rs`'s own
+# `#[cfg(test)] mod tests` (which still builds a real FIFO to prove
+# `Config::from_path` refuses it via the promoted `hop-protocol` function,
+# even though the `O_NONBLOCK` open itself no longer lives in this file).
 libc.workspace = true
 
 [dev-dependencies]
