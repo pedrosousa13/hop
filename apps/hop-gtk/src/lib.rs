@@ -16,6 +16,7 @@
 pub mod app;
 pub mod cli;
 pub mod ipc;
+pub mod keymap;
 pub mod layer_shell;
 pub mod screenshot;
 pub mod tokens;

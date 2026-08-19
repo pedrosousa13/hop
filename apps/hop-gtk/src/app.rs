@@ -124,9 +124,29 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         }
     };
 
+    // The keymap is resolved once, here, before either run mode builds a
+    // window — both `run_interactive` and `run_screenshot` call
+    // `ui::window::HopWindow::build`, which needs one regardless of which
+    // mode is running. A [`crate::keymap::KeymapError`] refuses to start
+    // `hop-gtk` at all, the same posture this function already takes one
+    // check above toward a bad `--socket` override, and the same posture
+    // `hopd::run` takes toward its own malformed config: see
+    // `keymap`'s module doc comment, "Refusal, and what it means for
+    // startup", for the full argument against starting anyway with an
+    // implicit complaint logged somewhere a user is unlikely to see it.
+    let keymap = match crate::keymap::Keymap::load() {
+        Ok(keymap) => keymap,
+        Err(err) => {
+            eprintln!("hop-gtk: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     match parsed {
-        cli::Args::Run { .. } => run_interactive(socket_path),
-        cli::Args::Screenshot { path, query, .. } => run_screenshot(socket_path, path, query),
+        cli::Args::Run { .. } => run_interactive(socket_path, keymap),
+        cli::Args::Screenshot { path, query, .. } => {
+            run_screenshot(socket_path, keymap, path, query)
+        }
         cli::Args::Usage => unreachable!("handled above"),
     }
 }
@@ -135,7 +155,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 /// `activate`, presents it on every `activate` after that (this run's own
 /// first activation, or a later one forwarded from a re-invocation) — see
 /// this module's doc comment.
-fn run_interactive(socket_path: PathBuf) -> ExitCode {
+fn run_interactive(socket_path: PathBuf, keymap: crate::keymap::Keymap) -> ExitCode {
     let app = adw::Application::new(Some(APP_ID), gio::ApplicationFlags::empty());
     let activation_token = std::env::var("XDG_ACTIVATION_TOKEN").ok();
 
@@ -146,7 +166,7 @@ fn run_interactive(socket_path: PathBuf) -> ExitCode {
         }
 
         let (cmd_tx, evt_rx) = ipc::spawn(socket_path.clone());
-        let window = ui::window::HopWindow::build(app, cmd_tx);
+        let window = ui::window::HopWindow::build(app, cmd_tx, keymap.clone());
         window.present_with_token(activation_token.as_deref());
 
         glib::spawn_future_local({
@@ -224,7 +244,12 @@ fn run_interactive(socket_path: PathBuf) -> ExitCode {
 /// does not care which headless backend is chosen, only that `GDK_BACKEND`
 /// (or a real display) resolves to *something* before `app.run_with_args`
 /// below opens one.
-fn run_screenshot(socket_path: PathBuf, out_path: PathBuf, query: String) -> ExitCode {
+fn run_screenshot(
+    socket_path: PathBuf,
+    keymap: crate::keymap::Keymap,
+    out_path: PathBuf,
+    query: String,
+) -> ExitCode {
     let app = adw::Application::new(Some(APP_ID), gio::ApplicationFlags::NON_UNIQUE);
     let exit_code = Rc::new(std::cell::Cell::new(ExitCode::FAILURE));
 
@@ -232,7 +257,7 @@ fn run_screenshot(socket_path: PathBuf, out_path: PathBuf, query: String) -> Exi
         let exit_code = exit_code.clone();
         move |app| {
             let (cmd_tx, evt_rx) = ipc::spawn(socket_path.clone());
-            let window = ui::window::HopWindow::build(app, cmd_tx.clone());
+            let window = ui::window::HopWindow::build(app, cmd_tx.clone(), keymap.clone());
             window.present_with_token(None);
 
             let done = Rc::new(std::cell::Cell::new(false));

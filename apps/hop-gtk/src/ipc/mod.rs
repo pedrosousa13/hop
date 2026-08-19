@@ -175,6 +175,26 @@ pub fn spawn(socket_path: PathBuf) -> (CommandSender, EventReceiver) {
     (CommandSender(cmd_tx), EventReceiver(evt_rx))
 }
 
+/// Test-only escape hatch: a [`CommandSender`] paired with a plain, directly
+/// readable receiver of the [`IpcCommand`]s sent through it — bypassing
+/// [`spawn`]'s background thread and real socket entirely.
+/// [`CommandSender`]'s only *production* constructor is [`spawn`],
+/// deliberately (this module's own doc comment: nothing outside this module
+/// can even name the type that touches the wire), but `ui::window`'s own
+/// `#[cfg(test)]` dispatch tests need to observe which [`IpcCommand`] a key
+/// press or a mouse click on a row produced, and have no interest in a real
+/// `hopd` connection to get there. `pub(crate)` rather than `pub`: reachable
+/// from anywhere in this crate's own test code, never from outside it — an
+/// integration test under `tests/` cannot see it (and does not need to,
+/// since none of issue #182's GTK-dependent tests live there; see
+/// `ui::window`'s test module for why they live beside the code they test
+/// instead).
+#[cfg(test)]
+pub(crate) fn test_channel() -> (CommandSender, async_channel::Receiver<IpcCommand>) {
+    let (tx, rx) = async_channel::unbounded();
+    (CommandSender(tx), rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
