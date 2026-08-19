@@ -565,26 +565,102 @@ mod tests {
     // defaults, criterion 3's rebinding, criterion 4's two refusal shapes)
     // with no display at all. What is left to prove here needs a real
     // `HopWindow`, built through the real `HopWindow::build`, so it needs a
-    // real GTK display: [`dispatch_action_moves_selection_and_activates`]
-    // proves `dispatch_action` — the function every keymap-resolved
-    // `Action` and (via [`super::activate_at`]) every mouse click reaches —
-    // actually drives the real `GtkSingleSelection` and sends the real
-    // `IpcCommand`s the design promises, and [`mouse_click_activates_a_row`]
-    // is D5's regression test: the list view's own `activate` signal,
-    // fired exactly as GTK fires it for a real single click, must produce
-    // the same `Execute` command a keyboard `Activate` would.
+    // real GTK display — both run inside
+    // `keyboard_and_mouse_dispatch_use_the_keymap_and_the_real_window`:
+    // `assert_dispatch_action_moves_selection_and_activates` proves
+    // `dispatch_action` — the function every keymap-resolved `Action` and
+    // (via `super::activate_at`) every mouse click reaches — actually
+    // drives the real `GtkSingleSelection` and sends the real `IpcCommand`s
+    // the design promises, and `assert_mouse_click_activates_the_clicked_row`
+    // is D5's regression test: the list view's own `activate` signal, fired
+    // exactly as GTK fires it for a real single click, must produce the
+    // same `Execute` command a keyboard `Activate` would.
     //
-    // The `key-pressed` closure `wire_keyboard` installs itself — the six
-    // lines that ask the keymap for an action and call `dispatch_action`
-    // with it — is not separately re-tested here. It is deliberately
-    // trivial (a `match` on `keymap.lookup(...)` with two arms, no
-    // branching logic of its own) and is checked by reading the diff
-    // instead, the same call `tests/view_tree_renderer.rs` makes explicitly
-    // for `Node::for_item`'s own trivial dispatch: "that part of the fix is
-    // a code-shape property, checked by reading the code, not by a test."
-    // What *is* worth a runtime proof is exactly what could actually be
-    // wrong — which action a key or a click resolves to, and what that
-    // action does — and both are exercised below.
+    // Neither test below drives a real GDK key event through the real
+    // `EventControllerKey` `wire_keyboard` installs — both call
+    // `dispatch_action` (or, for the mouse test, the list view's real
+    // `activate` signal) directly. That gap was raised in review as a real
+    // one, worth its own account rather than a wave at
+    // `tests/view_tree_renderer.rs`'s "trivial glue, checked by reading the
+    // diff" precedent: unlike `Node::for_item`, this glue sits directly in
+    // the path of the app's single most important interaction (typing a
+    // query, pressing Enter), and this issue removed
+    // `entry.connect_activate`'s own prior coverage of part of that path.
+    // The right response was to actually try synthesizing a real key event
+    // through this display and see what happens — not to keep citing the
+    // precedent.
+    //
+    // # What was tried, and why it does not work in this environment
+    //
+    // GTK3 had `gtk_test_widget_send_key(widget, keyval, modifiers)` in
+    // `gtktestutils.h` — build a synthetic `GdkEventKey` and hand it to
+    // `gtk_main_do_event` as though a backend had produced it. **GTK4
+    // removed it, with no replacement.** Confirmed two ways on this exact
+    // machine while investigating this: `grep -n "send_key" /usr/include/gtk-4.0/gtk/gtktestutils.h`
+    // matches nothing (the GTK3 copy at `/usr/include/gtk-3.0/gtk/gtktestutils.h`
+    // has it; the GTK4 one does not), and `gtk4-sys 0.11.4`'s generated
+    // bindings carry only `gtk_test_accessible_*`, `gtk_test_init`,
+    // `gtk_test_list_all_types`, `gtk_test_register_all_types`, and
+    // `gtk_test_widget_wait_for_draw` — no `send_key`, no `send_button`, no
+    // synthetic-event constructor of any kind.
+    //
+    // The lower-level route would be building a `GdkEvent`/`GdkKeyEvent` by
+    // hand and pushing it onto the display's queue with
+    // `gdk_display_put_event` — which *is* still present in `gdk4-sys`
+    // (`fn gdk_display_put_event(display: *mut GdkDisplay, event: *mut
+    // GdkEvent)`). It goes nowhere: GDK4's events are immutable and, by
+    // design, constructed only by each backend's own real input path.
+    // `/usr/include/gtk-4.0/gdk/gdkevents.h` declares no `_new` for
+    // `GdkEvent` at all, and `gdk4-sys` exposes only *getters* for
+    // `GdkKeyEvent` (`gdk_key_event_get_keyval`, `_get_keycode`,
+    // `_get_consumed_modifiers`, …) — nothing that builds one. There is
+    // nothing to hand `gdk_display_put_event` in the first place. This is a
+    // GDK4-wide removal, not a broadway-specific gap: the same absence
+    // would block this on X11 or Wayland too.
+    //
+    // Broadway's own client-side headers were checked on the chance the
+    // backend itself exposed something backend-specific for this — it does
+    // not. `/usr/include/gtk-4.0/gdk/broadway/gdkbroadwaydisplay.h` has
+    // exactly two pairs of functions:
+    // `gdk_broadway_display_show_keyboard`/`hide_keyboard` (toggling an
+    // on-screen keyboard prompt in the browser, for touch devices) and
+    // `get_surface_scale`/`set_surface_scale`. `gdkbroadwaysurface.h` adds
+    // nothing input-related either. Architecturally this makes sense once
+    // stated plainly: under broadway, this test process is the GTK
+    // *client*, not the source of input. The only thing that ever produces
+    // a real key event on a broadway display is an actual web browser,
+    // running broadway's own JavaScript client (served by `gtk4-broadwayd`
+    // itself) and forwarding real DOM keyboard events over broadway's own
+    // WebSocket wire protocol to the server, which is what turns them into
+    // GDK events for this process. A real browser (Chromium via Playwright,
+    // both of which happen to be present on this development machine)
+    // could in principle drive that whole path end to end — but doing so
+    // would mean this crate's test suite silently growing a dependency on a
+    // browser and a browser-automation framework being installed wherever
+    // `cargo test` runs, which is not established anywhere else in this
+    // repository's test infrastructure (`gtk4-broadwayd` is the one
+    // documented, minimal, `libgtk-4-bin`-provided requirement every
+    // display-needing test in this crate already relies on) and is not
+    // guaranteed to be present in this project's actual CI. That trade was
+    // not taken. If a future issue wants this coverage badly enough to
+    // justify it, `gtk4-broadwayd`'s HTTP endpoint plus a real browser
+    // driven by Playwright is the concrete path — reachable, just not
+    // reached in this pass, the same distinction issue #179 drew about
+    // `exec_round_trip.rs`'s own pre-existing gap.
+    //
+    // So: **synthesizing a real key event through this display is
+    // unreachable via any public GDK4/GTK4 API in this environment**, for
+    // any backend, confirmed by inspecting the actual headers and generated
+    // bindings this crate builds against rather than assumed. What remains
+    // untested end-to-end, honestly: that a real hardware Enter key press,
+    // with focus in the query entry, is dispatched by GTK to this
+    // controller before `GtkEntry`'s own input handling — the tests below
+    // cover everything downstream of that (the controller's own dispatch
+    // logic, `dispatch_action`'s effects, the mouse `activate` signal) but
+    // not GTK's own event-routing decision to deliver the press to this
+    // controller in the first place. `exec_round_trip.rs`'s own doc comment
+    // already discloses the sibling gap on the IPC side; this is the same
+    // kind of honest disclosure for the input side.
     //
     // # Why a re-exec'd subprocess, and why `gtk4-broadwayd`
     //

@@ -47,6 +47,44 @@
 //! *any* action at all, not about two actions resolving to the one a user
 //! happened to write last.
 //!
+//! # A rebound printable key can make that character unreachable
+//!
+//! Nothing in this schema stops a user from writing, say, `navigate_down =
+//! "j"`. Once that binding exists, `ui::window`'s window-level
+//! `EventControllerKey` (attached in `PropagationPhase::Capture` — see that
+//! module's own doc comment for the full argument for why Capture) claims
+//! every `j` key press before the query entry's own text-input handling
+//! ever sees it, and returns `glib::Propagation::Stop`. The letter `j`
+//! becomes unreachable to type into the query for as long as that binding
+//! stands — there is no scoping by focus that exempts the entry while it
+//! holds keyboard focus, because Capture runs *before* GTK resolves which
+//! widget even has focus for the purposes of its own default key handling;
+//! by design, this crate's controller sees the key first, indifferent to
+//! what has focus.
+//!
+//! No §8 default triggers this: every default spelling
+//! ([`Action::default_spelling`]) is a non-printable key (an arrow, Page
+//! Up/Down, Home, End, Return, Tab, Escape, Menu) that a query never needs
+//! to type, so the hazard is inert until a user's own `[keymap]` table
+//! introduces a printable one. This module's own test suite demonstrates it
+//! directly, rather than only describing it: `keymap::tests::a_rebound_action_answers_to_its_new_key_and_no_longer_its_old_one`
+//! rebinds `navigate_down` to `"j"`, and the same lookup that proves `j` now
+//! resolves to `NavigateDown` is exactly what would stop that letter
+//! reaching a query's text.
+//!
+//! This is deliberately **not** guarded against here — no refusal, no
+//! automatic focus-scoping. A binding that fights the query entry is a
+//! *conflict*, between an action's key and the entry's own use of the
+//! identical character, and conflict detection is named explicitly out of
+//! scope for this issue: "Out of scope, per the issue: the settings-window
+//! capture widget and conflict detection (M6)." Refusing printable-key
+//! bindings, or scoping this controller by focus so the entry gets first
+//! refusal on a character it might need, would both be this slice deciding
+//! a policy M6 owns. A user who rebinds an action to a printable key gets
+//! exactly what they asked for — that character intercepted, everywhere,
+//! unconditionally — with no warning about it anywhere in this crate until
+//! M6 gives it a place to warn from.
+//!
 //! # Refusal, and what it means for startup — criterion 4
 //!
 //! "An unparseable or unknown binding is refused with a message naming it,
