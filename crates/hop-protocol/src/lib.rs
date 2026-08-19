@@ -6,6 +6,7 @@ pub mod item;
 pub mod limits;
 pub mod mode;
 pub mod redaction;
+pub mod socket;
 pub mod wire;
 
 pub use content::*;
