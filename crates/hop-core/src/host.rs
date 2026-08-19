@@ -386,12 +386,11 @@ impl Default for HostPolicy {
 }
 
 /// Why [`ProviderHost::register`] refused a provider.
-#[derive(Debug)]
 pub enum RegistrationError {
     /// The provider's id exceeds [`MAX_PROVIDER_ID`] bytes.
     ///
     /// `id` preserves the raw manifest value for typed callers. Its `Display`
-    /// output sanitizes and bounds that value before rendering it.
+    /// and `Debug` outputs sanitize and bound that value before rendering it.
     IdTooLong { id: String, max: usize },
     /// Another provider is already registered under this
     /// [`ProviderManifest::id`].
@@ -404,6 +403,19 @@ pub enum RegistrationError {
     /// moved up one level from "which item" to "which provider" — and name
     /// enforcing uniqueness here as the M2 registry's job.
     DuplicateId(String),
+}
+
+impl fmt::Debug for RegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RegistrationError::IdTooLong { id, max } => f
+                .debug_struct("IdTooLong")
+                .field("id", &sanitize_provider_message(id))
+                .field("max", max)
+                .finish(),
+            RegistrationError::DuplicateId(id) => f.debug_tuple("DuplicateId").field(id).finish(),
+        }
+    }
 }
 
 impl fmt::Display for RegistrationError {
@@ -1664,6 +1676,17 @@ mod tests {
         assert!(rendered.len() <= MAX_ERROR_MESSAGE);
         assert!(!rendered.contains('\u{1b}'));
         assert!(!rendered.contains('\u{202e}'));
+        let debugged = format!("{err:?}");
+        assert_eq!(
+            debugged,
+            format!(
+                "IdTooLong {{ id: \"{}\", max: {MAX_PROVIDER_ID} }}",
+                "x".repeat(MAX_PROVIDER_MESSAGE)
+            ),
+            "Debug must preserve its structural shape while sanitizing and bounding the ID"
+        );
+        assert!(!debugged.contains("\\u{1b}"));
+        assert!(!debugged.contains("\\u{202e}"));
         assert_eq!(
             id, raw_id,
             "typed callers must receive the raw offending ID"
