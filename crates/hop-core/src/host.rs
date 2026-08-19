@@ -25,21 +25,31 @@
 //! - **Provider-supplied text is rewritten before it can leave through this
 //!   host**, by
 //!   [`sanitize_provider_message`](crate::sanitize::sanitize_provider_message),
-//!   on every path this module *returns* a value on. That has a stated
-//!   residual: a panicking provider's payload is provider-controlled text
-//!   too, and it reaches the process's stderr — and the journal — through
-//!   Rust's default panic hook, unsanitized and unbounded, before
-//!   [`ProviderHost::run_one`] ever sees the
-//!   [`JoinError`](tokio::task::JoinError) the panic surfaces as.
-//!   [`ProviderFailure::panicked`] deliberately does not carry that payload,
-//!   which closes the attribution half of the problem — a panic can no
-//!   longer make the daemon blame the wrong provider — but not this half.
-//!   Installing a panic hook would close it and is deliberately not done
-//!   here: `set_hook` is process-wide, so a hook that rewrites or suppresses
-//!   a provider's panic payload would do the same to a genuine daemon bug's,
-//!   and that trade is wider than this module should decide on its own.
-//!   Issue #104 owns that decision; until it lands, a provider that panics
-//!   with hostile text writes it to the daemon's stderr raw.
+//!   on every path this module *returns* a value on. A panicking provider's
+//!   payload used to be the one path around that: Rust's default panic hook
+//!   runs on the panicking thread before [`ProviderHost::run_one`] ever sees
+//!   the resulting [`JoinError`](tokio::task::JoinError), so it wrote the raw
+//!   payload to the process's stderr — and the journal — unsanitized and
+//!   unbounded, ahead of [`ProviderFailure::panicked`] ever existing to carry
+//!   a safe version of it. Issue #104 closes that: `CURRENT_PROVIDER_ID` is a
+//!   `tokio::task_local!` this module scopes around the provider's own
+//!   future at both spawn sites ([`ProviderHost::run_one`] and
+//!   [`ProviderHost::execute`]), and [`install_provider_panic_hook`] builds a
+//!   hook that reads it — readable because the hook runs synchronously
+//!   inside that future's own poll, so the scope is still active when it
+//!   runs — and, when it finds one, writes [`format_provider_panic`]'s
+//!   sanitized, bounded line instead of the raw payload. A panic the marker
+//!   does not recognize as a provider's — a bug in `hopd` itself, or in a
+//!   dependency — falls through to whatever hook ran before this one,
+//!   chained rather than replaced, so a first-party panic keeps its full,
+//!   unsanitized text and location exactly as before. This module only
+//!   *builds* the hook, though: `set_hook` is process-wide, so installing it
+//!   as a side effect of constructing a [`ProviderHost`] would reach every
+//!   process that links this crate, not just `hopd`. The guarantee above
+//!   therefore holds only for a process that calls
+//!   [`install_provider_panic_hook`] itself — `hopd::run` does, once, at
+//!   startup, before the runtime is built; a consumer that never calls it
+//!   sees today's unsanitized behavior, unchanged.
 //! - **One failing provider never empties a frame for the others**, which is
 //!   spec §9's per-provider isolation rule: providers are separate tasks
 //!   holding separate senders, so nothing about one provider's outcome is on
@@ -727,7 +737,15 @@ impl ProviderHost {
         // The handle is kept rather than moved into `timeout`, so the task can
         // still be aborted after the budget expires. `JoinHandle` is `Unpin`,
         // which is what makes `&mut handle` a future.
-        let mut handle = tokio::spawn(Arc::clone(&provider).query_erased(q, ctx));
+        //
+        // Scoped by `CURRENT_PROVIDER_ID` around exactly this future — the
+        // one that runs the provider's own code — and not around the
+        // supervisor task `spawn_query` spawned to call `run_one` itself,
+        // which runs only this module's own code. See `CURRENT_PROVIDER_ID`'s
+        // doc comment for why a panic hook can read a task-local scoped here
+        // at all.
+        let mut handle =
+            tokio::spawn(CURRENT_PROVIDER_ID.scope(id, Arc::clone(&provider).query_erased(q, ctx)));
         let outcome = match tokio::time::timeout(budget, &mut handle).await {
             Err(_elapsed) => {
                 handle.abort();
@@ -861,6 +879,7 @@ impl ProviderHost {
         };
 
         let provider_arc = Arc::clone(&registration.provider);
+        let id = registration.effective.id;
         let budget = self.policy.max_execute_budget;
 
         // The future runs on its own task — the same panic isolation the query
@@ -871,7 +890,13 @@ impl ProviderHost {
         // execute would otherwise wedge the whole connection (see
         // [`MAX_EXECUTE_BUDGET`] for the full reasoning). On a miss the task
         // is aborted so provider work does not outlive the refusal.
-        let mut handle = tokio::spawn(provider_arc.execute_erased(item_id, action_id));
+        //
+        // Scoped by `CURRENT_PROVIDER_ID`, the same as `run_one`'s inner
+        // spawn — see that call site and `CURRENT_PROVIDER_ID`'s own doc
+        // comment for why a process-wide panic hook can read it back.
+        let mut handle = tokio::spawn(
+            CURRENT_PROVIDER_ID.scope(id, provider_arc.execute_erased(item_id, action_id)),
+        );
         match tokio::time::timeout(budget, &mut handle).await {
             Err(_elapsed) => {
                 handle.abort();
@@ -960,6 +985,159 @@ impl<P: Provider> ErasedProvider for P {
     ) -> Pin<Box<dyn Future<Output = Result<ExecOutcome, ProviderError>> + Send + 'static>> {
         Box::pin(Provider::execute(self, item_id, action_id))
     }
+}
+
+tokio::task_local! {
+    /// Which provider's future is running on the current task, readable only
+    /// from inside that future's own poll. Issue #104's marker: the two
+    /// spawn sites that run provider code —
+    /// [`ProviderHost::run_one`]'s inner `tokio::spawn` and
+    /// [`ProviderHost::execute`]'s — each scope this to the id the host
+    /// captured for that provider at registration, around the provider's
+    /// future and nothing else on that task.
+    ///
+    /// # Why a process-wide panic hook can read a task-local at all
+    ///
+    /// [`std::panic::set_hook`] installs a callback that runs synchronously,
+    /// on the panicking thread, as part of unwinding — inside the
+    /// `Future::poll` call whose body panicked, before that call has
+    /// returned. [`LocalKey::scope`](tokio::task::LocalKey::scope) holds its
+    /// value for exactly as long as the future it wraps is being polled,
+    /// which is still true at the instant a panic inside that poll unwinds
+    /// through the hook. So [`install_provider_panic_hook`]'s hook can call
+    /// `CURRENT_PROVIDER_ID.try_with` from inside itself and read the id one
+    /// of the two spawn sites scoped, with no channel and no coordination
+    /// with `tokio::spawn` beyond wrapping the future once, at the moment it
+    /// is spawned.
+    ///
+    /// # Not inherited by a provider's own spawned tasks
+    ///
+    /// A tokio task-local is scoped to the future it wraps and nothing that
+    /// future itself spawns — `tokio::task_local!` never propagates a value
+    /// across a `tokio::spawn` boundary, the same way a thread-local does
+    /// not cross `std::thread::spawn`. A provider that spawns its own task
+    /// and panics there is therefore not recognized as a provider panic by
+    /// this marker; that panic reaches whatever hook is chained beneath
+    /// [`install_provider_panic_hook`]'s, unsanitized, like any other
+    /// unattributed panic. This is accepted rather than worked around:
+    /// nothing else in this module bounds a provider's *own* spawned tasks
+    /// either — [`ProviderHost::run_one`]'s budget and abort reach only the
+    /// future it spawned directly, never anything that future goes on to
+    /// spawn — so teaching the panic hook to see further than the rest of
+    /// the host does would be new scope invented for this one diagnostic,
+    /// not a gap this module already promises to close elsewhere.
+    static CURRENT_PROVIDER_ID: &'static str;
+}
+
+/// Turns one panic's payload and location into the single-line, sanitized,
+/// bounded text [`install_provider_panic_hook`]'s hook writes to stderr in
+/// place of Rust's default, unbounded rendering, once it has recognized the
+/// panic as a provider's via [`CURRENT_PROVIDER_ID`].
+///
+/// A pure function, deliberately, so it can be unit-tested without
+/// [`std::panic::set_hook`]: `std::panic::PanicHookInfo` cannot be
+/// constructed outside `std`, so every argument here is instead something a
+/// test *can* build directly — `&dyn Any` from an ordinary value, and
+/// `Option<&Location<'_>>` from [`Location::caller`](std::panic::Location::caller),
+/// which is `pub` and callable from any `#[track_caller]` function.
+///
+/// # Payload handling cannot unwrap
+///
+/// [`panic!`]'s payload is `&'static str` or `String` in the overwhelming
+/// common case, but [`std::panic::panic_any`] lets a caller panic with any
+/// `Send + 'static` value at all, and a provider is untrusted code that can
+/// call it same as anything else. A downcast miss therefore falls back to a
+/// fixed, first-party placeholder instead of unwrapping — the one thing this
+/// function must never do, since it runs inside a panic hook and a second
+/// panic there aborts the process rather than merely failing one query.
+///
+/// # Why the location is not sanitized
+///
+/// A panic's file and line are first-party information: they name where in
+/// *this provider's own compiled code* the `panic!` macro was invoked, never
+/// text the provider chose at runtime, so nothing here bounds or strips it —
+/// unlike `payload`, which is exactly that runtime-chosen text and is
+/// rewritten by [`sanitize_provider_message`]. Keeping the location intact
+/// is what keeps the diagnostic useful even when the message half has been
+/// stripped down to nothing: the call site alone is often enough to find the
+/// bug in the provider's source.
+pub fn format_provider_panic(
+    provider: &str,
+    payload: &dyn std::any::Any,
+    location: Option<&std::panic::Location<'_>>,
+) -> String {
+    let raw: &str = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>");
+
+    let message = sanitize_provider_message(raw);
+    let location = location
+        .map(|loc| format!(" at {}:{}", loc.file(), loc.line()))
+        .unwrap_or_default();
+
+    format!("provider `{provider}` panicked{location}: {message}")
+}
+
+/// Guards [`install_provider_panic_hook`] against installing itself more
+/// than once in a process. See that function's doc comment for why a second
+/// call must be a no-op rather than chaining again.
+static PROVIDER_PANIC_HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+/// Installs the panic hook that recognizes a provider's panic — via
+/// [`CURRENT_PROVIDER_ID`] — and writes [`format_provider_panic`]'s
+/// sanitized, bounded line for it, in place of Rust's default hook's raw,
+/// unbounded rendering of the payload.
+///
+/// # `hop-core` builds this; only a consumer installs it
+///
+/// This is a library, and [`std::panic::set_hook`] mutates process-global
+/// state. Installing a hook as a side effect of constructing a
+/// [`ProviderHost`] — or of merely linking this crate — would reach every
+/// process that depends on `hop-core` for reasons that have nothing to do
+/// with running `hopd`, this crate's own test binary included. So the hook
+/// is built here, next to the task-local and the sanitizer it composes, and
+/// a consumer — `hopd::run`, in practice, once, during startup — calls this
+/// function explicitly to install it. A consumer that never calls this sees
+/// today's behavior, unsanitized panic payload and all: this module makes
+/// the guarantee available, not automatic.
+///
+/// # Chained, never replaced
+///
+/// [`std::panic::take_hook`] hands back whatever hook was installed before
+/// this call — the default hook, if nothing has run first — and the new
+/// hook falls through to it for every panic `CURRENT_PROVIDER_ID` does not
+/// recognize as a provider's. Replacing it outright was considered and
+/// rejected: a first-party panic — a bug in `hopd` itself, or in one of its
+/// dependencies — is exactly the case this crate must not degrade, and
+/// chaining is what keeps its payload and location reaching the journal with
+/// the same fidelity as if this function had never been called.
+///
+/// # Safe to call more than once
+///
+/// A test binary that exercises more than one [`ProviderHost`] may call this
+/// function several times in one process, and it must be safe to. Without
+/// [`PROVIDER_PANIC_HOOK_INSTALLED`] guarding the body, a second call would
+/// `take_hook` *this* hook back as "previous" and wrap it a second time, so
+/// one real panic would run through the composed hook once per install
+/// rather than once per panic — a bug that stays silent, since the first
+/// (innermost) chained call still eventually reaches the real previous hook,
+/// and only shows up as panic handling that grows slower, or that duplicates
+/// output, with every extra install.
+pub fn install_provider_panic_hook() {
+    PROVIDER_PANIC_HOOK_INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            match CURRENT_PROVIDER_ID.try_with(|id| *id) {
+                Ok(provider) => eprintln!(
+                    "{}",
+                    format_provider_panic(provider, info.payload(), info.location())
+                ),
+                Err(_not_inside_a_provider_task) => previous(info),
+            }
+        }));
+    });
 }
 
 #[cfg(test)]
@@ -1056,6 +1234,103 @@ mod tests {
         assert_eq!(failure.provider(), "apps");
         assert_eq!(failure.kind(), FailureKind::Panicked);
         assert_eq!(failure.message(), "the provider panicked");
+    }
+
+    // --- `format_provider_panic` (issue #104) ---
+    //
+    // A pure function so it can be pinned without `std::panic::set_hook`:
+    // `std::panic::PanicHookInfo` cannot be constructed outside `std`, but
+    // both of this function's other-than-`&str` inputs can be — `&dyn Any`
+    // from an ordinary value, and `Location::caller()` from any
+    // `#[track_caller]` call site.
+
+    #[track_caller]
+    fn caller_location() -> &'static std::panic::Location<'static> {
+        std::panic::Location::caller()
+    }
+
+    #[test]
+    fn a_str_payload_appears_in_the_formatted_line() {
+        let payload: &dyn std::any::Any = &"boom";
+        let out = format_provider_panic("apps", payload, None);
+        assert_eq!(out, "provider `apps` panicked: boom");
+    }
+
+    #[test]
+    fn a_string_payload_appears_in_the_formatted_line() {
+        let owned = String::from("boom");
+        let payload: &dyn std::any::Any = &owned;
+        let out = format_provider_panic("apps", payload, None);
+        assert_eq!(out, "provider `apps` panicked: boom");
+    }
+
+    #[test]
+    fn a_non_string_payload_falls_back_instead_of_unwrapping_a_downcast_miss() {
+        // `std::panic::panic_any` lets a caller panic with any `Send +
+        // 'static` value, not just a string, and a provider is untrusted
+        // code that can reach it. The format function must degrade rather
+        // than unwrap a downcast that misses — unwrapping inside a panic
+        // hook aborts the process instead of merely failing a query.
+        let payload: u32 = 42;
+        let payload: &dyn std::any::Any = &payload;
+        let out = format_provider_panic("apps", payload, None);
+        assert!(out.starts_with("provider `apps` panicked: "));
+        assert!(!out.ends_with(": "), "a fallback message must still appear");
+    }
+
+    #[test]
+    fn control_characters_in_the_payload_are_stripped() {
+        let payload: &dyn std::any::Any = &"\u{1b}[31mred\u{1b}[0m\nmore\there";
+        let out = format_provider_panic("apps", payload, None);
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\t'));
+    }
+
+    #[test]
+    fn bidi_controls_in_the_payload_are_stripped() {
+        // A `String` payload here, not `&str`: `dyn Any` requires a `'static`
+        // concrete type, and a `&str` borrowed from a locally built `String`
+        // is not one. `panic_any(String::from(...))` is exactly how a
+        // provider would reach this shape.
+        for c in crate::sanitize::BIDI_CONTROLS {
+            let text = format!("apps{c}failed");
+            let payload: &dyn std::any::Any = &text;
+            let out = format_provider_panic("apps", payload, None);
+            assert!(!out.contains(*c), "{c:?} must be stripped: {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_payload_far_over_the_bound_is_truncated_to_it() {
+        let raw = "a".repeat(MAX_PROVIDER_MESSAGE * 50);
+        let payload: &dyn std::any::Any = &raw;
+        let out = format_provider_panic("apps", payload, None);
+        let message_part = &out["provider `apps` panicked: ".len()..];
+        assert_eq!(message_part.len(), MAX_PROVIDER_MESSAGE);
+    }
+
+    #[test]
+    fn the_panic_location_appears_when_present() {
+        let location = caller_location();
+        let payload: &dyn std::any::Any = &"boom";
+        let out = format_provider_panic("apps", payload, Some(location));
+        assert!(out.contains(location.file()), "{out:?}");
+        assert!(out.contains(&location.line().to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn a_missing_location_produces_no_location_fragment() {
+        let payload: &dyn std::any::Any = &"boom";
+        let out = format_provider_panic("apps", payload, None);
+        assert!(!out.contains(" at "));
+    }
+
+    #[test]
+    fn the_provider_id_appears_in_the_formatted_line() {
+        let payload: &dyn std::any::Any = &"boom";
+        let out = format_provider_panic("nasty", payload, None);
+        assert!(out.contains("nasty"));
     }
 
     #[test]
@@ -2170,6 +2445,67 @@ mod tests {
         }
     }
 
+    /// Where `ObservingProvider` records what `CURRENT_PROVIDER_ID` read as,
+    /// from inside its own future — `None` for "absent" (`try_with` erred)
+    /// rather than for "not yet observed", so a test that forgets to run the
+    /// provider fails on a missing value instead of a false negative.
+    #[derive(Default, Clone)]
+    pub(crate) struct ObservedProviderId(Arc<Mutex<Option<Option<&'static str>>>>);
+
+    impl ObservedProviderId {
+        pub(crate) fn get(&self) -> Option<Option<&'static str>> {
+            *self.0.lock().expect("no test panics holding this")
+        }
+
+        fn set(&self, observed: Option<&'static str>) {
+            *self.0.lock().expect("no test panics holding this") = Some(observed);
+        }
+    }
+
+    /// A provider whose `query` and `execute` each record what
+    /// `CURRENT_PROVIDER_ID` reads as from inside their own future, into
+    /// their own [`ObservedProviderId`] — proving the host's own two spawn
+    /// sites ([`ProviderHost::run_one`] and [`ProviderHost::execute`]) scope
+    /// the marker, rather than a hand-rolled `tokio::spawn` that only
+    /// mirrors them.
+    pub(crate) struct ObservingProvider {
+        pub(crate) query_seen: ObservedProviderId,
+        pub(crate) execute_seen: ObservedProviderId,
+    }
+
+    impl Provider for ObservingProvider {
+        fn manifest(&self) -> ProviderManifest {
+            ProviderManifest {
+                id: "observing",
+                kinds: vec![Kind::App],
+                modes: vec![Mode::All],
+                min_term_len: 0,
+                budget: Duration::from_millis(50),
+                ids_are_safe_to_persist_in_the_clear: false,
+            }
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, ProviderError> {
+            self.query_seen
+                .set(CURRENT_PROVIDER_ID.try_with(|id| *id).ok());
+            Ok(vec![])
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            self.execute_seen
+                .set(CURRENT_PROVIDER_ID.try_with(|id| *id).ok());
+            Ok(ExecOutcome::Done)
+        }
+    }
+
     /// A provider that panics inside its future.
     pub(crate) struct PanickingProvider;
 
@@ -2360,6 +2696,63 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("the provider's future was never dropped — the task was never actually aborted");
+    }
+
+    // --- `CURRENT_PROVIDER_ID` (issue #104) ---
+    //
+    // These pin the task-local marker itself — that both of the host's
+    // spawn sites scope it around the provider's own future, and that it is
+    // absent everywhere else. No `set_hook` involved; that half is in
+    // `crates/hop-core/tests/provider_panic_hook.rs`, which needs its own
+    // process because installing a panic hook is process-wide.
+
+    #[tokio::test]
+    async fn the_marker_is_absent_outside_any_provider_scope() {
+        assert_eq!(CURRENT_PROVIDER_ID.try_with(|id| *id).ok(), None);
+    }
+
+    #[tokio::test]
+    async fn run_ones_inner_spawn_scopes_the_marker_to_the_registered_id() {
+        let query_seen = ObservedProviderId::default();
+        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+        host.register(ObservingProvider {
+            query_seen: query_seen.clone(),
+            execute_seen: ObservedProviderId::default(),
+        })
+        .unwrap();
+
+        run(Arc::new(host), "x").await;
+
+        assert_eq!(
+            query_seen.get(),
+            Some(Some("observing")),
+            "the query future must see its own provider id through the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn executes_spawn_scopes_the_marker_to_the_registered_id() {
+        let execute_seen = ObservedProviderId::default();
+        let mut host = ProviderHost::new(HostPolicy::default(), Arc::new(NoopLog));
+        host.register(ObservingProvider {
+            query_seen: ObservedProviderId::default(),
+            execute_seen: execute_seen.clone(),
+        })
+        .unwrap();
+
+        host.execute(
+            "observing",
+            ItemId::new("app:1").unwrap(),
+            ActionId::new("open").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execute_seen.get(),
+            Some(Some("observing")),
+            "the execute future must see its own provider id through the marker"
+        );
     }
 
     #[tokio::test]
