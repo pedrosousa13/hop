@@ -58,6 +58,7 @@
 //! source (`hopd`'s `HostSource` accumulator) is where `assemble` now lives,
 //! called per arrival over the accumulated [`CheckedItems`](crate::pipeline::CheckedItems).
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -385,14 +386,12 @@ impl Default for HostPolicy {
 }
 
 /// Why [`ProviderHost::register`] refused a provider.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum RegistrationError {
     /// The provider's id exceeds [`MAX_PROVIDER_ID`] bytes.
     ///
-    /// `id` is the bounded, single-line sanitized representation used for
-    /// typed callers and display. It may differ from the raw manifest id when
-    /// that id contains controls or exceeds the provider-message budget.
-    #[error("provider id `{id}` exceeds the maximum length of {max} bytes")]
+    /// `id` preserves the raw manifest value for typed callers. Its `Display`
+    /// output sanitizes and bounds that value before rendering it.
     IdTooLong { id: String, max: usize },
     /// Another provider is already registered under this
     /// [`ProviderManifest::id`].
@@ -404,9 +403,25 @@ pub enum RegistrationError {
     /// collect every alias boost tagged with that id — issue #31's boost theft,
     /// moved up one level from "which item" to "which provider" — and name
     /// enforcing uniqueness here as the M2 registry's job.
-    #[error("a provider is already registered under the id `{0}`")]
     DuplicateId(String),
 }
+
+impl fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RegistrationError::IdTooLong { id, max } => write!(
+                f,
+                "provider id `{}` exceeds the maximum length of {max} bytes",
+                sanitize_provider_message(id)
+            ),
+            RegistrationError::DuplicateId(id) => {
+                write!(f, "a provider is already registered under the id `{id}`")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegistrationError {}
 
 /// One registered provider: the manifest captured at registration, the
 /// host-clamped copy scheduling reads, and the provider itself.
@@ -479,7 +494,7 @@ impl ProviderHost {
         let declared = Provider::manifest(&*provider);
         if declared.id.len() > MAX_PROVIDER_ID {
             return Err(RegistrationError::IdTooLong {
-                id: sanitize_provider_message(declared.id),
+                id: declared.id.to_string(),
                 max: MAX_PROVIDER_ID,
             });
         }
@@ -1106,7 +1121,9 @@ mod tests {
 
     use crate::provider::{Provider, ProviderManifest, QueryCtx};
     use crate::router::{Mode, RoutedQuery, route};
-    use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, Kind, MAX_PROVIDER_ID};
+    use hop_protocol::{
+        ActionId, ExecOutcome, Item, ItemId, Kind, MAX_ERROR_MESSAGE, MAX_PROVIDER_ID,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A provider whose manifest is whatever the test says it is, and whose
@@ -1643,11 +1660,14 @@ mod tests {
             panic!("expected IdTooLong, got {err:?}");
         };
         assert_eq!(*max, MAX_PROVIDER_ID);
-        assert!(id.len() <= MAX_PROVIDER_MESSAGE);
-        assert!(!id.contains('\u{1b}'));
-        assert!(!id.contains('\u{202e}'));
-        assert!(!err.to_string().contains('\u{1b}'));
-        assert!(!err.to_string().contains('\u{202e}'));
+        let rendered = err.to_string();
+        assert!(rendered.len() <= MAX_ERROR_MESSAGE);
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert_eq!(
+            id, raw_id,
+            "typed callers must receive the raw offending ID"
+        );
     }
 
     #[test]
