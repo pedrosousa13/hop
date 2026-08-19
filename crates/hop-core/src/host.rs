@@ -63,7 +63,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hop_protocol::{ActionId, ExecOutcome, Item, ItemId};
+use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, MAX_PROVIDER_ID};
 use tokio::sync::mpsc;
 
 use crate::pipeline::{CheckedItems, ProviderOutput, Rejection};
@@ -387,6 +387,9 @@ impl Default for HostPolicy {
 /// Why [`ProviderHost::register`] refused a provider.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistrationError {
+    /// The provider's id exceeds [`MAX_PROVIDER_ID`] bytes.
+    #[error("provider id `{id}` exceeds the maximum length of {max} bytes")]
+    IdTooLong { id: String, max: usize },
     /// Another provider is already registered under this
     /// [`ProviderManifest::id`].
     ///
@@ -451,14 +454,18 @@ impl ProviderHost {
     /// budget it gets. That is issue #32's criterion, and the reason the
     /// capture happens here rather than per query.
     ///
-    /// Refuses a provider whose id is already registered — see
-    /// [`RegistrationError::DuplicateId`].
+    /// Refuses a provider whose id exceeds [`MAX_PROVIDER_ID`] bytes or is
+    /// already registered — see [`RegistrationError::IdTooLong`] and
+    /// [`RegistrationError::DuplicateId`]. The byte bound is checked on the
+    /// captured manifest before duplicate detection or host mutation.
     pub fn register<P: Provider>(&mut self, provider: P) -> Result<(), RegistrationError> {
         self.register_arc(Arc::new(provider))
     }
 
     /// [`ProviderHost::register`] for a provider the caller already holds
-    /// behind an `Arc` — the same capture, the same refusals.
+    /// behind an `Arc` — the same capture and the same
+    /// [`RegistrationError::IdTooLong`] and [`RegistrationError::DuplicateId`]
+    /// refusals.
     pub fn register_arc<P: Provider>(&mut self, provider: Arc<P>) -> Result<(), RegistrationError> {
         // `provider.manifest()` is ambiguous here: `P` implements `Provider`
         // (which declares `manifest`) and, via the blanket `impl<P: Provider>
@@ -466,6 +473,12 @@ impl ProviderHost {
         // declares `manifest`). Fully qualifying the call picks the trait
         // whose contract this capture is actually about.
         let declared = Provider::manifest(&*provider);
+        if declared.id.len() > MAX_PROVIDER_ID {
+            return Err(RegistrationError::IdTooLong {
+                id: declared.id.to_string(),
+                max: MAX_PROVIDER_ID,
+            });
+        }
         if self.providers.iter().any(|r| r.effective.id == declared.id) {
             return Err(RegistrationError::DuplicateId(declared.id.to_string()));
         }
@@ -1089,7 +1102,7 @@ mod tests {
 
     use crate::provider::{Provider, ProviderManifest, QueryCtx};
     use crate::router::{Mode, RoutedQuery, route};
-    use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, Kind};
+    use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, Kind, MAX_PROVIDER_ID};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A provider whose manifest is whatever the test says it is, and whose
@@ -1101,6 +1114,8 @@ mod tests {
         /// How many times `manifest()` has been called — the counter that
         /// proves capture happens once.
         pub(crate) manifest_calls: AtomicUsize,
+        pub(crate) query_calls: AtomicUsize,
+        pub(crate) execute_calls: AtomicUsize,
     }
 
     impl ScriptedProvider {
@@ -1116,6 +1131,8 @@ mod tests {
                 },
                 items,
                 manifest_calls: AtomicUsize::new(0),
+                query_calls: AtomicUsize::new(0),
+                execute_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -1131,6 +1148,7 @@ mod tests {
             _q: Arc<RoutedQuery>,
             _ctx: QueryCtx,
         ) -> Result<Vec<Item>, ProviderError> {
+            self.query_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.items.clone())
         }
 
@@ -1139,6 +1157,7 @@ mod tests {
             _item_id: ItemId,
             _action_id: ActionId,
         ) -> Result<ExecOutcome, ProviderError> {
+            self.execute_calls.fetch_add(1, Ordering::Relaxed);
             Ok(ExecOutcome::Done)
         }
     }
@@ -1527,6 +1546,89 @@ mod tests {
             .expect_err("a duplicate id must be refused");
         assert!(matches!(err, RegistrationError::DuplicateId(id) if id == "apps"));
         assert_eq!(host.len(), 1, "the duplicate must not be registered");
+    }
+
+    #[tokio::test]
+    async fn a_provider_id_over_the_protocol_bound_is_refused_before_registration() {
+        let overlong_id: &'static str = Box::leak("x".repeat(MAX_PROVIDER_ID + 1).into_boxed_str());
+        let provider = Arc::new(ScriptedProvider::new(overlong_id, vec![Kind::App], vec![]));
+        let mut host = host();
+        host.register(ScriptedProvider::new("keeper", vec![Kind::App], vec![]))
+            .unwrap();
+        let manifests_before = host.manifests();
+
+        let err = host
+            .register_arc(provider.clone())
+            .expect_err("a provider id over the protocol bound must be refused");
+
+        match &err {
+            RegistrationError::IdTooLong { id, max } => {
+                assert_eq!(id, overlong_id);
+                assert_eq!(*max, MAX_PROVIDER_ID);
+            }
+            other => panic!("expected IdTooLong, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "provider id `{overlong_id}` exceeds the maximum length of {MAX_PROVIDER_ID} bytes"
+            )
+        );
+        assert_eq!(host.len(), 1, "a refused provider must not mutate the host");
+        assert!(
+            !host
+                .manifests()
+                .iter()
+                .any(|manifest| manifest.id == overlong_id),
+            "a refused provider must not appear among manifests"
+        );
+        assert_eq!(
+            host.manifests(),
+            manifests_before,
+            "a refused provider must leave existing manifests unchanged"
+        );
+        assert_eq!(
+            provider.manifest_calls.load(Ordering::Relaxed),
+            1,
+            "registration reads the manifest once before refusing it"
+        );
+
+        let host = Arc::new(host);
+        assert!(
+            run(host.clone(), "anything").await.is_empty(),
+            "a refused provider must not be queryable"
+        );
+        let execute_err = host
+            .execute(
+                overlong_id,
+                ItemId::new("app:missing").unwrap(),
+                ActionId::new("open").unwrap(),
+            )
+            .await
+            .expect_err("a refused provider must not be executable");
+        assert!(matches!(execute_err, ProviderError::Failed(_)));
+        assert_eq!(
+            provider.query_calls.load(Ordering::Relaxed),
+            0,
+            "the rejected provider must never be invoked for a query"
+        );
+        assert_eq!(
+            provider.execute_calls.load(Ordering::Relaxed),
+            0,
+            "the rejected provider must never be invoked for execution"
+        );
+    }
+
+    #[test]
+    fn a_provider_id_exactly_at_the_protocol_bound_registers() {
+        let exact_id: &'static str = Box::leak("x".repeat(MAX_PROVIDER_ID).into_boxed_str());
+        let mut host = host();
+
+        host.register(ScriptedProvider::new(exact_id, vec![Kind::App], vec![]))
+            .unwrap();
+
+        assert_eq!(host.len(), 1);
+        assert_eq!(host.manifests()[0].id, exact_id);
     }
 
     #[test]

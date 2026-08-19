@@ -346,6 +346,10 @@ const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_I
 /// that still checked `MAX_ITEM_ID` there would drop this module's own
 /// freshly recorded, maximally-long entries on their very next load, the
 /// exact restart-survival failure issue #72's brief rules out.
+/// The provider half of this derivation relies on
+/// [`crate::host::ProviderHost::register`], which refuses provider manifests
+/// whose ids exceed [`MAX_PROVIDER_ID`] before a registration can reach
+/// `Learning::record_launch`.
 ///
 /// `MAX_GLOBAL_ENTRIES` is enforced by `record`, which has always evicted
 /// down to it, and by `purge_and_bound`, also as of issue #37.
