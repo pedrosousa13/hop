@@ -1,0 +1,86 @@
+[package]
+name = "hop-gtk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hop-gtk"
+path = "src/main.rs"
+
+[dependencies]
+# `version` alongside `path` for the reason given in `hop-core/Cargo.toml`: a
+# bare path dependency is a wildcard requirement, which `cargo deny check
+# bans` flags.
+hop-protocol = { path = "../../crates/hop-protocol", version = "0.1.0" }
+
+# GTK4 + libadwaita, pinned to the "v4_14" / "v1_5" API tier rather than the
+# crates' latest — issue #179's environment note fixes this machine's GTK at
+# 4.14.5 and libadwaita at 1.5.0 (GNOME 46). Enabling a newer version feature
+# (e.g. `v4_18`) would let this crate call a symbol the installed `.so` does
+# not export, which fails at *link* time with an obscure "undefined symbol"
+# rather than a readable version error — so the feature tier is capped at
+# what this machine (and the GNOME 46 target the design spec names) actually
+# has, and raised deliberately, not by taking a crate's new default.
+# Renamed to the ecosystem's usual short names (`gtk`, `adw`) at the
+# `Cargo.toml` level rather than in every `use` — `libadwaita`'s own crate
+# docs and most gtk4-rs applications do the same, and it is what keeps
+# `gtk::Window` reading the way GTK's own C API and docs name the type,
+# rather than `gtk4::Window` everywhere in this crate.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+glib = "0.22"
+gio = "0.22"
+
+# `gtk4-layer-shell` where supported, per spec §8 — but the *crate* links
+# against a system `.so` (`libgtk4-layer-shell`) at compile time through its
+# own `-sys` crate's `pkg-config` probe in `build.rs`. Making it a plain,
+# always-on dependency would mean `cargo build` fails outright on any machine
+# without that library installed — including this one, per issue #179's
+# confirmed environment note. So it is `optional = true`, gated behind the
+# `layer-shell` feature (off by default), compiled in only when a builder
+# opts in on a machine that actually has the library. `layer_shell.rs`'s
+# runtime probe (`probe()`) reports "not compiled in" whenever this feature
+# is off, which is always, in this environment — see that module's doc
+# comment for the fallback path this makes the *default*, not a rarely-taken
+# branch.
+gtk4-layer-shell = { version = "0.8", optional = true }
+
+# The bridge between the tokio client task (its own OS thread, its own
+# runtime) and the GTK main thread's `glib::spawn_future_local` future — see
+# `ipc`'s module doc for why this crate rather than `tokio::sync::mpsc`: its
+# `Receiver::recv` is a plain `Future` with no `Send` requirement on the
+# executor polling it, which is what lets it be awaited from a
+# `glib::spawn_future_local` future (itself `!Send`, pinned to the glib main
+# context) while its `Sender` half is sent to, and used from, a different
+# thread entirely.
+async-channel = "2"
+
+# `net` for `tokio::net::UnixStream`, `io-util` for `AsyncReadExt` /
+# `AsyncWriteExt` — the same two the workspace's `sync`, `time`, `macros`,
+# `rt` set does not already carry. Unlike `hopd`, this crate needs no
+# `rt-multi-thread`: the IPC thread runs one connection, exactly like
+# `hop-cli`'s one-shot client (see that crate's module docs) except kept
+# alive for the process's lifetime, so a single current-thread runtime
+# (`tokio::runtime::Builder::new_current_thread`) is enough.
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+# Not called directly by any test in this crate: declaring it here is what
+# guarantees `cargo test -p hop-gtk` on its own builds the `hopd` binary
+# before this crate's tests run, which `tests/headless_smoke.rs` needs since
+# it locates `hopd`'s executable as `hop-gtk`'s own sibling in the shared
+# workspace target directory (see that file's `hopd_path` for why: Cargo
+# only guarantees a `CARGO_BIN_EXE_<name>` variable for a package's *own*
+# binaries, not a dependency's, so the sibling-path trick is what stands in
+# for it here).
+hopd = { path = "../../crates/hopd", version = "0.1.0" }
+
+[features]
+# Off by default — see the `gtk4-layer-shell` dependency comment above.
+layer-shell = ["dep:gtk4-layer-shell"]
+
+[lints]
+workspace = true

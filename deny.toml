@@ -150,6 +150,18 @@ confidence-threshold = 0.8
 # allow list.
 exceptions = [
     { allow = ["BSD-3-Clause"], name = "subtle" },
+    # `target-lexicon` (single license, no `OR` arm for MIT to satisfy) is a
+    # transitive `(build)`-only dependency of `system-deps` — the `pkg-config`
+    # probe every gtk-rs `-sys` crate's `build.rs` uses to find the GTK4 /
+    # libadwaita headers `apps/hop-gtk` links against (issue #179). It never
+    # compiles into any of hop's own binaries; it runs once, at build time, to
+    # decide compiler flags, which is why a narrow per-crate exception fits
+    # better than widening the general allow list above for a license this
+    # workspace takes on nowhere else. Apache-2.0 (the license this expression
+    # is "WITH" an added patent-clarifying exception to) is itself
+    # GPL-3.0-compatible, per the general note above on why Apache-2.0 is
+    # deliberately absent from — but not disallowed by — the allow list.
+    { allow = ["Apache-2.0 WITH LLVM-exception"], name = "target-lexicon" },
 ]
 
 [licenses.private]

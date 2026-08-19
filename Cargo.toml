@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/hop-protocol", "crates/hop-core", "crates/hopd", "crates/hop-cli"]
+members = [
+    "crates/hop-protocol",
+    "crates/hop-core",
+    "crates/hopd",
+    "crates/hop-cli",
+    "apps/hop-gtk",
+]
 
 [workspace.package]
 edition = "2024"
@@ -43,11 +49,13 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # block declared rather than smuggled in: the lint covers normal compilation
 # of both members — `src/` and `#[cfg(test)]` code alike — so each one needs
 # its own narrow `#[expect(unsafe_code)]` at the statement to build at all.
-# As of issue #161 there are five: that one production block, plus four
+# As of issue #179 there are six: that one production block, plus four
 # test-only `libc::mkfifo`/`pre_exec` calls in `hop-protocol`, `hopd::config`,
 # `hopd`'s `tests/activation.rs`, and `hopd::apps` (its own `mkfifo`, for the
 # identical FIFO-open hazard `hopd::config` closes for the config file,
-# closed here for a `.desktop` candidate). Each `expect` is itself the proof
+# closed here for a `.desktop` candidate), plus a second production block —
+# `hop-gtk`'s `ui::window`, setting `XDG_ACTIVATION_TOKEN` before `present()`
+# reads it back, on the GTK main thread. Each `expect` is itself the proof
 # the lint reaches where it's written: were it not firing there, the
 # unfulfilled expectation would warn, and CI's `-D warnings` would fail.
 #
