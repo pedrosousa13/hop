@@ -178,7 +178,13 @@ async fn serve_one_connection(
             }
             frame = reader_rx.recv() => {
                 match frame {
-                    Some(ReadEvent::Message(DaemonMsg::QueryRouted { query_id, mode, exclusive })) if Some(query_id) == current_id => {
+                    // `marker_span` (issue #184) is not yet surfaced through
+                    // `IpcEvent::Routed` — that is the frontend half of #184,
+                    // tracked separately. Named and discarded here rather
+                    // than matched with `..` so adding it to `IpcEvent` later
+                    // is a one-line diff at this exact spot, not a search for
+                    // where the wildcard was hiding it.
+                    Some(ReadEvent::Message(DaemonMsg::QueryRouted { query_id, mode, exclusive, marker_span: _ })) if Some(query_id) == current_id => {
                         let _ = evt_tx.send(IpcEvent::Routed { mode, exclusive }).await;
                     }
                     Some(ReadEvent::Message(DaemonMsg::Results { query_id, items, .. })) if Some(query_id) == current_id => {

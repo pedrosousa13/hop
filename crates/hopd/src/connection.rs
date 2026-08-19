@@ -44,7 +44,9 @@ use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
 };
 use hop_protocol::limits::{MAX_INBOUND_FRAME_BYTES, MAX_ITEMS_PER_RESULTS_FRAME};
-use hop_protocol::{API_VERSION, ClientMsg, DaemonMsg, ErrorCode, ErrorDetail, Item, ProtoError};
+use hop_protocol::{
+    API_VERSION, ClientMsg, DaemonMsg, ErrorCode, ErrorDetail, Item, MarkerSpan, ProtoError,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -336,12 +338,30 @@ async fn handle_message<S: ResultSource>(
             // answer, so the mode the client is told is necessarily the mode
             // the providers were asked under.
             let routed = route(&text_owned);
+            // `routed.marker_span` is a range into `text_owned` itself, which
+            // is `text` — a `QueryText`, bounded to `MAX_QUERY_TEXT` bytes at
+            // the wire boundary before routing ever runs — converted to an
+            // owned `String` two lines above. `span_of` (in
+            // `hop_core::router`) only ever returns a byte range it computed
+            // by slicing that same string, so `start <= end <=
+            // text_owned.len() <= MAX_QUERY_TEXT` holds for every value this
+            // line can see; `MarkerSpan::new`'s checks exist for a value
+            // arriving off the wire from an untrusted peer, which this one
+            // did not. `.expect` documents that this is not a defensive
+            // unwrap of input this function does not control.
+            let marker_span = routed.marker_span.map(|span| {
+                MarkerSpan::new(span.start, span.end).expect(
+                    "a span computed by routing an already-bounded QueryText always satisfies \
+                     MarkerSpan::new's bound and ordering checks",
+                )
+            });
             send_msg(
                 write_half,
                 &DaemonMsg::QueryRouted {
                     query_id: id,
                     mode: routed.mode,
                     exclusive: routed.exclusive,
+                    marker_span,
                 },
             )
             .await?;
