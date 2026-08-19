@@ -38,6 +38,7 @@
 use std::io;
 use std::time::Duration;
 
+use hop_core::pipeline::CheckedItems;
 use hop_core::router::route;
 use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
@@ -109,6 +110,21 @@ enum ReadEvent {
 /// replaces it rather than adding to it, so an item the daemon has since
 /// replaced away is no longer resolvable either. That is not a gap this
 /// struct leaves open; it is what criterion 6 (issue #103) asks for.
+///
+/// **Retained-set lifetime rule (issue #85, ruled 2026-08-19): the retained
+/// set expires on the next query for that id, and on nothing else.** No
+/// timer, no idle eviction — `delivered` lives exactly as long as this
+/// `Exchange` does, and the only thing that ever replaces an `Exchange` is
+/// the `Query` arm building a new one wholesale (see `handle_message`'s
+/// `ClientMsg::Query` arm). A superseded query's id becomes unresolvable the
+/// instant that happens, not on any schedule — the whole struct is dropped
+/// in one assignment, `delivered` included, so there is no window where a
+/// stale id is still technically resolvable and no separate cleanup step
+/// that could be skipped or delayed. `tests::an_execute_bound_against_a_superseded_query_is_refused_cleanly`
+/// pins this end to end: an `Execute` naming a superseded id and an item
+/// that id genuinely delivered is refused exactly as cleanly as one naming
+/// an id the daemon never emitted at all — see the `Execute` arm's own
+/// comment on why the two are honestly the same refusal.
 struct Exchange {
     /// The `query_id` every frame of this exchange carries.
     id: u64,
@@ -122,8 +138,10 @@ struct Exchange {
     /// agreement with `id` and `delivered` for the same reason those two
     /// live in one struct (see this struct's own docs).
     text: String,
-    /// The live source, or `None` once this exchange has ended.
-    source: Option<mpsc::Receiver<Vec<Item>>>,
+    /// The live source, or `None` once this exchange has ended. Issue #85:
+    /// the receiver carries [`CheckedItems`] rather than a bare `Vec<Item>`
+    /// — see [`ResultSource::start`]'s own docs for what that buys.
+    source: Option<mpsc::Receiver<CheckedItems>>,
     /// The last list [`forward_batch`] sent, bounded by
     /// [`MAX_ITEMS_PER_RESULTS_FRAME`] — this struct's own defensive bound on
     /// one assembled list, since [`ResultSource`]'s obligations say a source
@@ -144,7 +162,7 @@ enum Step {
     /// having finished.
     Peer(Option<ReadEvent>),
     /// The active source woke: a batch, or `None` for the source finishing.
-    Batch(Option<Vec<Item>>),
+    Batch(Option<CheckedItems>),
 }
 
 /// Serves one accepted connection to completion.
@@ -505,10 +523,23 @@ async fn handle_message<S: ResultSource>(
 /// This connection's [`MAX_ITEMS_PER_RESULTS_FRAME`] check stays regardless,
 /// because [`ResultSource`]'s obligations section is explicit that a source
 /// is not trusted to honour it on its own.
+///
+/// `batch` arrives as [`CheckedItems`] (issue #85), not a bare `Vec<Item>`,
+/// but this function's own job is unchanged: it takes the items with
+/// [`CheckedItems::into_items`] and forwards those. `batch`'s rejections —
+/// including a [`hop_core::pipeline::FailedCheck::TooManyItemsPerQuery`] one
+/// when `source.rs`'s accumulator overflowed the per-query cap on this
+/// arrival — are not this connection's to forward: `CONTEXT.md`'s
+/// truncate-and-terminate entry is explicit that nothing on the wire names
+/// what a per-query overflow drops, and that stays true here. They are
+/// dropped along with `into_items`'s discarded rejections, the same way
+/// `source.rs`'s own accumulator already discards the pin-budget half of
+/// `Assembly::rejections` — see [`HostSource::start`] for where a rejection
+/// this daemon *does* keep is actually readable.
 async fn forward_batch(
     exchange: &mut Option<Exchange>,
     write_half: &mut OwnedWriteHalf,
-    batch: Option<Vec<Item>>,
+    batch: Option<CheckedItems>,
 ) -> io::Result<()> {
     let Some(active) = exchange.as_mut() else {
         // Unreachable: the receiver this batch came from lives inside the
@@ -518,7 +549,7 @@ async fn forward_batch(
     };
     let query_id = active.id;
 
-    let Some(mut batch) = batch else {
+    let Some(batch) = batch else {
         // The source finished. Clearing it is what takes this query out of
         // the driver's wait — a closed receiver is permanently ready, so
         // leaving it in place would spin — and `QueryDone` is the exchange's
@@ -526,6 +557,7 @@ async fn forward_batch(
         active.source = None;
         return send_msg(write_half, &DaemonMsg::QueryDone { query_id }).await;
     };
+    let mut batch = batch.into_items();
 
     let capped = batch.len() > MAX_ITEMS_PER_RESULTS_FRAME;
     if capped {
@@ -707,7 +739,68 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use hop_core::provider::{Provider, ProviderManifest, QueryCtx};
+    use hop_core::router::{Mode, RoutedQuery};
     use hop_protocol::ItemTitle;
+
+    /// A provider that exists only to be a provider: [`CheckedItems::check`]
+    /// can be reached no other way, and this crate's test sources need a
+    /// real one to build a fixture list of already-checked items — see
+    /// [`checked_items`] below. `query` and `execute` are never called; this
+    /// crate's test sources hand-write the items they want checked rather
+    /// than obtaining them by actually running a query.
+    struct FixtureProvider(ProviderManifest);
+
+    impl Provider for FixtureProvider {
+        fn manifest(&self) -> ProviderManifest {
+            self.0.clone()
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            _q: Arc<RoutedQuery>,
+            _ctx: QueryCtx,
+        ) -> Result<Vec<Item>, hop_core::provider::ProviderError> {
+            unreachable!("FixtureProvider::query is never called by these tests")
+        }
+
+        async fn execute(
+            self: Arc<Self>,
+            _item_id: hop_protocol::ItemId,
+            _action_id: hop_protocol::ActionId,
+        ) -> Result<hop_protocol::ExecOutcome, hop_core::provider::ProviderError> {
+            unreachable!("FixtureProvider::execute is never called by these tests")
+        }
+    }
+
+    /// Builds a [`CheckedItems`] out of a fixture `Vec<Item>`, the way this
+    /// crate's tests build a batch to hand a [`ResultSource`] test double —
+    /// issue #85's "genuinely construct one" requirement for a test-only
+    /// path: this still runs [`CheckedItems::check`], against a manifest
+    /// that agrees with every item this file's fixtures build (`provider:
+    /// "test"`, `kind: Action`), rather than reaching into `CheckedItems`'s
+    /// private fields some other way. Panics if any of `items` would not
+    /// actually pass the check — a fixture that does not is a bug in the
+    /// fixture, not a case these tests want to construct silently.
+    fn checked_items(items: Vec<Item>) -> CheckedItems {
+        let manifest = ProviderManifest {
+            id: "test",
+            kinds: vec![hop_protocol::Kind::Action],
+            modes: vec![Mode::All],
+            min_term_len: 0,
+            budget: Duration::from_millis(50),
+            ids_are_safe_to_persist_in_the_clear: false,
+        };
+        let output =
+            hop_core::pipeline::ProviderOutput::from_provider(&FixtureProvider(manifest), items);
+        let checked = CheckedItems::check(vec![output]);
+        assert!(
+            checked.rejections().is_empty(),
+            "checked_items is for well-formed fixtures only — got {:?}",
+            checked.rejections()
+        );
+        checked
+    }
 
     /// An item whose id names it, so a test can tell two lists' items apart
     /// by identity rather than by count alone.
@@ -756,12 +849,16 @@ mod tests {
         let first = vec![item_named("only-in-first"), item_named("shared")];
         let second = vec![item_named("shared"), item_named("only-in-second")];
 
-        forward_batch(&mut exchange, &mut write_half, Some(first))
+        forward_batch(&mut exchange, &mut write_half, Some(checked_items(first)))
             .await
             .unwrap();
-        forward_batch(&mut exchange, &mut write_half, Some(second.clone()))
-            .await
-            .unwrap();
+        forward_batch(
+            &mut exchange,
+            &mut write_half,
+            Some(checked_items(second.clone())),
+        )
+        .await
+        .unwrap();
 
         let delivered = &exchange.as_ref().unwrap().delivered;
         assert_eq!(
@@ -830,7 +927,7 @@ mod tests {
     }
 
     impl ResultSource for ScriptedSource {
-        fn start(&self, _text: QueryText) -> mpsc::Receiver<Vec<Item>> {
+        fn start(&self, _text: QueryText) -> mpsc::Receiver<CheckedItems> {
             let (_tx, rx) = mpsc::channel(1);
             rx
         }
@@ -1209,6 +1306,158 @@ mod tests {
         assert!(
             source.launches.lock().expect("test lock").is_empty(),
             "a provider failure must never record a launch"
+        );
+    }
+
+    // --- Retained-set lifetime (issue #85): next-query-only, no timer. ---
+
+    /// A source that streams exactly one item and finishes — enough to prove
+    /// the retained-set lifetime test below against a genuinely delivered
+    /// item (via a real `Query` frame through `handle_message`), rather than
+    /// an `Exchange` built by hand the way every other test in this module
+    /// does. `execute` and `record_launch` both panic if reached: the
+    /// scenario this source exists for ends in a refusal that must never
+    /// dispatch to the source at all.
+    #[derive(Clone)]
+    struct OneShotSource(Item);
+
+    impl ResultSource for OneShotSource {
+        fn start(&self, _text: QueryText) -> mpsc::Receiver<CheckedItems> {
+            let (tx, rx) = mpsc::channel(1);
+            let item = self.0.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(checked_items(vec![item])).await;
+            });
+            rx
+        }
+
+        async fn execute(
+            &self,
+            _provider: &str,
+            _item_id: ItemId,
+            _action_id: ActionId,
+        ) -> Result<ExecOutcome, ProviderError> {
+            unreachable!("a refused execute must never reach the source")
+        }
+
+        async fn record_launch(&self, _provider: &str, _query: &str, _item_id: &ItemId) {
+            unreachable!("a refused execute must never record a launch")
+        }
+    }
+
+    /// Issue #85's third ruled decision, pinned end to end: the retained set
+    /// expires on the next query for that id, and on nothing else — no
+    /// timer. Two real `Query` frames run through `handle_message` (not a
+    /// hand-built `Exchange`, unlike every Execute test above), so
+    /// `Exchange::delivered` genuinely holds what query 1 streamed before
+    /// query 2 supersedes it wholesale — see `Exchange`'s own docs on why
+    /// supersession replaces `delivered` rather than merging into it. An
+    /// `Execute` naming query 1's id and the item it actually delivered must
+    /// then be refused cleanly (the same `UnknownItem` a stale or
+    /// never-emitted id gets — `Exchange`'s docs on `id` explain why the
+    /// three read as one honest refusal), not hang, not panic, and not
+    /// resolve against a set this connection has moved on from.
+    #[tokio::test]
+    async fn an_execute_bound_against_a_superseded_query_is_refused_cleanly() {
+        let mut state = HandshakeState::Ready;
+        let mut exchange: Option<Exchange> = None;
+        let source = OneShotSource(item_with_action("app:1", &["open"]));
+        let (mut peer, mut write_half) = write_half_pair();
+
+        // Query 1 starts the exchange. `handle_message`'s Query arm sends
+        // `QueryRouted` itself; drain it before touching the source's
+        // receiver.
+        handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Query {
+                id: 1,
+                text: QueryText::new("q").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::QueryRouted { query_id: 1, .. }
+        ));
+
+        // Drive the one batch `OneShotSource` streams through `forward_batch`
+        // by hand — the same step `drive`'s loop performs, done here
+        // directly so this test controls exactly when it happens.
+        let batch = exchange
+            .as_mut()
+            .expect("query 1 must have started an exchange")
+            .source
+            .as_mut()
+            .expect("query 1's exchange must still have a live source")
+            .recv()
+            .await
+            .expect("OneShotSource must send its one batch");
+        forward_batch(&mut exchange, &mut write_half, Some(batch))
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Results { query_id: 1, .. }
+        ));
+        assert_eq!(
+            exchange.as_ref().unwrap().delivered.len(),
+            1,
+            "sanity: query 1 must have genuinely delivered its one item \
+             before query 2 supersedes it"
+        );
+
+        // Query 2 supersedes query 1 — replacing the exchange wholesale,
+        // which drops query 1's retained set along with it.
+        handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Query {
+                id: 2,
+                text: QueryText::new("q2").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::QueryRouted { query_id: 2, .. }
+        ));
+
+        // Execute names query 1's id and the very item it delivered — an id
+        // this connection actually showed the client, just not under the
+        // query that is now live. It must still be refused cleanly.
+        let done = handle_message(
+            &mut state,
+            &mut exchange,
+            &mut write_half,
+            &source,
+            ClientMsg::Execute {
+                query_id: 1,
+                item_id: ItemId::new("app:1").unwrap(),
+                action_id: ActionId::new("open").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!done, "a stale-query refusal must not end the connection");
+        assert_eq!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Error {
+                query_id: Some(1),
+                error: ProtoError::new(
+                    ErrorCode::UnknownItem,
+                    ErrorDetail::Fixed("no such query or stale query id"),
+                ),
+            },
+            "a superseded query's retained set must not be resolvable, even \
+             for an item it genuinely delivered"
         );
     }
 }

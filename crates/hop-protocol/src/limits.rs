@@ -331,6 +331,23 @@ pub const MAX_ITEMS_PER_RESULTS_FRAME: usize = 1_000;
 /// at the seam a provider's answer is required to cross to reach assembly;
 /// it is still exactly "documented, not enforced" for an item built and
 /// consumed entirely outside that seam.
+///
+/// Issue #85 narrowed that residue once more, at the seam this doc names
+/// above: `hopd`'s `ResultSource` trait. Before #85, that seam's own docs
+/// said its field-bound guarantee held only because `HostSource` happened to
+/// route every provider's answer through `CheckedItems::check` before
+/// sending — "prose asking an implementor to remember it", not a property
+/// the trait's type made true. As of #85 it is: the channel
+/// `ResultSource::start` returns carries `CheckedItems` itself, not a bare
+/// `Vec<Item>`, so an implementation of that trait cannot construct a batch
+/// with an item that skipped the check — there is no route to the trait's
+/// return type that does not pass through `CheckedItems::check` or a
+/// combinator over a value that already did. `Ranker::rank`'s own gap is
+/// unchanged by this — it is a different, narrower seam than `ResultSource`,
+/// and #85 did not touch it — so the honest claim stays scoped: enforced at
+/// every seam a provider's answer, or a `ResultSource` implementation's
+/// batch, is required to cross; still "documented, not enforced" for an item
+/// built and consumed entirely outside both.
 pub const MAX_ITEMS_PER_QUERY: usize = 5_000;
 
 /// Maximum bytes of a client-to-daemon frame payload that `hopd` admits before

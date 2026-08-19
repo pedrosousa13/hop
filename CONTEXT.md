@@ -190,7 +190,7 @@ manifest id. Assembly accepts nothing else, so an item's self-description is
 never taken on trust.
 
 **Rejection** — one item assembly declined, and why. `CheckedItems::check`
-produces four of the five reasons `FailedCheck` distinguishes. Two are the
+produces four of the six reasons `FailedCheck` distinguishes. Two are the
 **manifest checks**: the item's `kind` is not one its producer declared, or
 its `provider` string is not its producer's manifest id — the two ways an
 item's self-description can be a lie. A third, `FailedCheck::FieldTooLong`,
@@ -202,23 +202,31 @@ fourth, `FailedCheck::TooManyItems`, is not about any one item at all — it
 records a whole provider answer over the per-answer item cap, decided before
 any item in it was inspected. The fifth reason, `FailedCheck::PinBudget`, is
 minted only later, inside `Pipeline::assemble`, for a pinned item the **pin
-budget** could not afford even though it passed every check above. Returned
-as data alongside the assembled items rather than logged directly, because
-`Pipeline::assemble` runs on every keystroke and may not have side effects.
-That used to mean rejections went unlogged everywhere, full stop; it no
-longer does. The **provider host** now reads everything `CheckedItems::check`
-itself can produce — all four reasons above, tallied truthfully by cause
-rather than as one undifferentiated count (a `TooManyItems` rejection stands
-for its whole dropped excess, not one item) — through its **log seam**, every
-time it runs `CheckedItems::check` on `ProviderHost::run_one`'s path. What
-still goes unlogged is the pin-budget reason, minted only inside
-`Pipeline::assemble` itself — and the daemon *does* call `assemble` now: the
+budget** could not afford even though it passed every check above. The sixth,
+`FailedCheck::TooManyItemsPerQuery` (issue #85), is minted later still and
+outside `check` entirely: `hopd::source`'s per-query accumulator mints it,
+over the **result source**'s own `MAX_ITEMS_PER_QUERY` cap, following
+`TooManyItems`'s own precedent one layer up — one aggregate rejection per
+overflowing arrival, never one per dropped item. Returned as data alongside
+the assembled items rather than logged directly, because `Pipeline::assemble`
+runs on every keystroke and may not have side effects. That used to mean
+rejections went unlogged everywhere, full stop; it no longer does. The
+**provider host** now reads everything `CheckedItems::check` itself can
+produce — the four reasons above it mints, tallied truthfully by cause rather
+than as one undifferentiated count (a `TooManyItems` rejection stands for its
+whole dropped excess, not one item) — through its **log seam**, every time it
+runs `CheckedItems::check` on `ProviderHost::run_one`'s path. What still goes
+unlogged are the pin-budget and per-query-cap reasons, both minted after that
+path: the daemon *does* call `assemble` (as `assemble_checked`) now — the
 **result source** does, on every provider arrival, over the accumulated
-**checked items**. What `assemble` returns, `Assembly::rejections` as a
-whole, travels back to hopd's accumulator in `source.rs` — the caller that
-discards it, the logged four and the unlogged pin-budget reason arriving
-together. Only the two manifest checks mean a provider lied; a rejection
-names which reason it was, so the five are never confused for one another.
+**checked items**, itself already carrying any per-query-cap rejection the
+accumulator minted before `assemble_checked` ever ran. What that returns
+travels to `hopd::connection` over the **result source**'s own channel — the
+caller that discards the rejections, the four logged reasons, and the two
+unlogged ones, arriving together but never reaching the wire (see
+**truncate-and-terminate**). Only the two manifest checks mean a provider
+lied; a rejection names which reason it was, so the six are never confused
+for one another.
 
 **Ranked body** — the scored, ordered items.
 
@@ -388,7 +396,12 @@ which answers from the providers registered with it. Only the walking
 skeleton's own provider is registered until issues #57 and #58 land the apps
 and calculator ones, so what comes back is still a single hardcoded item — but
 it arrives through the host, having passed the **manifest checks**, rather than
-bypassing it.
+bypassing it. As of issue #85, the channel carries **checked items**
+(`hop_core::pipeline::CheckedItems`) rather than a bare item list: that type's
+only constructors are `CheckedItems::check` and combinators over values `check`
+already produced, so an implementation of this seam cannot hand the daemon an
+item that skipped the per-item field-bound check — the trait's own type is the
+enforcement, not a paragraph asking an implementor to remember it.
 
 **Retained set** — the **last assembled list** an exchange has sent, replaced
 whole by each `results` frame under the replacement-frames rule, kept so that
@@ -400,7 +413,12 @@ replaced away is no longer resolvable, which is the decision issue #103
 recorded. Bounded by `MAX_ITEMS_PER_RESULTS_FRAME` — `connection.rs`'s
 `forward_batch` truncates one list to it before retaining — not
 `MAX_ITEMS_PER_QUERY`, which now bounds the daemon-side accumulator in the
-**result source** instead.
+**result source** instead. Its lifetime is a rule, ruled explicitly by issue
+#85: it expires on the next query for that id, and on nothing else — no timer,
+no idle eviction. The only thing that ever ends one early is a new `Query`
+replacing the whole `Exchange` it lives in; see `hopd::connection::Exchange`'s
+own docs for why that makes the rule true by construction rather than by
+discipline.
 
 **Replacement frame** — a `results` frame carrying a query's complete current
 list, which a client swaps its held list for in whole, never an increment. A
@@ -426,6 +444,21 @@ carry the same terminal frame. A client's only guard against an oversized list
 is the frame cap at the parse — `de_results_items` refuses a `results` frame
 over `MAX_ITEMS_PER_RESULTS_FRAME` — so that half of the cap *is* a refusal,
 and the two sides of one cap are named differently on purpose.
+
+As of issue #85, "nothing on the wire naming it" stays true for the *client*
+— truncate-and-terminate is a wire behavior, not a protocol change — but it
+stopped meaning nothing is named at all. The accumulator's own truncation
+(`hopd::source`'s `absorb_capped`, over `MAX_ITEMS_PER_QUERY`) now records
+what it drops as a **rejection**
+(`hop_core::pipeline::FailedCheck::TooManyItemsPerQuery`), riding alongside
+the surviving items in the same `CheckedItems` batch the **result source**
+hands the connection, following `FailedCheck::TooManyItems`'s own precedent
+one layer up. Never a silent truncation and never a refusal of the whole
+set — the maintainer's ruling on this issue in those exact terms. The
+connection's own `MAX_ITEMS_PER_RESULTS_FRAME` truncation is unchanged by
+this: it stays a wire-level truncation with nothing recorded, because it
+bounds a different thing (one frame, not the query's whole accumulated set)
+at a different layer, and this issue's ruling was scoped to the per-query cap.
 
 **Terminal frame** — the one frame that ends an exchange: `DaemonMsg::QueryDone`,
 sent when the source finishes, at the per-query cap, or in answer to a matching
@@ -465,8 +498,10 @@ single frame can break them, and each says so where it is defined:
 the parse — the **pre-allocation gate** — and `MAX_ITEMS_PER_QUERY` is applied
 in the daemon's result source (`source.rs`), where the **checked items** a
 query accumulates across every provider arrival — work no single frame can
-exceed — are capped and truncated. Where a bound is applied is a fact about
-what it bounds; being applied at the parse is not what makes one a bound.
+exceed — are capped and truncated, the excess recorded as a **rejection**
+rather than dropped silently (issue #85; see **truncate-and-terminate**).
+Where a bound is applied is a fact about what it bounds; being applied at the
+parse is not what makes one a bound.
 
 **Content rule** — a restriction on what a wire value may *contain*, as against
 a **bound**, which restricts how large it may be. Content rules live in
