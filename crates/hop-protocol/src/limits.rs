@@ -133,6 +133,8 @@ pub const MAX_ACTION_LABEL: usize = 128;
 ///
 /// A provider id is an identifier that matches a manifest id (`apps`,
 /// `windows`, `files`), not free text. 64 bytes is already generous for one.
+/// This byte bound is enforced both by wire deserialization and by provider
+/// host registration for in-process provider manifests.
 pub const MAX_PROVIDER_ID: usize = 64;
 
 /// Maximum bytes of an [`IconName`](crate::content::IconName), the name arm of

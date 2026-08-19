@@ -274,16 +274,23 @@ const FREQ_BOOST_CAP: i32 = 60;
 /// module derives from it.
 const MAX_PROVIDER_ID_DIGITS: usize = 2;
 
-/// The longest byte length [`provider_scoped_key`] can ever produce, and
-/// therefore the longest a [`persistence_key`] output — the only thing
-/// [`Learning::record`] ever inserts as a `global_frequency` key — can be:
-/// [`MAX_PROVIDER_ID_DIGITS`] digits, a `:`, up to [`MAX_PROVIDER_ID`] bytes
-/// of provider, a second `:`, and the longest id-part [`persistence_key`] can
-/// produce. That last figure is [`MAX_ITEM_ID`] itself, not the hash branch's
-/// fixed 71 bytes (`"sha256:"` plus 64 hex digits): the plaintext branch can
-/// write a plaintext-eligible provider's raw id verbatim up to the full
-/// item-id bound, which is longer, so the plaintext branch is the one that
-/// sets this ceiling.
+/// The longest byte length [`provider_scoped_key`] can produce on the
+/// registered daemon path, and therefore the longest a [`persistence_key`]
+/// output — the only thing [`Learning::record`] ever inserts as a
+/// `global_frequency` key on that path — can be: [`MAX_PROVIDER_ID_DIGITS`]
+/// digits, a `:`, up to [`MAX_PROVIDER_ID`] bytes of provider, a second `:`,
+/// and the longest id-part [`persistence_key`] can produce. That last figure
+/// is [`MAX_ITEM_ID`] itself, not the hash branch's fixed 71 bytes
+/// (`"sha256:"` plus 64 hex digits): the plaintext branch can write a
+/// plaintext-eligible provider's raw id verbatim up to the full item-id
+/// bound, which is longer, so the plaintext branch is the one that sets this
+/// ceiling.
+///
+/// This is not a universal bound on the public [`Learning::record_launch`]
+/// method: its documented direct-caller caveat says that it does not validate
+/// `provider`. A direct embedder can therefore produce a longer key outside
+/// this registered-provider derivation, which the load-side key bound may
+/// later drop.
 const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_ID + 1 + MAX_ITEM_ID;
 
 /// The most bytes [`Learning::load`] will read from a store file. A file
@@ -294,7 +301,8 @@ const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_I
 /// rather than picked as a round number:
 ///
 /// ```text
-///   MAX_GLOBAL_ENTRIES               1 000  entries that can reach `save`
+///   MAX_GLOBAL_ENTRIES               1 000  entries that can reach `save` on
+///                                           the registered daemon path
 ///                                           (neither row is a bound `save`
 ///                                           itself applies — see below for
 ///                                           what enforces each)
@@ -330,18 +338,24 @@ const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_I
 /// Neither of them is a bound [`Learning::save`] applies. `save` purges by
 /// retention and canonicalizes — both of which can only shrink the map — and
 /// then writes whatever `global_frequency` holds, however many entries that
-/// is and however long their keys are. Both rows hold transitively, and it
-/// is worth writing down through what.
+/// is and however long their keys are. Both rows hold transitively on the
+/// registered daemon path, and it is worth writing down through what.
 ///
 /// `MAX_PERSISTED_KEY_LEN` takes two enforcements, not one, the same shape
-/// issue #37 gave `MAX_ITEM_ID` before it. [`provider_scoped_key`] bounds
-/// every key [`Learning::record_launch`]'s write path can produce — it can
-/// only ever be as long as a legal provider and a legal id-part allow — and
-/// bounds nothing that arrives off disk: `global_frequency` is a
-/// `HashMap<String, _>`, so a parse imposes no length on its keys and calls
+/// issue #37 gave `MAX_ITEM_ID` before it. On the registered daemon path,
+/// [`crate::host::ProviderHost::register`] refuses provider manifests whose
+/// ids exceed [`MAX_PROVIDER_ID`] before hopd can pass them to
+/// [`Learning::record_launch`], so [`provider_scoped_key`] bounds every key
+/// that path can produce — it can only ever be as long as a legal provider
+/// and a legal id-part allow. The public `Learning::record_launch` method is
+/// intentionally unvalidated for direct embedders, as its own docs state;
+/// such a caller can produce a longer key outside this derivation.
+///
+/// The key bound covers nothing that arrives off disk: `global_frequency` is
+/// a `HashMap<String, _>`, so a parse imposes no length on its keys and calls
 /// no key-building function to impose one. `purge_and_bound` is what covers
-/// that second half, checking a loaded key's raw length against this
-/// constant rather than against `MAX_ITEM_ID` alone, precisely because a
+/// that second half, checking a loaded key's raw length against this constant
+/// rather than against `MAX_ITEM_ID` alone, precisely because a
 /// provider-scoped key legitimately runs past `MAX_ITEM_ID` now — a bound
 /// that still checked `MAX_ITEM_ID` there would drop this module's own
 /// freshly recorded, maximally-long entries on their very next load, the
@@ -360,20 +374,22 @@ const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_I
 /// A `Learning` obtained either way is bounded by nothing, and `save` would
 /// write it out exactly as it found it.
 ///
-/// So this ceiling's guarantee is about the round trip this module owns: a
-/// store whose state came from [`Learning::load`] or from `record`, saved,
-/// fits under it. That is the case that has to hold, because it is the one
-/// hop runs.
+/// So this ceiling's guarantee is about the registered daemon round trip this
+/// module owns: a store whose state came from [`Learning::load`] or from
+/// `record` with providers admitted by [`crate::host::ProviderHost::register`],
+/// saved, fits under it. That is the case that has to hold, because it is the
+/// one hop runs. A direct caller that passes an unvalidated provider string to
+/// `Learning::record_launch` is outside this guarantee.
 ///
 /// # That the round trip closes
 ///
-/// With both rows enforced on the way in, it does. The largest store a load
-/// can hand back is `MAX_GLOBAL_ENTRIES` entries keyed at
-/// `MAX_PERSISTED_KEY_LEN` bytes: every other dimension of an entry is
-/// bounded by its own type, and what `save` does before writing — retention
-/// purging, canonicalization — can only drop an entry, merge two, or shorten
-/// a key. That is exactly the store the maximal test builds. A store that
-/// survives a load therefore saves to a file the next load accepts.
+/// For the registered daemon path, with both rows enforced on the way in, it
+/// does. The largest store a load can hand back is `MAX_GLOBAL_ENTRIES`
+/// entries keyed at `MAX_PERSISTED_KEY_LEN` bytes: every other dimension of an
+/// entry is bounded by its own type, and what `save` does before writing —
+/// retention purging, canonicalization — can only drop an entry, merge two,
+/// or shorten a key. That is exactly the store the maximal test builds. A
+/// store that survives a load therefore saves to a file the next load accepts.
 ///
 /// Without the key bound it did not close, and the entry cap could not have
 /// closed it: a hand-written store in *compact* JSON can sit under this
@@ -383,8 +399,9 @@ const MAX_PERSISTED_KEY_LEN: usize = MAX_PROVIDER_ID_DIGITS + 1 + MAX_PROVIDER_I
 /// count in that story is legal throughout; only the key length is not.
 ///
 /// The ceiling **must** comfortably admit any store this module writes from
-/// state it produced, or a legitimate full store would fail to reload and
-/// the guard meant to protect a user's learning would be what discarded it.
+/// registered-provider state it produced, or a legitimate full store would
+/// fail to reload and the guard meant to protect a user's learning would be
+/// what discarded it.
 /// That requirement is held as a test rather than as a claim here:
 /// `the_largest_store_save_can_write_still_reloads_intact` builds a store
 /// sitting on every one of those maxima at once, saves it, measures the file
@@ -848,12 +865,17 @@ fn evict_lru_outer(map: &mut HashMap<String, HashMap<String, LearningEntry>>, ma
 ///
 /// # Why a plain separator does not work
 ///
-/// `provider` is bounded at [`MAX_PROVIDER_ID`] (64 bytes) but otherwise
-/// unconstrained — no character-set rule, nothing that keeps it from
-/// containing whatever separator this function might pick — and `id_part` is
-/// built from an id bounded at [`MAX_ITEM_ID`] (4 096 bytes) with the same
-/// lack of a content rule. `format!("{provider}:{id_part}")` is forgeable for
-/// exactly that reason: a provider `"apps:app"` presenting id `"firefox"`
+/// On the registered daemon path, `provider` has been bounded at
+/// [`MAX_PROVIDER_ID`] (64 bytes) by [`crate::host::ProviderHost::register`].
+/// This helper does not enforce that bound: the public
+/// [`Learning::record_launch`] method intentionally accepts an unvalidated
+/// provider string from direct embedders, who can therefore produce a longer
+/// key outside the persisted-key derivation. In either path, the provider is
+/// otherwise unconstrained — no character-set rule, nothing that keeps it
+/// from containing whatever separator this function might pick — and
+/// `id_part` is built from an id bounded at [`MAX_ITEM_ID`] (4 096 bytes) with
+/// the same lack of a content rule. `format!("{provider}:{id_part}")` is
+/// forgeable for exactly that reason: a provider `"apps:app"` presenting id `"firefox"`
 /// produces `"apps:app:firefox"`, the identical string the honest provider
 /// `"apps"` produces for id `"app:firefox"`. Nothing about the choice of
 /// separator matters here — the *provider itself* chooses both halves of the
