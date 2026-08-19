@@ -1259,11 +1259,11 @@ Two facts about that worth carrying into the implementing slice:
   sources against `deny.toml` as its own CI job. A hashing crate therefore has
   to clear three separate checks, not one: the `[licenses]` allow-list —
   today GPL-3.0-only, ISC, MIT, MPL-2.0 and Unicode-3.0, with `exceptions`
-  empty (`[licenses].allow` in `deny.toml` [Amended 2026-08-10]; ISC was added since, by
+  empty (`[licenses].allow` in `deny.toml` [Amended 2026-08-10] [Amended 2026-08-18]); ISC was added since, by
   `da5f65f` (#57), for `inotify`/`inotify-sys`, the apps provider's
   filesystem watcher) — plus
-  `[bans]`'s empty `deny` list (`[bans].deny` in `deny.toml` [Amended 2026-08-10]) and
-  `[advisories]`'s empty `ignore` list (`[advisories].ignore` in `deny.toml`). These are a
+  `[bans]`'s empty `deny` list (`[bans].deny` in `deny.toml` [Amended 2026-08-10] [Amended 2026-08-18]) and
+  `[advisories]`'s empty `ignore` list (`[advisories].ignore` in `deny.toml` [Amended 2026-08-18]). These are a
   constraint on the choice rather than a reason not to make it.
 
   **What #35 closed is narrower than the issue it was filed under, and this
