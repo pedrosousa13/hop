@@ -14,6 +14,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # apps/hop-gtk (issue #179) links against the system GTK4 and
+      # libadwaita, discovered through `pkg-config` by the gtk4-rs/
+      # libadwaita-rs `-sys` crates' `build.rs` — a plain `cargo build` (and
+      # so `clippy`/`test` below, which both compile the workspace first)
+      # fails outright without the `-dev` packages' headers and `.pc` files.
+      # `libgtk-4-bin` is the third package for a reason that is easy to
+      # miss and easy to get wrong: it provides `gtk4-broadwayd`, the GTK4
+      # headless display server `apps/hop-gtk/tests/headless_smoke.rs`
+      # spawns to satisfy this issue's criterion 8 (headless capture in
+      # CI). The *other* thing named `broadwayd` that Ubuntu ships,
+      # `libgtk-3-bin`'s own binary of the same name, speaks GTK3's
+      # incompatible broadway protocol and cannot serve a GTK4 client at
+      # all — installing only `libgtk-4-dev` (headers) without
+      # `libgtk-4-bin` (this binary) would build cleanly and then fail
+      # `headless_smoke.rs` at run time with "failed to spawn
+      # gtk4-broadwayd", which is exactly the trap that test's own doc
+      # comment documents having hit once already while this was built.
+      # `libadwaita-1-dev` is the same story one layer up, for
+      # `apps/hop-gtk`'s libadwaita dependency.
+      - name: Install GTK4 + libadwaita
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libgtk-4-bin libadwaita-1-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
