@@ -77,9 +77,29 @@ use thiserror::Error;
 pub const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
 
 /// The subdirectory of `$XDG_RUNTIME_DIR` the derived socket lives in.
+///
+/// The value is not a free choice this module made on its own:
+/// `hopd::runtime_dir::resolve` already creates `<XDG_RUNTIME_DIR>/hop`
+/// (with its own literal `"hop"`, not this constant — unifying the two is
+/// later work, not this task's), and `contrib/systemd/hopd.socket`'s
+/// `ListenStream=%t/hop/hopd.sock` hardcodes the same directory name a
+/// third time, so that a standalone-started `hopd` and a socket-activated
+/// one agree on where the socket lives. `derived` composing anything other
+/// than `"hop"` here would make it disagree with both.
 pub const RUNTIME_SUBDIR: &str = "hop";
 
 /// The socket's file name.
+///
+/// `hopd::server` has held its own private copy of this same string
+/// (`const SOCKET_FILE_NAME`, used to build the path it binds) since
+/// before this module existed; this is not a replacement for that copy —
+/// unifying the two is Task 3's job. `contrib/systemd/hopd.socket`'s
+/// `ListenStream=%t/hop/hopd.sock` is a second, independent place the
+/// literal appears, since a systemd `.socket` unit has no way to reference
+/// a Rust constant (its own comment says as much, pointing back at
+/// `server.rs`). This crate needs its own copy because `hop-cli` and
+/// `hop-gtk` have never had one to reuse — each spelled `"hopd.sock"`
+/// inline in its own `socket_path()`.
 pub const SOCKET_FILE_NAME: &str = "hopd.sock";
 
 /// Every way a socket path can fail to be produced, whether derived or
@@ -100,6 +120,14 @@ pub const SOCKET_FILE_NAME: &str = "hopd.sock";
 #[derive(Debug, Error)]
 pub enum SocketPathError {
     /// `$XDG_RUNTIME_DIR` is not set.
+    ///
+    /// Kept as its own variant rather than folded into
+    /// [`SocketPathError::RuntimeDirEmpty`] behind one generic "bad runtime
+    /// directory" case, for the reverse of that variant's own reason: the
+    /// fix is different — export the variable at all, versus stop exporting
+    /// it as empty — and a reader told only "the runtime directory is bad"
+    /// has to go re-derive which of those two applies before they can act
+    /// on the message.
     #[error("{XDG_RUNTIME_DIR} is not set")]
     RuntimeDirUnset,
 
@@ -197,6 +225,17 @@ pub fn runtime_dir() -> Result<PathBuf, SocketPathError> {
 }
 
 /// `<runtime_dir>/hop/hopd.sock` — the path used when no override is given.
+///
+/// This only composes a path; it does not canonicalize it or check that
+/// anything along the way exists. Nothing needs that check here: with no
+/// override, `hopd` itself creates `<runtime_dir>/hop` at 0700 before
+/// binding inside it (`hopd::runtime_dir::resolve`), so validating
+/// existence in this function would only ever fire before the daemon has
+/// had the chance to create the very directory it is about to create
+/// anyway — a race this function has no way to win and no reason to enter.
+/// [`resolve_in`] is where an override earns that validation, because an
+/// override's entire risk is pointing somewhere `hopd::runtime_dir` never
+/// touches and so never gets created or checked for it.
 pub fn derived(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(RUNTIME_SUBDIR).join(SOCKET_FILE_NAME)
 }
