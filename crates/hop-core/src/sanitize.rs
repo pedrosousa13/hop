@@ -113,8 +113,11 @@ pub fn sanitize_provider_message(raw: &str) -> String {
 /// safe to interpolate into a single-line, human-readable diagnostic. Issue
 /// #159's fix for every call site that used to build a diagnostic line with
 /// `path.display()`: `apps.rs`'s `malformed_log_line`, `config.rs`'s
-/// `ConfigError` variants, `source.rs`'s scan-failure lines, `learning.rs`'s
-/// save-failure lines, and `server.rs`'s `ListenerError::AlreadyListening`.
+/// `ConfigError` variants, `source.rs`'s learning-save lines
+/// (`record_launch`'s `eprintln!`), and `server.rs`'s
+/// `ListenerError::AlreadyListening`. `learning.rs` itself has no production
+/// diagnostic built this way — its two `path.display()` uses are test-only
+/// panic messages, untouched by this change.
 /// Unix filenames may contain newlines, carriage returns, ESC, other C0/C1
 /// controls, DEL, and Unicode bidirectional overrides — a `.desktop` file
 /// whose name carries one of these could otherwise open a second
@@ -154,11 +157,15 @@ pub fn sanitize_provider_message(raw: &str) -> String {
 /// for this workspace: every crate binds a Unix domain socket
 /// unconditionally and `hopd`'s `Cargo.toml` says outright that it "has no
 /// non-Unix target", and `learning.rs` already gates its own Unix-only
-/// steps (durability fsyncs, `0600` permissions) behind `#[cfg(unix)]` for
-/// the identical reason. This function follows that precedent — gated
-/// rather than unconditional, purely so this crate still type-checks on
-/// the rare host where it is built off Unix; `hopd`, its only consumer,
-/// never is.
+/// steps (durability fsyncs, `0600` permissions) behind `#[cfg(unix)]` by
+/// *omitting* the step off Unix rather than shipping a parallel
+/// implementation. This function follows that same precedent, one level
+/// up: the whole function is `#[cfg(unix)]`, so off Unix it is simply
+/// absent rather than present-but-lossy. A `to_string_lossy` fallback was
+/// considered and rejected — it would reintroduce the exact `U+FFFD` loss
+/// this function exists to avoid, silently, on the one target nothing in
+/// this workspace ever builds for: `hopd`, this crate's only consumer,
+/// has no non-Unix target either.
 ///
 /// # The escaping vocabulary, and why it cannot be misread
 ///
@@ -192,6 +199,7 @@ pub fn sanitize_provider_message(raw: &str) -> String {
 /// for newline were considered and rejected for exactly this reason:
 /// introducing a *second* meaning for `\` followed by an ordinary letter
 /// would reopen the ambiguity this function exists to close.
+#[cfg(unix)]
 pub fn escape_path(path: &Path) -> String {
     let bytes = path_to_bytes(path);
     let mut out = String::with_capacity(bytes.len());
@@ -229,29 +237,21 @@ pub fn escape_path(path: &Path) -> String {
     out
 }
 
-/// The raw bytes behind a path, platform-appropriately. See
-/// [`escape_path`]'s "Non-UTF-8 bytes" section for why the Unix arm reads
-/// the path's actual bytes rather than going through [`Path::display`]'s
-/// lossy conversion.
+/// The raw bytes behind a path. See [`escape_path`]'s "Non-UTF-8 bytes"
+/// section for why this reads the path's actual bytes via
+/// [`OsStrExt::as_bytes`](std::os::unix::ffi::OsStrExt::as_bytes) rather
+/// than going through [`Path::display`]'s lossy conversion. `#[cfg(unix)]`
+/// like [`escape_path`] itself — there is deliberately no non-Unix arm; see
+/// [`escape_path`]'s doc comment for why one was rejected.
 #[cfg(unix)]
 fn path_to_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
     use std::os::unix::ffi::OsStrExt;
     std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
 }
 
-/// Non-Unix fallback so this crate still type-checks off Unix, even though
-/// `hopd` — its only consumer — never builds there. `OsStrExt::as_bytes` is
-/// Unix-only, so this arm has nothing byte-exact to fall back to and uses
-/// the same lossy `to_string_lossy` conversion `Path::display` does; the
-/// byte-exact guarantee `escape_path` documents is specifically about the
-/// Unix arm above.
-#[cfg(not(unix))]
-fn path_to_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
-    std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
-}
-
 /// Escapes one already-valid-UTF-8 chunk's characters into `out`, per
 /// [`escape_path`]'s documented vocabulary.
+#[cfg(unix)]
 fn push_escaped_str(s: &str, out: &mut String) {
     for c in s.chars() {
         if c == '\\' {
@@ -279,6 +279,7 @@ fn push_escaped_str(s: &str, out: &mut String) {
 }
 
 /// Appends one raw byte's `\xHH` escape to `out`.
+#[cfg(unix)]
 fn push_hex_byte(b: u8, out: &mut String) {
     use std::fmt::Write as _;
     #[expect(
@@ -398,172 +399,179 @@ mod tests {
     // contract: a control byte must never disappear, it must turn into a
     // visible, unambiguous escape sequence instead. See `escape_path`'s doc
     // comment for the vocabulary these pin.
+    //
+    // `escape_path` itself is `#[cfg(unix)]` (see its doc comment), so the
+    // tests pinning it live in their own `#[cfg(unix)]` submodule rather than
+    // each carrying the attribute separately.
+    #[cfg(unix)]
+    mod escape_path_tests {
+        use super::*;
+        use std::path::Path;
 
-    use std::path::Path;
+        #[test]
+        fn an_ordinary_ascii_path_passes_through_unchanged() {
+            let path = Path::new("/home/pedro/.config/hop/config.toml");
+            assert_eq!(escape_path(path), "/home/pedro/.config/hop/config.toml");
+        }
 
-    #[test]
-    fn an_ordinary_ascii_path_passes_through_unchanged() {
-        let path = Path::new("/home/pedro/.config/hop/config.toml");
-        assert_eq!(escape_path(path), "/home/pedro/.config/hop/config.toml");
-    }
-
-    #[test]
-    fn ordinary_non_ascii_unicode_survives_untouched() {
-        // Accents, CJK, and emoji are not the target of this function —
-        // only control and direction characters are. Mangling any of these
-        // would make the escaped path useless for the exact reason
-        // stripping would: it would no longer name the real file.
-        let path = Path::new("/home/pedro/Documents/résumé_日本語_😀.pdf");
-        assert_eq!(
-            escape_path(path),
-            "/home/pedro/Documents/résumé_日本語_😀.pdf"
-        );
-    }
-
-    #[test]
-    fn path_separators_survive_unescaped() {
-        // A path with every separator escaped would not be a path anymore —
-        // the reader has to be able to walk it.
-        let path = Path::new("/a/b/c/d.txt");
-        let out = escape_path(path);
-        assert_eq!(out.matches('/').count(), 4);
-        assert_eq!(out, "/a/b/c/d.txt");
-    }
-
-    #[test]
-    fn an_ordinary_path_escapes_identically_to_display() {
-        // `config.rs`'s existing tests assert
-        // `err.to_string().contains(&path.display().to_string())` for
-        // ordinary tempdir paths. That must keep passing untouched, and it
-        // can only do that if this function is a no-op on paths with
-        // nothing to escape — this pins that invariant directly, at the
-        // source, rather than relying on the config tests to notice a
-        // regression.
-        let dir = std::env::temp_dir().join("hop-issue-159-fixture");
-        assert_eq!(escape_path(&dir), dir.display().to_string());
-    }
-
-    #[test]
-    fn a_newline_in_a_file_name_cannot_start_a_second_log_line() {
-        let path = Path::new("/home/pedro/apps/evil\nname.desktop");
-        let out = escape_path(path);
-        assert!(
-            !out.contains('\n'),
-            "a raw newline must never reach the escaped output: {out:?}"
-        );
-        assert_eq!(out, "/home/pedro/apps/evil\\x0aname.desktop");
-    }
-
-    #[test]
-    fn a_carriage_return_is_escaped() {
-        let path = Path::new("evil\rname");
-        assert_eq!(escape_path(path), "evil\\x0dname");
-    }
-
-    #[test]
-    fn esc_cannot_open_a_terminal_control_sequence() {
-        let path = Path::new("evil\u{1b}[31mname");
-        let out = escape_path(path);
-        assert!(
-            !out.contains('\u{1b}'),
-            "a raw ESC must never reach the escaped output: {out:?}"
-        );
-        assert_eq!(out, "evil\\x1b[31mname");
-    }
-
-    #[test]
-    fn del_is_escaped() {
-        let path = Path::new("evil\u{7f}name");
-        assert_eq!(escape_path(path), "evil\\x7fname");
-    }
-
-    #[test]
-    fn a_c1_control_character_is_escaped() {
-        // U+0085 NEL, a C1 control — `char::is_control` reaches it even
-        // though it is outside the ASCII C0 range.
-        let path = Path::new("evil\u{85}name");
-        assert_eq!(escape_path(path), "evil\\x85name");
-    }
-
-    #[test]
-    fn every_bidi_control_character_is_escaped() {
-        // Reuses `BIDI_CONTROLS`, the same enumerated Trojan Source set
-        // `sanitize_provider_message` strips, for the identical reason: a
-        // direction override can make a path *display* as something other
-        // than what it says.
-        for c in BIDI_CONTROLS {
-            let name = format!("evil{c}name");
-            let path = Path::new(&name);
-            let out = escape_path(path);
-            assert!(
-                !out.contains(*c),
-                "{c:?} must not reach the escaped output unescaped"
-            );
-            assert!(
-                out.contains(&format!("\\u{{{:x}}}", *c as u32)),
-                "{c:?} must escape to its \\u{{HEX}} form: {out:?}"
+        #[test]
+        fn ordinary_non_ascii_unicode_survives_untouched() {
+            // Accents, CJK, and emoji are not the target of this function —
+            // only control and direction characters are. Mangling any of these
+            // would make the escaped path useless for the exact reason
+            // stripping would: it would no longer name the real file.
+            let path = Path::new("/home/pedro/Documents/résumé_日本語_😀.pdf");
+            assert_eq!(
+                escape_path(path),
+                "/home/pedro/Documents/résumé_日本語_😀.pdf"
             );
         }
-    }
 
-    #[test]
-    fn a_right_to_left_override_does_not_reorder_the_escaped_output() {
-        let path = Path::new("apps\u{202e}desktop.exe");
-        assert_eq!(escape_path(path), "apps\\u{202e}desktop.exe");
-    }
+        #[test]
+        fn path_separators_survive_unescaped() {
+            // A path with every separator escaped would not be a path anymore —
+            // the reader has to be able to walk it.
+            let path = Path::new("/a/b/c/d.txt");
+            let out = escape_path(path);
+            assert_eq!(out.matches('/').count(), 4);
+            assert_eq!(out, "/a/b/c/d.txt");
+        }
 
-    #[test]
-    fn a_literal_backslash_is_escaped_so_it_cannot_be_confused_with_an_escape() {
-        // The ambiguity this function exists to close: a file literally
-        // named backslash-n (two ordinary bytes) must render differently
-        // from a file containing one real newline byte, or a reader could
-        // not tell them apart.
-        let literal_backslash_n = Path::new("evil\\nname");
-        let real_newline = Path::new("evil\nname");
+        #[test]
+        fn an_ordinary_path_escapes_identically_to_display() {
+            // `config.rs`'s existing tests assert
+            // `err.to_string().contains(&path.display().to_string())` for
+            // ordinary tempdir paths. That must keep passing untouched, and it
+            // can only do that if this function is a no-op on paths with
+            // nothing to escape — this pins that invariant directly, at the
+            // source, rather than relying on the config tests to notice a
+            // regression.
+            let dir = std::env::temp_dir().join("hop-issue-159-fixture");
+            assert_eq!(escape_path(&dir), dir.display().to_string());
+        }
 
-        let literal_out = escape_path(literal_backslash_n);
-        let newline_out = escape_path(real_newline);
+        #[test]
+        fn a_newline_in_a_file_name_cannot_start_a_second_log_line() {
+            let path = Path::new("/home/pedro/apps/evil\nname.desktop");
+            let out = escape_path(path);
+            assert!(
+                !out.contains('\n'),
+                "a raw newline must never reach the escaped output: {out:?}"
+            );
+            assert_eq!(out, "/home/pedro/apps/evil\\x0aname.desktop");
+        }
 
-        assert_ne!(literal_out, newline_out);
-        assert_eq!(literal_out, "evil\\\\nname");
-        assert_eq!(newline_out, "evil\\x0aname");
-    }
+        #[test]
+        fn a_carriage_return_is_escaped() {
+            let path = Path::new("evil\rname");
+            assert_eq!(escape_path(path), "evil\\x0dname");
+        }
 
-    #[test]
-    fn non_utf8_path_bytes_are_escaped_byte_for_byte_not_replaced_with_u_fffd() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
+        #[test]
+        fn esc_cannot_open_a_terminal_control_sequence() {
+            let path = Path::new("evil\u{1b}[31mname");
+            let out = escape_path(path);
+            assert!(
+                !out.contains('\u{1b}'),
+                "a raw ESC must never reach the escaped output: {out:?}"
+            );
+            assert_eq!(out, "evil\\x1b[31mname");
+        }
 
-        // 0xFF is not a valid UTF-8 lead byte anywhere — guaranteed invalid
-        // on its own, unlike a lone continuation byte which could in
-        // principle be mistaken for one half of something else.
-        let mut raw = b"evil".to_vec();
-        raw.push(0xFF);
-        raw.extend_from_slice(b"name");
+        #[test]
+        fn del_is_escaped() {
+            let path = Path::new("evil\u{7f}name");
+            assert_eq!(escape_path(path), "evil\\x7fname");
+        }
 
-        let os_string = OsString::from_vec(raw);
-        let path = std::path::PathBuf::from(os_string);
+        #[test]
+        fn a_c1_control_character_is_escaped() {
+            // U+0085 NEL, a C1 control — `char::is_control` reaches it even
+            // though it is outside the ASCII C0 range.
+            let path = Path::new("evil\u{85}name");
+            assert_eq!(escape_path(path), "evil\\x85name");
+        }
 
-        let out = escape_path(&path);
+        #[test]
+        fn every_bidi_control_character_is_escaped() {
+            // Reuses `BIDI_CONTROLS`, the same enumerated Trojan Source set
+            // `sanitize_provider_message` strips, for the identical reason: a
+            // direction override can make a path *display* as something other
+            // than what it says.
+            for c in BIDI_CONTROLS {
+                let name = format!("evil{c}name");
+                let path = Path::new(&name);
+                let out = escape_path(path);
+                assert!(
+                    !out.contains(*c),
+                    "{c:?} must not reach the escaped output unescaped"
+                );
+                assert!(
+                    out.contains(&format!("\\u{{{:x}}}", *c as u32)),
+                    "{c:?} must escape to its \\u{{HEX}} form: {out:?}"
+                );
+            }
+        }
 
-        assert!(
-            !out.contains('\u{fffd}'),
-            "the byte must be escaped, not lossily replaced: {out:?}"
-        );
-        assert_eq!(out, "evil\\xffname");
-    }
+        #[test]
+        fn a_right_to_left_override_does_not_reorder_the_escaped_output() {
+            let path = Path::new("apps\u{202e}desktop.exe");
+            assert_eq!(escape_path(path), "apps\\u{202e}desktop.exe");
+        }
 
-    #[test]
-    fn a_run_of_invalid_bytes_each_escapes_individually() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
+        #[test]
+        fn a_literal_backslash_is_escaped_so_it_cannot_be_confused_with_an_escape() {
+            // The ambiguity this function exists to close: a file literally
+            // named backslash-n (two ordinary bytes) must render differently
+            // from a file containing one real newline byte, or a reader could
+            // not tell them apart.
+            let literal_backslash_n = Path::new("evil\\nname");
+            let real_newline = Path::new("evil\nname");
 
-        // Two bytes that together are not a valid UTF-8 sequence, so both
-        // must appear in the output as their own two-digit escape.
-        let raw = vec![b'x', 0xC0, 0xC0, b'y'];
-        let os_string = OsString::from_vec(raw);
-        let path = std::path::PathBuf::from(os_string);
+            let literal_out = escape_path(literal_backslash_n);
+            let newline_out = escape_path(real_newline);
 
-        assert_eq!(escape_path(&path), "x\\xc0\\xc0y");
+            assert_ne!(literal_out, newline_out);
+            assert_eq!(literal_out, "evil\\\\nname");
+            assert_eq!(newline_out, "evil\\x0aname");
+        }
+
+        #[test]
+        fn non_utf8_path_bytes_are_escaped_byte_for_byte_not_replaced_with_u_fffd() {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            // 0xFF is not a valid UTF-8 lead byte anywhere — guaranteed invalid
+            // on its own, unlike a lone continuation byte which could in
+            // principle be mistaken for one half of something else.
+            let mut raw = b"evil".to_vec();
+            raw.push(0xFF);
+            raw.extend_from_slice(b"name");
+
+            let os_string = OsString::from_vec(raw);
+            let path = std::path::PathBuf::from(os_string);
+
+            let out = escape_path(&path);
+
+            assert!(
+                !out.contains('\u{fffd}'),
+                "the byte must be escaped, not lossily replaced: {out:?}"
+            );
+            assert_eq!(out, "evil\\xffname");
+        }
+
+        #[test]
+        fn a_run_of_invalid_bytes_each_escapes_individually() {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            // Two bytes that together are not a valid UTF-8 sequence, so both
+            // must appear in the output as their own two-digit escape.
+            let raw = vec![b'x', 0xC0, 0xC0, b'y'];
+            let os_string = OsString::from_vec(raw);
+            let path = std::path::PathBuf::from(os_string);
+
+            assert_eq!(escape_path(&path), "x\\xc0\\xc0y");
+        }
     }
 }
