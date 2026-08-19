@@ -17,7 +17,8 @@
 //! than waiting for #57's apps provider to make it real.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ use hop_core::host::{ProviderEvent, ProviderHost, ProviderLog};
 use hop_core::pipeline::{CheckedItems, FailedCheck, Pipeline, Rejection};
 use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery, route};
+use hop_core::sanitize::escape_path;
 use hop_protocol::{
     Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, ItemSubtitle, ItemTitle, Kind,
     MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, QueryText,
@@ -601,18 +603,44 @@ impl ResultSource for HostSource {
         let learning = self.pipeline.lock().await.learning.clone();
 
         let path_for_save = path.clone();
+        // `path` is `learning_path`: environment-derived (issue #159), the
+        // same way the config path is, so it runs through `escape_path`
+        // rather than `path.display()` before reaching stderr.
         match tokio::task::spawn_blocking(move || learning.save(&path_for_save)).await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => eprintln!(
-                "hopd: failed to save the learning store to {}: {err}",
-                path.display()
-            ),
-            Err(join_err) => eprintln!(
-                "hopd: learning store save task for {} panicked: {join_err}",
-                path.display()
-            ),
+            Ok(Err(err)) => eprintln!("{}", learning_save_failed_line(path, &err)),
+            Err(join_err) => eprintln!("{}", learning_save_panicked_line(path, &join_err)),
         }
     }
+}
+
+/// Builds the line [`HostSource::record_launch`] writes to stderr when
+/// saving the learning store to `path` returns `err`. Extracted as a pure
+/// function — mirroring `apps.rs`'s `malformed_log_line`, which exists for
+/// the identical reason — because capturing stderr in a unit test needs
+/// either a new dependency or `unsafe` fd redirection, and this workspace
+/// forbids both. Asserting on this function's return value is as close as a
+/// test can get to pinning what `record_launch` actually sends to stderr.
+///
+/// `path` runs through [`escape_path`], not `path.display()` (issue #159):
+/// `learning_path` is environment-derived, the same way the config path is
+/// — see `record_launch`'s own doc comment.
+fn learning_save_failed_line(path: &Path, err: &io::Error) -> String {
+    format!(
+        "hopd: failed to save the learning store to {}: {err}",
+        escape_path(path)
+    )
+}
+
+/// Builds the line [`HostSource::record_launch`] writes to stderr when the
+/// blocking save task itself panicked (`join_err`) rather than `save`
+/// returning an error. Same extraction rationale, and the same issue #159
+/// treatment of `path`, as [`learning_save_failed_line`].
+fn learning_save_panicked_line(path: &Path, join_err: &tokio::task::JoinError) -> String {
+    format!(
+        "hopd: learning store save task for {} panicked: {join_err}",
+        escape_path(path)
+    )
 }
 
 /// The daemon's [`ProviderLog`]: one line per event on stderr.
@@ -822,6 +850,59 @@ mod tests {
              1 forged provenance, 1 field too long, 10 dropped over the \
              per-answer item cap)"
         );
+    }
+
+    #[test]
+    fn learning_save_failed_line_names_the_path_and_the_error() {
+        // A focused unit test of the pure line-building function, mirroring
+        // `apps.rs`'s `malformed_log_line_names_the_path_and_the_reason` —
+        // see `learning_save_failed_line`'s own doc comment for why a pure
+        // function is what a test can assert on here.
+        let err = io::Error::other("no space left on device");
+        let line = learning_save_failed_line(Path::new("/home/pedro/.local/state/hop.json"), &err);
+        assert!(
+            line.contains("/home/pedro/.local/state/hop.json"),
+            "{line:?}"
+        );
+        assert!(line.contains("no space left on device"), "{line:?}");
+    }
+
+    /// Issue #159: `learning_path` is `$XDG_STATE_HOME`-derived and not
+    /// otherwise validated before this function runs, so a newline in it
+    /// must not reach stderr unescaped — it would otherwise look like a
+    /// second, independent `hopd:` log line.
+    #[test]
+    fn learning_save_failed_line_escapes_a_newline_in_the_path() {
+        let err = io::Error::other("no space left on device");
+        let line = learning_save_failed_line(
+            Path::new("/home/pedro/.local/state/evil\nname/hop.json"),
+            &err,
+        );
+        assert!(
+            !line.contains('\n'),
+            "a raw newline must never reach the logged line: {line:?}"
+        );
+        assert!(line.contains("evil\\x0aname"), "{line:?}");
+    }
+
+    #[tokio::test]
+    async fn learning_save_panicked_line_escapes_a_newline_in_the_path() {
+        // A genuine `JoinError`, from a task that actually panicked —
+        // constructing one any other way is not available off the public
+        // API, and this is the same way `hop-core`'s own panic-isolation
+        // tests get one.
+        let handle = tokio::spawn(async { panic!("synthetic panic for this test") });
+        let join_err = handle.await.expect_err("the spawned task panicked");
+
+        let line = learning_save_panicked_line(
+            Path::new("/home/pedro/.local/state/evil\nname/hop.json"),
+            &join_err,
+        );
+        assert!(
+            !line.contains('\n'),
+            "a raw newline must never reach the logged line: {line:?}"
+        );
+        assert!(line.contains("evil\\x0aname"), "{line:?}");
     }
 
     #[tokio::test]

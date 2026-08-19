@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use hop_core::sanitize::escape_path;
 use hop_protocol::MAX_ITEMS_PER_RESULTS_FRAME;
 
 /// The environment variable that names the config directory root. Named once
@@ -116,6 +117,15 @@ impl Default for Config {
 /// Errors loading a config. Anything that means "there was a config to read,
 /// or a config that could not be parsed safely" is a distinct, explicit error
 /// rather than a silent fallback to defaults.
+///
+/// Every variant's `path` runs through [`escape_path`] rather than
+/// `path.display()` (issue #159): `path` is `$XDG_CONFIG_HOME`-derived, so
+/// an attacker who controls the environment or a symlink target the
+/// config-directory resolution follows controls this string too, and
+/// `path.display()` would have interpolated it into these `Display` strings
+/// raw. For an ordinary path with nothing to escape the two are identical —
+/// see `escape_path`'s own doc comment for why — so this changes nothing
+/// about the message an ordinary misconfigured install sees.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// Neither `XDG_CONFIG_HOME` nor `HOME` is set, so no config path can be
@@ -136,7 +146,7 @@ pub enum ConfigError {
     /// "this file could not be turned into text", which is this variant's
     /// whole scope; what the text says once it exists is
     /// [`ConfigError::Parse`]'s.
-    #[error("could not read config file {}: {err}", .path.display())]
+    #[error("could not read config file {}: {err}", escape_path(.path))]
     Read {
         /// The path that could not be read.
         path: PathBuf,
@@ -152,7 +162,7 @@ pub enum ConfigError {
     /// distinction is the whole point of this check (issue #160). Distinct
     /// from [`ConfigError::Read`]: the open itself succeeded here, and it is
     /// the object's type, not an I/O failure, that disqualifies it.
-    #[error("config file {} is not a regular file", .path.display())]
+    #[error("config file {} is not a regular file", escape_path(.path))]
     NotARegularFile {
         /// The path that did not resolve to a regular file.
         path: PathBuf,
@@ -164,7 +174,7 @@ pub enum ConfigError {
     /// cap are never read off the descriptor, so whether they would have
     /// been valid, readable TOML is never known — this file is refused for
     /// its size alone.
-    #[error("config file {} is larger than the {MAX_CONFIG_BYTES}-byte limit", .path.display())]
+    #[error("config file {} is larger than the {MAX_CONFIG_BYTES}-byte limit", escape_path(.path))]
     TooLarge {
         /// The path whose contents exceeded [`MAX_CONFIG_BYTES`].
         path: PathBuf,
@@ -172,7 +182,7 @@ pub enum ConfigError {
 
     /// A config file exists but is not valid TOML. The error names the path
     /// so a user can open the offending file.
-    #[error("config file {} is not valid TOML: {err}", .path.display())]
+    #[error("config file {} is not valid TOML: {err}", escape_path(.path))]
     Parse {
         /// The path that did not parse.
         path: PathBuf,
@@ -182,7 +192,7 @@ pub enum ConfigError {
     },
 
     /// `max_results` is present but is not a whole number.
-    #[error("config `max_results` in {} is not a whole number", .path.display())]
+    #[error("config `max_results` in {} is not a whole number", escape_path(.path))]
     MaxResultsNotInteger {
         /// The config path that carried the bad value.
         path: PathBuf,
@@ -191,7 +201,7 @@ pub enum ConfigError {
     /// `max_results` is an integer below the valid range of `1..=MAX_ITEMS_PER_RESULTS_FRAME`.
     #[error(
         "config `max_results` in {} is {value}, but at least 1 is required",
-        .path.display()
+        escape_path(.path)
     )]
     MaxResultsOutOfRange {
         /// The config path that carried the bad value.
@@ -207,7 +217,7 @@ pub enum ConfigError {
     /// clamping, exactly as the assertion refuses a raised constant.
     #[error(
         "config `max_results` in {} is {value}, which exceeds the maximum of {MAX_ITEMS_PER_RESULTS_FRAME} items per results frame",
-        .path.display()
+        escape_path(.path)
     )]
     MaxResultsOverFrame {
         /// The config path that carried the bad value.
@@ -217,7 +227,7 @@ pub enum ConfigError {
     },
 
     /// `max_term_chars` is present but is not a whole number.
-    #[error("config `max_term_chars` in {} is not a whole number", .path.display())]
+    #[error("config `max_term_chars` in {} is not a whole number", escape_path(.path))]
     MaxTermCharsNotInteger {
         /// The config path that carried the bad value.
         path: PathBuf,
@@ -227,7 +237,7 @@ pub enum ConfigError {
     /// `1..=MAX_TERM_CHARS`.
     #[error(
         "config `max_term_chars` in {} is {value}, but at least 1 is required",
-        .path.display()
+        escape_path(.path)
     )]
     MaxTermCharsOutOfRange {
         /// The config path that carried the bad value.
@@ -242,7 +252,7 @@ pub enum ConfigError {
     /// that would break the frame contract rather than truncating it down.
     #[error(
         "config `max_term_chars` in {} is {value}, which exceeds the maximum of {} characters",
-        .path.display(),
+        escape_path(.path),
         hop_core::rank::MAX_TERM_CHARS
     )]
     MaxTermCharsOverCeiling {
@@ -573,6 +583,25 @@ mod tests {
             Config::load_from_env(Some(dir.path().to_string_lossy().into_owned()), None).unwrap();
         assert_eq!(config, Config::default());
         assert_eq!(config.max_results, crate::source::MAX_RESULTS);
+    }
+
+    /// Issue #159: every `ConfigError` variant's `Display` runs its `path`
+    /// through `escape_path` rather than `path.display()`, because `path` is
+    /// derived from `XDG_CONFIG_HOME`/`HOME` — environment the daemon does
+    /// not control. Constructed directly (not via a real file with a
+    /// newline in its name) because the point is pinning what `Display`
+    /// does with a given `path` field, not re-testing `Config::from_path`'s
+    /// own file-classification logic.
+    #[test]
+    fn config_error_display_escapes_control_characters_in_the_path() {
+        let path = PathBuf::from("/home/pedro/.config/hop/evil\nname.toml");
+        let err = ConfigError::NotARegularFile { path };
+        let message = err.to_string();
+        assert!(
+            !message.contains('\n'),
+            "a raw newline must never reach the Display output: {message:?}"
+        );
+        assert!(message.contains("evil\\x0aname.toml"), "{message:?}");
     }
 
     #[test]

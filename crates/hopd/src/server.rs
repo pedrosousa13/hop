@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hop_core::host::ProviderHost;
+use hop_core::sanitize::escape_path;
 use thiserror::Error;
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
@@ -310,10 +311,16 @@ pub enum ListenerError {
     /// already answering there. See `acquire_listener`'s "# A live
     /// listener's pathname is never replaced (#158)" doc section for how
     /// this is decided and why a connect probe rather than a lockfile.
+    ///
+    /// `path` runs through [`escape_path`], not `path.display()` (issue
+    /// #159): it is built from `XDG_RUNTIME_DIR`, an environment variable,
+    /// so it is exactly the kind of environment-derived string this
+    /// function exists to make safe to interpolate — the socket file name
+    /// itself is fixed, but the directory component is not.
     #[error(
         "a daemon is already listening at {}; refusing to replace it — stop the \
          running hopd first, or point XDG_RUNTIME_DIR somewhere else",
-        .path.display()
+        escape_path(.path)
     )]
     AlreadyListening {
         /// The socket path a live listener already answers on.
@@ -446,6 +453,38 @@ fn acquire_listener(
             std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
             Ok(listener)
         }
+    }
+}
+
+#[cfg(test)]
+mod listener_error_tests {
+    use super::*;
+
+    /// Issue #159: `AlreadyListening`'s `path` is `XDG_RUNTIME_DIR`-derived,
+    /// so a newline (or any other control character) reaching it from the
+    /// environment must not reach the user-facing message unescaped —
+    /// otherwise it could forge what looks like a second daemon log line.
+    #[test]
+    fn already_listening_escapes_control_characters_in_the_path() {
+        let err = ListenerError::AlreadyListening {
+            path: PathBuf::from("/run/user/1000/evil\nhopd.sock"),
+        };
+        let message = err.to_string();
+        assert!(
+            !message.contains('\n'),
+            "a raw newline must never reach the Display output: {message:?}"
+        );
+        assert!(message.contains("evil\\x0ahopd.sock"), "{message:?}");
+    }
+
+    /// An ordinary socket path — the overwhelming common case — must render
+    /// exactly as `path.display()` would have, so this message does not
+    /// change shape for the install that never had anything to escape.
+    #[test]
+    fn an_ordinary_path_still_reads_the_same() {
+        let path = PathBuf::from("/run/user/1000/hop/hopd.sock");
+        let err = ListenerError::AlreadyListening { path: path.clone() };
+        assert!(err.to_string().contains(&path.display().to_string()));
     }
 }
 
