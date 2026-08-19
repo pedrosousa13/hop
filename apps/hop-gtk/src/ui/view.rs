@@ -4,7 +4,7 @@
 //!
 //! # Why a node is data, not a widget
 //!
-//! Decision D2 of the M3 design spec (`docs/superpowers/specs/…frontend-design.md`)
+//! Decision D2 of the M3 design spec (`docs/superpowers/specs/2026-08-10-hop-m3-frontend-design.md`)
 //! rules that the *view catalog* belongs to the wire protocol rather than to
 //! whichever tier is doing the rendering: v3's sandboxed Tier 2 plugins get
 //! the same catalog v2's trusted Tier 1 plugins do, because what a plugin
@@ -38,8 +38,10 @@
 //!   (`set_visible_child_name`). The slot's widget tree — the stack itself —
 //!   is created exactly once per slot and reused for the slot's entire
 //!   lifetime; a second node type is one more page added in
-//!   [`build_dispatch_container`] and one more match arm added in [`bind`],
-//!   with the factory's own structure ([`build`], below) untouched.
+//!   [`build_dispatch_container`], one more match arm each in [`bind`] and
+//!   [`unbind`], and one more arm in [`Node::for_item`] — the one place
+//!   that decides which variant a bound `Item` becomes — with the
+//!   factory's own structure ([`build`], below) untouched.
 //!
 //! This module takes the second shape. With exactly one node type, the
 //! stack [`build_dispatch_container`] builds holds exactly one page — that
@@ -56,9 +58,14 @@
 //! risk as over-abstracting against a view-tree catalog that does not exist
 //! yet, and rules explicitly that adding a second, speculative node (a
 //! `Detail`, an `ActionPanel`, anything test-only or commented out) would be
-//! a misreading of it. What proves the dispatch point in this module *can*
-//! carry a second node type — acceptance criterion 3 — is the shape of
-//! [`build_dispatch_container`] and [`bind`] above, together with
+//! a misreading of it. [`Node::for_item`] is not an exception to this: it
+//! is the one place the seam decides *which* variant a bound `Item`
+//! becomes, and with one variant it has nothing to decide — its body is
+//! `Node::Row(item)`, unconditionally, not a match with one arm dressed up
+//! to look like a classifier. What proves the dispatch point in this
+//! module *can* carry a second node type — acceptance criterion 3 — is the
+//! shape of [`build_dispatch_container`], [`bind`], [`unbind`], and
+//! [`Node::for_item`] above, together with
 //! `tests/view_tree_renderer.rs`'s recycling test, never a second variant
 //! added to prove it.
 
@@ -81,6 +88,29 @@ pub enum Node {
 }
 
 impl Node {
+    /// Builds the node a bound `item` should render as — the one place in
+    /// this seam that decides *which* [`Node`] variant an [`Item`] becomes.
+    ///
+    /// Before this constructor existed, [`build`]'s `connect_bind` and
+    /// `connect_unbind` closures each wrote `Node::Row(item)` directly,
+    /// which quietly put that decision *inside* the factory itself —
+    /// harmless with one variant, but it meant a second node type would
+    /// have needed classification logic added identically to both closures
+    /// in `build()`, which is exactly the change to the factory's own
+    /// structure acceptance criterion 3 rules out. Routing both call sites
+    /// through this function instead means the decision lives in exactly
+    /// one place, and `build()` never has to change to accommodate it.
+    ///
+    /// This always returns `Node::Row(item)`, unconditionally — deliberately
+    /// not a `match`, an `if`, or any other branch, because there is no
+    /// second variant to route toward yet (see this module's guard
+    /// section). What a second, real node type changes is this function's
+    /// body, and only this function's body: `build()`'s two closures keep
+    /// calling `Node::for_item` exactly as they do today.
+    pub fn for_item(item: Item) -> Node {
+        Node::Row(item)
+    }
+
     /// The `Row` variant's page name on the dispatch container's
     /// `gtk::Stack`.
     ///
@@ -132,9 +162,11 @@ fn build_dispatch_container() -> gtk::Stack {
 /// `set_child` in scope here to reach for even by mistake — the only thing
 /// this function can do to `stack` is select one of the pages `setup`
 /// already built into it. Adding a second [`Node`] variant means adding one
-/// arm to the `match` below (and one page to
-/// [`build_dispatch_container`]) — the factory `build` returns keeps its own
-/// shape unchanged either way, which is acceptance criterion 3.
+/// arm to the `match` below, one page to [`build_dispatch_container`], and
+/// one arm to [`Node::for_item`] — never a change to [`build`]'s own
+/// closures, which only ever call `bind` and `Node::for_item` by name and
+/// never need to know how many variants either one now handles. That is
+/// acceptance criterion 3.
 pub fn bind(stack: &gtk::Stack, node: &Node) {
     let page_name = node.page_name();
     if let Some(widget) = stack.child_by_name(page_name) {
@@ -171,7 +203,8 @@ pub fn bind(stack: &gtk::Stack, node: &Node) {
 /// `bind` saw, at the moment `unbind` runs, exactly symmetrically with
 /// `bind`'s own `connect_bind` handler. [`build`]'s `connect_unbind`
 /// handler therefore reads it the same way `connect_bind` does and builds
-/// the same [`Node::Row`] `bind` was given for that slot.
+/// the same [`Node`] — via [`Node::for_item`], never by naming a variant
+/// inline — that `bind` was given for that slot.
 ///
 /// That symmetry is what keeps this a real seam rather than half of one.
 /// Without it, a second node type would need new item-reading code added
@@ -190,11 +223,21 @@ pub fn unbind(stack: &gtk::Stack, node: &Node) {
 
 /// Builds the `GtkListView` factory: `setup` gives every slot the dispatch
 /// container [`build_dispatch_container`] builds, and `bind`/`unbind` read
-/// the slot's item (or lack of one) and hand it to [`bind`]/[`unbind`]
-/// above. This is acceptance criterion 2 — the factory renders through the
-/// dispatch point rather than constructing a row directly — and it replaces
-/// what used to be `ui::row::build`'s own responsibility before issue #181:
-/// see that function's doc comment for what moved and what did not.
+/// the slot's item (or lack of one), turn it into a [`Node`] with
+/// [`Node::for_item`], and hand that to [`bind`]/[`unbind`] above. This is
+/// acceptance criterion 2 — the factory renders through the dispatch point
+/// rather than constructing a row directly — and it replaces what used to
+/// be `ui::row::build`'s own responsibility before issue #181: see that
+/// function's doc comment for what moved and what did not.
+///
+/// Neither closure below ever names a [`Node`] variant itself (an earlier
+/// version of this function did, writing `Node::Row(item)` inline in both
+/// — review caught that this quietly put the "which variant" decision
+/// inside the factory, which a second node type would have had to
+/// duplicate into both closures to extend, a change to the factory's own
+/// structure that acceptance criterion 3 forbids). Both call
+/// [`Node::for_item`] instead, so this function's own body has nothing left
+/// to change when a second node type is added.
 pub fn build() -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
 
@@ -225,7 +268,7 @@ pub fn build() -> gtk::SignalListItemFactory {
             return;
         };
         let item = model::item_of(&item_object);
-        bind(&stack, &Node::Row(item));
+        bind(&stack, &Node::for_item(item));
     });
 
     factory.connect_unbind(|_, object| {
@@ -246,7 +289,7 @@ pub fn build() -> gtk::SignalListItemFactory {
             return;
         };
         let item = model::item_of(&item_object);
-        unbind(&stack, &Node::Row(item));
+        unbind(&stack, &Node::for_item(item));
     });
 
     factory

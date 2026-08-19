@@ -56,7 +56,7 @@ const CHILD_MARKER: &str = "HOP_GTK_VIEW_TREE_TEST_CHILD";
 /// A spawned `gtk4-broadwayd`, killed on drop — the same shape as
 /// `tests/headless_smoke.rs`'s own `BroadwayServer`, duplicated rather than
 /// shared for the same reason that file's `DaemonProcess` duplicates
-/// `hopd/tests/socket.rs`'s helper: each integration test file under
+/// `crates/hopd/tests/socket.rs`'s helper: each integration test file under
 /// `tests/` compiles as its own separate crate, with no shared module
 /// unless routed through `tests/common`, and this is the only piece this
 /// file needs from it. Display number is derived from this process's own
@@ -171,7 +171,25 @@ fn run_assertions() {
     let item_a = test_item(1, "first result");
     let item_b = test_item(2, "second result");
 
-    view::bind(&stack, &Node::Row(item_a.clone()));
+    // Every `Node` built below goes through `Node::for_item` rather than
+    // naming `Node::Row` directly — the same call `view::build()`'s
+    // `connect_bind`/`connect_unbind` closures make after review's second
+    // finding on this issue: an earlier version of those closures wrote
+    // `Node::Row(item)` inline, which put the "which variant does this
+    // item become" decision inside the factory itself, a change to the
+    // factory's own structure a second node type would have had
+    // to duplicate into both closures to extend — exactly what acceptance
+    // criterion 3 rules out. `Node::for_item` unconditionally returns
+    // `Node::Row(item)` today, so no runtime assertion can tell its output
+    // apart from constructing `Node::Row` by hand — that part of the fix
+    // is a code-shape property, checked by reading `view.rs`'s `build`,
+    // not by a test (see `Node::for_item`'s own doc comment, and criterion
+    // 3's original text: "demonstrated by a test or by the shape of the
+    // code"). What this test *can* still pin is that the constructor is a
+    // real, working entry point — calling it drives the exact same
+    // dispatch, recycling, and rendering behavior a hand-built `Node::Row`
+    // would, through every assertion below.
+    view::bind(&stack, &Node::for_item(item_a.clone()));
     assert_eq!(
         stack.visible_child_name().as_deref(),
         Some("row"),
@@ -189,7 +207,7 @@ fn run_assertions() {
         "the rendered row must show the bound item's title"
     );
 
-    view::bind(&stack, &Node::Row(item_b.clone()));
+    view::bind(&stack, &Node::for_item(item_b.clone()));
     let widget_after_second_bind = stack
         .visible_child()
         .expect("a page must still be the stack's visible child after the second bind");
@@ -217,7 +235,7 @@ fn run_assertions() {
     // bound, exactly what `list_item.item()` would still return inside a
     // real `connect_unbind` handler at this point — is what this test can
     // do to stand in for that handler's own call.
-    view::unbind(&stack, &Node::Row(item_b.clone()));
+    view::unbind(&stack, &Node::for_item(item_b.clone()));
     assert_eq!(
         label_after_second_bind.text(),
         "",
