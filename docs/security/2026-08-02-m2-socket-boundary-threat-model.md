@@ -3,7 +3,7 @@
 Date: 2026-08-02
 Issue: [#53](https://github.com/pedrosousa13/hop/issues/53)
 Milestone: M2 — Daemon
-Status: Recorded; amended 2026-08-04, 2026-08-06, 2026-08-10, 2026-08-17, 2026-08-18
+Status: Recorded; amended 2026-08-04, 2026-08-06, 2026-08-10, 2026-08-17, 2026-08-18, 2026-08-19
 Decisions by: Pedro Sousa
 
 Two design forks are settled here —
@@ -277,6 +277,48 @@ the second amendment left them.
 Each changed passage is marked **[Amended 2026-08-10]** in place below, the
 same shape the two amendments above already use.
 
+**Amendment, 2026-08-19.** Issue #158 changed "The socket path" bullet under
+"Entry points that are not frames": the standalone branch of
+`acquire_listener` (`server.rs`) no longer removes whatever sits at the
+socket path unconditionally before binding. It now probes the path with a
+real connect attempt (`probe_socket_liveness`, `server.rs`) and refuses
+outright — `ListenerError::AlreadyListening`, no `remove_file`, no `bind` —
+when that probe finds a live listener already answering there; the
+unconditional `remove_file` only still runs on the two outcomes that mean
+nothing live is at the path (`ECONNREFUSED`, `ENOENT`). The bullet is left
+as originally written and annotated in place, per this document's own rule,
+rather than rewritten.
+
+Two things #158 does not change, both worth stating because a narrower fix
+could plausibly have undone them. First, the reason the original removal
+tolerated only `NotFound` — no `exists()`-then-`remove_file` TOCTOU window,
+no blind spot for a dangling symlink `exists()` reports as absent — is
+exactly the reasoning #158's own connect probe relies on too: it asks the
+kernel the liveness question directly, the same way a real client's connect
+already does, rather than stat-ing first and racing what it saw. #158 adds a
+liveness question ahead of the removal; it does not relax what the removal
+itself tolerates once it runs. Second, the socket file's 0600 mode, narrowed
+by `set_permissions` right after `bind`, is untouched — #158's new branch
+returns before `bind` is ever reached on the live-listener path, so it has
+no interaction with mode at all.
+
+This is a lifecycle and availability control, not a new authentication
+boundary: "Where peer trust comes from" already treats a hostile same-uid
+process as inside the boundary, and #158 does not change who is trusted to
+reach the socket — only whether a second `hopd` may silently take over a
+live listener's pathname out from under the clients already depending on it.
+`acquire_listener`'s own "# A live listener's pathname is never replaced
+(#158)" doc section (`server.rs`) says the same thing from the
+implementation side: the probe closes the specific failure #158 was filed
+for — an established, serving daemon losing its name to a second, later
+start — and leaves ordinary `bind`-time contention between two daemons
+racing to claim a path neither has bound yet exactly as unarbitrated as it
+was before, which is a starting-order coin flip with no established victim
+rather than the displacement #158 closes.
+
+Each changed passage below is marked **[Amended 2026-08-19]** in place, the
+same shape this document's other amendments already use.
+
 ---
 
 ## What this is
@@ -449,7 +491,28 @@ control is *which uid*, and there is no finer distinction available.
   restarting after a crash work without a TOCTOU window or a
   dangling-symlink blind spot — and narrows the socket file to 0600 with
   `set_permissions` right after `bind`, decided rather than inherited from
-  the umask.
+  the umask. **[Amended 2026-08-19]** The "unconditionally" above is no
+  longer true, and #158 (`64d319d`) is why: the standalone branch of
+  `acquire_listener` now calls `probe_socket_liveness` (`server.rs`) before
+  it touches the path at all — a real connect attempt, the same one a
+  client would make. A successful connect (`SocketLiveness::Live`) means a
+  live `hopd` is already answering, and `acquire_listener` returns
+  `ListenerError::AlreadyListening` immediately: no `remove_file`, no
+  `bind`. Only the two outcomes that mean nothing live is there —
+  `ECONNREFUSED` (`SocketLiveness::Stale`) and `ENOENT`
+  (`SocketLiveness::Absent`) — still reach the `remove_file` call this
+  bullet describes, unconditionally within *that* narrower case. The
+  TOCTOU and dangling-symlink reasoning just above for why the removal
+  tolerates only `NotFound` is unchanged and still applies to that same
+  `remove_file` call; what changed is only whether the removal runs at
+  all. The socket file's 0600 mode, narrowed right after `bind`, is also
+  unchanged — the live-listener path returns before `bind` is ever
+  reached. See `acquire_listener`'s own "# A live listener's pathname is
+  never replaced (#158)" doc section (`server.rs`) for the full reasoning,
+  including the residual race #158 does not close (two daemons racing to
+  bind a path neither has bound yet) and why this is a same-uid lifecycle
+  and availability control rather than a change to "Where peer trust comes
+  from" below.
 - **Socket activation.** systemd passes a listening descriptor the daemon did
   not create ([#62](https://github.com/pedrosousa13/hop/issues/62)). The unit
   file's socket mode becomes part of the boundary at that point.

@@ -9,10 +9,11 @@
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hop_core::host::ProviderHost;
+use thiserror::Error;
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 
@@ -70,28 +71,99 @@ pub(crate) fn build_host() -> ProviderHost {
 /// [`build_host`]'s provider registry and calls this function directly, so
 /// everything documented below is exactly what the binary does.
 ///
-/// # Stale-socket removal is provisional
+/// # A live listener's pathname is never replaced (#158)
 ///
-/// Whatever sits at the socket path is removed before binding, unconditionally
-/// — not gated on an `exists()` check first. This is what makes restarting
-/// hopd after a crash work at all — `bind` otherwise fails with `AddrInUse`
-/// against a leftover socket file, live or not — but it is not a
-/// single-instance guard: nothing here checks whether another `hopd` is still
-/// listening on that path before unlinking it out from under it. That check
-/// is a later M2 slice's job, not this daemon's.
+/// This section used to be called "Stale-socket removal is provisional" and
+/// said plainly that nothing here checked whether another `hopd` was still
+/// listening before unlinking its pathname — the check was left to "a later
+/// M2 slice." #158 is that slice, and this section documents what actually
+/// landed rather than what was deferred.
 ///
-/// The removal is unconditional rather than `if socket_path.exists() {
-/// remove_file }` for two reasons. First, that shape is a TOCTOU: whatever
-/// might be true between the `exists()` check and the `remove_file` call is
-/// exactly the kind of race this process cannot rule out just by checking
+/// **The problem the old unconditional removal had.** A Unix listener stays
+/// open after its pathname is unlinked — the primary Linux
+/// [`unlink(2)`](https://man7.org/linux/man-pages/man2/unlink.2.html)
+/// documentation says as much: removing a name does not invalidate the
+/// object behind it for anyone already holding it open. So a second
+/// standalone `hopd`, started while a first is still live, could unlink the
+/// first's socket file and bind its own at the freed path. The first
+/// daemon kept serving the connections it already had; every *new* client
+/// reached the second. Nothing signaled either daemon that this had
+/// happened.
+///
+/// **Why the removal was unconditional in the first place, and why that
+/// reasoning still holds.** `if socket_path.exists() { remove_file }` was
+/// rejected, not merely not yet written, for two reasons that #158 does not
+/// get to undo: first, that shape is a TOCTOU — whatever might become true
+/// between the `exists()` check and the `remove_file` call is exactly the
+/// kind of race a stat-then-unlink sequence cannot rule out by checking
 /// first. Second, `exists()` follows symlinks and reports `false` for a
-/// dangling one — a socket path left behind as a symlink to a since-deleted
-/// target would make `exists()` say "nothing here" and then `bind` fail with
-/// `AddrInUse` anyway, since the kernel still finds a directory entry there.
-/// `remove_file` alone, tolerating only `NotFound`, handles both: the common
-/// case (nothing there) and the dangling-symlink case (something there that
-/// isn't a live socket) the same way, and still surfaces a genuine permission
-/// or I/O error instead of swallowing it.
+/// dangling one — a socket path left behind as a symlink to a
+/// since-deleted target would make `exists()` say "nothing here" and then
+/// `bind` fail with `AddrInUse` anyway, since the kernel still finds a
+/// directory entry there. Any fix had to keep clearing both of those, not
+/// just the live-listener gap.
+///
+/// **What changed.** The standalone branch now asks a different question
+/// before it touches the path at all: it connects to `socket_path` the way
+/// a real client would.
+///
+/// - A successful connect means a live `hopd` is answering. `acquire_listener`
+///   returns [`ListenerError::AlreadyListening`] immediately — no
+///   `remove_file`, no `bind` — and drops the probe connection. The live
+///   daemon sees one connection open and close, indistinguishable in its
+///   logs from a client that connected and went away; that is the accepted
+///   cost of asking the question this way rather than not asking it at all.
+/// - `ECONNREFUSED` means a socket file is present but nothing is listening
+///   — exactly what a crashed or hard-killed `hopd` leaves behind, and
+///   exactly the case the old unconditional removal existed to recover.
+///   `acquire_listener` now reaches `remove_file` deliberately, on this
+///   outcome, rather than unconditionally.
+/// - `ENOENT` means nothing is at the path — including a dangling symlink,
+///   whose target lookup fails the same way a real client's connect would.
+///   Nothing to remove; falling through to the `remove_file` call below,
+///   which still tolerates `NotFound` on its own, covers a symlink that
+///   really is there and the benign race where something removed it
+///   between the probe and this call.
+/// - Any other connect error (permission denied, the path exists but is not
+///   a socket at all) is surfaced as [`ListenerError::Io`] rather than
+///   folded into either case above — a genuine I/O problem should read as
+///   one, not get silently treated as "stale" or "safe to start anyway."
+///
+/// **Why a connect probe rather than an advisory lock.** An `flock`/`O_EXCL`
+/// lockfile would close the residual race below entirely: its ownership is
+/// arbitrated by the kernel across processes, not inferred from watching a
+/// connect attempt's outcome. It was rejected for this slice because it
+/// costs a second file with its own lifecycle to design and test — creation
+/// mode, who cleans up a lock left by a killed process, whether *it* now
+/// needs the same "restart must still work" unconditional-removal treatment
+/// the socket itself needed — none of which buys anything a live-hopd
+/// probe does not already answer for the one question this issue is
+/// actually about: is something accepting connections at this path right
+/// now. A connect probe asks the kernel that exact question, the same way a
+/// real client already does, with no new file and no new dependency. #158
+/// is explicitly a same-uid lifecycle and availability control inside the
+/// trust boundary the threat model already declares
+/// (`docs/security/2026-08-02-m2-socket-boundary-threat-model.md`, "The
+/// boundary"), not a new authentication mechanism — so the cheaper
+/// mechanism that answers the actual question wins, and the stronger one
+/// documented here is not free to fall back on if this posture ever turns
+/// out to be wrong.
+///
+/// **The residual race, and why it is acceptable.** Between the probe
+/// reporting "not live" and the `remove_file` + `bind` that follow, a
+/// second process running this same function concurrently could reach
+/// `bind` too — the probe adds no lock, so that interleaving is not made
+/// impossible. What it does rule out is the specific failure #158 was filed
+/// for: a daemon that is already established and serving connections
+/// having its name pulled out from under it by a second, later start. Two
+/// `hopd`s racing to start against a path neither has bound yet is a
+/// starting-order coin flip with no established victim — ordinary
+/// `AddrInUse`-shaped contention, the same class every `bind` on a shared
+/// path already has, and a different situation from silently displacing a
+/// daemon clients already depend on. A live listener is never unlinked on
+/// this path: it either answers the probe, and the standalone bind refuses
+/// outright, or it does not, and there was nothing live to unlink in the
+/// first place.
 ///
 /// # The socket's mode is decided, not inherited
 ///
@@ -138,7 +210,20 @@ pub(crate) fn build_host() -> ProviderHost {
 /// with itself. Everything else about the connection is the production path,
 /// unchanged: the only thing a test gets to choose is where the items come
 /// from.
-pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::Result<()> {
+///
+/// # The return type
+///
+/// [`ListenerError`], not a bare `io::Error`: this function's only error
+/// path before the accept loop starts is [`acquire_listener`]'s, and #158
+/// made that path distinguish "a daemon is already listening" from a
+/// generic I/O failure. Widening `serve_with`'s own signature to match is
+/// what lets that distinction survive all the way to [`crate::run`]'s
+/// `eprintln!("hopd: {err}")` and to the user — see
+/// [`ListenerError`]'s own doc comment.
+pub async fn serve_with<S: ResultSource>(
+    runtime_dir: &Path,
+    source: S,
+) -> Result<(), ListenerError> {
     let activation = activation::inherited_fd(|k| std::env::var(k).ok(), std::process::id());
     let listener = acquire_listener(runtime_dir, activation)?;
 
@@ -206,14 +291,91 @@ pub async fn serve_with<S: ResultSource>(runtime_dir: &Path, source: S) -> io::R
     }
 }
 
+/// Why [`acquire_listener`] (and therefore [`serve_with`]) could not
+/// produce a listener.
+///
+/// Before #158 this was a bare `io::Result`, which meant a live-listener
+/// refusal would have reached a user as text indistinguishable from a
+/// permission or disk error — two failures with completely different
+/// correct responses ("something is already answering here; leave it
+/// alone, or stop it first" versus "check this daemon's file permissions").
+/// [`AlreadyListening`](ListenerError::AlreadyListening) is what makes the
+/// refusal its own diagnosis: `#[error(...)]` below is exactly the text
+/// [`crate::run`]'s `eprintln!("hopd: {err}")` shows a user, so this is not
+/// merely an internal distinction — it is the wording the acceptance
+/// criterion asks for.
+#[derive(Debug, Error)]
+pub enum ListenerError {
+    /// A connect probe against the socket path succeeded: a live `hopd` is
+    /// already answering there. See `acquire_listener`'s "# A live
+    /// listener's pathname is never replaced (#158)" doc section for how
+    /// this is decided and why a connect probe rather than a lockfile.
+    #[error(
+        "a daemon is already listening at {}; refusing to replace it — stop the \
+         running hopd first, or point XDG_RUNTIME_DIR somewhere else",
+        .path.display()
+    )]
+    AlreadyListening {
+        /// The socket path a live listener already answers on.
+        path: PathBuf,
+    },
+
+    /// Any other failure acquiring the listener: permission denied on the
+    /// runtime directory or socket, a `remove_file` that failed for a
+    /// reason other than `NotFound`, `bind` itself failing, and so on —
+    /// unchanged in substance from what a bare `io::Error` said before
+    /// #158, just now a named variant instead of the only shape this type
+    /// could take.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+/// Whether a connect attempt against the socket path found a live
+/// listener, a socket file nothing is behind, or nothing at all. See
+/// [`probe_socket_liveness`].
+enum SocketLiveness {
+    /// A live listener accepted the probe connection.
+    Live,
+    /// The path exists but nothing is listening — `ECONNREFUSED`, what a
+    /// crashed or hard-killed `hopd` leaves behind.
+    Stale,
+    /// Nothing is at the path at all — `ENOENT`, including a dangling
+    /// symlink, whose target lookup fails the same way.
+    Absent,
+}
+
+/// Decides [`SocketLiveness`] for `socket_path` by attempting to connect to
+/// it exactly as a real client would, rather than by `stat`-ing it first.
+///
+/// See `acquire_listener`'s "# A live listener's pathname is never replaced
+/// (#158)" doc section for the full reasoning: briefly, connecting is what
+/// lets this function ask "is something accepting connections here right
+/// now" without the TOCTOU an `exists()`-then-`remove_file` shape would
+/// introduce, and without `exists()`'s own blind spot for a dangling
+/// symlink. Any connect failure other than the two that name "not live"
+/// (`ConnectionRefused`, `NotFound`) is returned as a genuine I/O error
+/// rather than folded into either case — a permission failure or a path
+/// that is not a socket at all should read as its own problem, not as
+/// "stale" or "safe to start anyway."
+fn probe_socket_liveness(socket_path: &Path) -> io::Result<SocketLiveness> {
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_probe_connection) => Ok(SocketLiveness::Live),
+        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => Ok(SocketLiveness::Stale),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(SocketLiveness::Absent),
+        Err(err) => Err(err),
+    }
+}
+
 /// Turns either an inherited descriptor or `runtime_dir` into a working
 /// listener. See this crate's implementation plan
 /// (`docs/superpowers/plans/2026-08-09-issue-62-socket-activation.md`,
-/// Design decisions 1 and 3) for the full reasoning behind both branches.
+/// Design decisions 1 and 3) for the full reasoning behind both branches,
+/// and `serve_with`'s "# A live listener's pathname is never replaced
+/// (#158)" doc section for the standalone branch's liveness check.
 fn acquire_listener(
     runtime_dir: &Path,
     activation: Option<activation::InheritedFd>,
-) -> io::Result<UnixListener> {
+) -> Result<UnixListener, ListenerError> {
     match activation {
         Some(found) => {
             if found.declared > 1 {
@@ -256,18 +418,25 @@ fn acquire_listener(
             // already be non-blocking, so this is set explicitly rather
             // than assumed.
             std_listener.set_nonblocking(true)?;
-            tokio::net::UnixListener::from_std(std_listener)
+            Ok(tokio::net::UnixListener::from_std(std_listener)?)
         }
         None => {
-            // Exactly today's standalone path, unchanged: see
-            // `serve_with`'s own doc comment ("The socket's mode is
-            // decided, not inherited") for the stale-removal and chmod
-            // reasoning.
+            // #158: unlike the rest of this branch, the liveness check
+            // below is new — see `serve_with`'s doc comment ("A live
+            // listener's pathname is never replaced") for the stale-vs-live
+            // decision and the mode/chmod reasoning that follows it.
             let socket_path = runtime_dir.join(SOCKET_FILE_NAME);
-            match std::fs::remove_file(&socket_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
+            match probe_socket_liveness(&socket_path)? {
+                SocketLiveness::Live => {
+                    return Err(ListenerError::AlreadyListening { path: socket_path });
+                }
+                SocketLiveness::Stale | SocketLiveness::Absent => {
+                    match std::fs::remove_file(&socket_path) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
             }
             let listener = UnixListener::bind(&socket_path)?;
             std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
@@ -300,10 +469,76 @@ mod acquire_listener_tests {
     #![allow(clippy::unwrap_used)]
 
     use std::os::fd::IntoRawFd;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::*;
     use crate::activation::InheritedFd;
+
+    /// The live-listener case (#158). A first listener is bound and left
+    /// running — nothing here ever calls `accept` on it, because the point
+    /// is proving the *second* `acquire_listener` call refuses to disturb
+    /// it before either side accepts anything. `acquire_listener` must
+    /// refuse rather than unlink-and-rebind, and the first listener must
+    /// still be reachable at the exact same path afterward — checked here
+    /// by inode, and separately by proving it still accepts below.
+    #[tokio::test]
+    async fn a_live_listener_is_refused_without_being_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join(SOCKET_FILE_NAME);
+        let first = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let original_inode = std::fs::metadata(&socket_path).unwrap().ino();
+
+        let result = acquire_listener(dir.path(), None);
+        let err = result.expect_err("a live listener at the path must be refused");
+        assert!(
+            matches!(&err, ListenerError::AlreadyListening { path } if path == &socket_path),
+            "expected AlreadyListening naming {socket_path:?}, got {err:?}"
+        );
+
+        let inode_after_refusal = std::fs::metadata(&socket_path).unwrap().ino();
+        assert_eq!(
+            original_inode, inode_after_refusal,
+            "the refusal must not unlink or replace the live listener's socket path"
+        );
+
+        // The first listener must still be the one answering at this path —
+        // not merely present on disk, but actually able to accept.
+        let accept_task = tokio::spawn(async move { first.accept().await });
+        let _client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let accepted = accept_task.await.unwrap();
+        assert!(
+            accepted.is_ok(),
+            "the first listener must still accept after the refusal: {:?}",
+            accepted.err()
+        );
+    }
+
+    /// The stale-path case (#158). Binding and dropping a listener without
+    /// ever accepting anything leaves exactly what a hard-killed or crashed
+    /// `hopd` would: a socket inode on disk with nothing behind it to
+    /// accept a connection (`std`'s `UnixListener` does not unlink its own
+    /// path on drop). `acquire_listener` must still recover this path per
+    /// the documented policy, producing a listener that actually works.
+    #[tokio::test]
+    async fn a_stale_socket_file_is_recovered_and_a_fresh_listener_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join(SOCKET_FILE_NAME);
+        {
+            let _abandoned = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        }
+
+        let listener = acquire_listener(dir.path(), None)
+            .expect("a stale socket file must still be recoverable");
+
+        let accept_task = tokio::spawn(async move { listener.accept().await });
+        let _client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let accepted = accept_task.await.unwrap();
+        assert!(
+            accepted.is_ok(),
+            "the recovered listener must actually accept: {:?}",
+            accepted.err()
+        );
+    }
 
     #[tokio::test]
     async fn with_no_activation_it_binds_and_chmods_the_socket_path_exactly_as_before() {
@@ -346,6 +581,67 @@ mod acquire_listener_tests {
         assert!(
             !never_created.exists(),
             "activation must never create, bind inside, or otherwise touch the runtime dir path"
+        );
+    }
+
+    /// #158's own pin of the brief's activation criterion ("does not unlink
+    /// or rebind the activated path"), distinct from the test just above.
+    /// That test predates #158 and only proves the runtime dir path is
+    /// never *created* by activation; it never puts anything live there, so
+    /// it cannot exercise the case #158 actually made interesting: a
+    /// runtime-dir path that already has a *live* listener on it — exactly
+    /// what the standalone branch's `probe_socket_liveness` exists to find
+    /// and refuse to disturb. Activation must never reach that probe at
+    /// all — `acquire_listener`'s `match activation` takes the `Some` arm
+    /// unconditionally and returns before `probe_socket_liveness` or
+    /// `remove_file` are ever called — so a live socket sitting at the
+    /// runtime path during activation must come out the other side
+    /// completely undisturbed, checked here the same two ways
+    /// `a_live_listener_is_refused_without_being_unlinked` checks the
+    /// standalone branch's own live-listener case: by inode, and by proving
+    /// it still accepts.
+    #[tokio::test]
+    async fn with_an_inherited_fd_a_live_socket_at_the_runtime_path_is_left_completely_alone() {
+        let backing = tempfile::tempdir().unwrap();
+        let std_listener =
+            std::os::unix::net::UnixListener::bind(backing.path().join("activated.sock")).unwrap();
+        let fd = std_listener.into_raw_fd();
+
+        // The runtime dir this activation call is handed also has a live,
+        // already-bound listener sitting at exactly the path the standalone
+        // branch would probe — and, finding it live, refuse to unlink.
+        // Nothing here ever calls `accept` on it before `acquire_listener`
+        // returns, because the point is proving the activation branch never
+        // reaches for it in the first place.
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let live_path = runtime_dir.path().join(SOCKET_FILE_NAME);
+        let live_listener = tokio::net::UnixListener::bind(&live_path).unwrap();
+        let original_inode = std::fs::metadata(&live_path).unwrap().ino();
+
+        let result = acquire_listener(runtime_dir.path(), Some(InheritedFd { fd, declared: 1 }));
+        assert!(
+            result.is_ok(),
+            "activation must succeed regardless of what sits at the runtime-dir path: {:?}",
+            result.err()
+        );
+
+        // The live socket must be untouched: same inode, and still able to
+        // accept — not merely present on disk, but actually the thing
+        // answering there, exactly as `probe_socket_liveness` would have
+        // found had the standalone branch run instead.
+        let inode_after = std::fs::metadata(&live_path).unwrap().ino();
+        assert_eq!(
+            original_inode, inode_after,
+            "activation must not unlink or rebind the live socket at the runtime-dir path"
+        );
+        let accept_task = tokio::spawn(async move { live_listener.accept().await });
+        let _client = tokio::net::UnixStream::connect(&live_path).await.unwrap();
+        let accepted = accept_task.await.unwrap();
+        assert!(
+            accepted.is_ok(),
+            "the live listener at the runtime-dir path must still accept, untouched by \
+             activation: {:?}",
+            accepted.err()
         );
     }
 
