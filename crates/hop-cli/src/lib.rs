@@ -25,21 +25,43 @@
 //!
 //! # Why no clap
 //!
-//! Meanwhile the hand-rolled match in [`parse`] stays in: `query` and `exec`
-//! both take positional arguments (joined free text plus a fixed tail of ids
-//! for `exec`), with no flags or `--help` to generate. That trade tips the
-//! other way once `toggle` and `doctor` land — multiple flags,
-//! subcommand-specific options, and `--help` text generated rather than
-//! hand-maintained are what a parser earns its dependency weight back on.
-//! Until then, a parser here would be solving a problem this binary does not
-//! have yet, and it keeps this crate's only dependency beyond `hop-protocol`
-//! and `serde_json` at zero.
+//! Meanwhile the hand-rolled match in [`parse`] stays in. Issue #180 gave
+//! this binary a real flag — `--socket <path>`, ahead of the subcommand —
+//! alongside `query` and `exec`'s positional arguments (joined free text
+//! plus a fixed tail of ids for `exec`), which is one more shape than "no
+//! flags at all" but still nowhere near what earns a parser generator its
+//! dependency weight back: one flag, taking one value, recognized before a
+//! fixed set of subcommand names, with no subcommand-specific options and no
+//! generated `--help` text this binary wants to own. `hopd::parse` (issue
+//! #122, then #180) already carries the identical `--socket` shape by hand
+//! for the same reason, so this module matches its sibling rather than
+//! reaching for a dependency neither yet needs. That trade tips the other
+//! way once `toggle` and `doctor` land with their own flags — this doc
+//! comment is the point to revisit it, not a standing argument that today's
+//! three-flag-or-fewer world will hold forever.
+//!
+//! # Why `--socket` only before the subcommand
+//!
+//! `query` and `exec` treat every argument after their name as free text (or
+//! trailing ids) to send to `hopd`, not as further flags — see [`parse`]'s
+//! own doc comment for why a single joined token is what a shell hands over.
+//! A `--socket` that `parse` tried to recognize *after* the subcommand name
+//! would have to somehow tell "the socket flag" apart from "the literal
+//! four characters `--socket`, which the user is searching for or trying to
+//! execute" — there is no such rule that does not also break a query for
+//! `--socket` itself. So `parse` only ever looks for `--socket` in the
+//! tokens that precede a recognized subcommand name; once it sees anything
+//! else, that token and everything after it become the subcommand's own
+//! argument list, `--socket`-shaped tokens included. `hop query --socket x`
+//! therefore queries the literal text `--socket x`, unchanged from before
+//! this issue — not a bug this issue introduces, but the one form the
+//! alternative (parsing `--socket` anywhere) would have had to special-case
+//! away.
 
-use std::env;
 use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use hop_protocol::framing::{
@@ -56,7 +78,34 @@ use hop_protocol::{
 /// stray frame — see the stale-frame comment in [`try_run_query`].
 const QUERY_ID: u64 = 1;
 
-/// What `hop`'s argument list resolved to. Kept separate from the code that
+/// What `hop`'s argument list resolved to, in full: the `--socket` override
+/// (if any) and the subcommand.
+///
+/// Kept as a struct wrapping [`Command`], rather than adding a `socket`
+/// field to every `Command` variant, because the two questions have
+/// different owners: which subcommand to run is a decision `main` makes by
+/// matching on `Command`, unchanged since before this issue; where `hopd`'s
+/// socket lives is a decision `main` makes once, up front, before it even
+/// looks at `command` — see [`Command`]'s own doc comment and `main.rs`.
+/// Threading `socket` through every `Command` variant instead would mean
+/// every existing match arm, and every existing test that builds a
+/// `Command` value, gains a field it does not otherwise care about.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Invocation {
+    /// `None` when `--socket` was not given (the derived path applies) and
+    /// `Some(raw)` when it was, carrying whatever bytes followed the flag,
+    /// unvalidated — [`parse`] stays pure (see its own doc comment) and
+    /// cannot itself check the one rule that matters, that the path resolves
+    /// inside `$XDG_RUNTIME_DIR`. `main.rs` is what turns a `Some` into a
+    /// validated path, or a refusal, before any command runs — the same
+    /// split `hopd::Invocation::Serve`'s own field documents for the
+    /// identical reason (design decision D6 of issue #180's plan).
+    pub socket: Option<PathBuf>,
+    /// Which subcommand to run, or [`Command::Usage`] if none parsed.
+    pub command: Command,
+}
+
+/// What `hop`'s subcommand resolved to. Kept separate from the code that
 /// acts on it — [`parse`] never touches a socket or prints anything — so the
 /// `*_parses` / `*_is_usage` tests below exercise the parsing rule alone.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,19 +131,53 @@ pub enum Command {
 }
 
 /// The line `main` prints to stderr for [`Command::Usage`].
-pub const USAGE: &str =
-    "usage: hop version | hop query <text>... | hop exec <query> <item-id> <action-id>";
+pub const USAGE: &str = "usage: hop [--socket <path>] version | hop [--socket <path>] query <text>... | hop [--socket <path>] exec <query> <item-id> <action-id>";
 
 /// Parses `args` — the process's arguments with `argv[0]` already stripped —
-/// into a [`Command`].
+/// into an [`Invocation`].
+///
+/// Leading `--socket <path>` pairs are peeled off first — see this module's
+/// "Why `--socket` only before the subcommand" doc section for why that
+/// order is not negotiable — leaving whatever comes after to resolve into a
+/// [`Command`] exactly as it always has. `--socket` with nothing after it,
+/// or a second `--socket` before the subcommand, is [`Command::Usage`] with
+/// no socket carried: [`parse`] does not decide which of two overrides the
+/// caller meant, the same refusal `hopd::parse` gives a repeated flag.
 ///
 /// `hop query hello world`'s two tokens after `query` are joined with single
 /// spaces into one query string (`"hello world"`), not just the first token
 /// — `query` takes free text, and a shell hands that text over unquoted as
 /// one argument per word, so treating only `args.next()` as the query would
 /// silently drop every word after the first.
-pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Command {
-    match args.next().as_deref() {
+pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Invocation {
+    let mut socket: Option<PathBuf> = None;
+
+    // The first token that is not part of a leading `--socket <path>` pair
+    // — either the subcommand name, or `None` if nothing follows the flag.
+    let first = loop {
+        match args.next() {
+            Some(token) if token == "--socket" => {
+                if socket.is_some() {
+                    return Invocation {
+                        socket: None,
+                        command: Command::Usage,
+                    };
+                }
+                match args.next() {
+                    Some(value) => socket = Some(PathBuf::from(value)),
+                    None => {
+                        return Invocation {
+                            socket: None,
+                            command: Command::Usage,
+                        };
+                    }
+                }
+            }
+            token => break token,
+        }
+    };
+
+    let command = match first.as_deref() {
         Some("version") => Command::Version,
         Some("query") => {
             let tokens: Vec<String> = args.collect();
@@ -104,36 +187,41 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Command {
                 Command::Query(tokens.join(" "))
             }
         }
-        Some("exec") => {
-            // `exec` needs a query and exactly two ids: the item id and the
-            // action id. Everything after `exec` except the trailing two is
-            // the query (joined with single spaces, exactly like `query`), so
-            // the last two tokens are popped off and validated as ids. At
-            // least one token must remain as the query and at least three
-            // tokens total — `hop exec <item> <action>` does not name a query
-            // and is refused as usage.
-            let mut tokens: Vec<String> = args.collect();
-            let Some(action_id) = tokens.pop() else {
-                return Command::Usage;
-            };
-            let Some(item_id) = tokens.pop() else {
-                return Command::Usage;
-            };
-            if tokens.is_empty() {
-                return Command::Usage;
-            }
-            let query = tokens.join(" ");
-            match (ItemId::new(item_id), ActionId::new(action_id)) {
-                (Ok(item_id), Ok(action_id)) => Command::Exec {
-                    query,
-                    item_id,
-                    action_id,
-                },
-                // An id over its documented bound cannot name any item this
-                // daemon could have delivered.
-                _ => Command::Usage,
-            }
-        }
+        Some("exec") => parse_exec(args.collect()),
+        _ => Command::Usage,
+    };
+
+    Invocation { socket, command }
+}
+
+/// Parses the tokens after `exec` into a [`Command::Exec`], or
+/// [`Command::Usage`] if they do not fit the shape.
+///
+/// `exec` needs a query and exactly two ids: the item id and the action id.
+/// Everything except the trailing two tokens is the query (joined with
+/// single spaces, exactly like `query`), so the last two tokens are popped
+/// off and validated as ids. At least one token must remain as the query and
+/// at least three tokens total — `hop exec <item> <action>` does not name a
+/// query and is refused as usage.
+fn parse_exec(mut tokens: Vec<String>) -> Command {
+    let Some(action_id) = tokens.pop() else {
+        return Command::Usage;
+    };
+    let Some(item_id) = tokens.pop() else {
+        return Command::Usage;
+    };
+    if tokens.is_empty() {
+        return Command::Usage;
+    }
+    let query = tokens.join(" ");
+    match (ItemId::new(item_id), ActionId::new(action_id)) {
+        (Ok(item_id), Ok(action_id)) => Command::Exec {
+            query,
+            item_id,
+            action_id,
+        },
+        // An id over its documented bound cannot name any item this daemon
+        // could have delivered.
         _ => Command::Usage,
     }
 }
@@ -152,11 +240,17 @@ pub fn print_version() {
 /// sends the query, and assembles the streamed results and prints them once
 /// `query_done` arrives.
 ///
+/// `socket` is the already-resolved socket path — `main.rs` resolved
+/// [`Invocation::socket`] against `$XDG_RUNTIME_DIR` before dispatching here
+/// (design decision D6 of issue #180's plan), so nothing in this flow reads
+/// the environment or can fall back to a different path than the one the
+/// caller was told about.
+///
 /// Returns the process's exit code rather than a `Result` — every error this
 /// flow can hit is reported to stderr and mapped to exit code 1 right here,
 /// per the behavior spec, so there is nothing left for `main` to decide.
-pub fn run_query(text: &str) -> ExitCode {
-    match try_run_query(text) {
+pub fn run_query(socket: &Path, text: &str) -> ExitCode {
+    match try_run_query(socket, text) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("hop: {err}");
@@ -175,9 +269,14 @@ pub fn run_query(text: &str) -> ExitCode {
 /// against the frame it already holds). `run_query` maps every variant to
 /// exit 1; `run_exec` maps the three refusal variants to their dedicated exit
 /// codes (see [`run_exec`]) and everything else to 1.
+///
+/// No longer carries a `RuntimeDirUnset` variant: the socket path is
+/// resolved in `main.rs` now, before either flow's `try_run_*` function is
+/// even called, so a socket-resolution failure is reported and exits through
+/// [`USAGE`]'s own code (`ExitCode::from(2)`) rather than through this enum
+/// and exit 1 — see `main.rs`.
 #[derive(Debug)]
 enum ClientError {
-    RuntimeDirUnset,
     Connect(std::io::Error),
     Io(std::io::Error),
     Frame(FrameError),
@@ -201,7 +300,6 @@ enum ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientError::RuntimeDirUnset => write!(f, "XDG_RUNTIME_DIR is not set"),
             ClientError::Connect(err) => write!(f, "failed to connect to hopd: {err}"),
             ClientError::Io(err) => write!(f, "lost the connection to hopd: {err}"),
             ClientError::Frame(err) => write!(f, "{err}"),
@@ -218,13 +316,6 @@ impl fmt::Display for ClientError {
             ClientError::ProviderFailed(what) => write!(f, "provider failed to execute: {what}"),
         }
     }
-}
-
-/// Derives `hopd`'s socket path from `XDG_RUNTIME_DIR`, the same convention
-/// `hopd::runtime_dir` uses to create it.
-fn socket_path() -> Result<PathBuf, ClientError> {
-    let runtime_dir = env::var("XDG_RUNTIME_DIR").map_err(|_| ClientError::RuntimeDirUnset)?;
-    Ok(PathBuf::from(runtime_dir).join("hop").join("hopd.sock"))
 }
 
 fn send(stream: &mut UnixStream, msg: &ClientMsg) -> Result<(), ClientError> {
@@ -251,9 +342,11 @@ fn recv(stream: &mut UnixStream) -> Result<DaemonMsg, ClientError> {
 /// exchange here (the query failed; there is nothing to resolve against), as
 /// does a connection-scoped (`None`) error; any other id is a stale frame and
 /// is dropped, exactly as in the query flow.
-fn connect_and_query(text: &str) -> Result<(UnixStream, Vec<Item>), ClientError> {
-    let socket_path = socket_path()?;
-    let mut stream = UnixStream::connect(&socket_path).map_err(ClientError::Connect)?;
+///
+/// `socket` is the already-resolved path — see [`run_query`]'s doc comment
+/// for why this function itself never derives or reads it.
+fn connect_and_query(socket: &Path, text: &str) -> Result<(UnixStream, Vec<Item>), ClientError> {
+    let mut stream = UnixStream::connect(socket).map_err(ClientError::Connect)?;
 
     send(
         &mut stream,
@@ -332,8 +425,8 @@ fn connect_and_query(text: &str) -> Result<(UnixStream, Vec<Item>), ClientError>
     }
 }
 
-fn try_run_query(text: &str) -> Result<(), ClientError> {
-    let (_stream, assembled) = connect_and_query(text)?;
+fn try_run_query(socket: &Path, text: &str) -> Result<(), ClientError> {
+    let (_stream, assembled) = connect_and_query(socket, text)?;
     for item in &assembled {
         let line = serde_json::to_string(item).map_err(ClientError::Encode)?;
         println!("{line}");
@@ -368,11 +461,12 @@ fn map_daemon_error(error: ProtoError) -> ClientError {
 /// refusal. All three are query-scoped and non-terminal to the connection;
 /// the sole exchange ends with the daemon's `Executed` or a matching error.
 fn try_run_exec(
+    socket: &Path,
     query: &str,
     item_id: ItemId,
     action_id: ActionId,
 ) -> Result<ExecOutcome, ClientError> {
-    let (mut stream, assembled) = connect_and_query(query)?;
+    let (mut stream, assembled) = connect_and_query(socket, query)?;
 
     let Some(item) = assembled.iter().find(|i| i.id == item_id) else {
         return Err(ClientError::UnknownItem(item_id.as_str().to_string()));
@@ -427,8 +521,11 @@ fn try_run_exec(
 ///
 /// Codes 10-12 are deliberately above the generic 1 so a script can tell the
 /// three refusals apart from a transport failure.
-pub fn run_exec(query: &str, item_id: ItemId, action_id: ActionId) -> ExitCode {
-    match try_run_exec(query, item_id, action_id) {
+///
+/// `socket` is the already-resolved path — see [`run_query`]'s doc comment
+/// for why this flow never derives or reads it itself.
+pub fn run_exec(socket: &Path, query: &str, item_id: ItemId, action_id: ActionId) -> ExitCode {
+    match try_run_exec(socket, query, item_id, action_id) {
         Ok(_) => ExitCode::SUCCESS,
         Err(ClientError::UnknownItem(id)) => {
             eprintln!("hop: no such item: {id}");
@@ -457,13 +554,16 @@ mod tests {
 
     #[test]
     fn version_parses() {
-        assert_eq!(parse(["version".to_string()].into_iter()), Command::Version);
+        assert_eq!(
+            parse(["version".to_string()].into_iter()).command,
+            Command::Version
+        );
     }
 
     #[test]
     fn query_with_text_parses() {
         assert_eq!(
-            parse(["query".to_string(), "hello".to_string()].into_iter()),
+            parse(["query".to_string(), "hello".to_string()].into_iter()).command,
             Command::Query("hello".to_string())
         );
     }
@@ -478,14 +578,18 @@ mod tests {
                     "world".to_string()
                 ]
                 .into_iter()
-            ),
+            )
+            .command,
             Command::Query("hello world".to_string())
         );
     }
 
     #[test]
     fn query_without_text_is_usage() {
-        assert_eq!(parse(["query".to_string()].into_iter()), Command::Usage);
+        assert_eq!(
+            parse(["query".to_string()].into_iter()).command,
+            Command::Usage
+        );
     }
 
     #[test]
@@ -499,7 +603,8 @@ mod tests {
                     "open".to_string(),
                 ]
                 .into_iter()
-            ),
+            )
+            .command,
             Command::Exec {
                 query: "hello".to_string(),
                 item_id: ItemId::new("app:1").unwrap(),
@@ -522,7 +627,8 @@ mod tests {
                     "run".to_string(),
                 ]
                 .into_iter()
-            ),
+            )
+            .command,
             Command::Exec {
                 query: "open calc".to_string(),
                 item_id: ItemId::new("app:1").unwrap(),
@@ -533,14 +639,18 @@ mod tests {
 
     #[test]
     fn exec_with_only_one_token_is_usage() {
-        assert_eq!(parse(["exec".to_string()].into_iter()), Command::Usage);
+        assert_eq!(
+            parse(["exec".to_string()].into_iter()).command,
+            Command::Usage
+        );
     }
 
     #[test]
     fn exec_with_only_ids_and_no_query_is_usage() {
         // Two tokens after `exec` name the ids but leave no query text.
         assert_eq!(
-            parse(["exec".to_string(), "app:1".to_string(), "open".to_string(),].into_iter()),
+            parse(["exec".to_string(), "app:1".to_string(), "open".to_string(),].into_iter())
+                .command,
             Command::Usage
         );
     }
@@ -559,21 +669,97 @@ mod tests {
                     "open".to_string(),
                 ]
                 .into_iter()
-            ),
+            )
+            .command,
             Command::Usage
         );
     }
 
     #[test]
     fn no_args_is_usage() {
-        assert_eq!(parse(std::iter::empty::<String>()), Command::Usage);
+        assert_eq!(parse(std::iter::empty::<String>()).command, Command::Usage);
     }
 
     #[test]
     fn unknown_subcommand_is_usage() {
         assert_eq!(
-            parse(["frobnicate".to_string()].into_iter()),
+            parse(["frobnicate".to_string()].into_iter()).command,
             Command::Usage
         );
+    }
+
+    #[test]
+    fn no_socket_flag_leaves_socket_none() {
+        let invocation = parse(["version".to_string()].into_iter());
+        assert_eq!(invocation.socket, None);
+        assert_eq!(invocation.command, Command::Version);
+    }
+
+    #[test]
+    fn a_socket_flag_before_the_subcommand_carries_the_path() {
+        let invocation = parse(
+            [
+                "--socket".to_string(),
+                "/run/user/1000/hop-dev/hopd.sock".to_string(),
+                "version".to_string(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            invocation.socket,
+            Some(PathBuf::from("/run/user/1000/hop-dev/hopd.sock"))
+        );
+        assert_eq!(invocation.command, Command::Version);
+    }
+
+    #[test]
+    fn a_socket_flag_before_query_carries_the_path_and_the_query_still_parses() {
+        let invocation = parse(
+            [
+                "--socket".to_string(),
+                "/run/user/1000/hop-dev/hopd.sock".to_string(),
+                "query".to_string(),
+                "hello".to_string(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            invocation.socket,
+            Some(PathBuf::from("/run/user/1000/hop-dev/hopd.sock"))
+        );
+        assert_eq!(invocation.command, Command::Query("hello".to_string()));
+    }
+
+    #[test]
+    fn a_socket_flag_with_no_value_is_usage() {
+        let invocation = parse(["--socket".to_string()].into_iter());
+        assert_eq!(invocation.command, Command::Usage);
+    }
+
+    #[test]
+    fn a_repeated_socket_flag_is_usage() {
+        let invocation = parse(
+            [
+                "--socket".to_string(),
+                "/run/user/1000/a.sock".to_string(),
+                "--socket".to_string(),
+                "/run/user/1000/b.sock".to_string(),
+                "version".to_string(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(invocation.command, Command::Usage);
+    }
+
+    #[test]
+    fn a_socket_flag_after_the_subcommand_is_not_consumed_and_stays_query_text() {
+        // D7: `hop query …` joins every token after `query` into the query
+        // text, so a trailing `--socket` is not a flag at all from this
+        // point on — it is unchanged behaviour, not a bug, that it becomes
+        // part of the query.
+        let invocation =
+            parse(["query".to_string(), "--socket".to_string(), "x".to_string()].into_iter());
+        assert_eq!(invocation.socket, None);
+        assert_eq!(invocation.command, Command::Query("--socket x".to_string()));
     }
 }

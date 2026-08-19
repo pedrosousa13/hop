@@ -4,7 +4,9 @@ The GNOME-native, trustworthy-plugins launcher that works everywhere.
 
 Pre-alpha. This repository currently contains M2's daemon through the query
 lifecycle and its provider host: a `hopd` daemon that serves streamed,
-cancellable queries over `$XDG_RUNTIME_DIR/hop/hopd.sock`, routed through
+cancellable queries over `$XDG_RUNTIME_DIR/hop/hopd.sock` (issue #180 lets
+`--socket <path>` override that default, on `hopd` and both its clients, to
+any path that still resolves inside `$XDG_RUNTIME_DIR`), routed through
 `hop-core`'s query router and provider host (results come from the walking
 skeleton's item and, as of issue #57, a real apps provider indexing
 installed `.desktop` files), and a `hop` CLI that speaks to it (`hop query`,
@@ -66,3 +68,10 @@ The daemon starts the first time something connects to
 installed the same way) is enough to trigger it. `systemctl --user status
 hopd.service` confirms it is running afterward. If the unit ever declares
 more than one socket, hopd uses only the first and warns on stderr.
+
+A standalone `hopd --socket <path>` (with the matching `hop --socket <path>`
+or `hop-gtk --socket <path>` on the client side) binds a different socket
+instead of the derived one — useful for running a development `hopd`
+alongside a real session's own, at `$XDG_RUNTIME_DIR/hop-dev/hopd.sock` or
+similar. `<path>` must still resolve inside `$XDG_RUNTIME_DIR`; anything else
+is refused rather than silently falling back to the derived path.

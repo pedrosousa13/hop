@@ -79,37 +79,54 @@ const APP_ID: &str = "dev.hop.Launcher";
 /// comment for why that loop itself never gives up).
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Resolves `hopd`'s socket path the same way `hop-cli` does — see
-/// `crates/hop-cli/src/lib.rs`'s `socket_path()`. Duplicated rather than
-/// shared because `hop-cli` does not expose it as a library function today;
-/// were a third caller to need it, the pair would be worth promoting into
-/// `hop-protocol` instead of copied a second time.
-fn socket_path() -> Result<PathBuf, String> {
-    let runtime_dir =
-        std::env::var("XDG_RUNTIME_DIR").map_err(|_| "XDG_RUNTIME_DIR is not set".to_string())?;
-    Ok(PathBuf::from(runtime_dir).join("hop").join("hopd.sock"))
-}
-
 /// Runs `hop-gtk` for `args` (`argv` with `argv[0]` already stripped) and
 /// returns the process's exit code.
+///
+/// Resolving `hopd`'s socket path used to be this function's own
+/// `socket_path()`, a private duplicate of `hop-cli`'s identical four lines
+/// — that function's doc comment named exactly the condition under which
+/// duplicating it a second time would stop being the right call: "were a
+/// third caller to need it, the pair would be worth promoting into
+/// `hop-protocol` instead of copied a second time." Issue #180 is that third
+/// caller — it gives `hopd` a `--socket` override and gives one to each
+/// client besides, so both existing copies had to grow the identical
+/// override-resolution logic regardless — and `hop_protocol::socket::socket_path`
+/// (Task 1 of that issue) is the promotion this comment predicted, called
+/// here instead of `hop-gtk` growing its own second flavor of the override
+/// check `hop-cli`'s `main.rs` and `hopd`'s `main.rs` both also now do.
+///
+/// [`cli::Args::Usage`] is handled first, before anything about `--socket`
+/// is even looked at: a malformed flag (of any of the three this binary
+/// now takes) is refused by [`cli::parse`] itself, and there is nothing left
+/// to resolve. For [`cli::Args::Run`] and [`cli::Args::Screenshot`], the
+/// `socket` field each carries is resolved right here, immediately after
+/// `parse` returns (design decision D6 of issue #180's plan) — `None`
+/// derives the default path exactly as before this issue, `Some` resolves
+/// and constrains the override. A refusal is reported and exits through the
+/// same code the `Usage` arm above already uses, per that decision: no new
+/// error channel, no new exit code.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let parsed = cli::parse(args);
-    if parsed == cli::Args::Usage {
-        eprintln!("{}", cli::USAGE);
-        return ExitCode::FAILURE;
-    }
 
-    let socket_path = match socket_path() {
+    let socket = match &parsed {
+        cli::Args::Run { socket } | cli::Args::Screenshot { socket, .. } => socket.as_deref(),
+        cli::Args::Usage => {
+            eprintln!("{}", cli::USAGE);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let socket_path = match hop_protocol::socket::socket_path(socket) {
         Ok(path) => path,
-        Err(reason) => {
-            eprintln!("hop-gtk: {reason}");
+        Err(err) => {
+            eprintln!("hop-gtk: {err}");
             return ExitCode::FAILURE;
         }
     };
 
     match parsed {
-        cli::Args::Run => run_interactive(socket_path),
-        cli::Args::Screenshot { path, query } => run_screenshot(socket_path, path, query),
+        cli::Args::Run { .. } => run_interactive(socket_path),
+        cli::Args::Screenshot { path, query, .. } => run_screenshot(socket_path, path, query),
         cli::Args::Usage => unreachable!("handled above"),
     }
 }
