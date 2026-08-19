@@ -5,6 +5,11 @@
 //! implementation, against a real `hopd` built from this workspace,
 //! acceptance criterion 6.
 //!
+//! Issue #184 adds a third capture, of an exclusive route (`"=1+1"`), to the
+//! same test — its own criterion 7 asks for a headless capture covering both
+//! an exclusive and a non-exclusive route, and `"2+2"`'s existing capture
+//! already is the non-exclusive half.
+//!
 //! # Why a subprocess per screenshot rather than driving `hop_gtk::app` in-process
 //!
 //! GTK is not safely re-initializable within one process — `gtk::init()` (and
@@ -228,6 +233,7 @@ fn captures_the_empty_state_and_a_results_state_headless() {
     let out_dir = tempfile::tempdir().unwrap();
     let empty_state_png = out_dir.path().join("empty-state.png");
     let results_state_png = out_dir.path().join("results-state.png");
+    let exclusive_route_png = out_dir.path().join("exclusive-route.png");
 
     // Empty-query state: nothing typed, whatever the freshly connected
     // window shows.
@@ -237,7 +243,13 @@ fn captures_the_empty_state_and_a_results_state_headless() {
     // Results state: "2+2" is the same deterministic calculator query
     // `crates/hopd/tests/calculator.rs` drives against this same real
     // `build_host()` registry — no external state, no network, the same
-    // answer on every run.
+    // answer on every run. This is a *non-exclusive* route
+    // (`hop_core::router`'s own test names it
+    // `an_inferred_math_query_reports_calculator_without_exclusivity`): a
+    // bare mathematical expression is a shape `route()` infers Calculator
+    // from, not a marker it consumed, so issue #184's mode label must stay
+    // absent on this capture — see the `"=1+1"` capture further down in this
+    // same test for the exclusive-route case that shows it.
     run_screenshot(&daemon, &broadway, &results_state_png, Some("2+2"));
     assert_is_a_png(&results_state_png);
 
@@ -250,5 +262,24 @@ fn captures_the_empty_state_and_a_results_state_headless() {
     assert_ne!(
         empty_bytes, results_bytes,
         "the empty and results screenshots must not be byte-identical"
+    );
+
+    // Issue #184, criterion 7: a headless capture of an *exclusive* route
+    // too, so this suite proves the mode label and marker highlight actually
+    // render somewhere, not only that the crate compiles them. `"=1+1"`
+    // routes through the `=` sigil (`hop_core::router::route`'s
+    // `Mode::Calculator` exclusive branch) rather than being inferred from
+    // shape — same deterministic, network-free calculator arithmetic as
+    // `"2+2"` above, but this time `exclusive: true` and a real
+    // `marker_span` over the leading `=`, so both of this issue's signals
+    // are on screen in this one capture.
+    run_screenshot(&daemon, &broadway, &exclusive_route_png, Some("=1+1"));
+    assert_is_a_png(&exclusive_route_png);
+
+    let exclusive_bytes = std::fs::read(&exclusive_route_png).unwrap();
+    assert_ne!(
+        exclusive_bytes, results_bytes,
+        "an exclusive route (mode label shown) must render differently from \
+         a non-exclusive one (mode label absent) with an otherwise similar query"
     );
 }
