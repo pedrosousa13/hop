@@ -1,0 +1,242 @@
+/* hop — tokens.css
+ *
+ * The v1 design system. §8a of the v1 design spec requires this file to exist
+ * before any GTK pixels are written: "Every component consumes tokens; no
+ * ad-hoc values."
+ *
+ * Source of the decisions here:
+ *   docs/superpowers/specs/2026-08-19-hop-m3-visual-design.md
+ *
+ * This file is the concrete token API that docs/theme-token-contract.md
+ * deliberately declined to invent in advance. That contract governs which of
+ * these a user theme may override; this file governs what they are.
+ *
+ * Every contrast ratio in a comment below was computed from WCAG relative
+ * luminance against the surface the token actually renders on — including,
+ * where it matters, the *composited* selected-row background rather than a
+ * flat neutral. Three values in the first draft failed that check and were
+ * raised; each is marked WAS below so the correction is not silently redone.
+ */
+
+:root {
+
+  /* ==========================================================
+     TYPEFACES
+     Both are bundled via GResource rather than trusted to be
+     installed. A launcher cannot let its identity element fall
+     back silently to generic `monospace` on a fresh install.
+     ========================================================== */
+  --hop-font-mono: "Iosevka Term", "Iosevka", ui-monospace, monospace;
+  --hop-font-sans: "Inter", -apple-system, "Cantarell", sans-serif;
+
+  /* ==========================================================
+     TYPE SCALE
+     Mono is reserved for text that is literally machine text:
+     what you typed, what was computed, where a file lives, and
+     when data was fetched. Everything else is proportional.
+     ========================================================== */
+  --hop-text-input:        500 20px/26px   var(--hop-font-mono);
+  --hop-text-calc-result:  500 22px/28px   var(--hop-font-mono);
+  --hop-text-title:        500 14px/20px   var(--hop-font-sans);
+  --hop-text-subtitle:     400 12.5px/18px var(--hop-font-sans);
+  --hop-text-path:         400 11.5px/16px var(--hop-font-mono);
+  --hop-text-timestamp:    400 11px/14px   var(--hop-font-mono);
+  --hop-text-hint-label:   500 11px/14px   var(--hop-font-sans);
+  --hop-text-hint-key:     500 11px/14px   var(--hop-font-mono);
+  --hop-text-section:      600 11px/14px   var(--hop-font-sans);
+  --hop-text-empty:        400 13.5px/20px var(--hop-font-sans);
+  --hop-text-error:        500 13.5px/20px var(--hop-font-sans);
+
+  --hop-tracking-path:     -0.01em;
+  --hop-tracking-hint:      0.02em;
+  --hop-tracking-section:   0.08em;
+
+  /* ==========================================================
+     NEUTRAL RAMP — DARK (the default; hop is dark-first)
+     Ratios are against --hop-neutral-950 unless noted.
+     ========================================================== */
+  --hop-neutral-950: #121214; /* window background                        */
+  --hop-neutral-900: #18181c; /* row surface                              */
+  --hop-neutral-800: #202024; /* row hover                                */
+  --hop-neutral-700: #2b2b31; /* raised surface                           */
+  --hop-neutral-600: #3a3a41; /* hairline; decorative, exempt from 3:1    */
+  --hop-neutral-500: #6a6a74; /* dimmed text          3.50:1  WAS #55555e (2.54:1, failed 3:1) */
+  --hop-neutral-400: #8f8e95; /* path / timestamp     5.77:1; 4.54:1 on the selected row       */
+  --hop-neutral-300: #b4b3b8; /* subtitle             8.98:1; 8.50:1 on the row surface        */
+  --hop-neutral-100: #f4f3f1; /* title / query       16.87:1                                   */
+
+  /* ==========================================================
+     NEUTRAL RAMP — LIGHT
+     Warm paper, not clinical white. Ratios against
+     --hop-neutral-0-light unless noted.
+     ========================================================== */
+  --hop-neutral-0-light:   #faf9f6; /* window background                  */
+  --hop-neutral-50-light:  #f3f1ec; /* row surface                        */
+  --hop-neutral-100-light: #eae7df; /* row hover                          */
+  --hop-neutral-200-light: #e2ded3; /* raised surface                     */
+  --hop-neutral-300-light: #d8d3c5; /* hairline                           */
+  --hop-neutral-400-light: #b9b3a0; /* strong border / disabled           */
+  --hop-neutral-600-light: #6a6559; /* path / timestamp  5.51:1; 4.84:1 on the selected row
+                                       WAS #706b5d — 4.43:1 on the selected row, failed 4.5:1 */
+  --hop-neutral-700-light: #4f4b41; /* subtitle          8.26:1; 7.70:1 on the row surface    */
+  --hop-neutral-900-light: #211f1a; /* title / query    15.64:1                                */
+
+  /* ==========================================================
+     THE ONE ACCENT — amber-gold, hue ~40deg
+     Used ONLY for the selection indicator, the focus ring, and
+     action hints. Never for body text. That restraint is what
+     keeps the UI legible when a careless theme desaturates
+     everything around it.
+     Chosen against: every major desktop's default blue; Ubuntu's
+     orange-red (hue ~15deg); the violet that has become AI
+     tooling's own default.
+     ========================================================== */
+  --hop-accent:              #e3a83b;              /* 8.85:1 on the window ground */
+  --hop-accent-hover:        #f2bb57;
+  --hop-accent-subdued:      rgba(227, 168, 59, 0.14); /* selected-row fill; composites to #2f2719 */
+  --hop-accent-ring:         rgba(227, 168, 59, 0.40);
+
+  --hop-accent-light:         #875c0f;             /* 5.13:1 on paper; 4.51:1 on its selected row */
+  --hop-accent-light-hover:   #a9740f;
+  --hop-accent-light-subdued: rgba(135, 97, 16, 0.10); /* composites to #efeadf */
+  --hop-accent-light-ring:    rgba(135, 97, 16, 0.35);
+
+  /* ==========================================================
+     SPACING / RADIUS / ELEVATION
+     ========================================================== */
+  --hop-space-1: 4px;  --hop-space-2: 8px;  --hop-space-3: 12px; --hop-space-4: 16px;
+  --hop-space-5: 20px; --hop-space-6: 24px; --hop-space-7: 32px; --hop-space-8: 40px;
+
+  --hop-radius-sm:   6px;   /* hint chips                         */
+  --hop-radius-md:  10px;   /* rows, selection indicator          */
+  --hop-radius-lg:  14px;   /* the window panel                   */
+  --hop-radius-full: 999px; /* key glyph pill                     */
+
+  --hop-shadow-window:       0 20px 60px -10px rgba(0, 0, 0, 0.65),
+                             0 0 0 1px rgba(255, 255, 255, 0.06);
+  --hop-shadow-window-light: 0 20px 60px -15px rgba(33, 31, 26, 0.25),
+                             0 0 0 1px rgba(0, 0, 0, 0.06);
+
+  /* ==========================================================
+     GEOMETRY
+     --hop-row-h is a *base*, not a fixed height. At elevated
+     text-scaling factors the row grows from measured content and
+     the window grows in height with it, capped at
+     --hop-window-max-h-ratio of the monitor. Width never grows:
+     long titles ellipsize and the action hint collapses to
+     icon-only before it would be pushed off-window.
+     ========================================================== */
+  --hop-window-w:           400px;
+  --hop-window-h:           500px;
+  --hop-window-max-h-ratio: 0.8;
+  --hop-row-h:               56px;
+  --hop-query-h:             56px;
+
+  /* ==========================================================
+     MOTION
+     Open decelerates (arriving); close accelerates (dismissing).
+     The asymmetry is deliberate, not an oversight.
+     ========================================================== */
+  --hop-duration-open:    140ms;
+  --hop-duration-close:   110ms;
+  --hop-duration-sel:      90ms;  /* repeats under key-repeat; must never lag */
+  --hop-duration-state:   120ms;
+  --hop-duration-resolve: 100ms;
+  --hop-duration-fast:     80ms;
+  --hop-delay-hint:        40ms;  /* kills hint flicker during fast traversal */
+
+  --hop-ease-out: cubic-bezier(0.16, 1, 0.3, 1);   /* open, resolve  */
+  --hop-ease-in:  cubic-bezier(0.4, 0, 1, 1);      /* close          */
+  --hop-ease-sel: cubic-bezier(0.22, 1, 0.36, 1);  /* selection      */
+  --hop-ease-std: cubic-bezier(0.4, 0, 0.2, 1);    /* state crossfade*/
+}
+
+/* ============================================================
+   SEMANTIC LAYER — what components actually consume.
+   Components reference these, never the ramp directly, so the
+   light theme is a token swap rather than a component rewrite.
+   ============================================================ */
+:root {
+  --hop-bg:        var(--hop-neutral-950);
+  --hop-bg-hover:  var(--hop-neutral-800);
+  --hop-fg:        var(--hop-neutral-100);
+  --hop-fg-2:      var(--hop-neutral-300);
+  --hop-fg-3:      var(--hop-neutral-400);
+  --hop-fg-dim:    var(--hop-neutral-500);
+  --hop-line:      var(--hop-neutral-600);
+  --hop-sel-fill:  var(--hop-accent-subdued);
+  --hop-sel-ring:  var(--hop-accent-ring);
+  --hop-sel-bar:   var(--hop-accent);
+  --hop-shadow:    var(--hop-shadow-window);
+}
+
+.hop-theme-light {
+  --hop-bg:        var(--hop-neutral-0-light);
+  --hop-bg-hover:  var(--hop-neutral-100-light);
+  --hop-fg:        var(--hop-neutral-900-light);
+  --hop-fg-2:      var(--hop-neutral-700-light);
+  --hop-fg-3:      var(--hop-neutral-600-light);
+  --hop-fg-dim:    var(--hop-neutral-400-light);
+  --hop-line:      var(--hop-neutral-300-light);
+  --hop-sel-fill:  var(--hop-accent-light-subdued);
+  --hop-sel-ring:  var(--hop-accent-light-ring);
+  --hop-sel-bar:   var(--hop-accent-light);
+  --hop-shadow:    var(--hop-shadow-window-light);
+}
+
+/* ============================================================
+   HONESTY-CRITICAL MEMBERS
+   docs/theme-token-contract.md reserves `.hop-honesty` for the
+   cached-data "as of" labels, pending skeleton rows, the offline
+   indicator, and error rows, and locks four property categories
+   on them: presence, opacity, perceivable dimensions, and
+   legible contrast.
+   These declarations are the locked values. The renderer MUST
+   install this block above GTK_STYLE_PROVIDER_PRIORITY_USER, or
+   the lock is decorative and a user theme wins.
+   The design rule that follows from the lock: a member's meaning
+   must live in its words and its shape, never in a colour —
+   colour is the one thing a theme may still change.
+   ============================================================ */
+.hop-honesty {
+  opacity: 1;
+  visibility: visible;
+}
+.hop-honesty--row,
+.hop-honesty--error,
+.hop-honesty--offline {
+  display: flex;
+}
+.hop-honesty .hop-honesty-text {
+  color: var(--hop-fg);
+  font: var(--hop-text-subtitle);
+}
+.hop-honesty .hop-honesty-stamp {
+  color: var(--hop-fg-2);
+  font: var(--hop-text-timestamp);
+}
+/* A skeleton bar with no width collapses to invisible, which is
+   the same lie as hiding it. Dimensions are locked, not just
+   opacity. */
+.hop-honesty .hop-skeleton {
+  min-width: 24px;
+  min-height: 9px;
+}
+
+/* ============================================================
+   REDUCED MOTION
+   Translation and scale are the vestibular triggers, not fades —
+   so the reduced variant strips transforms and keeps (shorter)
+   opacity transitions, rather than disabling motion wholesale.
+   GTK drives this from Gtk.Settings:gtk-enable-animations.
+   ============================================================ */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --hop-duration-open:  85ms;
+    --hop-duration-close: 85ms;
+    --hop-duration-sel:    1ms;
+    --hop-duration-state:  1ms;
+    --hop-duration-resolve: 1ms;
+    --hop-delay-hint:      0ms;
+  }
+}
