@@ -26,7 +26,10 @@ that referenced either carry a `// DIVERGENCE:` comment saying so.
 
 **Action** — something you can do to an item: open, focus, copy, run, close a
 window, move to a workspace, open a URL. An item's **default action** is the
-one Enter runs.
+one Enter runs. `hop-gtk`'s `keymap::Action` (issue #182) is a *different*,
+frontend-local vocabulary — what a key press or click means at the UI level
+(move the selection, dismiss the window, …) — not this term; the two meet
+only where `keymap::Action::Activate` runs an item's default action.
 
 **Provider** — a source of items. Describes itself with a **manifest** (its id,
 the kinds it produces, the modes it serves, a minimum term length, a per-query

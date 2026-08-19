@@ -249,6 +249,25 @@ const MAX_KEYMAP_BYTES: u64 = KEYMAP_KEY_LINE_BYTES * MAX_KEYMAP_KEYS + KEYMAP_C
 /// hardcoded-handler retrofit this issue exists to prevent: a later issue
 /// building the menu or the completer would have to touch this module's
 /// schema and parsing *and* write the feature, instead of only the feature.
+///
+/// # A different `Action` from `hop_protocol::item::Action`
+///
+/// `CONTEXT.md`'s glossary already defines **Action** as a domain term:
+/// "something you can do to an item… An item's default action is the one
+/// Enter runs." That is [`hop_protocol::item::Action`] — a wire type
+/// naming what a *provider* offers to do with one item (open, focus, copy,
+/// run, close a window, …), carried in [`hop_protocol::Item::actions`] and
+/// picked by id.
+///
+/// This `Action` is a different, unrelated vocabulary: the frontend's own
+/// *key* action vocabulary, naming what a key press or a click *means* at
+/// the UI level (move the selection, dismiss the window, …), never
+/// serialized, never seen by `hopd` or a provider. The two meet at exactly
+/// one point — [`Action::Activate`] is the keymap action whose effect is to
+/// *run* whichever `hop_protocol::item::Action` the selected item names as
+/// its default — and that is the one place in this module's own doc
+/// comments below where both types are named explicitly, rather than
+/// leaning on the word "action" to carry both meanings at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     /// Move the list selection one row toward the start.
@@ -263,10 +282,15 @@ pub enum Action {
     Home,
     /// Move the list selection to the last row.
     End,
-    /// Run the selected item's default action — Enter, by default, and also
-    /// the effect a mouse click on a row produces (D5 of the plan this issue
-    /// implements): both routes resolve to this one action rather than to
-    /// two independent code paths that happen to agree today.
+    /// Runs the selected item's default action — [`hop_protocol::Item::default_action`]'s
+    /// `ActionId`, naming one of the item's own [`hop_protocol::item::Action`]s,
+    /// the wire-typed "what to do with this item" `CONTEXT.md`'s **Action**
+    /// glossary entry describes, distinct from this enum (see this enum's
+    /// own doc comment, "A different `Action` from `hop_protocol::item::Action`").
+    /// Bound to Enter by default, and also the effect a mouse click on a
+    /// row produces (D5 of the plan this issue implements): both routes
+    /// resolve to this one keymap `Action` rather than to two independent
+    /// code paths that happen to agree today.
     Activate,
     /// Open the secondary-action menu for the selected item. Bound and
     /// dispatched by this module and `ui::window`; the menu itself does not

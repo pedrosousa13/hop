@@ -7,9 +7,12 @@
 //! all three binaries already depend on, so `socket` is where deriving and
 //! resolving `hopd`'s socket path is shared rather than copied three times
 //! (issue #180), and `config_file` is where the bounded, hazard-aware read
-//! of a config file — `hopd`'s config today, `hop-gtk`'s keymap tomorrow —
-//! is shared rather than copied a second time (issue #182). See each
-//! module's own doc comment for its full case.
+//! of a config file is shared rather than copied a second time (issue
+//! #182): `hopd::config::Config::from_path` calls it for `hopd`'s own two
+//! scalar keys, and `hop_gtk::keymap::Keymap::from_path` calls the same
+//! function for `hop-gtk`'s `[keymap]` table — two readers of the identical
+//! attacker-influenceable path today, not a promise about a reader still to
+//! come. See each module's own doc comment for its full case.
 
 #[cfg(unix)]
 pub mod config_file;
