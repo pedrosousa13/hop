@@ -629,7 +629,9 @@ dependencies = [
  "hopd",
  "libadwaita",
  "tempfile",
+ "thiserror",
  "tokio",
+ "toml",
 ]
 
 [[package]]

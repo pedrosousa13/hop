@@ -10,10 +10,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
-# Only for the `O_NONBLOCK` flag on `IconPath::open_regular_file`, which is the
-# one place this crate touches the filesystem, and for `mkfifo` in the test that
-# covers it. std already links libc; this brings in the flag constant rather than
-# a second implementation of it.
+# For the `O_NONBLOCK` flag this crate's two filesystem-touching call sites
+# both carry: `IconPath::open_regular_file` (`content.rs`, issue #131) and
+# `config_file::read` (issue #182, the bounded, hazard-aware config-file
+# read promoted out of `hopd::config`) — and for `mkfifo` in the test that
+# covers each of them. std already links libc; this brings in the flag
+# constant rather than a second implementation of it.
 #
 # These two are the first dependencies the contract crate has taken beyond serde
 # and thiserror, and they arrived before this workspace had a supply-chain gate.

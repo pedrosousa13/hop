@@ -1,13 +1,21 @@
 //! The typed IPC contract for hop: every type that crosses a process
 //! boundary. That is the crate's core and the rule for what belongs here —
 //! a type two or more of `hopd`, `hop-cli` and `hop-gtk` need to agree on
-//! the shape of, on either side of the socket. `socket` is the one module
-//! that does not fit that rule (nothing in it crosses the wire); it lives
-//! here anyway because this is the one crate all three binaries already
-//! depend on, so it is where deriving and resolving `hopd`'s socket path is
-//! shared rather than copied three times — see that module's own doc
-//! comment for the full case (issue #180).
+//! the shape of, on either side of the socket. `socket` and `config_file`
+//! are the two modules that do not fit that rule (nothing in either
+//! crosses the wire); they live here anyway because this is the one crate
+//! all three binaries already depend on, so `socket` is where deriving and
+//! resolving `hopd`'s socket path is shared rather than copied three times
+//! (issue #180), and `config_file` is where the bounded, hazard-aware read
+//! of a config file is shared rather than copied a second time (issue
+//! #182): `hopd::config::Config::from_path` calls it for `hopd`'s own two
+//! scalar keys, and `hop_gtk::keymap::Keymap::from_path` calls the same
+//! function for `hop-gtk`'s `[keymap]` table — two readers of the identical
+//! attacker-influenceable path today, not a promise about a reader still to
+//! come. See each module's own doc comment for its full case.
 
+#[cfg(unix)]
+pub mod config_file;
 pub mod content;
 pub mod framing;
 pub mod item;

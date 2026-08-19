@@ -15,6 +15,22 @@ path = "src/main.rs"
 # bans` flags.
 hop-protocol = { path = "../../crates/hop-protocol", version = "0.1.0" }
 
+# Issue #182's `keymap` module parses `[keymap]` out of `config.toml` —
+# `toml` is already a workspace dependency (the root `Cargo.toml`'s own
+# comment on it is `hopd::config`'s justification, which this crate's use is
+# the same shape of: no hand-rolled TOML parser worth writing). Pulling it in
+# here is not a *new* dependency, only a second consumer of one the workspace
+# already vets and pins; `keymap.rs` reads out of `toml::Value` directly, the
+# same low-level, `from_str`-only surface `hopd::config::parse` uses, so this
+# needs no `serde` dependency of its own either.
+toml.workspace = true
+
+# `keymap::KeymapError` — one typed refusal per way loading a keymap can go
+# wrong (criterion 4), the same shape `hopd::config::ConfigError` and
+# `hop_protocol::config_file::ConfigFileError` already use `thiserror` for.
+# Already a workspace dependency; this is a second consumer, not a new one.
+thiserror.workspace = true
+
 # GTK4 + libadwaita, pinned to the "v4_14" / "v1_5" API tier rather than the
 # crates' latest — issue #179's environment note fixes this machine's GTK at
 # 4.14.5 and libadwaita at 1.5.0 (GNOME 46). Enabling a newer version feature

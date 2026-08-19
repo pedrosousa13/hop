@@ -49,9 +49,11 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # block declared rather than smuggled in: the lint covers normal compilation
 # of both members — `src/` and `#[cfg(test)]` code alike — so each one needs
 # its own narrow `#[expect(unsafe_code)]` at the statement to build at all.
-# As of issue #179 there are six: that one production block, plus four
-# test-only `libc::mkfifo`/`pre_exec` calls in `hop-protocol`, `hopd::config`,
-# `hopd`'s `tests/activation.rs`, and `hopd::apps` (its own `mkfifo`, for the
+# As of issue #182 there are seven: that one production block, plus five
+# test-only `libc::mkfifo`/`pre_exec` calls in `hop-protocol::content`,
+# `hop-protocol`'s own `config_file` (the config-file read promoted out of
+# `hopd::config` by issue #182), `hopd::config`, `hopd`'s
+# `tests/activation.rs`, and `hopd::apps` (its own `mkfifo`, for the
 # identical FIFO-open hazard `hopd::config` closes for the config file,
 # closed here for a `.desktop` candidate), plus a second production block —
 # `hop-gtk`'s `ui::window`, setting `XDG_ACTIVATION_TOKEN` before `present()`
