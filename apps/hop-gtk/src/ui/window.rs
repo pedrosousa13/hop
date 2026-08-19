@@ -33,7 +33,7 @@ use hop_protocol::{ExecOutcome, Item};
 
 use crate::ipc::{CommandSender, IpcCommand, IpcEvent};
 use crate::tokens;
-use crate::ui::{model, row};
+use crate::ui::{model, view};
 
 /// The pre-built window and everything it owns. `Clone` and cheap to clone —
 /// every field is a GTK/glib reference-counted handle — so `app`'s
@@ -75,7 +75,7 @@ impl HopWindow {
         selection.set_autoselect(false);
         selection.set_can_unselect(true);
 
-        let factory = row::build();
+        let factory = view::build();
         let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory));
 
         let scrolled = gtk::ScrolledWindow::builder()

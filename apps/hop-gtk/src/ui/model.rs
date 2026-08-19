@@ -3,8 +3,8 @@
 //!
 //! # Why `BoxedAnyObject` rather than a hand-written `glib::Object` subclass
 //!
-//! [`Item`] already carries every field the row factory (`ui::row`) needs
-//! and is `Clone` — a full `#[glib::object_subclass]` type exists to expose
+//! [`Item`] already carries every field the `Row` node's widget (`ui::row`)
+//! needs and is `Clone` — a full `#[glib::object_subclass]` type exists to expose
 //! GObject *properties* to something outside Rust (a `.ui` template, GTK
 //! Inspector, a language binding). Nothing here needs that: `ui::row`'s
 //! `bind` reads straight through a borrowed `Item`, in the same process, in
