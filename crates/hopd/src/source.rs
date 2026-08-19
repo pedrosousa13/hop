@@ -25,6 +25,7 @@ use hop_core::host::{ProviderEvent, ProviderHost, ProviderLog};
 use hop_core::pipeline::{CheckedItems, FailedCheck, Pipeline, Rejection};
 use hop_core::provider::{Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery, route};
+use hop_core::sanitize::escape_path;
 use hop_protocol::{
     Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, ItemSubtitle, ItemTitle, Kind,
     MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, QueryText,
@@ -601,15 +602,18 @@ impl ResultSource for HostSource {
         let learning = self.pipeline.lock().await.learning.clone();
 
         let path_for_save = path.clone();
+        // `path` is `learning_path`: environment-derived (issue #159), the
+        // same way the config path is, so it runs through `escape_path`
+        // rather than `path.display()` before reaching stderr.
         match tokio::task::spawn_blocking(move || learning.save(&path_for_save)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => eprintln!(
                 "hopd: failed to save the learning store to {}: {err}",
-                path.display()
+                escape_path(path)
             ),
             Err(join_err) => eprintln!(
                 "hopd: learning store save task for {} panicked: {join_err}",
-                path.display()
+                escape_path(path)
             ),
         }
     }

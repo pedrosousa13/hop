@@ -633,8 +633,17 @@ fn evaluate_candidate(app_id: String, content: &str) -> ScanDecision {
 /// fd redirection, and this workspace forbids both. Asserting on this
 /// function's return value is as close as a test can get to pinning what
 /// `scan_apps` actually sends to stderr.
+///
+/// `path` runs through [`escape_path`], not `path.display()` (issue #159):
+/// this is a `.desktop` *candidate's* path, named by whatever the file
+/// system handed `read_dir`, which on Unix can be any byte sequence at all
+/// — a name carrying a newline or an ESC would otherwise let one malformed
+/// file forge a second log line, or drive the terminal reading it.
 fn malformed_log_line(path: &Path, reason: &str) -> String {
-    format!("hopd: apps provider: skipping {}: {reason}", path.display())
+    format!(
+        "hopd: apps provider: skipping {}: {reason}",
+        escape_path(path)
+    )
 }
 
 /// The boxed closure type [`PRE_ACQUIRE_HOOK`] stores, factored out purely to
@@ -1369,6 +1378,23 @@ mod scan_tests {
         let line = malformed_log_line(Path::new("/tmp/x/firefox.desktop"), "not a regular file");
         assert!(line.contains("/tmp/x/firefox.desktop"), "{line:?}");
         assert!(line.contains("not a regular file"), "{line:?}");
+    }
+
+    /// Issue #159: a `.desktop` candidate's *name* is filesystem-derived and
+    /// not otherwise validated before this function runs, so a newline in it
+    /// must not reach stderr unescaped — it would otherwise look like a
+    /// second, independent `hopd: apps provider:` log line.
+    #[test]
+    fn malformed_log_line_escapes_a_newline_in_the_path() {
+        let line = malformed_log_line(
+            Path::new("/home/pedro/.local/share/applications/evil\nname.desktop"),
+            "not a regular file",
+        );
+        assert!(
+            !line.contains('\n'),
+            "a raw newline must never reach the logged line: {line:?}"
+        );
+        assert!(line.contains("evil\\x0aname.desktop"), "{line:?}");
     }
 
     // --- New coverage: issue #108's review follow-up — a file skipped for
@@ -3274,7 +3300,7 @@ use std::sync::Arc;
 
 use hop_core::provider::{APPS_PROVIDER_ID, Provider, ProviderError, ProviderManifest, QueryCtx};
 use hop_core::router::{Mode, RoutedQuery};
-use hop_core::sanitize::sanitize_single_line;
+use hop_core::sanitize::{escape_path, sanitize_single_line};
 
 /// The apps provider: answers a query from [`AppIndex`] with no disk
 /// access, and dispatches `execute` through [`focus_or_launch`].
