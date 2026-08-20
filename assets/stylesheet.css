@@ -163,6 +163,67 @@ listview > row:hover {
 }
 
 /* ============================================================
+   .hop-row-hint-label / .hop-row-hint-key — `ui/row.rs` (issue #197)
+   The row's right-aligned action hint: a label chip naming the selected
+   item's default action ("Open") and a key-glyph chip naming the key that
+   runs it ("Enter"). Two selectors, not one, because `tokens.css` pairs
+   `--hop-text-hint-label` with `--hop-text-hint-key` specifically because
+   the two are typographically distinct — proportional for the label,
+   mono for the key glyph, matching `.hop-row-subtitle`'s proportional
+   `--hop-text-subtitle` above and giving the key glyph the same "this is
+   machine text" mono treatment tokens.css's TYPE SCALE comment reserves
+   for "what you typed, what was computed, where a file lives" — a key
+   binding is exactly that.
+
+   Both chips share one surface (`--hop-bg-hover`, the one semantic "raised
+   off the row" token this file already trusts under both palettes — see
+   `listview > row`'s own comment above for why a ramp literal would
+   silently break the light palette here) and one letter-spacing
+   (`--hop-tracking-hint`), and differ in exactly the two properties that
+   carry their distinct roles: radius (`--hop-radius-sm`, tokens.css's own
+   "hint chips" comment, for the label; `--hop-radius-full`, its "key glyph
+   pill" comment, for the key) and colour (`--hop-fg-2` for the label,
+   `--hop-accent` for the key).
+
+   `--hop-accent` on the key glyph, not the label, is deliberate:
+   `tokens.css`'s own header reserves that colour for exactly three things
+   — "the selection indicator, the focus ring, and action hints" — and
+   also says, in the same breath, "Never for body text." The label chip's
+   text *is* body text (an item's own action name, e.g. "Open" or "Copy"),
+   so it stays on the ordinary subtitle-tier `--hop-fg-2`; the key glyph is
+   not prose, it is the one-or-two-character badge naming a physical key,
+   the same kind of short, non-prose affordance the selection indicator and
+   focus ring already are. Using the accent there is this element
+   *exercising* its reservation, not an exception carved into the
+   never-for-body-text rule.
+
+   `ui::row::build` gives each chip a widget name and, via the exact same
+   string, this selector's class — the doubled-identity precedent
+   `.hop-row-subtitle`'s own comment above documents, applied here to two
+   widgets instead of one. `padding` uses the spacing scale
+   (`--hop-space-1`/`--hop-space-2`) rather than a literal, matching this
+   file's own rule that no design value appears here that is not a
+   `{{...}}` placeholder.
+   ============================================================ */
+.hop-row-hint-label {
+  font: {{font:hop-text-hint-label}};
+  letter-spacing: {{hop-tracking-hint}};
+  color: {{hop-fg-2}};
+  background-color: {{hop-bg-hover}};
+  border-radius: {{hop-radius-sm}};
+  padding: {{hop-space-1}} {{hop-space-2}};
+}
+
+.hop-row-hint-key {
+  font: {{font:hop-text-hint-key}};
+  letter-spacing: {{hop-tracking-hint}};
+  color: {{hop-accent}};
+  background-color: {{hop-bg-hover}};
+  border-radius: {{hop-radius-full}};
+  padding: {{hop-space-1}} {{hop-space-2}};
+}
+
+/* ============================================================
    .hop-mode-label — `ui/mode_label.rs:74`
    Owns this label's full typography now: weight/size/family from
    `--hop-text-section`, tracking from `--hop-tracking-section`, colour from

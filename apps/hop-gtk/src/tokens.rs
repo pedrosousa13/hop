@@ -406,6 +406,21 @@ pub static ICON_SIZE_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-icon-siz
 pub static WINDOW_SIZE_PX: LazyLock<(i32, i32)> =
     LazyLock::new(|| (px_token("hop-window-w"), px_token("hop-window-h")));
 
+/// `--hop-space-2`, in pixels: the gap `ui::row::build` puts between the
+/// action hint's two chips (issue #197) — the same spacing-scale token
+/// [`MODE_LABEL_MARGIN_END_PX`] reads a different rung of for a different
+/// purpose, read here for `gtk::Box::new`'s own `spacing` argument rather
+/// than a hardcoded `8` a future edit to `tokens.css`'s spacing scale could
+/// silently drift away from.
+pub static HINT_CHIP_GAP_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-space-2"));
+
+/// `--hop-space-3`, in pixels: the gap `ui::row::build` leaves between the
+/// text column and the action hint (issue #197), via
+/// `gtk::Widget::set_margin_start` — the same token and the same technique
+/// [`MODE_LABEL_MARGIN_END_PX`] already uses for the mode label's own
+/// margin, reused here rather than retyped as a literal.
+pub static HINT_MARGIN_START_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-space-3"));
+
 /// Panics with a message naming `name` and what its declaration was expected
 /// to look like.
 ///
@@ -654,6 +669,16 @@ mod tests {
     #[test]
     fn mode_label_margin_matches_tokens_css() {
         assert_eq!(*MODE_LABEL_MARGIN_END_PX, 12);
+    }
+
+    #[test]
+    fn hint_chip_gap_matches_tokens_css() {
+        assert_eq!(*HINT_CHIP_GAP_PX, 8);
+    }
+
+    #[test]
+    fn hint_margin_start_matches_tokens_css() {
+        assert_eq!(*HINT_MARGIN_START_PX, 12);
     }
 
     #[test]

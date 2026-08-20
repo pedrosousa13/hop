@@ -73,6 +73,7 @@ use gtk::prelude::*;
 
 use hop_protocol::Item;
 
+use crate::keymap::Keymap;
 use crate::ui::{model, row};
 
 /// One node in the view tree a `GtkListView` slot can be asked to render.
@@ -82,9 +83,47 @@ use crate::ui::{model, row};
 /// incomplete catalog. `Row` carries the [`Item`] it renders, not a widget:
 /// see this module's doc comment's "why a node is data, not a widget"
 /// section for why that distinction is the whole basis of decision D2.
+///
+/// # Issue #197: why `Row` also carries a [`Keymap`]
+///
+/// The row's action hint needs both the item's own default-action label
+/// *and* the key that runs [`crate::keymap::Action::Activate`] — the
+/// second of which lives on a [`Keymap`], not on [`Item`] at all. Two
+/// shapes were considered for getting that keymap to `ui::row::bind`,
+/// which is where `assets/tokens.css`'s hint tokens say the label and the
+/// key glyph both have to be resolved (two typographically distinct
+/// widgets, one resolving function — see `ui::row`'s own "Issue #197" doc
+/// section):
+///
+/// - **Pre-resolve a display string in `ui::view::bind` and carry that
+///   instead of a `Keymap`.** Rejected: it would split the hint's
+///   resolution across two modules — the *lookup* (`keymap.binding_for`)
+///   here, the *pairing with the item's own label* over in `ui::row` —
+///   for no reason `ui::view` otherwise has to know about `Action` at all
+///   (this module never once imports `crate::keymap::Action`, and should
+///   not have to gain that import just to plumb a hint through). Every
+///   other per-item resolution this crate does (the icon, the subtitle)
+///   already lives entirely inside `ui::row`, next to the item fields it
+///   reads; carrying the whole `Keymap` keeps the hint the same shape as
+///   those two instead of a one-off exception.
+/// - **Carry the `Keymap` itself**, `Clone`d once per bind/unbind call
+///   from the copy [`build`] captures. Chosen: `Keymap` is already
+///   `Clone` (phase A of this issue), its two `HashMap`s hold at most one
+///   entry per [`crate::keymap::Action`] variant — ten today — so cloning
+///   it on every bind is not a cost worth avoiding, and `ui::row::bind`
+///   ends up with exactly the same shape it already has for `Item`: read
+///   whatever fields the row needs, no pre-digestion by a caller that
+///   does not render anything itself.
+///
+/// This widens what `Row` carries, not how many variants exist — the
+/// "one node type, no branching" guarantee this module's own doc comment
+/// describes is about [`Node`]'s variant count and about [`bind`]/[`unbind`]
+/// never gaining a second match arm to reach `ui::row`, neither of which
+/// this change touches.
 pub enum Node {
-    /// A single result row, rendered by [`row::build`]/[`row::bind`].
-    Row(Item),
+    /// A single result row, rendered by [`row::build`]/[`row::bind`]
+    /// against the carried [`Item`] and [`Keymap`].
+    Row(Item, Keymap),
 }
 
 impl Node {
@@ -101,14 +140,18 @@ impl Node {
     /// through this function instead means the decision lives in exactly
     /// one place, and `build()` never has to change to accommodate it.
     ///
-    /// This always returns `Node::Row(item)`, unconditionally — deliberately
-    /// not a `match`, an `if`, or any other branch, because there is no
-    /// second variant to route toward yet (see this module's guard
-    /// section). What a second, real node type changes is this function's
-    /// body, and only this function's body: `build()`'s two closures keep
-    /// calling `Node::for_item` exactly as they do today.
-    pub fn for_item(item: Item) -> Node {
-        Node::Row(item)
+    /// This always returns `Node::Row(item, keymap)`, unconditionally —
+    /// deliberately not a `match`, an `if`, or any other branch, because
+    /// there is no second variant to route toward yet (see this module's
+    /// guard section). What a second, real node type changes is this
+    /// function's body, and only this function's body: `build()`'s two
+    /// closures keep calling `Node::for_item` exactly as they do today.
+    ///
+    /// `keymap` joined this constructor's signature in issue #197,
+    /// alongside `item` — see [`Node`]'s own doc comment, "why `Row` also
+    /// carries a `Keymap`", for why the row's action hint needs one.
+    pub fn for_item(item: Item, keymap: Keymap) -> Node {
+        Node::Row(item, keymap)
     }
 
     /// The `Row` variant's page name on the dispatch container's
@@ -131,7 +174,7 @@ impl Node {
     /// the pairing [`Node::ROW_PAGE`] describes.
     fn page_name(&self) -> &'static str {
         match self {
-            Node::Row(_) => Self::ROW_PAGE,
+            Node::Row(_, _) => Self::ROW_PAGE,
         }
     }
 }
@@ -171,7 +214,7 @@ pub fn bind(stack: &gtk::Stack, node: &Node) {
     let page_name = node.page_name();
     if let Some(widget) = stack.child_by_name(page_name) {
         match node {
-            Node::Row(item) => row::bind(&widget, item),
+            Node::Row(item, keymap) => row::bind(&widget, item, keymap),
         }
     }
     // Unconditional rather than nested inside the `if let` above: `setup`
@@ -216,7 +259,7 @@ pub fn bind(stack: &gtk::Stack, node: &Node) {
 pub fn unbind(stack: &gtk::Stack, node: &Node) {
     if let Some(widget) = stack.child_by_name(node.page_name()) {
         match node {
-            Node::Row(_) => row::unbind(&widget),
+            Node::Row(_, _) => row::unbind(&widget),
         }
     }
 }
@@ -238,7 +281,16 @@ pub fn unbind(stack: &gtk::Stack, node: &Node) {
 /// structure that acceptance criterion 3 forbids). Both call
 /// [`Node::for_item`] instead, so this function's own body has nothing left
 /// to change when a second node type is added.
-pub fn build() -> gtk::SignalListItemFactory {
+///
+/// `keymap` is `Clone`d once into each of `connect_bind`'s and
+/// `connect_unbind`'s closures below (issue #197), and once more out of
+/// each closure's own capture on every call — see `Node`'s own doc
+/// comment, "why `Row` also carries a `Keymap`", for why the row's action
+/// hint needs a copy at all, and why cloning it this often is not a cost
+/// worth engineering around. Nothing about `setup`'s closure changes: the
+/// dispatch container it builds has no content to resolve yet, only pages
+/// to register.
+pub fn build(keymap: Keymap) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
 
     // GTK 4.8 widened these signals' second parameter from the concrete
@@ -254,7 +306,8 @@ pub fn build() -> gtk::SignalListItemFactory {
         list_item.set_child(Some(&build_dispatch_container()));
     });
 
-    factory.connect_bind(|_, object| {
+    let bind_keymap = keymap.clone();
+    factory.connect_bind(move |_, object| {
         let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
             return;
         };
@@ -268,10 +321,10 @@ pub fn build() -> gtk::SignalListItemFactory {
             return;
         };
         let item = model::item_of(&item_object);
-        bind(&stack, &Node::for_item(item));
+        bind(&stack, &Node::for_item(item, bind_keymap.clone()));
     });
 
-    factory.connect_unbind(|_, object| {
+    factory.connect_unbind(move |_, object| {
         let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
             return;
         };
@@ -289,7 +342,7 @@ pub fn build() -> gtk::SignalListItemFactory {
             return;
         };
         let item = model::item_of(&item_object);
-        unbind(&stack, &Node::for_item(item));
+        unbind(&stack, &Node::for_item(item, keymap.clone()));
     });
 
     factory

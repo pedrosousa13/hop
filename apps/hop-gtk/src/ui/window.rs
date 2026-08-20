@@ -154,7 +154,14 @@ impl HopWindow {
         selection.set_autoselect(false);
         selection.set_can_unselect(true);
 
-        let factory = view::build();
+        // `keymap` is cloned here, not moved: `view::build` needs its own
+        // copy to resolve every row's action hint (issue #197 — see
+        // `ui::view::Node`'s own doc comment, "why `Row` also carries a
+        // `Keymap`"), and `wire_keyboard` below still needs the original to
+        // resolve key presses into `Action`s. `Keymap` is `Clone` exactly
+        // so both consumers can each own a copy rather than one borrowing
+        // from the other for the window's whole lifetime.
+        let factory = view::build(keymap.clone());
         let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory));
         // Single click activates a row rather than GTK's own double-click
         // default — the launcher convention §8 names ("mouse click still
