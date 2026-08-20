@@ -309,6 +309,34 @@ mod tests {
         );
     }
 
+    /// Issue #215's own regression test: `GtkListView`'s own bare
+    /// `listview` node (not `listview > row`, which was already styled)
+    /// must paint the window-ground token — before the fix, no selector
+    /// named the bare node at all, so any area the list view owns but no
+    /// realized row covers fell through to libadwaita's stock background.
+    /// This test fails against that bug (no `listview {` rule exists to
+    /// extract) and passes once the rule is added, resolving `--hop-bg`
+    /// under both palettes exactly as
+    /// `resolved_real_stylesheet_differs_between_palettes` above already
+    /// pins for `window.background` itself.
+    #[test]
+    fn listview_own_node_paints_the_window_ground_token() {
+        let dark = resolve(Palette::Dark, Motion::Full);
+        let light = resolve(Palette::Light, Motion::Full);
+
+        let dark_rule = extract_rule(&dark, "listview {");
+        let light_rule = extract_rule(&light, "listview {");
+
+        assert!(
+            dark_rule.contains("background-color: #121214;"),
+            "the listview node should resolve --hop-bg to the dark ramp's value, got: {dark_rule}"
+        );
+        assert!(
+            light_rule.contains("background-color: #faf9f6;"),
+            "the listview node should resolve --hop-bg to the light ramp's value, got: {light_rule}"
+        );
+    }
+
     /// Issue #214's own regression test: `.hop-row-hint-key`'s `color:`
     /// must actually vary by palette, not silently pin to the dark accent
     /// under both. Before the fix, `{{hop-accent}}` named a raw ramp entry
