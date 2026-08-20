@@ -65,7 +65,7 @@ use gio::prelude::*;
 use gtk::prelude::*;
 
 use crate::ipc::{self, IpcEvent};
-use crate::{cli, screenshot, ui};
+use crate::{cli, screenshot, style, ui};
 
 /// GNOME reverse-DNS convention; unregistered (no publisher claims this
 /// prefix on Flathub or similar) since v1 has not shipped anywhere that
@@ -151,6 +151,49 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+/// `connect_startup` handler both [`run_interactive`] and [`run_screenshot`]
+/// register, installing hop's own stylesheet via [`style::install`] before
+/// either run's first `activate` fires (`style::install`'s own doc comment,
+/// "Why `connect_startup`, not `connect_activate`", is where the deeper
+/// GObject-signal-ordering argument for that hook lives; this comment is the
+/// narrower one this function itself needs to make: *both* run modes call
+/// it, not just one).
+///
+/// # Why `run_screenshot` installs it too — this was a deliberate call, not
+/// an oversight
+///
+/// It would have been easy to skip this for `--screenshot`, on the
+/// reasoning that a headless capture harness is a testing tool and testing
+/// tools do not need to look pretty. That reasoning is backwards for
+/// *this* harness specifically: the design spec's §11 makes `--screenshot`
+/// non-optional precisely *because* it is how every future visual check of
+/// this crate gets made — `tests/headless_smoke.rs`'s own module doc names
+/// it as the CI-facing proof that acceptance criteria were actually met on
+/// screen, and any future reviewer (human or agent) asked to eyeball a
+/// capture for this issue's own visual claims would be looking at a
+/// captured window. A capture of a window wearing GTK's stock Adwaita theme
+/// instead of hop's own — because the one code path that loads
+/// `assets/stylesheet.css` was wired into `run_interactive` only — would
+/// make every one of those future checks worthless without any of them
+/// failing loudly: the PNG would just quietly show the wrong thing, forever,
+/// until someone thought to ask why. Installing it in both paths costs one
+/// extra `connect_startup` call and keeps the harness honest about what it
+/// is actually a picture of.
+fn install_stylesheet(_app: &adw::Application) {
+    // `connect_startup` fires only after `GtkApplication`'s own default
+    // handler has already resolved a display — see `style::install`'s doc
+    // comment for the `G_SIGNAL_RUN_FIRST` ordering this relies on. A
+    // `None` here would mean that invariant broke, which is a programming
+    // error worth failing loudly over (matching this crate's own
+    // fail-loudly precedent in `tokens.rs`/`stylesheet.rs`), not an
+    // ordinary, recoverable runtime condition to quietly degrade around —
+    // there is no window to show, styled or not, without a display.
+    let Some(display) = gtk::gdk::Display::default() else {
+        panic!("hop-gtk: no gdk::Display available at GApplication startup");
+    };
+    style::install(&display);
+}
+
 /// The ordinary, unique-instance run: builds the window once on first
 /// `activate`, presents it on every `activate` after that (this run's own
 /// first activation, or a later one forwarded from a re-invocation) — see
@@ -158,6 +201,8 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 fn run_interactive(socket_path: PathBuf, keymap: crate::keymap::Keymap) -> ExitCode {
     let app = adw::Application::new(Some(APP_ID), gio::ApplicationFlags::empty());
     let activation_token = std::env::var("XDG_ACTIVATION_TOKEN").ok();
+
+    app.connect_startup(install_stylesheet);
 
     app.connect_activate(move |app| {
         if let Some(existing) = app.active_window() {
@@ -252,6 +297,8 @@ fn run_screenshot(
 ) -> ExitCode {
     let app = adw::Application::new(Some(APP_ID), gio::ApplicationFlags::NON_UNIQUE);
     let exit_code = Rc::new(std::cell::Cell::new(ExitCode::FAILURE));
+
+    app.connect_startup(install_stylesheet);
 
     app.connect_activate({
         let exit_code = exit_code.clone();

@@ -26,6 +26,68 @@
 //! GTK CSS has nothing else to hardcode them *as* — but until then, the two
 //! values this crate structurally depends on are extracted from the same
 //! authored file everything else will eventually agree with.
+//!
+//! # A parsed token *table*, not a single-shot text scan
+//!
+//! The original version of this module answered every lookup with a
+//! first-match text scan: find `--<name>:`, read up to the next `;`, done.
+//! That is correct for a *literal* — `--hop-row-h: 56px;` — but
+//! `assets/tokens.css` also has a "SEMANTIC LAYER" section (`--hop-bg`,
+//! `--hop-fg`, `--hop-sel-fill`, …) whose declarations are `var()` chains
+//! onto the neutral ramp (`--hop-bg: var(--hop-neutral-950);`), and a
+//! `.hop-theme-light` block that *redefines the same semantic names* for the
+//! light palette, later in the file. A first-match text scan gets both
+//! wrong: it returns the literal text `var(--hop-neutral-950)` instead of
+//! following it, and it can never reach `.hop-theme-light`'s
+//! redeclarations, because the dark `:root`'s come first.
+//!
+//! [`TokenTable`] fixes both by actually understanding the file's block
+//! structure well enough to tell blocks apart, and [`resolve`] follows
+//! `var()` references to a concrete value instead of returning them as
+//! literal text. `tokens.css` contains five kinds of block; here is what
+//! each becomes in the table, and why:
+//!
+//! - **The two unconditional `:root` blocks** — the neutral/type/spacing
+//!   ramp, and the "SEMANTIC LAYER" aliases onto it — merge into one `base`
+//!   table. They declare disjoint names (the ramp's `--hop-neutral-*` never
+//!   collides with the semantic layer's `--hop-bg`/`--hop-fg`/etc.), so
+//!   merging them loses nothing and correctly models "true regardless of
+//!   palette, or anything else."
+//! - **`.hop-theme-light`** redeclares exactly the semantic layer's names,
+//!   for the light palette. It is kept as a *separate* overlay table rather
+//!   than merged into `base`, because — unlike the two `:root` blocks — it
+//!   is conditional: folding it into `base` would make the light values win
+//!   unconditionally, destroying the dark palette [`resolve`] must still be
+//!   able to produce. [`Palette::Light`] resolution checks this overlay
+//!   first and falls back to `base` for names it does not redeclare (the
+//!   ramp literals it points at, e.g. `--hop-neutral-0-light`, which live in
+//!   `base` because they are unconditional too); [`Palette::Dark`] never
+//!   consults the overlay at all.
+//! - **The `@media (prefers-reduced-motion: reduce)` block** — including the
+//!   third `:root` nested inside it — is skipped entirely, on purpose. It
+//!   redefines the motion-duration tokens, but nothing in this crate reads
+//!   `Gtk.Settings:gtk-enable-animations` or otherwise consumes a
+//!   reduced-motion signal yet (reduced motion is explicitly out of scope
+//!   for the issue this change belongs to), so folding it into `base`
+//!   unconditionally would silently apply the *reduced*-motion durations
+//!   regardless of the user's actual system preference — worse than not
+//!   modelling it at all. When reduced-motion support is built, it should
+//!   get its own overlay table shaped like `light_overlay`, selected the
+//!   same way — not be retrofitted into `base`.
+//! - **The five `.hop-honesty*` rule blocks** are skipped entirely: they are
+//!   component rules (`opacity: 1;`, `color: var(--hop-fg);`, `min-width:
+//!   24px;`), not `--custom-property` *declarations*, so they have no
+//!   business in a token table regardless of how they are reached. The two
+//!   dimension literals on `.hop-honesty .hop-skeleton` are bare numbers,
+//!   not `var()` references, on purpose — see that rule's own comment in
+//!   `assets/tokens.css` for why `docs/theme-token-contract.md` requires
+//!   exactly that.
+//!   [`classify_selector`] only recognises `:root` and `.hop-theme-light` as
+//!   token-bearing selectors; every other selector — honesty rules included
+//!   — is `Skip` by construction, not by an incidental syntax mismatch (a
+//!   `.hop-honesty*` body never happens to contain a `--name: value;` shape
+//!   in this file, but the classification does not rely on that holding).
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 /// The full contents of the repo's `assets/tokens.css`, bundled into the
@@ -34,19 +96,284 @@ use std::sync::LazyLock;
 /// or an install layout finding the source tree.
 const TOKENS_CSS: &str = include_str!("../../../assets/tokens.css");
 
-/// Finds a `--custom-property: <N>px;` declaration in [`TOKENS_CSS`] and
-/// returns `N`. Panics with the property name and the file this is sourced
-/// from on any failure — a missing or reshaped token is a build-time
-/// programming error to catch immediately, not a degraded runtime state to
-/// carry forward silently (the exact failure mode this module's doc comment
-/// says a raw `CssProvider` load would produce).
-fn px_token(name: &str) -> i32 {
-    let needle = format!("--{name}:");
-    let after = TOKENS_CSS
-        .split_once(&needle)
+/// Which of `tokens.css`'s two palettes to resolve a token against. Dark is
+/// hop's default (`assets/tokens.css`'s own header: "hop is dark-first");
+/// Light is the `.hop-theme-light` overlay. See this module's top-level doc
+/// comment for how each variant treats the parsed [`TokenTable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Palette {
+    Dark,
+    Light,
+}
+
+/// A parsed, unresolved view of `assets/tokens.css`: every `--name: value;`
+/// declaration this module cares about, sorted into the two tables the
+/// module doc comment describes. Values are stored exactly as written —
+/// still possibly a `var(--other-name)` chain — [`resolve`] is what follows
+/// those.
+struct TokenTable {
+    /// Both unconditional `:root` blocks, merged.
+    base: HashMap<String, String>,
+    /// `.hop-theme-light`'s redeclarations, consulted only for
+    /// [`Palette::Light`], checked before falling back to `base`.
+    light_overlay: HashMap<String, String>,
+}
+
+/// Parsed once, on first use, and kept for the process's lifetime — parsing
+/// `tokens.css` is pure text work with no I/O beyond the `include_str!`
+/// already baked into the binary, so there is nothing to invalidate or
+/// re-run.
+static TABLE: LazyLock<TokenTable> = LazyLock::new(|| TokenTable::parse(TOKENS_CSS));
+
+impl TokenTable {
+    fn parse(css: &str) -> Self {
+        let stripped = strip_comments(css);
+        let mut base = HashMap::new();
+        let mut light_overlay = HashMap::new();
+
+        let mut rest: &str = &stripped;
+        while let Some(open_rel) = rest.find('{') {
+            let selector = rest[..open_rel].trim();
+            let close_rel = find_matching_brace(rest, open_rel);
+            let body = &rest[open_rel + 1..close_rel];
+
+            match classify_selector(selector) {
+                BlockKind::Base => parse_declarations(body, &mut base),
+                BlockKind::LightOverlay => parse_declarations(body, &mut light_overlay),
+                BlockKind::Skip => {}
+            }
+
+            rest = &rest[close_rel + 1..];
+        }
+
+        Self {
+            base,
+            light_overlay,
+        }
+    }
+}
+
+/// What a top-level (or `@media`-nested) block's selector means for the
+/// token table. See this module's top-level doc comment for the reasoning
+/// behind each arm.
+enum BlockKind {
+    Base,
+    LightOverlay,
+    Skip,
+}
+
+fn classify_selector(selector: &str) -> BlockKind {
+    match selector {
+        ":root" => BlockKind::Base,
+        ".hop-theme-light" => BlockKind::LightOverlay,
+        _ => BlockKind::Skip,
+    }
+}
+
+/// Removes every `/* ... */` comment from `css`, replacing each with
+/// nothing (every comment in `tokens.css` is already surrounded by
+/// whitespace on both sides, so this never fuses two tokens together that a
+/// comment used to separate).
+///
+/// This has to run *before* any block or declaration scanning, not after:
+/// several comments in `tokens.css` mention a real token name in prose
+/// (`/* Ratios are against --hop-neutral-950 unless noted. */`, inside the
+/// `:root` block that also *declares* `--hop-neutral-950`). A scanner
+/// looking for the next `--name:` would find that prose mention first, and
+/// go hunting for its `:` — which it would find, wrongly, several lines
+/// later at the real declaration's own colon, producing one corrupt
+/// multi-line "name" and silently losing the real, short one.
+fn strip_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find("*/")
+            .unwrap_or_else(|| panic!("assets/tokens.css has an unterminated `/* ... */` comment"));
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Given the index of a `{` in `s`, returns the index of the `}` that closes
+/// it, counting nested braces so a block containing another block — the
+/// `@media` block's nested `:root { ... }` is the only case `tokens.css`
+/// actually has — is skipped as one unit rather than stopping at the first
+/// `}`, which would be the *inner* block's own close.
+fn find_matching_brace(s: &str, open_at: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut depth = 1u32;
+    let mut i = open_at + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("assets/tokens.css has a `{{` with no matching `}}`")
+}
+
+/// Parses every `--name: value;` declaration out of a block's body (comments
+/// already stripped) into `out`. Handles more than one declaration per
+/// line — `tokens.css`'s `SPACING` block packs four onto one — by looping
+/// until no further `--` is found.
+fn parse_declarations(body: &str, out: &mut HashMap<String, String>) {
+    let mut rest = body;
+    while let Some(dash_pos) = rest.find("--") {
+        let after = &rest[dash_pos + 2..];
+        let colon_pos = after.find(':').unwrap_or_else(|| {
+            panic!("assets/tokens.css has a `--` custom property with no terminating `:`")
+        });
+        let name = after[..colon_pos].trim().to_string();
+
+        let value_rest = &after[colon_pos + 1..];
+        let semi_pos = value_rest.find(';').unwrap_or_else(|| {
+            panic!("assets/tokens.css's `--{name}` declaration has no terminating `;`")
+        });
+        let value = value_rest[..semi_pos].trim().to_string();
+
+        out.insert(name, value);
+        rest = &value_rest[semi_pos + 1..];
+    }
+}
+
+/// Looks up `name`'s declaration in `table` for `palette`, **unresolved** —
+/// a value that is itself `var(--x)` is returned as that literal text, not
+/// followed. [`resolve`] is the chain-following counterpart; [`font_token`]
+/// is the one caller that needs this unresolved form, because it must split
+/// a `<weight> <size>/<line> var(--family)` shorthand into pieces *before*
+/// the trailing piece is resolved — resolving the whole shorthand first
+/// would inline the family stack's own internal whitespace
+/// (`"Inter", -apple-system, ...`) into the string being split, breaking the
+/// assumption that the shorthand has exactly one whitespace-delimited
+/// trailing token.
+///
+/// Panics naming `name` and the file if neither table has it — a missing
+/// token is a build-time programming error to catch immediately, in the
+/// same spirit as every panic in this module.
+fn raw_from<'a>(table: &'a TokenTable, name: &str, palette: Palette) -> &'a str {
+    let value = match palette {
+        Palette::Light => table
+            .light_overlay
+            .get(name)
+            .or_else(|| table.base.get(name)),
+        Palette::Dark => table.base.get(name),
+    };
+    value
+        .map(String::as_str)
         .unwrap_or_else(|| panic!("assets/tokens.css has no `--{name}` declaration"))
-        .1;
-    let digits: String = after
+}
+
+/// [`raw_from`] against the module's real, parsed [`TABLE`]. `TABLE` is a
+/// `'static` item, so a borrow into it — including the transitive borrow
+/// this returns — is itself `'static`, which is what lets
+/// [`font_token`] hand its `family` field a `&'static str` without owning a
+/// copy.
+fn raw(name: &str, palette: Palette) -> &'static str {
+    raw_from(&TABLE, name, palette)
+}
+
+/// Resolves `name` to a concrete value under `palette`, following every
+/// `var(--other-name)` reference the declaration contains — to arbitrary
+/// depth, not just the one hop `assets/tokens.css`'s semantic layer happens
+/// to use today. Panics naming the missing token if a reference points at a
+/// name with no declaration, and panics naming the whole cycle if a chain
+/// ever revisits a name it has already started resolving, rather than
+/// recursing forever — see `resolve_with_path`'s own doc comment for how.
+pub fn resolve(name: &str, palette: Palette) -> String {
+    resolve_from(&TABLE, name, palette)
+}
+
+fn resolve_from(table: &TokenTable, name: &str, palette: Palette) -> String {
+    let mut path = Vec::new();
+    resolve_with_path(table, name, palette, &mut path)
+}
+
+/// `path` holds the names currently being resolved, outermost first — the
+/// call stack's own contents, made inspectable. Before resolving `name`,
+/// this checks whether `name` is already in `path`: if it is, `name` refers
+/// back to itself through some chain of `var()`s, and resolving it further
+/// would recurse the same cycle forever. Catching that *here*, by checking a
+/// bounded `Vec` before each recursive step, is what turns a `var()` cycle
+/// into a panic that names every link in the loop instead of an unbounded
+/// recursion that would eventually blow the stack — the difference the
+/// brief for this module requires: "detected, not hit as a stack overflow."
+fn resolve_with_path(
+    table: &TokenTable,
+    name: &str,
+    palette: Palette,
+    path: &mut Vec<String>,
+) -> String {
+    if let Some(pos) = path.iter().position(|seen| seen.as_str() == name) {
+        let mut cycle: Vec<String> = path[pos..].to_vec();
+        cycle.push(name.to_string());
+        panic!(
+            "assets/tokens.css has a `var()` reference cycle: {}",
+            cycle.join(" -> ")
+        );
+    }
+
+    path.push(name.to_string());
+    let raw_value = raw_from(table, name, palette);
+    let resolved = substitute_vars(table, raw_value, palette, path);
+    path.pop();
+    resolved
+}
+
+/// Replaces every `var(--other-name)` occurrence in `value` with that name's
+/// own resolved value, left to right. Most tokens this module reads contain
+/// at most one `var()` (the semantic layer's whole-value aliases, and the
+/// type scale's trailing `var(--hop-font-*)`), but this loops rather than
+/// assuming that, so a future declaration combining more than one — a
+/// shorthand mixing a literal with a referenced colour, say — resolves
+/// correctly too.
+fn substitute_vars(
+    table: &TokenTable,
+    value: &str,
+    palette: Palette,
+    path: &mut Vec<String>,
+) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("var(--") {
+        out.push_str(&rest[..start]);
+        let after_marker = &rest[start + "var(--".len()..];
+        let close = after_marker
+            .find(')')
+            .unwrap_or_else(|| panic!("assets/tokens.css has an unterminated `var()` reference"));
+        let inner_name = after_marker[..close].trim();
+        out.push_str(&resolve_with_path(table, inner_name, palette, path));
+        rest = &after_marker[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Finds a `--custom-property: <N>px;` declaration and returns `N`. Panics
+/// with the property name and the file this is sourced from on any failure
+/// — a missing or reshaped token is a build-time programming error to catch
+/// immediately, not a degraded runtime state to carry forward silently (the
+/// exact failure mode this module's doc comment says a raw `CssProvider`
+/// load would produce).
+///
+/// Every caller of this function reads a `GEOMETRY` token, none of which
+/// `.hop-theme-light` redeclares, so resolving against [`Palette::Dark`]
+/// always agrees with [`Palette::Light`] here — there is no palette
+/// parameter to thread through for values that structurally cannot differ
+/// by palette.
+fn px_token(name: &str) -> i32 {
+    let value = resolve(name, Palette::Dark);
+    let digits: String = value
         .trim_start()
         .chars()
         .take_while(|c| c.is_ascii_digit())
@@ -79,26 +406,6 @@ pub static ICON_SIZE_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-icon-siz
 pub static WINDOW_SIZE_PX: LazyLock<(i32, i32)> =
     LazyLock::new(|| (px_token("hop-window-w"), px_token("hop-window-h")));
 
-/// Finds a `--custom-property: <value>;` declaration in [`TOKENS_CSS`] and
-/// returns `<value>`, trimmed of surrounding whitespace — the same lookup
-/// [`px_token`] performs before it goes on to require the value be a bare
-/// `<N>px`. Factored out because issue #184's tokens (the mode label's
-/// typography, its letter-spacing, and the marker highlight's colour) come in
-/// a few more shapes than a bare pixel integer: a hex colour, a `font:`
-/// shorthand, and an `em` tracking value.
-fn raw_token(name: &str) -> &'static str {
-    let needle = format!("--{name}:");
-    let after = TOKENS_CSS
-        .split_once(&needle)
-        .unwrap_or_else(|| panic!("assets/tokens.css has no `--{name}` declaration"))
-        .1;
-    after
-        .split_once(';')
-        .unwrap_or_else(|| panic!("assets/tokens.css's `--{name}` has no terminating `;`"))
-        .0
-        .trim()
-}
-
 /// Panics with a message naming `name` and what its declaration was expected
 /// to look like.
 ///
@@ -122,14 +429,18 @@ fn bad_token(name: &str, expected: &str) -> ! {
 /// Every colour this module reads — [`ACCENT_RGB`], [`MODE_LABEL_RGB`] — is a
 /// ramp-level literal (`--hop-accent`, `--hop-neutral-400`) rather than a
 /// *semantic* alias one `var()` hop away (`--hop-sel-bar`, `--hop-fg-3` and
-/// the rest of tokens.css's "SEMANTIC LAYER" section), so this never needs to
-/// follow an indirection — unlike [`font_token`] below, which does have one
-/// `var(--hop-font-*)` hop to resolve. See each `LazyLock`'s own doc comment
-/// for why its particular literal was the one chosen.
+/// the rest of tokens.css's "SEMANTIC LAYER" section), so [`resolve`] never
+/// actually has a chain to follow for either of these names — unlike
+/// [`font_token`] below, which does have one `var(--hop-font-*)` hop to
+/// resolve. Routed through [`resolve`] anyway, rather than a bespoke direct
+/// lookup, so this module has exactly one lookup path rather than two. See
+/// each `LazyLock`'s own doc comment for why its particular literal was the
+/// one chosen. Also palette-invariant, for the same reason [`px_token`]'s
+/// doc comment gives.
 fn hex_token(name: &str) -> (u8, u8, u8) {
-    let raw = raw_token(name);
+    let value = resolve(name, Palette::Dark);
     let expected = "a bare `#rrggbb` value";
-    let hex = raw
+    let hex = value
         .strip_prefix('#')
         .unwrap_or_else(|| bad_token(name, expected));
     if hex.len() != 6 || !hex.is_ascii() {
@@ -157,8 +468,17 @@ pub struct FontToken {
     pub family: &'static str,
 }
 
+/// Parses a `--hop-text-*` type-scale token into a [`FontToken`]. Resolved
+/// against [`Palette::Dark`] unconditionally, with no palette parameter of
+/// its own — palette-invariant for the same reason [`px_token`]'s doc
+/// comment gives: `.hop-theme-light` redeclares exactly 11 names (the
+/// SEMANTIC LAYER's `--hop-bg`/`--hop-fg`/etc.), and every `--hop-text-*`
+/// token lives only in the first, unconditional `:root` block alongside the
+/// `--hop-tracking-*` and `--hop-font-*` tokens it references — none of the
+/// three families is among those 11, so there is no light-palette
+/// declaration for `resolve` to ever prefer over the dark one here.
 fn font_token(name: &str) -> FontToken {
-    let raw = raw_token(name);
+    let raw = raw(name, Palette::Dark);
     let expected = "`<weight> <N>px/<N>px var(--hop-font-*)`";
     let mut parts = raw.split_whitespace();
 
@@ -185,11 +505,26 @@ fn font_token(name: &str) -> FontToken {
         .and_then(|s| s.strip_suffix(')'))
         .unwrap_or_else(|| bad_token(name, expected));
 
+    // `resolve` (not the unresolved `raw`) because `--hop-font-*` is itself a
+    // bare literal with no further `var()` of its own — resolving it is a
+    // no-op substitution, and doing it through the same chain-following path
+    // as everything else needs no special case for "this particular
+    // reference happens to be one hop and no more."
+    //
+    // Leaked, not cloned into an owned `String` field: `TABLE` — and
+    // therefore this value, since it is built once inside a `LazyLock` that
+    // itself never drops — already lives for the process's entire lifetime.
+    // Leaking here spends that unavoidable lifetime up front, in exchange
+    // for keeping `FontToken::family`'s type (`&'static str`) exactly what
+    // it was before this module gained the ability to follow `var()` chains,
+    // so nothing downstream of this struct (`ui::mode_label`) has to change.
+    let family: &'static str = Box::leak(resolve(family_name, Palette::Dark).into_boxed_str());
+
     FontToken {
         weight,
         size_px,
         line_height_px,
-        family: raw_token(family_name),
+        family,
     }
 }
 
@@ -197,9 +532,13 @@ fn font_token(name: &str) -> FontToken {
 /// `--hop-tracking-section`'s `0.08em`. `em` here is relative to the type
 /// token it is paired with (`--hop-text-section`'s own `size_px`) — the same
 /// pairing D5/criterion 4 name explicitly: "`--hop-text-section` with
-/// `--hop-tracking-section`".
+/// `--hop-tracking-section`". Resolved against [`Palette::Dark`]
+/// unconditionally, palette-invariant for the same reason
+/// [`font_token`]'s doc comment gives: every `--hop-tracking-*` name lives
+/// only in the first, unconditional `:root` block, not among
+/// `.hop-theme-light`'s 11 redeclared names.
 fn em_token(name: &str) -> f64 {
-    raw_token(name)
+    resolve(name, Palette::Dark)
         .strip_suffix("em")
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| bad_token(name, "a bare `<N>em` value"))
@@ -327,5 +666,75 @@ mod tests {
         assert_eq!(widen_channel(0x00), 0x0000);
         assert_eq!(widen_channel(0xff), 0xffff);
         assert_eq!(widen_channel(0xe3), 0xe3e3);
+    }
+
+    #[test]
+    fn resolves_a_var_chain_to_the_real_files_concrete_value() {
+        // `--hop-bg` is a `var(--hop-neutral-950)` chain in the real,
+        // shipped `tokens.css` — the exact case the first-match text scanner
+        // this module used to have could not follow (it would have returned
+        // the literal text `var(--hop-neutral-950)`).
+        assert_eq!(resolve("hop-bg", Palette::Dark), "#121214");
+    }
+
+    #[test]
+    fn resolves_a_multi_hop_synthetic_chain() {
+        // The real file only ever chains one `var()` deep. A synthetic table
+        // proves `resolve` actually walks a chain rather than special-casing
+        // "exactly one hop", the way `raw`/`font_token` used to have to.
+        let table = TokenTable::parse(":root { --a: var(--b); --b: var(--c); --c: 3px; }");
+        assert_eq!(resolve_from(&table, "a", Palette::Dark), "3px");
+    }
+
+    #[test]
+    #[should_panic(expected = "hop-this-token-does-not-exist")]
+    fn missing_token_panics_naming_it() {
+        resolve("hop-this-token-does-not-exist", Palette::Dark);
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle")]
+    fn var_cycle_panics_rather_than_overflowing() {
+        // A naive recursive resolver with no cycle guard would recurse `a`
+        // -> `b` -> `a` -> `b` -> ... forever and abort the whole test
+        // process with a stack overflow — which cargo would report as the
+        // entire test binary crashing, not as a clean, isolated
+        // `#[should_panic]` pass/fail for this one test. Confirmed by
+        // running this test: `cargo test -p hop-gtk --lib` completes
+        // normally and reports this test as passed, rather than the process
+        // aborting — the empirical proof that `resolve_with_path`'s
+        // path-tracking guard actually catches the cycle instead of hitting
+        // the stack limit.
+        let table = TokenTable::parse(":root { --a: var(--b); --b: var(--a); }");
+        resolve_from(&table, "a", Palette::Dark);
+    }
+
+    #[test]
+    fn light_palette_resolves_a_semantic_token_to_the_light_ramp() {
+        // `--hop-fg` is `.hop-theme-light`'s redeclaration of a name the
+        // dark `:root` already defines — the exact case the first-match
+        // scanner this module used to have could never reach, because the
+        // dark declaration always comes first in the file.
+        let dark = resolve("hop-fg", Palette::Dark);
+        let light = resolve("hop-fg", Palette::Light);
+        assert_eq!(dark, "#f4f3f1", "dark hop-fg is --hop-neutral-100");
+        assert_eq!(
+            light, "#211f1a",
+            "light hop-fg is --hop-neutral-900-light, via .hop-theme-light"
+        );
+        assert_ne!(
+            dark, light,
+            "the light palette must not resolve to the dark value"
+        );
+    }
+
+    #[test]
+    fn light_palette_falls_back_to_base_for_names_it_does_not_redeclare() {
+        // `.hop-theme-light` only redeclares the semantic layer's names, not
+        // the ramp literals they point at (`--hop-neutral-0-light` etc.),
+        // which live unconditionally in `base`. Palette::Light must still
+        // resolve a bare ramp name like `hop-icon-size` — it is not present
+        // in the light overlay at all.
+        assert_eq!(resolve("hop-icon-size", Palette::Light), "26px");
     }
 }

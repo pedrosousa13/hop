@@ -19,5 +19,7 @@ pub mod ipc;
 pub mod keymap;
 pub mod layer_shell;
 pub mod screenshot;
+pub mod style;
+pub mod stylesheet;
 pub mod tokens;
 pub mod ui;

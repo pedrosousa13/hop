@@ -15,6 +15,43 @@
 //! `#[non_exhaustive]`, so a future variant fails this file to compile
 //! rather than silently reusing some other mode's label or falling through
 //! to a placeholder nobody chose.
+//!
+//! # CSS supersedes the Pango stand-in — issue #193
+//!
+//! Until this change, [`build`] set this label's font, colour and tracking
+//! by constructing a `pango::AttrList` in Rust and calling
+//! `gtk::Label::set_attributes` with it — the module's own prior comment
+//! named that a "documented stand-in", because this crate had no
+//! `gtk::CssProvider` installed anywhere yet, so a CSS rule for
+//! `.hop-mode-label` (the class [`build`] already applied) would have had
+//! nothing to load it and would never have rendered at all.
+//!
+//! `assets/stylesheet.css` now carries that rule — see its own
+//! `.hop-mode-label` section. This module's Pango code was **removed**, not
+//! kept alongside it, and that is a deliberate call, not an oversight: GTK
+//! applies a label's own `set_attributes` `PangoAttrList` *on top of*
+//! whatever the label's CSS style resolves to, for every property that list
+//! sets (`gtk_label_set_attributes`'s own documentation: attributes are
+//! "applied and merged with any other attributes previously effected"). Kept
+//! side by side, the CSS rule would have been permanently dead — masked by
+//! the Pango attributes for every property they both set — while still
+//! being, textually, the exact same design value (the same `--hop-text-
+//! section`/`--hop-tracking-section`/`--hop-neutral-400` tokens) expressed a
+//! second time. That is precisely "a design value living in two places" in
+//! the sense this issue's own global constraint forbids, whether or not it
+//! currently renders — a CSS rule nobody will ever see take effect is not a
+//! *safer* duplicate, it is a *quieter* one.
+//!
+//! The honest cost of removing it now, disclosed rather than silently
+//! accepted: no `gtk::CssProvider` is installed by this same change (that is
+//! issue #193's own Task 3, the very next step in this plan), so between
+//! this commit landing and that one, `.hop-mode-label` renders with GTK's
+//! default label styling — no custom weight, size, family, tracking, or
+//! colour — rather than the typography it had a moment ago. That gap is
+//! temporary, scoped to this one label, and closes the moment Task 3 loads
+//! `assets/stylesheet.css` into a real provider; it was judged the smaller
+//! cost against shipping a stylesheet rule this issue's own review would
+//! have to explain away as inert on arrival.
 
 use gtk::prelude::*;
 
@@ -41,11 +78,13 @@ pub fn label_for(mode: Mode) -> &'static str {
     }
 }
 
-/// Builds the mode label widget: typography read from `--hop-text-section`
-/// (weight, size, family) and `--hop-tracking-section` (letter-spacing, D7's
-/// legibility signal), coloured with the muted `--hop-neutral-400` ramp step
-/// (see [`tokens::MODE_LABEL_RGB`]'s own doc comment for why that step).
-/// Starts absent — see [`apply`] — so a freshly built window, before any
+/// Builds the mode label widget. Its typography (weight, size, family,
+/// tracking, colour) is `assets/stylesheet.css`'s `.hop-mode-label` rule's
+/// job now, not this function's — see this module's own top doc comment,
+/// "CSS supersedes the Pango stand-in", for why the Rust-side Pango
+/// construction this function used to do was removed rather than kept
+/// alongside it. `add_css_class` below is what gives that rule something to
+/// match. Starts absent — see [`apply`] — so a freshly built window, before any
 /// `QueryRouted` frame has ever arrived, shows nothing: criterion 1's
 /// "absent entirely otherwise" covers the state that precedes the first
 /// query too, not only a later non-exclusive one.
@@ -78,7 +117,6 @@ pub fn build() -> gtk::Label {
     // Decorative with respect to input: a click meant for the entry beneath
     // it must never be intercepted by this label sitting visually on top.
     label.set_can_target(false);
-    label.set_attributes(Some(&typography_attributes()));
     apply(&label, None);
     label
 }
@@ -113,75 +151,6 @@ pub fn apply(label: &gtk::Label, shown: Option<Mode>) {
     }
 }
 
-/// Maps a CSS-scale numeric weight, as `--hop-text-section` spells it
-/// (`600`), to the [`gtk::pango::Weight`] enum `AttrInt::new_weight` wants.
-/// Every weight `assets/tokens.css`'s `TYPE SCALE` section actually uses
-/// (400, 500, 600) has a named variant here; anything else falls back to the
-/// numeric `Weight::__Unknown` — Pango's own escape hatch for a raw weight
-/// number outside its named set — rather than this function refusing to
-/// build at all over a token value this crate does not happen to consume
-/// today. Unlike [`label_for`]'s closed, wire-contract `Mode` enum, a CSS
-/// font-weight is an open numeric range by nature, so a catch-all here is
-/// the correct shape, not the gap D5 warns against for `Mode`.
-fn pango_weight(css_weight: u16) -> gtk::pango::Weight {
-    match css_weight {
-        400 => gtk::pango::Weight::Normal,
-        500 => gtk::pango::Weight::Medium,
-        600 => gtk::pango::Weight::Semibold,
-        700 => gtk::pango::Weight::Bold,
-        other => gtk::pango::Weight::__Unknown(i32::from(other)),
-    }
-}
-
-/// Converts a pixel value to the 1024-per-unit scale Pango's own attribute
-/// constructors (`AttrSize::new_size_absolute`, `AttrInt::new_letter_spacing`)
-/// measure in — `gtk::pango::SCALE` is that constant (`PANGO_SCALE`, 1024).
-/// "Absolute" size is what makes the result a device pixel count rather than
-/// a value further scaled by the display's own point-to-pixel conversion,
-/// matching CSS `font-size: <N>px`'s own meaning — the meaning
-/// `assets/tokens.css`'s `px` units are authored with throughout.
-fn px_to_pango_units(px: f64) -> i32 {
-    (px * f64::from(gtk::pango::SCALE)).round() as i32
-}
-
-/// Builds the mode label's typography as one `pango::AttrList`, read
-/// entirely from `--hop-text-section` and `--hop-tracking-section`.
-///
-/// Direct Pango attributes rather than a GTK CSS rule: this crate has no
-/// `gtk::CssProvider` installed anywhere yet — `tokens.rs`'s own doc comment
-/// records why (`tokens.css` is authored web CSS, not GTK CSS, and a real
-/// stylesheet pass that hardcodes literal values out of it is explicitly
-/// named as future work, not this issue's to start). Applying the parsed
-/// values directly as Pango attributes gets every value from its token
-/// (criterion 4) without taking on that larger, separately-scoped decision
-/// here.
-fn typography_attributes() -> gtk::pango::AttrList {
-    let font = &*tokens::MODE_LABEL_FONT;
-    let list = gtk::pango::AttrList::new();
-
-    list.insert(gtk::pango::AttrString::new_family(font.family));
-    list.insert(gtk::pango::AttrInt::new_weight(pango_weight(font.weight)));
-    list.insert(gtk::pango::AttrSize::new_size_absolute(px_to_pango_units(
-        font.size_px,
-    )));
-
-    // Letter-spacing is `em`, relative to this same token's own font size —
-    // see `tokens::MODE_LABEL_TRACKING_EM`'s doc comment for the pairing.
-    let tracking_px = *tokens::MODE_LABEL_TRACKING_EM * font.size_px;
-    list.insert(gtk::pango::AttrInt::new_letter_spacing(px_to_pango_units(
-        tracking_px,
-    )));
-
-    let (r, g, b) = *tokens::MODE_LABEL_RGB;
-    list.insert(gtk::pango::AttrColor::new_foreground(
-        tokens::widen_channel(r),
-        tokens::widen_channel(g),
-        tokens::widen_channel(b),
-    ));
-
-    list
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,27 +172,5 @@ mod tests {
         assert_eq!(label_for(Mode::Weather), "Weather");
         assert_eq!(label_for(Mode::Actions), "Actions");
         assert_eq!(label_for(Mode::WebSearch), "Web Search");
-    }
-
-    #[test]
-    fn pango_weight_maps_the_type_scales_own_weights() {
-        assert_eq!(pango_weight(400), gtk::pango::Weight::Normal);
-        assert_eq!(pango_weight(500), gtk::pango::Weight::Medium);
-        assert_eq!(pango_weight(600), gtk::pango::Weight::Semibold);
-    }
-
-    #[test]
-    fn pango_weight_falls_back_to_the_raw_number_off_the_known_set() {
-        assert_eq!(
-            pango_weight(350),
-            gtk::pango::Weight::__Unknown(350),
-            "an unrecognized CSS weight must still produce a usable Pango weight"
-        );
-    }
-
-    #[test]
-    fn px_to_pango_units_scales_by_pango_scale() {
-        assert_eq!(px_to_pango_units(11.0), 11 * gtk::pango::SCALE);
-        assert_eq!(px_to_pango_units(0.0), 0);
     }
 }
