@@ -53,8 +53,12 @@ a future revision of `assets/tokens.css` could rename or restructure what
 backs them without changing this contract. As implemented today, in that
 file's honesty-critical members block:
 
-- presence — `.hop-honesty { visibility: visible }`, and `display: flex` on
-  `.hop-honesty--row`, `.hop-honesty--error`, `.hop-honesty--offline`
+- presence — not a CSS declaration: GTK's CSS parser has no `display` and no
+  `visibility` property. A widget's on-screen presence is a widget property
+  (`gtk_widget_set_visible`), not a style one, so no stylesheet — hop's own
+  included, and no user theme either — can hide or reveal a widget through
+  CSS. That makes the guarantee *stronger* than a locked CSS property: there
+  is no property left for a hostile theme to contest.
 - opacity — `.hop-honesty { opacity: 1 }`
 - dimensions — the locked `min-width`/`min-height` on
   `.hop-honesty .hop-skeleton`
@@ -62,11 +66,12 @@ file's honesty-critical members block:
   `.hop-honesty .hop-honesty-text`; `--hop-fg-2` and `--hop-text-timestamp`
   on `.hop-honesty .hop-honesty-stamp`
 
-Presence, opacity, and dimensions are fixed declarations rather than
-overridable custom properties — that absence of a token is deliberate, since
-none of the three may ever become theme-swappable. Contrast is the one
-guarantee carried by named tokens, because legibility rides on the same color
-and type-scale tokens the rest of the surface uses.
+Opacity and dimensions are fixed declarations rather than overridable custom
+properties — that absence of a token is deliberate, since neither may ever
+become theme-swappable. Presence is not a declaration to begin with, fixed or
+otherwise, for the reason given above. Contrast is the one guarantee carried
+by named tokens, because legibility rides on the same color and type-scale
+tokens the rest of the surface uses.
 
 When a requested theme style would hide a member, make it imperceptible,
 collapse it below perceivable dimensions, or make it illegible through
