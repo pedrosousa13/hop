@@ -166,23 +166,39 @@ listview {
    the wrapper GTK itself creates, not that inner Box.
 
    A resting row is deliberately painted the *same* colour as the window
-   ground (`{{hop-bg}}`, not a distinct "row surface" literal), for a real
-   reason, not a shortcut: `tokens.css`'s own SEMANTIC LAYER never promotes
-   `--hop-neutral-900` (its own ramp comment: "row surface") to a
-   palette-aware alias the way it does `--hop-bg` (window bg) and
-   `--hop-bg-hover` (row hover) — only those two rows of the ramp made it
-   into the semantic layer `.hop-theme-light` actually overlays. Referencing
-   `--hop-neutral-900` directly here would silently break under the light
-   palette: that name lives only in the *dark* ramp's unconditional `:root`
-   block, so `Palette::Light` would still resolve it to the dark literal
-   (`#18181c`) sitting under a light window ground — a floating dark tile
-   this file has no honest token to avoid without inventing one `tokens.css`
-   does not have (re-opening the token table is this issue's own explicit
-   out-of-scope). Using `{{hop-bg}}` for the resting state is the reading
-   that is actually correct under both palettes with the tokens that exist
-   today: a row starts flush with the window and only distinguishes itself
-   on hover, via `--hop-bg-hover` — the one row-specific token the semantic
-   layer *does* promote.
+   ground (`{{hop-bg}}`, not a distinct "row surface" literal). This is the
+   v1 design decision, ruled on in issue #204: a resting row is flush with
+   the window and distinguishes itself only on `:hover` (`{{hop-bg-hover}}`,
+   below) and on selection (`{{hop-sel-fill}}`, `.hop-selection-indicator`
+   further down) — not a stopgap standing in for a surface still owed. No
+   row-surface alias is promoted into `tokens.css`'s SEMANTIC LAYER, no
+   light-palette row value is invented, and none of that is left to do:
+   #204 closes the question of whether a resting row should read as its own
+   surface, and settles it "no." `--hop-neutral-900` keeps its ramp slot —
+   see that token's own annotation in `tokens.css` for why an interior ramp
+   step stays even with no rule consuming it.
+
+   #193, which first shipped this rule, reached the same `{{hop-bg}}` value
+   but recorded it as forced rather than chosen: the ramp's own comments
+   called `--hop-neutral-950` "window background" and `--hop-neutral-900`
+   "row surface" as if the two were always meant to diverge, and #193's own
+   out-of-scope ("re-opening any token value or the §8a direction") meant
+   it could paint the row no other way without making a design call that
+   was not #193's to make. #204 is that design call, made deliberately: the
+   ramp's naming predates the ruling and does not override it.
+
+   The one part of #193's account that outlives it, kept here because two
+   later rules still cite it as their own precedent for the same trap
+   (`.hop-row-hint-label`/`.hop-row-hint-key`'s comment on
+   `--hop-hint-accent`, and `.hop-mode-label`'s on `--hop-fg-3`, both
+   further down): `--hop-neutral-900` lives only in the *dark* ramp's
+   unconditional `:root` block, so a rule naming it directly would resolve
+   to the dark literal `#18181c` under `Palette::Light` too — a floating
+   dark tile under a light window ground, because `.hop-theme-light` only
+   overlays the SEMANTIC LAYER's own aliases, never a bare ramp name. That
+   trap is why `{{hop-bg}}` — a promoted alias — is the only *correct*
+   spelling here even setting the v1 ruling aside; it is no longer the
+   *reason* the rule reads this way.
    ============================================================ */
 listview > row {
   background-color: {{hop-bg}};
