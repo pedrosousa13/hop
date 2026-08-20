@@ -2,6 +2,16 @@
 //! `Node` enum, the `gtk::Stack`-based dispatch container `setup` builds,
 //! and the `bind`/`unbind` functions that select and populate its pages.
 //!
+//! Issue #190 extended this file's single `#[test]` with the icon coverage
+//! its own brief asks for: both `IconSpec` arms, each arm's failure path,
+//! `icon: None`'s blank slot, and the row's layout holding fixed across
+//! every one of those — see the "--- issue #190" section inside
+//! [`run_assertions`] below for all of it, structured as one long sequence
+//! of binds against the *same* slot so every assertion in that section also
+//! keeps re-proving recycling (acceptance criterion 5): no bind in the
+//! whole sequence ever gets a different widget instance than the one
+//! before it.
+//!
 //! This is a different proof than `tests/headless_smoke.rs`'s: that test
 //! captures a rendered PNG and diffs two frames, which can show a title
 //! painted on screen but cannot show *which widget instance* is on screen,
@@ -44,9 +54,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use gtk::prelude::*;
+use gtk::{gdk, glib};
 
+use hop_gtk::tokens;
+use hop_gtk::ui::row;
 use hop_gtk::ui::view::{self, Node};
-use hop_protocol::{Action, ActionId, ActionKind, Item, ItemId, ItemTitle, Kind};
+use hop_protocol::{
+    Action, ActionId, ActionKind, IconName, IconPath, IconSpec, Item, ItemId, ItemTitle, Kind,
+};
 
 /// Set on the re-exec'd child so it knows to run [`run_assertions`]
 /// in-process instead of spawning a second child — see this file's module
@@ -198,9 +213,12 @@ fn run_assertions() {
     let widget_after_first_bind = stack
         .visible_child()
         .expect("a page must be the stack's visible child once bind has run");
-    let label_after_first_bind = widget_after_first_bind
-        .downcast_ref::<gtk::Label>()
-        .expect("the Row page's widget is the label ui/row.rs builds");
+    let container_after_first_bind = widget_after_first_bind
+        .downcast_ref::<gtk::Box>()
+        .expect("the Row page's widget is the gtk::Box ui/row.rs builds")
+        .clone();
+    let label_after_first_bind = row::title_widget(&container_after_first_bind)
+        .expect("build must give the row a named title label");
     assert_eq!(
         label_after_first_bind.text(),
         item_a.title.as_str(),
@@ -216,11 +234,15 @@ fn run_assertions() {
         "recycling: binding a slot to a second item must reuse the same widget instance, \
          never destroy and rebuild it — acceptance criterion 5"
     );
-    let label_after_second_bind = widget_after_second_bind
-        .downcast_ref::<gtk::Label>()
-        .unwrap();
     assert_eq!(
-        label_after_second_bind.text(),
+        row::title_widget(&container_after_first_bind),
+        Some(label_after_first_bind.clone()),
+        "recycling must hold for the title label too: still the exact same gtk::Label \
+         instance after a second bind, not a fresh one built by find_named_child returning a \
+         different widget"
+    );
+    assert_eq!(
+        label_after_first_bind.text(),
         item_b.title.as_str(),
         "the same recycled label must now show the second item's title"
     );
@@ -237,13 +259,313 @@ fn run_assertions() {
     // do to stand in for that handler's own call.
     view::unbind(&stack, &Node::for_item(item_b.clone()));
     assert_eq!(
-        label_after_second_bind.text(),
+        label_after_first_bind.text(),
         "",
         "unbind must clear the row's text, exactly as ui/row.rs's connect_unbind did before \
          this refactor"
     );
 
     println!("view-tree dispatch and recycling assertions passed");
+
+    // --- issue #190: the icon slot. Everything below reuses the exact same
+    // `stack`/slot the assertions above already bound twice and unbound
+    // once, so every assertion in this section is also, incidentally,
+    // another round of the same recycling proof: if any bind below ever
+    // got a fresh widget instead of the one `setup` built once, the
+    // `container` identity assertion at the top of this section would
+    // catch it before any of the icon-specific assertions below even run.
+    let container = stack
+        .visible_child()
+        .and_then(|w| w.downcast::<gtk::Box>().ok())
+        .expect("the Row page's widget is still the same gtk::Box after the section above");
+    assert_eq!(
+        container, container_after_first_bind,
+        "the icon-slot assertions below must run against the exact same recycled row widget \
+         the title assertions above just proved recycling holds for"
+    );
+    let icon = row::icon_widget(&container).expect("build must give the row a named icon image");
+
+    // The row's reserved layout, captured once with no icon bound at all
+    // (item_a carries `icon: None`) and asserted unchanged after every
+    // subsequent case below. `measure`'s `natural` component is what a
+    // real `GtkBox`/`GtkStack` parent actually allocates from — unlike the
+    // `height_request`/`width_request` property getters, which only ever
+    // echo back whatever was last poked at the widget and would keep
+    // reporting the old value even if some future change made the widget
+    // *ignore* its own request. A regression that let, say, a large
+    // decoded texture grow the icon past its reserved size, or let
+    // `resolve_icon` fail to reserve space for a cleared icon, would move
+    // one of these three numbers — that is what makes this assertion one
+    // that actually fails on a layout shift rather than one that could
+    // pass by construction.
+    view::bind(&stack, &Node::for_item(item_a.clone()));
+    let baseline_layout = row_layout(&container, &icon);
+    assert_eq!(
+        baseline_layout,
+        (
+            *tokens::ROW_HEIGHT_PX,
+            *tokens::ICON_SIZE_PX,
+            *tokens::ICON_SIZE_PX
+        ),
+        "the row and icon slot must be reserved at exactly the tokens.css sizes with no icon \
+         bound at all"
+    );
+
+    // `IconSpec::Name`, a name the Adwaita theme installed in this test's
+    // environment does have (`/usr/share/icons/Adwaita/scalable/places/folder.svg`).
+    // `ui::row::resolve_icon` hands this straight to
+    // `gtk::Image::set_icon_name` and does nothing else, so what is
+    // checked here is that pass-through: the image's storage type becomes
+    // `IconName` and its `icon-name` property is exactly the name given.
+    let folder_item = item_with_icon(
+        5,
+        "has a real icon name",
+        IconSpec::Name(icon_name("folder")),
+    );
+    view::bind(&stack, &Node::for_item(folder_item.clone()));
+    assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
+    assert_eq!(icon.icon_name().as_deref(), Some("folder"));
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "a resolved icon-name must not change the row's reserved layout"
+    );
+
+    // `IconSpec::Name`, a name this environment's theme does *not* have.
+    // `resolve_icon`'s brief is explicit that this arm does not
+    // special-case a lookup miss — it sets the same property the `folder`
+    // case above does and trusts GTK's own icon-name rendering to fall
+    // back to `image-missing` on its own. That fallback is verified here
+    // directly against the same `gtk::IconTheme` GTK's own icon-name
+    // rendering path consults (`GtkIconTheme::lookup_icon`, the same
+    // lookup a `gtk::Image` showing an icon-name performs internally to
+    // paint itself): looking up this exact name comes back with an
+    // `IconPaintable` whose own `icon-name` is `image-missing`, which is
+    // precisely GTK's documented "none of the given icon names were
+    // found" behavior.
+    let missing_name = "hop-test-icon-the-adwaita-theme-does-not-ship";
+    let display = gdk::Display::default().expect("a broadway display must be open by this point");
+    let theme = gtk::IconTheme::for_display(&display);
+    assert!(
+        !theme.has_icon(missing_name),
+        "test bug: {missing_name} must not actually exist in this environment's icon theme, or \
+         this test proves nothing about the lookup-miss path"
+    );
+    let missing_name_item = item_with_icon(
+        6,
+        "name the theme lacks",
+        IconSpec::Name(icon_name(missing_name)),
+    );
+    view::bind(&stack, &Node::for_item(missing_name_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
+    assert_eq!(
+        icon.icon_name().as_deref(),
+        Some(missing_name),
+        "resolve_icon's Name arm must pass the name through unchanged, not try to detect the \
+         miss itself — GTK's own rendering is what falls back, per this issue's brief"
+    );
+    let looked_up = theme.lookup_icon(
+        missing_name,
+        &[],
+        *tokens::ICON_SIZE_PX,
+        1,
+        gtk::TextDirection::Ltr,
+        gtk::IconLookupFlags::empty(),
+    );
+    assert_eq!(
+        looked_up.icon_name().as_deref(),
+        Some(std::path::Path::new("image-missing")),
+        "GTK's own icon-name resolution for a name the theme lacks must be the image-missing \
+         fallback — the desired behavior this issue's brief names explicitly"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "a theme miss must not change the row's reserved layout either"
+    );
+
+    // `IconSpec::Path`, a real, decodable image file written to a
+    // `tempfile` directory and opened through
+    // `IconPath::open_regular_file` — the one opener this crate is allowed
+    // to use, per this crate's global constraint. `TINY_PNG` is a valid,
+    // minimal 1x1 PNG, so `load_path_texture` inside `resolve_icon` should
+    // reach its success path: a decoded `gdk::Texture` set as the image's
+    // paintable.
+    let icon_dir = tempfile::tempdir().expect("failed to create a tempdir for a test icon file");
+    let real_icon_path = icon_dir.path().join("icon.png");
+    std::fs::write(&real_icon_path, TINY_PNG).expect("failed to write the test icon file");
+    let path_item = item_with_icon(
+        7,
+        "has a real icon file",
+        IconSpec::Path(icon_path(&real_icon_path)),
+    );
+    view::bind(&stack, &Node::for_item(path_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::Paintable);
+    assert!(
+        icon.paintable().is_some(),
+        "a decoded icon file must be set as the image's paintable"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "a resolved icon file must not change the row's reserved layout, even though the \
+         decoded texture's own intrinsic size (1x1) has nothing to do with the reserved size"
+    );
+
+    // `IconSpec::Path` pointing at a directory: `open_regular_file` refuses
+    // to hand back a file at all (`IconOpenError::NotARegularFile`), which
+    // is the "the open refused" failure this issue's brief names. `bind`
+    // must set `image-missing` explicitly here — unlike the `Name` miss
+    // case above, nothing about GTK's own rendering does this for a
+    // `Paintable`-storage image, so `resolve_icon` has to do it itself.
+    let dir_item = item_with_icon(
+        8,
+        "path is a directory",
+        IconSpec::Path(icon_path(icon_dir.path())),
+    );
+    view::bind(&stack, &Node::for_item(dir_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
+    assert_eq!(icon.icon_name().as_deref(), Some("image-missing"));
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "an open failure must not change the row's reserved layout"
+    );
+
+    // `IconSpec::Path` pointing at a real, regular file whose bytes do not
+    // decode as any image format `gdk::Texture::from_bytes` understands —
+    // the "the bytes did not decode" failure this issue's brief names,
+    // distinct from the directory case above (that one never gets past
+    // `open_regular_file` at all). Must land on the same `image-missing`
+    // outcome.
+    let garbage_path = icon_dir.path().join("not-an-image.bin");
+    std::fs::write(&garbage_path, b"this is not image data")
+        .expect("failed to write the garbage test file");
+    let garbage_item = item_with_icon(
+        9,
+        "path decodes to nothing",
+        IconSpec::Path(icon_path(&garbage_path)),
+    );
+    view::bind(&stack, &Node::for_item(garbage_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
+    assert_eq!(icon.icon_name().as_deref(), Some("image-missing"));
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "a decode failure must not change the row's reserved layout"
+    );
+
+    // Rebinding the same slot to `icon: None`, right after it held a
+    // resolved icon (the garbage-path bind just above still shows
+    // `image-missing`, which is itself an icon-name being displayed) — the
+    // brief's own recycling requirement: "a row bound to an item with an
+    // icon then rebound to `icon: None` shows no leftover icon." `Empty`
+    // is `gtk::Image`'s own "nothing is set" storage type, distinct from
+    // both `IconName` (even the `image-missing` case above) and
+    // `Paintable`, so this is the assertion that would fail if `clear()`
+    // were ever dropped from `resolve_icon`'s `None` arm and the previous
+    // bind's icon silently kept showing.
+    let blank_item = item_with_icon_none(10, "icon removed on rebind");
+    view::bind(&stack, &Node::for_item(blank_item));
+    assert_eq!(
+        icon.storage_type(),
+        gtk::ImageType::Empty,
+        "rebinding to icon: None must leave no leftover icon from the previous bind"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "clearing the icon back to blank must not change the row's reserved layout"
+    );
+
+    // `unbind`'s own symmetry: it must clear the icon exactly as it clears
+    // the title, so a recycled row about to be rebound to a *different*
+    // node type someday would not carry this row's icon forward by
+    // accident. Rebind to an item with a real icon first so there is
+    // something for `unbind` to actually clear.
+    view::bind(&stack, &Node::for_item(folder_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
+    view::unbind(&stack, &Node::for_item(folder_item_for_unbind()));
+    assert_eq!(
+        icon.storage_type(),
+        gtk::ImageType::Empty,
+        "unbind must clear the icon, symmetrically with the title it already clears"
+    );
+
+    println!("row icon assertions passed");
+}
+
+/// The row's reserved layout: the container's own measured height, and the
+/// icon's own measured width and height — all three read through
+/// `gtk::Widget::measure`'s `natural` component. See the comment at this
+/// function's one call site (inside [`run_assertions`]) for why `measure`
+/// rather than the `height_request`/`width_request` property getters.
+fn row_layout(container: &gtk::Box, icon: &gtk::Image) -> (i32, i32, i32) {
+    let (_, container_height, _, _) = container.measure(gtk::Orientation::Vertical, -1);
+    let (_, icon_width, _, _) = icon.measure(gtk::Orientation::Horizontal, -1);
+    let (_, icon_height, _, _) = icon.measure(gtk::Orientation::Vertical, -1);
+    (container_height, icon_width, icon_height)
+}
+
+/// A tiny, valid 1x1 transparent PNG (the shortest well-formed PNG there
+/// is) — decoded directly against `gdk::Texture::from_bytes` while writing
+/// this file, to confirm the "resolves" half of the `Path` arm's coverage
+/// exercises a real decode rather than a format this format-agnostic
+/// decoder happens to reject.
+const TINY_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0,
+    0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5, 1, 1,
+    39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+/// Builds an [`IconName`] from a plain `&str`, panicking on a value that
+/// would break one of that type's own rules — every name this file passes
+/// in is a short, ASCII, control-free literal, so a failure here is a bug
+/// in the test, not a case worth a `Result`.
+fn icon_name(name: &str) -> IconName {
+    IconName::new(name).expect("test icon name must pass IconName's own rules")
+}
+
+/// Builds an [`IconPath`] from a filesystem `path`, panicking the same way
+/// [`icon_name`] does — every path this file passes in comes from a
+/// `tempfile` directory, which is always absolute.
+fn icon_path(path: &std::path::Path) -> IconPath {
+    IconPath::new(
+        path.to_str()
+            .expect("tempfile paths on this platform are valid UTF-8")
+            .to_string(),
+    )
+    .expect("test icon path must pass IconPath's own rules")
+}
+
+/// A tiny [`Item`] carrying `spec` as its icon.
+fn item_with_icon(n: usize, title: &str, spec: IconSpec) -> Item {
+    let mut item = test_item(n, title);
+    item.icon = Some(spec);
+    item
+}
+
+/// A tiny [`Item`] with `icon` left `None` — spelled out as its own
+/// function (rather than a bare `test_item(n, title)` call) only so every
+/// binding site in the icon section above reads the same way: one call,
+/// one icon state, named.
+fn item_with_icon_none(n: usize, title: &str) -> Item {
+    test_item(n, title)
+}
+
+/// The exact item [`run_assertions`]'s `unbind` call at the end of the icon
+/// section stands in for — the same shape `item_b.clone()` plays for the
+/// title's own `unbind` assertion earlier in that function: a real
+/// `connect_unbind` handler would read `list_item.item()` and get back
+/// whatever was most recently bound, and this file has no live
+/// `gtk::ListItem` bound to a real list to read that back out of, so it
+/// rebuilds the same item by hand instead.
+fn folder_item_for_unbind() -> Item {
+    item_with_icon(
+        5,
+        "has a real icon name",
+        IconSpec::Name(icon_name("folder")),
+    )
 }
 
 /// A tiny [`Item`]; `n` differentiates ids so a future assertion could tell
