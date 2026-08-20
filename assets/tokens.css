@@ -237,9 +237,9 @@
    the same lie as hiding it. Dimensions are locked, not just
    opacity. These are bare literals, not `--name` tokens, on purpose:
    docs/theme-token-contract.md's "Locked guarantees" section requires
-   presence, opacity, and dimensions to be "fixed declarations rather
-   than overridable custom properties" for exactly this reason — none
-   of the three may ever become theme-swappable. An earlier revision
+   opacity and dimensions to be "fixed declarations rather than
+   overridable custom properties" for exactly this reason — neither
+   may ever become theme-swappable. An earlier revision
    named these two as `--hop-skeleton-min-w`/`-h` custom properties in
    the `:root` block above; that was reverted (issue #193 Task 3
    re-review) because a named, `:root`-declared property reads to a

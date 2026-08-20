@@ -431,10 +431,10 @@ listview > row:hover {
    comment before "fixing" these two lines back into a `{{...}}` placeholder.
 
    `docs/theme-token-contract.md`'s "Locked guarantees" section is
-   normative and says, verbatim: "Presence, opacity, and dimensions are
-   fixed declarations rather than overridable custom properties — that
-   absence of a token is deliberate, since none of the three may ever
-   become theme-swappable." Dimensions is one of the three; this rule's
+   normative and says, verbatim: "Opacity and dimensions are fixed
+   declarations rather than overridable custom properties — that absence
+   of a token is deliberate, since neither may ever become
+   theme-swappable." Dimensions is one of the two; this rule's
    `min-width`/`min-height` *are* that category, for exactly the skeleton
    bar the contract's own worked example names ("the locked min-width/
    min-height on `.hop-honesty .hop-skeleton`"). A named custom property in
