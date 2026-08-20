@@ -50,8 +50,12 @@ Hop owns the properties that carry the truthfulness guarantee for every
 
 The contract locks these property categories, not concrete token identifiers:
 a future revision of `assets/tokens.css` could rename or restructure what
-backs them without changing this contract. As implemented today, in that
-file's honesty-critical members block:
+backs them without changing this contract. As implemented today, in
+`assets/stylesheet.css`'s honesty-critical members block — the file GTK
+loads. `assets/tokens.css` carries its own, only partly overlapping block,
+inert: no `gtk::CssProvider` ever parses it, and it still declares the
+`display` and `visibility` that `stylesheet.css` deliberately omits because
+GTK supports neither:
 
 - presence — not a CSS declaration: GTK's CSS parser has no `display` and no
   `visibility` property. A widget's on-screen presence is a widget property
