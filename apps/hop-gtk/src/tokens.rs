@@ -486,12 +486,14 @@ pub struct FontToken {
 /// Parses a `--hop-text-*` type-scale token into a [`FontToken`]. Resolved
 /// against [`Palette::Dark`] unconditionally, with no palette parameter of
 /// its own — palette-invariant for the same reason [`px_token`]'s doc
-/// comment gives: `.hop-theme-light` redeclares exactly 11 names (the
-/// SEMANTIC LAYER's `--hop-bg`/`--hop-fg`/etc.), and every `--hop-text-*`
-/// token lives only in the first, unconditional `:root` block alongside the
-/// `--hop-tracking-*` and `--hop-font-*` tokens it references — none of the
-/// three families is among those 11, so there is no light-palette
-/// declaration for `resolve` to ever prefer over the dark one here.
+/// comment gives: `.hop-theme-light` redeclares exactly 12 names (the
+/// SEMANTIC LAYER's `--hop-bg`/`--hop-fg`/`--hop-hint-accent`/etc. — the
+/// 12th, `--hop-hint-accent`, added by issue #214), and every
+/// `--hop-text-*` token lives only in the first, unconditional `:root`
+/// block alongside the `--hop-tracking-*` and `--hop-font-*` tokens it
+/// references — none of the three families is among those 12, so there is
+/// no light-palette declaration for `resolve` to ever prefer over the dark
+/// one here.
 fn font_token(name: &str) -> FontToken {
     let raw = raw(name, Palette::Dark);
     let expected = "`<weight> <N>px/<N>px var(--hop-font-*)`";
@@ -551,7 +553,7 @@ fn font_token(name: &str) -> FontToken {
 /// unconditionally, palette-invariant for the same reason
 /// [`font_token`]'s doc comment gives: every `--hop-tracking-*` name lives
 /// only in the first, unconditional `:root` block, not among
-/// `.hop-theme-light`'s 11 redeclared names.
+/// `.hop-theme-light`'s 12 redeclared names.
 fn em_token(name: &str) -> f64 {
     resolve(name, Palette::Dark)
         .strip_suffix("em")
@@ -568,14 +570,24 @@ pub static MODE_LABEL_FONT: LazyLock<FontToken> = LazyLock::new(|| font_token("h
 pub static MODE_LABEL_TRACKING_EM: LazyLock<f64> =
     LazyLock::new(|| em_token("hop-tracking-section"));
 
-/// `--hop-neutral-400`, the mode label's text colour: the same muted,
-/// path/timestamp-tier ramp step tokens.css already uses for small
-/// informational text, rather than the primary `--hop-fg`/`--hop-fg-2` that
-/// query text and titles get. 5.77:1 against the dark window ground — the M3
-/// visual spec's accessibility floor holds "Path, timestamp, muted text" to
-/// 4.5:1, and the mode label is real content a screen reader announces
-/// (criterion 6), not decoration, so it is held to that bar rather than the
-/// lower 3:1 "dimmed hint text" one a merely decorative label could use.
+/// `--hop-neutral-400`: the same muted, path/timestamp-tier ramp step
+/// tokens.css already uses for small informational text, rather than the
+/// primary `--hop-fg`/`--hop-fg-2` that query text and titles get. 5.77:1
+/// against the dark window ground — the M3 visual spec's accessibility
+/// floor holds "Path, timestamp, muted text" to 4.5:1, and the mode label
+/// is real content a screen reader announces (criterion 6), not decoration,
+/// so it is held to that bar rather than the lower 3:1 "dimmed hint text"
+/// one a merely decorative label could use.
+///
+/// `.hop-mode-label`'s own CSS rule no longer reads this ramp step by this
+/// raw name directly — issue #214 repointed it at `--hop-fg-3`, the
+/// semantic alias `.hop-theme-light` overlays with the light ramp's
+/// equivalent step, so the label actually varies by palette. This static
+/// still reads `--hop-neutral-400` here, which resolves to the identical
+/// dark-palette value `--hop-fg-3` does (`--hop-fg-3` is defined as
+/// `var(--hop-neutral-400)` under the dark palette), so the ramp step this
+/// doc comment justifies is unchanged; only its own regression test below
+/// still calls this static.
 pub static MODE_LABEL_RGB: LazyLock<(u8, u8, u8)> = LazyLock::new(|| hex_token("hop-neutral-400"));
 
 /// `--hop-space-3`, in pixels: the mode label's margin from the query field's
