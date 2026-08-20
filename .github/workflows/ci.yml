@@ -39,8 +39,19 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev libgtk-4-bin libadwaita-1-dev
 
+      # Pinned to the exact version `rust-toolchain.toml` pins, not left on
+      # `@stable`: an unpinned action would install whatever is newest that
+      # day, and if that ever drifted from the version this repo's own
+      # `rust-toolchain.toml` names, `cargo` would silently auto-install a
+      # *second* toolchain to honour the override file (rustup resolves that
+      # file ahead of whatever this step's `rustup default` sets — see the
+      # comment there for how that was verified) instead of using the one
+      # this step just installed. Keeping both pins equal is what makes this
+      # step's install actually the one that runs, rather than a wasted
+      # download. See `rust-toolchain.toml` for why 1.98.0 specifically is
+      # pinned rather than floating (issue #223).
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
 
@@ -131,8 +142,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same version pin as `ci`'s toolchain step, for the same reason: see
+      # the comment there and in `rust-toolchain.toml` (issue #223). This
+      # step's own component list is untouched by the pin.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
 

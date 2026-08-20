@@ -1334,7 +1334,18 @@ fn decode_hex_tag(value: &str) -> Option<[u8; INTEGRITY_TAG_BYTES]> {
         return None;
     }
     let mut decoded = [0_u8; INTEGRITY_TAG_BYTES];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    // `as_chunks::<2>()` splits into a slice of `[u8; 2]` pairs plus a
+    // remainder `&[u8]` of the bytes left over (length < 2) — unlike the
+    // `chunks_exact(2)` this replaced, it does not drop that remainder
+    // implicitly; it hands it back for the caller to account for. Discarding
+    // it here (`.0` takes only the chunks) is safe, not an oversight:
+    // `INTEGRITY_TAG_HEX_BYTES` is defined as
+    // `INTEGRITY_TAG_BYTES * 2`, so it is even by construction, and the
+    // length check just above rejects every `value` except one of exactly
+    // that length. A slice with an even length splits into `[u8; 2]` chunks
+    // with zero bytes left over, so the remainder here is always empty and
+    // `.1` has nothing this loop needs.
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = char::from(pair[0]).to_digit(16)? as u8;
         let low = char::from(pair[1]).to_digit(16)? as u8;
         decoded[index] = (high << 4) | low;
