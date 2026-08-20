@@ -131,6 +131,9 @@
   --hop-window-max-h-ratio: 0.8;
   --hop-row-h:               56px;
   --hop-query-h:             56px;
+  /* Row anatomy per the M3 visual spec: 26px icon · title · subtitle ·
+     right-aligned action hint, inside the 56px --hop-row-h above. */
+  --hop-icon-size:           26px;
 
   /* ==========================================================
      MOTION
