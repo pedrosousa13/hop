@@ -178,9 +178,10 @@ listview > row:hover {
    the two are typographically distinct — proportional for the label,
    mono for the key glyph, matching `.hop-row-subtitle`'s proportional
    `--hop-text-subtitle` above and giving the key glyph the same "this is
-   machine text" mono treatment tokens.css's TYPE SCALE comment reserves
-   for "what you typed, what was computed, where a file lives" — a key
-   binding is exactly that.
+   machine text" mono treatment tokens.css's TYPE SCALE comment reserves —
+   that comment now names "what key runs the selected action" as one of
+   the four things mono is for, so the key glyph isn't argued into the
+   reservation by analogy, it's what the reservation names.
 
    Both chips share one surface (`--hop-bg-hover`, the one semantic "raised
    off the row" token this file already trusts under both palettes — see
