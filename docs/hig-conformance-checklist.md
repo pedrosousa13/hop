@@ -545,24 +545,31 @@ surfaces genuinely tracing to their tokens, not stock Adwaita, confirmed
 against a live capture rather than assumed from the stylesheet's text alone.
 
 But "a provider now exists" is not "every themeable surface passes", and
-this pass's own captures surface several concrete surfaces that still fall
-back to an un-tokenized Adwaita default, each checked against this item's own
-pass condition rather than waved through on the provider's existence:
+this pass's own captures surfaced several concrete surfaces that fell back to
+an un-tokenized Adwaita default, each checked against this item's own pass
+condition rather than waved through on the provider's existence. One of them
+— the window/listview base background, immediately below — has since been
+closed by issue #215; the rest remain stock:
 
-- **Most of the window, in the state a user sees most often.** An
-  empty-query capture (`--screenshot out.png`, no `--query`) shows almost the
-  entire window body — everywhere the `gtk::ListView` widget's own base CSS
-  node is visible, not covered by an actual `row` child — filled with a flat
-  `rgb(30, 30, 30)`, sampled consistently across a wide area (bottom-left,
-  bottom-right, and directly below the last real row in the results
-  capture). That value matches neither `--hop-bg` (`#121214` = `rgb(18, 18,
-  20)`) nor `--hop-bg-hover` (`#202024` = `rgb(32, 32, 36)`) — it reads as
-  libadwaita's own stock dark `window`/`view` background, showing through
-  because `assets/stylesheet.css` styles `window.background` and
-  `listview > row` but never the `listview` node itself, so any area the
-  list view owns but no realized row covers still paints Adwaita's default.
-  Since the empty-query state is the window's default, most-often-seen
-  state, this is not a cosmetic corner case.
+- **Most of the window, in the state a user sees most often — closed by
+  issue #215.** An empty-query capture (`--screenshot out.png`, no
+  `--query`) originally showed almost the entire window body — everywhere
+  the `gtk::ListView` widget's own base CSS node is visible, not covered by
+  an actual `row` child — filled with a flat `rgb(30, 30, 30)`, sampled
+  consistently across a wide area (bottom-left, bottom-right, and directly
+  below the last real row in the results capture). That value matched
+  neither `--hop-bg` (`#121214` = `rgb(18, 18, 20)`) nor `--hop-bg-hover`
+  (`#202024` = `rgb(32, 32, 36)`) — it read as libadwaita's own stock dark
+  `window`/`view` background, showing through because `assets/stylesheet.css`
+  styled `window.background` and `listview > row` but never the `listview`
+  node itself, so any area the list view owns but no realized row covers
+  still painted Adwaita's default. Since the empty-query state is the
+  window's default, most-often-seen state, this was not a cosmetic corner
+  case. Issue #215 closed it: `assets/stylesheet.css` now also declares
+  `listview { background-color: {{hop-bg}}; }`, resolved against the same
+  window-ground token `window.background` above already paints, confirmed
+  red/green with a live capture — the same area now samples `rgb(18, 18,
+  20)`, matching `--hop-bg` exactly, not libadwaita's stock default.
 - **The query entry.** The zoomed capture (item 1's `--query code` PNG)
   shows the entry's background as `rgb(40, 40, 42)` — a fourth colour,
   matching none of `--hop-bg`/`--hop-bg-hover`/`--hop-fg` — and its focus
@@ -603,10 +610,12 @@ full typography (weight/size/family/tracking/colour, all now via
 `.hop-mode-label`'s CSS rule rather than the removed Pango stand-in — see
 item 2c) do trace to tokens, confirmed by source and, where a live example
 existed to capture, by pixel sampling. The gaps above are named as what they
-are: real and specific, not a residue of "no provider yet." Worth a
-follow-up issue for the window/listview background gap in particular, since
-it dominates the most commonly seen state; not filed here per this pass's
-own scope.
+are: real and specific, not a residue of "no provider yet." The window/listview
+background gap dominated the most commonly seen state and was, as this pass
+suggested, worth a follow-up issue; that follow-up was filed and closed as
+issue #215 (see above). The query entry, the row title's typography, the
+window's own shape, and font family remain open, not filed here per this
+pass's own scope.
 
 ---
 
@@ -687,7 +696,7 @@ environment.
 | 3 | Reduced motion | Binding | Partially satisfied (updated by #207, after this table's own `0fc1c92` snapshot) — a real, live-verified subject exists for the action hint's entrance fade; the other five motion-table rows (window open/close, selection move, skeleton→resolved, state change) remain exactly as unbuilt as at `0fc1c92` — see item 3's own section above for the full account |
 | 4 | Full keyboard operability | Binding | Unknown — not independently verified end-to-end |
 | 5 | Window model | Deliberately broken | Satisfied, verified |
-| 6 | Stock widget styling | Deliberately broken | Partially satisfied — the provider (#193) exists and several surfaces confirmed tokenized; the window/listview base background (most of the default empty state), the query entry, the row title's typography, and the window's own shape remain stock Adwaita |
+| 6 | Stock widget styling | Deliberately broken | Partially satisfied (updated by #215, after this table's own `0fc1c92` snapshot) — the provider (#193) exists and several surfaces confirmed tokenized; the window/listview base background (most of the default empty state) is now tokenized too, closing that surface; the query entry, the row title's typography, and the window's own shape remain stock Adwaita — see item 6's own section above for the full account |
 | 7 | Accent colour | Deliberately broken | Partially satisfied — never follows the desktop; the selection indicator and hint-key glyph now genuinely render the accent (pixel-confirmed); the focus ring is entirely unbuilt, confirmed stock Adwaita blue on screen |
 
 None of the above is this issue's to fix — see #183's own scope, and #202's

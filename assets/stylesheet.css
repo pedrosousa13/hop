@@ -123,12 +123,14 @@ window.background {
    There *is* one more widget between the window and this node in
    `ui::window::build` — a `gtk::ScrolledWindow` wraps the `gtk::ListView` —
    but it introduces no CSS node of its own that paints over this one.
-   `GtkScrolledWindow`'s own "CSS nodes" doc: a child that implements the
-   `GtkScrollable` interface (`GtkListView` does — confirmed the same gir
-   file's `<implements name="Scrollable"/>` on the `ListView` class, and
-   `GtkScrolledWindow`'s own prose: "Widgets with native scrolling support
-   ... are added directly. For other types of widget, [GtkViewport] acts as
-   an adaptor") is added straight through, with no `GtkViewport` inserted —
+   `GtkScrolledWindow`'s class documentation, in its general prose *before*
+   the "CSS nodes" heading (that heading's own section names only
+   `scrolledwindow`, `overshoot`/`undershoot`, and `junction`, and says
+   nothing about `GtkViewport` or `GtkScrollable`): a child that implements
+   the `GtkScrollable` interface (`GtkListView` does — confirmed the same
+   gir file's `<implements name="Scrollable"/>` on the `ListView` class) is
+   "added directly. For other types of widget, [GtkViewport] acts as an
+   adaptor" — so no `GtkViewport` is inserted for a `GtkScrollable` child —
    confirmed against `ui::window::build` itself,
    `gtk::ScrolledWindow::builder().child(&list_view)`, never
    `set_child`-ing a `Viewport` in between. So `listview` is genuinely the
