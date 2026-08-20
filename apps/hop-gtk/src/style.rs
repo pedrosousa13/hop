@@ -7,7 +7,7 @@
 //! naming this module's job (issue #193's own plan, Task 3) as the one still
 //! missing.
 //!
-//! # Exactly one provider, reloaded, never replaced
+//! # Exactly one *ordinary* provider, reloaded, never replaced
 //!
 //! [`install`] builds a single [`gtk::CssProvider`], adds it once at
 //! [`gtk::STYLE_PROVIDER_PRIORITY_APPLICATION`] — above GTK's own built-in
@@ -16,22 +16,121 @@
 //! is not this module's call to make; it is `docs/theme-token-contract.md`'s
 //! "Ordinary user-theme surface" section, a normative document this issue
 //! does not get to contradict just because a *stronger* provider would be
-//! easier to reach for. A second, above-user-priority provider that *would*
-//! outrank a user theme is exactly what `.hop-honesty`'s locks eventually
-//! need — and exactly what this module deliberately does not add: nothing
-//! in this crate carries the `.hop-honesty` class yet (issue #200), so a
-//! second provider today would have no widget to protect and nothing to
-//! prove it works.
+//! easier to reach for.
+//!
+//! This section's title says "ordinary" now, not just "one": since issue
+//! #200, [`install_locked`] below adds a *second*, independent provider —
+//! see "A second provider, above user priority" further down for that one's
+//! own reasoning, kept deliberately separate from this section's rather
+//! than folded in, because the two providers answer different questions
+//! ("what does hop look like" vs "what may a user theme never take away")
+//! and conflating their doc comments would blur that they are not two
+//! options for the same job. Every claim in *this* section is still about
+//! [`install`] and [`install`] alone: one `gtk::CssProvider`, one priority,
+//! reloaded in place, never replaced, never duplicated.
 //!
 //! A colour-scheme change (see "Following the system colour scheme" below)
 //! or a motion-setting change (see "Following the reduced-motion setting")
-//! does not add a second provider either — [`gtk::CssProvider::load_from_string`]
+//! does not add a second *ordinary* provider either — [`gtk::CssProvider::load_from_string`]
 //! *replaces* whatever a provider was previously loaded with (this is
 //! `gtk_css_provider_load_from_data`'s own documented behavior, not an
 //! assumption), so reloading the same instance already installed is
 //! sufficient. This is also why [`install`] must be called exactly once per
 //! process: a second call would install a second, redundant provider at the
 //! same priority, doubling every rule's specificity contest for no benefit.
+//! ([`install_locked`] must likewise be called exactly once — the identical
+//! argument, one priority level up, made in full in its own section below
+//! rather than assumed to transfer without being said.)
+//!
+//! # A second provider, above user priority — the honesty-critical lock
+//!
+//! Issue #200. [`install_locked`] builds a *second*, independent
+//! [`gtk::CssProvider`] — not the same object [`install`] built, reused at a
+//! different priority — and adds it at [`STYLE_PROVIDER_PRIORITY_LOCKED`],
+//! one above [`gtk::STYLE_PROVIDER_PRIORITY_USER`]. `app.rs`'s
+//! `install_stylesheet` calls both, from the same `connect_startup` handler
+//! that used to call only [`install`].
+//!
+//! **Why a second object, not the first one re-added at a second priority.**
+//! A single [`gtk::CssProvider`] can only ever hold one loaded stylesheet
+//! text at a time — [`gtk::CssProvider::load_from_string`] *replaces* it, as
+//! the section above already establishes — so there is no way for one
+//! provider instance to carry the *whole* sheet at
+//! [`gtk::STYLE_PROVIDER_PRIORITY_APPLICATION`] and *simultaneously* carry
+//! only the honesty-critical rules at a second, higher priority; whichever
+//! text it last loaded is the only text it has. Two independent provider
+//! objects, each attached to the display at its own priority, is the only
+//! way GTK's style-provider API expresses "these two rule sets rank
+//! differently" at all — [`gtk::style_context_add_provider_for_display`]
+//! takes one provider and one priority per call, with no notion of a single
+//! provider carrying two.
+//!
+//! **Why the locked provider's content is a narrow slice, not the whole
+//! sheet re-added a second time.** This is the sharper reason "two
+//! providers, not one reconfigured" matters, and the brief for this issue
+//! is emphatic about it: if [`install_locked`] loaded the *same*, full
+//! `stylesheet::resolve` text this second provider's higher priority would
+//! win *every* rule against a user theme, not only the honesty-critical
+//! ones — silently revoking `docs/theme-token-contract.md`'s "Ordinary
+//! user-theme surface" guarantee that a user theme is authoritative
+//! *everywhere outside* `.hop-honesty`. [`stylesheet::resolve_locked_block`]
+//! is what keeps that from happening: it resolves only the four rules
+//! bracketed by `assets/stylesheet.css`'s own
+//! `HOP-HONESTY-LOCKED-BLOCK-START`/`-END` sentinel comments — see that
+//! function's own doc comment for why that slice, rather than a
+//! hand-duplicated second copy of the same four rules, is what this second
+//! provider loads. [`install`]'s own provider still carries the *entire*
+//! sheet, honesty-critical rules included, at
+//! [`gtk::STYLE_PROVIDER_PRIORITY_APPLICATION`] — so a widget wearing
+//! `.hop-honesty` still renders correctly even if [`install_locked`] were
+//! somehow never called (a defense-in-depth side effect of not deleting
+//! those rules from the ordinary sheet, not this module's actual guarantee,
+//! which is [`install_locked`] itself).
+//!
+//! **What it protects, concretely, and what it does not.**
+//! `ui::offline_indicator::build` is the first (and, per this issue's own scope,
+//! only) widget carrying `.hop-honesty` — its offline text and its per-row
+//! "as of HH:MM" stamp are what this provider's opacity and contrast rules
+//! now have a real subject to lock. `.hop-honesty .hop-skeleton`'s
+//! dimension lock has no widget wearing it yet (the pending-skeleton-rows
+//! member is later, separately-scoped work — see
+//! `assets/stylesheet.css`'s own "HONESTY-CRITICAL SELECTORS" comment) —
+//! its rule is loaded into this provider regardless, inert until then, for
+//! the same "already correct, only needs a class applied" reasoning
+//! `assets/stylesheet.css`'s own comment already gives for why it was
+//! authored before anything used it. This provider never attempts a
+//! presence lock of any kind — see `assets/stylesheet.css`'s own "PRESENCE
+//! IS NEVER EXPRESSED HERE" section for why that is not this provider's
+//! job at all, CSS having no `display`/`visibility` to lock in the first
+//! place.
+//!
+//! **Reload and subscription, generalized rather than duplicated.** Both
+//! providers need the identical live behavior the sections below describe
+//! (re-resolve and reload on a colour-scheme change, and again on a
+//! motion-setting change) — the honesty-critical lock is worthless if it
+//! silently reverted to a stale palette's colours the moment the desktop's
+//! dark/light toggle flipped, since the contrast guarantee is specifically
+//! about *this* palette's tokens remaining legible. Rather than hand-write
+//! that subscription logic a second time — a second [`reload`], a second
+//! [`follow_colour_scheme`], a second [`follow_motion_setting`], each a
+//! near-duplicate of the first and free to quietly drift out of sync with
+//! it — [`install`] and [`install_locked`] both funnel through
+//! [`install_provider`], parameterized by which of
+//! [`crate::stylesheet::resolve`]/[`crate::stylesheet::resolve_locked_block`]
+//! to re-resolve with. Both are plain `fn(Palette, Motion) -> String`
+//! function pointers (`Copy`, no captured state), not closures, so this
+//! adds no runtime indirection beyond an ordinary function call, and no
+//! generic type parameter a caller has to reason about — [`install`] and
+//! [`install_locked`] each still construct their own, fully independent
+//! [`gtk::CssProvider`], at their own priority, with their own signal
+//! subscriptions; only the *shape* of "build, guard, reload, attach,
+//! subscribe" is shared, never the runtime objects themselves. A future
+//! divergence between the two providers' *reload* behavior — say, one
+//! needing to consult something the other should not — remains exactly as
+//! easy to express as it would be with two hand-duplicated copies: nothing
+//! about sharing [`install_provider`] forces the two resolver functions to
+//! behave identically, only the surrounding "install it, guard it, keep it
+//! live" plumbing.
 //!
 //! # Why `connect_startup`, not `connect_activate`
 //!
@@ -144,15 +243,16 @@
 //!
 //! # Guarding parse errors — loud in debug/test, quiet in release
 //!
-//! [`gtk::CssProvider::connect_parsing_error`] is connected on hop's own
-//! provider, and only on it — a user's own theme loads through a
-//! *different* `gtk::CssProvider` GTK constructs internally for
+//! [`gtk::CssProvider::connect_parsing_error`] is connected on both of hop's
+//! own providers (issue #200 added the second — see "A second provider,
+//! above user priority" above), and only on them — a user's own theme loads
+//! through a *different* `gtk::CssProvider` GTK constructs internally for
 //! `~/.config/gtk-4.0/gtk.css` and the system theme, which this module never
 //! touches and never connects to. That is what makes "a parse error in
 //! hop's own sheet is a programming error; a parse error in a user's theme
 //! must never be fatal" true by construction rather than by a runtime
-//! branch: the two error sources are physically different objects, and this
-//! module's handler only ever hears from one of them.
+//! branch: the error sources are physically different objects, and this
+//! module's handler only ever hears from the two it connected itself.
 //!
 //! `cfg!(debug_assertions)` (not a `#[cfg]` attribute — see [`guard_parse_errors`]'s
 //! own doc comment for why a runtime `if` on a compile-time constant was
@@ -177,15 +277,39 @@
 //! fail-loudly panic in this crate already uses (`tokens.rs`,
 //! `stylesheet.rs`), just crossing one more FFI frame to get there.
 
+use crate::stylesheet;
 use crate::tokens::{Motion, Palette};
 
-/// Installs hop's stylesheet onto `display`, following every design
+/// One above [`gtk::STYLE_PROVIDER_PRIORITY_USER`] (800) — GTK names no
+/// "outranks a user theme" priority of its own; [`STYLE_PROVIDER_PRIORITY_USER`]
+/// is the highest tier it names, since GTK's own priority scheme was never
+/// designed to let anything out-rank the user. This crate names the one
+/// value above it that [`install_locked`] needs, per
+/// `docs/theme-token-contract.md`'s "Future enforcement status" section:
+/// "install the locked styling above `GTK_STYLE_PROVIDER_PRIORITY_USER`".
+/// Any value greater than 800 would satisfy that — GTK compares provider
+/// priorities as plain integers, with no reserved gaps or required
+/// spacing — and `+ 1` is the smallest one, which is also the clearest to
+/// read: "the next tier up from user", not an arbitrary large constant that
+/// would invite a reader to wonder what headroom it was leaving for.
+///
+/// `pub` — not merely an [`install_locked`] implementation detail — so
+/// `tests/honesty_locked_provider.rs` can attach its own probe providers at
+/// exactly this priority rather than re-deriving `+ 1` a second time
+/// somewhere a future change to this constant would not reach.
+///
+/// [`gtk::STYLE_PROVIDER_PRIORITY_USER`]: gtk::STYLE_PROVIDER_PRIORITY_USER
+pub const STYLE_PROVIDER_PRIORITY_LOCKED: u32 = gtk::STYLE_PROVIDER_PRIORITY_USER + 1;
+
+/// Installs hop's *ordinary* stylesheet onto `display` — the full,
+/// resolved `assets/stylesheet.css`, at
+/// [`gtk::STYLE_PROVIDER_PRIORITY_APPLICATION`] — following every design
 /// decision this module's own doc comment explains. Called once per
 /// process, from a `connect_startup` handler — see `app.rs` for the two call
 /// sites and why both exist.
 ///
 /// Returns the installed [`gtk::CssProvider`] itself, so a caller can hold
-/// the exact live instance `follow_colour_scheme`/`follow_motion_setting`
+/// the exact live instance the colour-scheme/motion-setting subscriptions
 /// are reloading. `app.rs`'s own call sites drop it (a colour-scheme or
 /// motion-setting change reloads the provider through the display it is
 /// already attached to; nothing in production code needs to touch it again
@@ -194,19 +318,72 @@ use crate::tokens::{Motion, Palette};
 /// [`gtk::CssProvider::to_str`] after driving a change — see
 /// `tests/style_colour_scheme.rs` for the palette axis and
 /// `tests/motion_setting.rs` for the motion one.
+///
+/// See this module's doc comment, "A second provider, above user
+/// priority", for [`install_locked`] — the sibling this function does
+/// *not* call itself; `app.rs`'s `install_stylesheet` calls both.
 pub fn install(display: &gtk::gdk::Display) -> gtk::CssProvider {
+    install_provider(
+        display,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        stylesheet::resolve,
+    )
+}
+
+/// Installs the honesty-critical *locked block* onto `display` — issue
+/// #200, and this module's doc comment, "A second provider, above user
+/// priority", for the full account of what this is and why it is a
+/// genuinely separate [`gtk::CssProvider`] rather than [`install`]'s own
+/// provider re-added at a second priority. Called once per process,
+/// alongside [`install`], from the same `connect_startup` handler —
+/// `app.rs`'s `install_stylesheet`.
+///
+/// Returns the installed provider for the identical reason [`install`]
+/// does: nothing in production code needs it back (`app.rs` drops it), but
+/// a test proving this provider's own colour-scheme/motion-setting
+/// subscriptions actually fire needs a handle to read back with
+/// [`gtk::CssProvider::to_str`] — see `tests/honesty_locked_provider.rs`.
+pub fn install_locked(display: &gtk::gdk::Display) -> gtk::CssProvider {
+    install_provider(
+        display,
+        STYLE_PROVIDER_PRIORITY_LOCKED,
+        stylesheet::resolve_locked_block,
+    )
+}
+
+/// The shared "build, guard, reload, attach, subscribe" shape both
+/// [`install`] and [`install_locked`] follow — see this module's doc
+/// comment, "Reload and subscription, generalized rather than duplicated",
+/// for why a shared function parameterized by which stylesheet resolver to
+/// use was chosen over hand-duplicating [`reload`]/[`follow_colour_scheme`]/
+/// [`follow_motion_setting`] a second time.
+///
+/// `resolve_sheet` is a plain function pointer
+/// (`fn(Palette, Motion) -> String`), not a `Fn` closure trait object or an
+/// `impl Fn` generic — [`crate::stylesheet::resolve`] and
+/// [`crate::stylesheet::resolve_locked_block`] are both already exactly
+/// that signature, with no state to capture, so a function pointer is the
+/// simplest type that fits; nothing here needs the extra generality (or the
+/// extra monomorphized code size) a generic `impl Fn` parameter would add
+/// for a caller that only ever passes one of two free functions.
+fn install_provider(
+    display: &gtk::gdk::Display,
+    priority: u32,
+    resolve_sheet: fn(Palette, Motion) -> String,
+) -> gtk::CssProvider {
     let provider = gtk::CssProvider::new();
     guard_parse_errors(&provider);
-    reload(&provider, current_palette(), current_motion());
-
-    gtk::style_context_add_provider_for_display(
-        display,
+    reload(
         &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        resolve_sheet,
+        current_palette(),
+        current_motion(),
     );
 
-    follow_colour_scheme(provider.clone());
-    follow_motion_setting(provider.clone());
+    gtk::style_context_add_provider_for_display(display, &provider, priority);
+
+    follow_colour_scheme(provider.clone(), resolve_sheet);
+    follow_motion_setting(provider.clone(), resolve_sheet);
     provider
 }
 
@@ -293,47 +470,63 @@ fn gtk_enable_animations() -> bool {
     settings.is_gtk_enable_animations()
 }
 
-/// Re-resolves [`crate::stylesheet::resolve`] for `palette` and `motion`
-/// and loads it into `provider`, replacing whatever it held before — see
-/// this module's doc comment, "Exactly one provider, reloaded, never
-/// replaced", for why that replace-in-place behavior is what lets a
-/// colour-scheme *or* motion-setting change reuse this same `provider`
-/// instance rather than installing a second one.
-fn reload(provider: &gtk::CssProvider, palette: Palette, motion: Motion) {
-    provider.load_from_string(&crate::stylesheet::resolve(palette, motion));
+/// Re-resolves `resolve_sheet` for `palette` and `motion` and loads it into
+/// `provider`, replacing whatever it held before — see this module's doc
+/// comment, "Exactly one *ordinary* provider, reloaded, never replaced",
+/// for why that replace-in-place behavior is what lets a colour-scheme *or*
+/// motion-setting change reuse this same `provider` instance rather than
+/// installing a second one. `resolve_sheet` is
+/// [`install_provider`]'s own parameter, threaded one call further in —
+/// this function does not care, and does not need to, whether it was
+/// handed [`crate::stylesheet::resolve`] or
+/// [`crate::stylesheet::resolve_locked_block`]; either is "the current
+/// stylesheet text for this provider", which is all a reload ever needs.
+fn reload(
+    provider: &gtk::CssProvider,
+    resolve_sheet: fn(Palette, Motion) -> String,
+    palette: Palette,
+    motion: Motion,
+) {
+    provider.load_from_string(&resolve_sheet(palette, motion));
 }
 
 /// Subscribes `provider` to libadwaita's style manager, so a live
-/// colour-scheme change re-resolves and reloads it for the other palette —
-/// re-reading [`current_motion`] fresh on every fire, rather than assuming
-/// the motion axis is unchanged, so a colour-scheme flip can never silently
-/// revert a motion-setting change that happened first. See this module's
-/// doc comment, "Subscription lifetime", for why the `StyleManager` handle
-/// and the returned `SignalHandlerId` are both deliberately left unstored
-/// here rather than threaded back out to a caller that would otherwise
-/// have nothing correct to do with either.
-fn follow_colour_scheme(provider: gtk::CssProvider) {
+/// colour-scheme change re-resolves (via `resolve_sheet`) and reloads it
+/// for the other palette — re-reading [`current_motion`] fresh on every
+/// fire, rather than assuming the motion axis is unchanged, so a
+/// colour-scheme flip can never silently revert a motion-setting change
+/// that happened first. See this module's doc comment, "Subscription
+/// lifetime", for why the `StyleManager` handle and the returned
+/// `SignalHandlerId` are both deliberately left unstored here rather than
+/// threaded back out to a caller that would otherwise have nothing correct
+/// to do with either.
+fn follow_colour_scheme(provider: gtk::CssProvider, resolve_sheet: fn(Palette, Motion) -> String) {
     let style_manager = adw::StyleManager::default();
     style_manager.connect_dark_notify(move |manager| {
-        reload(&provider, palette_for(manager.is_dark()), current_motion());
+        reload(
+            &provider,
+            resolve_sheet,
+            palette_for(manager.is_dark()),
+            current_motion(),
+        );
     });
 }
 
 /// Subscribes `provider` to `gtk::Settings::default()`, so a live change to
 /// `gtk-enable-animations` — GNOME's reduced-motion toggle, per this
 /// module's doc comment, "Following the reduced-motion setting" — re-
-/// resolves and reloads it for the other motion state. Symmetrical with
-/// [`follow_colour_scheme`] in every way that matters: re-reads
-/// [`current_palette`] fresh on every fire (so a motion-setting change can
-/// never silently revert a colour-scheme change that happened first), and
-/// deliberately leaves both the `Settings` handle and the returned
-/// `SignalHandlerId` unstored, for the identical "process-wide singleton,
-/// not a value this module owns" reasoning this module's doc comment gives
-/// for `AdwStyleManager` — see that section for the full argument, and
-/// [`gtk_enable_animations`]'s own doc comment for why the `Option` this
-/// call site's `gtk::Settings::default()` can return is handled by
-/// panicking rather than by a silent fallback.
-fn follow_motion_setting(provider: gtk::CssProvider) {
+/// resolves (via `resolve_sheet`) and reloads it for the other motion
+/// state. Symmetrical with [`follow_colour_scheme`] in every way that
+/// matters: re-reads [`current_palette`] fresh on every fire (so a
+/// motion-setting change can never silently revert a colour-scheme change
+/// that happened first), and deliberately leaves both the `Settings`
+/// handle and the returned `SignalHandlerId` unstored, for the identical
+/// "process-wide singleton, not a value this module owns" reasoning this
+/// module's doc comment gives for `AdwStyleManager` — see that section for
+/// the full argument, and [`gtk_enable_animations`]'s own doc comment for
+/// why the `Option` this call site's `gtk::Settings::default()` can return
+/// is handled by panicking rather than by a silent fallback.
+fn follow_motion_setting(provider: gtk::CssProvider, resolve_sheet: fn(Palette, Motion) -> String) {
     let Some(settings) = gtk::Settings::default() else {
         panic!(
             "hop-gtk: no gtk::Settings available to subscribe to — see \
@@ -344,6 +537,7 @@ fn follow_motion_setting(provider: gtk::CssProvider) {
     settings.connect_gtk_enable_animations_notify(move |settings| {
         reload(
             &provider,
+            resolve_sheet,
             current_palette(),
             motion_for(settings.is_gtk_enable_animations()),
         );

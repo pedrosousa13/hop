@@ -20,6 +20,14 @@
 //! [`gtk::CssProvider::to_str`] to confirm it changed to the other motion
 //! state's values.
 //!
+//! Issue #200 extends this file's `run_assertions` the same way it extends
+//! `tests/style_colour_scheme.rs`: also installing [`style::install_locked`]
+//! and driving the identical motion-setting flip against it, for this
+//! issue's own "the locked block survives ... a motion change" acceptance
+//! criterion — see `run_assertions`'s own comment on that section for why
+//! "survives" reads differently here than it does for the palette axis
+//! (the locked block has no motion-varying content to begin with).
+//!
 //! # What this test does and does not prove
 //!
 //! **Proves:** [`style::install`]'s `connect_gtk_enable_animations_notify`
@@ -160,9 +168,11 @@ fn drain_pending_glib_events() {
 /// `.hop-row-hint-shown.hop-row-hint`), so this searches for the one
 /// class name unique to this rule rather than the exact selector string.
 /// `opacity: 1;` alone would *not* be unique — `assets/stylesheet.css`'s
-/// inert `.hop-honesty { opacity: 1; }` rule (issue #200's future work,
-/// authored but not yet applied to any widget) declares the identical
-/// property/value pair.
+/// `.hop-honesty { opacity: 1; }` rule declares the identical
+/// property/value pair, and (since issue #200) is no longer merely authored
+/// and inert: `ui::offline_indicator::build` applies that class to a real,
+/// rendered widget now, which makes this disambiguation matter for more
+/// than a hypothetical future collision.
 const HINT_SHOWN_RULE_MARKER: &str = "hop-row-hint-shown";
 
 /// The real assertions, run inside the re-exec'd child process described in
@@ -204,6 +214,30 @@ fn run_assertions() {
         "expected the token-resolved 80ms hint-fade duration, got:\n{full_rule}"
     );
 
+    // Issue #200's own second provider — "the locked block survives ... a
+    // motion change" (this issue's own acceptance criterion). Unlike the
+    // palette axis (`style_colour_scheme.rs`'s own extension of this same
+    // shape), none of the locked block's four rules reference a
+    // `{{motion:...}}` placeholder — `stylesheet::resolve_locked_block`'s
+    // output is byte-for-byte identical under [`Motion::Full`] and
+    // [`Motion::Reduced`], confirmed directly against its own resolved text
+    // while writing this test. "Survives" therefore means something
+    // narrower and more literal here than it does for the palette axis: not
+    // "visibly changes to the other state's values" (there is no other
+    // state's values to change to) but "the live
+    // `connect_gtk_enable_animations_notify` handler `style::install_locked`
+    // wires up actually fires for *this* provider too, reloads it without
+    // erroring or corrupting its content, and the same locked rules are
+    // still there afterward" — a real, if less visually dramatic, proof
+    // than the ordinary provider's own hint-fade delay collapsing to `0`.
+    let locked_provider = style::install_locked(&display);
+    let locked_full_css = locked_provider.to_str();
+    assert!(
+        locked_full_css.contains("opacity: 1;"),
+        "expected the locked provider to carry its opacity lock right after \
+         style::install_locked, got:\n{locked_full_css}"
+    );
+
     // The actual runtime exercise: flip the setting through
     // `gtk::Settings`'s own public setter — the same `notify::
     // gtk-enable-animations` signal path a real desktop's reduced-motion
@@ -237,6 +271,14 @@ fn run_assertions() {
         "the full-motion 40ms delay must not survive the reload, got:\n{reduced_rule}"
     );
 
+    let locked_reduced_css = locked_provider.to_str();
+    assert_eq!(
+        locked_reduced_css, locked_full_css,
+        "the locked block carries no `{{{{motion:...}}}}` placeholder, so a live reload \
+         triggered by a motion-setting change must reload it with byte-for-byte identical \
+         content, not silently drop or corrupt it — got a difference after the reload"
+    );
+
     // Flip back: a live, repeatable restyle, not a one-shot transition this
     // test could pass by accident on a handler that only ever runs once.
     settings.set_gtk_enable_animations(true);
@@ -249,8 +291,15 @@ fn run_assertions() {
          delay again, got:\n{full_rule_again}"
     );
 
+    let locked_full_css_again = locked_provider.to_str();
+    assert_eq!(
+        locked_full_css_again, locked_full_css,
+        "the locked provider must still carry the identical locked block after flipping \
+         back to full motion"
+    );
+
     println!(
-        "the installed gtk::CssProvider reloads live on a gtk::Settings \
+        "both the ordinary and the locked gtk::CssProvider reload live on a gtk::Settings \
          gtk-enable-animations change, in both directions"
     );
 }

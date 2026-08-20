@@ -100,11 +100,15 @@
 //! - **The five `.hop-honesty*` rule blocks** are skipped entirely: they are
 //!   component rules (`opacity: 1;`, `color: var(--hop-fg);`, `min-width:
 //!   24px;`), not `--custom-property` *declarations*, so they have no
-//!   business in a token table regardless of how they are reached. The two
-//!   dimension literals on `.hop-honesty .hop-skeleton` are bare numbers,
-//!   not `var()` references, on purpose — see that rule's own comment in
-//!   `assets/tokens.css` for why `docs/theme-token-contract.md` requires
-//!   exactly that.
+//!   business in a token table regardless of how they are reached. That
+//!   reasoning holds regardless of whether any widget carries
+//!   `.hop-honesty` — before issue #200, nothing did; since it,
+//!   `ui::offline_indicator::build` does — because it is about what shape these
+//!   rules are (component styling, not token declarations), never about
+//!   whether they currently have a consumer. The two dimension literals on
+//!   `.hop-honesty .hop-skeleton` are bare numbers, not `var()` references,
+//!   on purpose — see that rule's own comment in `assets/tokens.css` for
+//!   why `docs/theme-token-contract.md` requires exactly that.
 //!   [`classify_selector`] only recognises `:root` and `.hop-theme-light` as
 //!   token-bearing selectors; every other selector — honesty rules included
 //!   — is `Skip` by construction, not by an incidental syntax mismatch (a
@@ -835,6 +839,16 @@ pub static MODE_LABEL_RGB: LazyLock<(u8, u8, u8)> = LazyLock::new(|| hex_token("
 /// (§8a's placement for the empty-state prefix cheatsheet, "inline in the
 /// query bar, right-aligned") rather than flush against the window edge.
 pub static MODE_LABEL_MARGIN_END_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-space-3"));
+
+/// `--hop-space-2`, in pixels: the gap `ui::offline_indicator::build` puts between
+/// its two labels (issue #200) — the offline text and the "as of HH:MM"
+/// stamp beside it. The same token [`HINT_CHIP_GAP_PX`] reads for a
+/// different pair of widgets, read again here under its own name rather
+/// than reused under that one, for the reason [`HINT_MARGIN_START_PX`]'s
+/// own doc comment already gives for a shared token read at more than one
+/// call site: a name says which widget it sizes, not just which token it
+/// happens to share.
+pub static OFFLINE_ROW_GAP_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-space-2"));
 
 /// `--hop-accent`, the consumed-marker highlight's foreground colour — the
 /// one deliberate exception to `assets/tokens.css`'s own header rule that the

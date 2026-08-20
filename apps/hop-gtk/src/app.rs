@@ -228,12 +228,19 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 }
 
 /// `connect_startup` handler both [`run_interactive`] and [`run_screenshot`]
-/// register, installing hop's own stylesheet via [`style::install`] before
+/// register, installing hop's own stylesheets — both of them, as of issue
+/// #200 — via [`style::install`] and [`style::install_locked`] before
 /// either run's first `activate` fires (`style::install`'s own doc comment,
 /// "Why `connect_startup`, not `connect_activate`", is where the deeper
 /// GObject-signal-ordering argument for that hook lives; this comment is the
 /// narrower one this function itself needs to make: *both* run modes call
-/// it, not just one).
+/// it, not just one). The two `style::install*` calls are independent of
+/// each other — see `style.rs`'s own "A second provider, above user
+/// priority" doc section for why the honesty-critical lock is a wholly
+/// separate [`gtk::CssProvider`] rather than a second call this function
+/// somehow derives from the first's result — so their order here does not
+/// matter and is not meaningful; they are written in the same order
+/// `style.rs` itself declares them.
 ///
 /// # Why `run_screenshot` installs it too — this was a deliberate call, not
 /// an oversight
@@ -268,6 +275,7 @@ fn install_stylesheet(_app: &adw::Application) {
         panic!("hop-gtk: no gdk::Display available at GApplication startup");
     };
     style::install(&display);
+    style::install_locked(&display);
 }
 
 /// The ordinary, unique-instance run: builds the window once on first

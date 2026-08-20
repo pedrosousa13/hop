@@ -88,10 +88,16 @@
  * *stronger* than the CSS-based one `tokens.css`'s own `.hop-honesty` block
  * models (`display: flex` there is inert once GTK drops it, not a locked
  * property) — not weaker. This file therefore never attempts `display` or
- * `visibility` on anything, honesty-critical or not, and no widget in this
- * crate carries `.hop-honesty` yet (that lands with issue #200, alongside
- * the widgets it protects) — so nothing here enforces presence in code
- * either; there is no widget yet to enforce it on.
+ * `visibility` on anything, honesty-critical or not — presence is
+ * guaranteed by construction, in Rust, not by a rule in this file.
+ *
+ * Issue #200 is what first gives that guarantee a real subject:
+ * `ui::offline_indicator::build` is the first widget in this crate to carry
+ * `.hop-honesty`, and it never calls `gtk_widget_set_visible(false)` on
+ * itself for any reason a hostile theme could substitute for — the widget
+ * either exists in the tree and is shown, per `ui::offline_indicator::apply`'s own
+ * doc comment, or it does not, and no CSS loaded at any priority, hop's own
+ * included, has any say in that decision.
  */
 
 /* ============================================================
@@ -190,8 +196,13 @@ listview > row:hover {
    .hop-row-subtitle — `ui/row.rs` (issue #196)
    Owns the row's subtitle label's typography: `font:` from
    `--hop-text-subtitle` (12.5px proportional, per the `{{font:...}}` form —
-   see PLACEHOLDER SYNTAX above and `.hop-honesty .hop-honesty-text`'s own
-   rule below for the direct precedent), colour from `--hop-fg-2` — the
+   see PLACEHOLDER SYNTAX above and `.hop-status`'s own rule further down
+   for the direct precedent of the full shorthand form; `.hop-honesty
+   .hop-honesty-text` below reads the same `hop-text-subtitle` token but,
+   since a code-review fix to issue #200, through the split
+   `{{font-weight:...}}`/`{{font-size:...}}`/`{{font-family:...}}` forms
+   instead — see that rule's own comment for why it cannot use this
+   shorthand), colour from `--hop-fg-2` — the
    semantic alias `tokens.css`'s SEMANTIC LAYER promotes specifically for a
    subtitle-tier ramp step, resolving under both palettes with no new token.
 
@@ -436,6 +447,34 @@ listview > row:hover {
 }
 
 /* ============================================================
+   .hop-offline-indicator — `ui/offline_indicator.rs` (issue #200; renamed
+   from `.hop-offline-row`/`OfflineRow` during #200's own code review —
+   `CONTEXT.md` reserves "row" for the results list's recycled
+   `GtkListView` per-item vocabulary `ui/row.rs` already owns, and this
+   widget is that vocabulary's structural opposite: built once, never
+   recycled. `docs/theme-token-contract.md:35` already called this reserved
+   member "the offline indicator", so the class and the Rust type both
+   adopted that name instead of inventing a third one.)
+   The offline indicator's own container: horizontal padding only, the
+   "shape" half of the design rule the honesty-critical section below
+   quotes in full ("a member's meaning must live in its words and its
+   shape, never in a colour"). Deliberately its own class, separate from
+   `.hop-honesty` below, and deliberately *not* part of the locked block:
+   padding is ordinary presentation, the kind of value
+   "Ordinary user-theme surface" in docs/theme-token-contract.md leaves a
+   theme free to change, same as any other widget's spacing. Nothing here
+   could compromise the guarantee even if a hostile theme zeroed it out —
+   `.hop-honesty-text`'s and `.hop-honesty-stamp`'s own `font:`/`font-weight:`/
+   `font-size:` declarations below fix their type size as part of the
+   *contrast* lock, so shrinking this box's padding can bring its two
+   children closer together but can never shrink the glyphs themselves
+   toward imperceptibility.
+   ============================================================ */
+.hop-offline-indicator {
+  padding: {{hop-space-2}} {{hop-space-3}};
+}
+
+/* ============================================================
    HONESTY-CRITICAL SELECTORS
    `tokens.css`'s own `.hop-honesty` block (its comment: "docs/theme-token-
    contract.md reserves `.hop-honesty` for the cached-data 'as of' labels,
@@ -447,26 +486,123 @@ listview > row:hover {
    comment above ("PRESENCE IS NEVER EXPRESSED HERE") it is not attempted
    here at all — not an oversight, the *point*.
 
-   Nothing in this crate carries `.hop-honesty`, `.hop-honesty-text`,
-   `.hop-honesty-stamp`, or `.hop-skeleton` yet — issue #200 adds the
-   cached-data label, the skeleton row, the offline indicator, and the error
-   row these classes protect. These rules are authored now, inert until then,
-   for the same reason the brief for this issue gives: so that issue does not
-   also have to invent the styling rules its own widgets need, only apply a
-   class name to a rule that is already here and already correct.
+   `ui::offline_indicator::build` (issue #200) is the first widget to carry
+   `.hop-honesty`, `.hop-honesty-text`, and `.hop-honesty-stamp` — the
+   offline indicator and its own "as of HH:MM" stamp, together, since
+   one widget happens to need both members the contract reserves separately.
+   `.hop-skeleton` still has nothing wearing it: the pending-skeleton-rows
+   member is a separate, later widget (this issue's own brief marks it and
+   the error row explicitly out of scope — "one widget is enough to make
+   the lock real and testable"). Its rule stays here regardless, authored
+   and already correct, for the same reason it was authored inert in the
+   first place: so that follow-up issue only has to apply a class name.
+
+   These four rules are also, near-verbatim, `style.rs`'s second,
+   above-`GTK_STYLE_PROVIDER_PRIORITY_USER` provider's entire payload — see
+   the `HOP-HONESTY-LOCKED-BLOCK` sentinel comments bracketing them below,
+   and `apps/hop-gtk/src/stylesheet.rs`'s `resolve_locked_block` doc comment
+   for why that provider reads this exact slice of this exact file rather
+   than a second, hand-copied source of truth. Nothing may sit between the
+   two sentinels that is not one of the three CSS-expressible locked
+   categories this file's own module doc names — the sentinel comments
+   themselves say so, for a reader who lands here first. "Near", not
+   "exactly" verbatim, since a code-review fix to issue #200 split
+   `.hop-honesty-text`/`.hop-honesty-stamp`'s `font:` shorthand into
+   longhands right at the sentinel boundary — see the comment immediately
+   above the `-START` marker below for why.
    ============================================================ */
+
+/* FONT FAMILY LIVES HERE, OUTSIDE THE LOCKED BLOCK — a code-review fix to
+   issue #200, not part of its original scope.
+
+   `docs/theme-token-contract.md:18-20` is normative and explicit: "the
+   boundary is narrow. On honesty-critical elements, a user theme may still
+   restyle the font family and accent, provided the element remains
+   present and legible." The locked block below used to declare
+   `font: {{font:hop-text-subtitle}}` / `font: {{font:hop-text-timestamp}}`
+   on these same two selectors — and GTK's `font:` shorthand, like ordinary
+   CSS-Fonts shorthand, sets `font-family` as part of the same declaration
+   it sets weight and size with, no way to name one without the other. Loading
+   that shorthand into `style.rs`'s above-user-priority provider therefore
+   locked family too, silently over-locking past what the contract actually
+   grants a user theme, and a review of this issue caught it.
+
+   The fix is this split: `font-family` moves up here, into the *ordinary*
+   part of this file — parsed by `stylesheet::resolve`'s full-file pass, so
+   `style::install`'s application-priority provider still carries it (the
+   default, no-user-theme render still shows the designed family, exactly
+   as before this fix) — and is never repeated inside the
+   `HOP-HONESTY-LOCKED-BLOCK-START`/`-END` sentinels below, so
+   `stylesheet::resolve_locked_block`'s slice, and therefore
+   `style::install_locked`'s above-user provider, never declares it at all.
+   A user-priority theme's own `.hop-honesty .hop-honesty-text { font-family:
+   ...; }` then has nothing above it contesting that one property, and wins
+   the cascade — while the locked block's own `font-weight:`/`font-size:`
+   declarations (below) still keep contrast/legibility locked, per the
+   contract's own "Hop's locked values win whenever a requested style would
+   violate the truthfulness guarantee" sentence one paragraph later.
+   `tests/honesty_locked_provider.rs`'s
+   `hostile_user_theme_can_override_the_locked_font_family` proves the
+   overridable direction; `hostile_user_theme_cannot_override_the_locked_categories`
+   (unchanged by this fix) keeps proving weight/size/colour/dimensions/opacity
+   still cannot be.
+
+   Left deliberately unedited: `docs/theme-token-contract.md`'s own "Locked
+   guarantees" section (lines 69-71) still describes contrast as carried by
+   "`--hop-fg` and `--hop-text-subtitle`" / "`--hop-fg-2` and
+   `--hop-text-timestamp`" — the *pre-split*, single-`font:` shorthand form
+   this comment's split just moved away from. That is a real, now-existing
+   gap between the contract's "as implemented today" prose and this file's
+   actual locked declarations, not an oversight this fix quietly closed:
+   editing `docs/theme-token-contract.md`'s normative text is out of scope
+   for this fix (that document is issue #199's to amend), and the
+   contract's own property-category promise — contrast locked, family not —
+   is what this split actually satisfies; only the worked-example prose
+   naming the exact CSS shape has fallen behind. */
+.hop-honesty .hop-honesty-text {
+  font-family: {{font-family:hop-text-subtitle}};
+}
+
+.hop-honesty .hop-honesty-stamp {
+  font-family: {{font-family:hop-text-timestamp}};
+}
+
+/* HOP-HONESTY-LOCKED-BLOCK-START — apps/hop-gtk/src/stylesheet.rs's
+   `resolve_locked_block` extracts exactly the declarations between this
+   marker and its `-END` pair below as `style.rs`'s second, above-user-
+   priority provider's entire content: the opacity, dimension, and contrast
+   locks `docs/theme-token-contract.md`'s "Locked guarantees" section
+   names. Do not add anything here that is not one of those three
+   categories — presence is never expressed in CSS at all (see "PRESENCE
+   IS NEVER EXPRESSED HERE" above), and nothing else has any business
+   out-ranking a user theme. This comment, like every other in this file,
+   is stripped before either provider ever loads this text — see
+   `resolve_locked_block`'s own doc comment for exactly how the raw,
+   unstripped template is sliced before that stripping happens.
+
+   `.hop-honesty-text`/`.hop-honesty-stamp` declare `font-weight:`/
+   `font-size:` here, never `font:` and never `font-family:` — see the
+   "FONT FAMILY LIVES HERE, OUTSIDE THE LOCKED BLOCK" comment immediately
+   above this marker for why: `font:` is a shorthand that also sets
+   family, and family is the one thing
+   `docs/theme-token-contract.md:18-20` says a user theme may still
+   restyle on a honesty-critical element. Weight and size are not covered
+   by that carve-out — they stay locked, as two of the three fields
+   `{{font:name}}` used to set together. */
 .hop-honesty {
   opacity: 1;
 }
 
 .hop-honesty .hop-honesty-text {
   color: {{hop-fg}};
-  font: {{font:hop-text-subtitle}};
+  font-weight: {{font-weight:hop-text-subtitle}};
+  font-size: {{font-size:hop-text-subtitle}};
 }
 
 .hop-honesty .hop-honesty-stamp {
   color: {{hop-fg-2}};
-  font: {{font:hop-text-timestamp}};
+  font-weight: {{font-weight:hop-text-timestamp}};
+  font-size: {{font-size:hop-text-timestamp}};
 }
 
 /* THE ONE SANCTIONED EXCEPTION to this file's own "no design value appears
@@ -505,3 +641,4 @@ listview > row:hover {
   min-width: 24px;
   min-height: 9px;
 }
+/* HOP-HONESTY-LOCKED-BLOCK-END */

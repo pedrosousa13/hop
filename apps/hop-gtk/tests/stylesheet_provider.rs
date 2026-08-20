@@ -27,6 +27,19 @@
 //! now takes a [`Motion`] too, rather than a second, parallel function
 //! being added alongside it.
 //!
+//! Issue #200 extends this file the identical way a second time, along a
+//! different axis: `style.rs`'s new second provider loads
+//! [`stylesheet::resolve_locked_block`]'s output, not
+//! [`stylesheet::resolve`]'s whole-file output — a different string,
+//! substituted through the same placeholder pipeline but never itself
+//! handed to a real `gtk::CssProvider` anywhere else in this crate's test
+//! suite — so it needs the identical zero-parse-error proof, under the
+//! identical 2×2 matrix, rather than inheriting the whole-file check's
+//! result for a text it does not actually load. `run_assertions` below now
+//! calls `assert_zero_parse_errors` twice per palette/motion pair, once for
+//! each resolver, rather than a second copy of this file existing solely to
+//! narrow which resolver it calls.
+//!
 //! # Re-exec under broadway
 //!
 //! Same shape, for the same reasons, as `tests/view_tree_renderer.rs`'s own
@@ -153,20 +166,54 @@ fn run_assertions() {
 
     for palette in [Palette::Dark, Palette::Light] {
         for motion in [Motion::Full, Motion::Reduced] {
-            assert_zero_parse_errors(palette, motion);
+            assert_zero_parse_errors(
+                "assets/stylesheet.css",
+                stylesheet::resolve(palette, motion),
+                palette,
+                motion,
+            );
+            // Issue #200's own extension of this guard — the exact same
+            // shape issue #207 already used to grow this file from two
+            // palettes to a full palette-by-motion matrix (this file's own
+            // module doc, "extending the existing guard rather than adding
+            // a separate, narrower one"): `style.rs`'s second,
+            // above-user-priority provider loads
+            // `stylesheet::resolve_locked_block`'s output, not
+            // `stylesheet::resolve`'s, so it needs its own zero-parse-error
+            // proof rather than inheriting the one above for a text it
+            // never actually loads. `resolve_locked_block` is a slice of
+            // the exact same file, so this is not expected to ever catch
+            // anything the check above would not — it exists so that
+            // fact stays proven rather than assumed.
+            assert_zero_parse_errors(
+                "assets/stylesheet.css's honesty-critical locked block",
+                stylesheet::resolve_locked_block(palette, motion),
+                palette,
+                motion,
+            );
         }
     }
 
-    println!("resolved stylesheet parses cleanly under both palettes and both motion states");
+    println!(
+        "resolved stylesheet, and its honesty-critical locked block, both parse cleanly under \
+         both palettes and both motion states"
+    );
 }
 
-/// Resolves `assets/stylesheet.css` for `palette` and `motion`, loads it
-/// into a fresh `gtk::CssProvider`, and fails with every collected parser
-/// diagnostic if its `parsing-error` signal fired even once. A `Vec` of
-/// messages, not just a count, is what this collects — a failure here
-/// should tell a developer exactly what GTK rejected and where, not just
-/// that something, somewhere, did not parse.
-fn assert_zero_parse_errors(palette: Palette, motion: Motion) {
+/// Loads `resolved` (already-resolved CSS text, named by `source` for this
+/// function's own failure message) into a fresh `gtk::CssProvider`, and
+/// fails with every collected parser diagnostic if its `parsing-error`
+/// signal fired even once. A `Vec` of messages, not just a count, is what
+/// this collects — a failure here should tell a developer exactly what GTK
+/// rejected and where, not just that something, somewhere, did not parse.
+///
+/// `palette`/`motion` are threaded through only for the failure message —
+/// this function does no resolving itself, `run_assertions`'s two call
+/// sites (`stylesheet::resolve` and, since issue #200,
+/// `stylesheet::resolve_locked_block`) each already resolved their own
+/// text before calling in, so a caller cannot mismatch which resolver
+/// produced `resolved`.
+fn assert_zero_parse_errors(source: &str, resolved: String, palette: Palette, motion: Motion) {
     let provider = gtk::CssProvider::new();
     let messages: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let error_count = Rc::new(Cell::new(0u32));
@@ -180,12 +227,12 @@ fn assert_zero_parse_errors(palette: Palette, motion: Motion) {
         }
     });
 
-    provider.load_from_string(&stylesheet::resolve(palette, motion));
+    provider.load_from_string(&resolved);
 
     assert_eq!(
         error_count.get(),
         0,
-        "expected zero gtk::CssProvider parse errors resolving assets/stylesheet.css under \
+        "expected zero gtk::CssProvider parse errors resolving {source} under \
          {palette:?}/{motion:?}, got {}: {:#?}",
         error_count.get(),
         messages.borrow(),

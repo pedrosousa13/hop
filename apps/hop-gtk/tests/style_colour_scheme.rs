@@ -16,6 +16,14 @@
 //! serialized content back with [`gtk::CssProvider::to_str`] to confirm it
 //! changed to the other palette's values.
 //!
+//! Issue #200 extends this file's `run_assertions` to also install
+//! [`style::install_locked`] and drive the identical colour-scheme flip
+//! against it — this issue's own acceptance criterion, "the locked block
+//! survives a palette change", needs the identical runtime proof
+//! `style_colour_scheme.rs` already builds for the ordinary provider, not a
+//! second file re-deriving the same `BroadwayServer`/re-exec scaffolding
+//! for one more provider on the same display.
+//!
 //! # What this test does and does not prove
 //!
 //! **Proves:** [`style::install`]'s `connect_dark_notify` closure is live
@@ -190,6 +198,32 @@ fn run_assertions() {
          is the active palette, got:\n{dark_css}"
     );
 
+    // Issue #200's own second provider — the identical exercise, on the
+    // identical signal, for the honesty-critical locked block: "the locked
+    // block survives a palette change" (this issue's own acceptance
+    // criterion) means the live `connect_dark_notify` handler
+    // `style::install_locked` wires up must reload *this* provider too, not
+    // just the ordinary one, and must reload it with the *other* palette's
+    // contrast colour — `--hop-fg`, resolved on `.hop-honesty-text` — the
+    // same way `dark_css`/`light_css` above pin `--hop-bg` for the ordinary
+    // sheet. `#f4f3f1` (dark `--hop-fg`) and `#211f1a` (light `--hop-fg`)
+    // were read directly off `stylesheet::resolve_locked_block`'s own
+    // output while writing this test, the same empirical-first approach
+    // `stylesheet.rs`'s own tests already use for every other palette-pinned
+    // literal.
+    let locked_provider = style::install_locked(&display);
+    let locked_dark_css = locked_provider.to_str();
+    assert!(
+        locked_dark_css.contains("color: rgb(244,243,241);"),
+        "expected the dark palette's --hop-fg contrast colour in the locked provider right \
+         after style::install_locked, got:\n{locked_dark_css}"
+    );
+    assert!(
+        !locked_dark_css.contains("color: rgb(33,31,26);"),
+        "the light palette's --hop-fg contrast colour must not appear while dark is the \
+         active palette, got:\n{locked_dark_css}"
+    );
+
     // The actual runtime exercise: flip the colour scheme through
     // `AdwStyleManager`'s own public setter — the same `notify::dark` signal
     // path a real desktop's dark/light toggle drives — and confirm the
@@ -217,6 +251,18 @@ fn run_assertions() {
          reload, got:\n{light_css}"
     );
 
+    let locked_light_css = locked_provider.to_str();
+    assert!(
+        locked_light_css.contains("color: rgb(33,31,26);"),
+        "expected the live-reloaded locked provider to hold the light palette's --hop-fg \
+         contrast colour after the colour-scheme change, got:\n{locked_light_css}"
+    );
+    assert!(
+        !locked_light_css.contains("color: rgb(244,243,241);"),
+        "the dark palette's --hop-fg contrast colour must not survive the reload, \
+         got:\n{locked_light_css}"
+    );
+
     // Flip back: "restyles the window without restarting it" means a live,
     // repeatable restyle, not a one-shot transition this test could pass by
     // accident on a handler that only ever runs once (e.g. one that
@@ -230,8 +276,15 @@ fn run_assertions() {
          the dark palette again, got:\n{dark_css_again}"
     );
 
+    let locked_dark_css_again = locked_provider.to_str();
+    assert!(
+        locked_dark_css_again.contains("color: rgb(244,243,241);"),
+        "expected switching back to dark to reload the locked provider with the dark \
+         palette's --hop-fg contrast colour again, got:\n{locked_dark_css_again}"
+    );
+
     println!(
-        "the installed gtk::CssProvider reloads live on an AdwStyleManager \
-         colour-scheme change, in both directions"
+        "both the ordinary and the locked gtk::CssProvider reload live on an \
+         AdwStyleManager colour-scheme change, in both directions"
     );
 }
