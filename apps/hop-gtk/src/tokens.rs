@@ -464,6 +464,15 @@ pub struct FontToken {
     pub family: &'static str,
 }
 
+/// Parses a `--hop-text-*` type-scale token into a [`FontToken`]. Resolved
+/// against [`Palette::Dark`] unconditionally, with no palette parameter of
+/// its own — palette-invariant for the same reason [`px_token`]'s doc
+/// comment gives: `.hop-theme-light` redeclares exactly 11 names (the
+/// SEMANTIC LAYER's `--hop-bg`/`--hop-fg`/etc.), and every `--hop-text-*`
+/// token lives only in the first, unconditional `:root` block alongside the
+/// `--hop-tracking-*` and `--hop-font-*` tokens it references — none of the
+/// three families is among those 11, so there is no light-palette
+/// declaration for `resolve` to ever prefer over the dark one here.
 fn font_token(name: &str) -> FontToken {
     let raw = raw(name, Palette::Dark);
     let expected = "`<weight> <N>px/<N>px var(--hop-font-*)`";
@@ -519,7 +528,11 @@ fn font_token(name: &str) -> FontToken {
 /// `--hop-tracking-section`'s `0.08em`. `em` here is relative to the type
 /// token it is paired with (`--hop-text-section`'s own `size_px`) — the same
 /// pairing D5/criterion 4 name explicitly: "`--hop-text-section` with
-/// `--hop-tracking-section`".
+/// `--hop-tracking-section`". Resolved against [`Palette::Dark`]
+/// unconditionally, palette-invariant for the same reason
+/// [`font_token`]'s doc comment gives: every `--hop-tracking-*` name lives
+/// only in the first, unconditional `:root` block, not among
+/// `.hop-theme-light`'s 11 redeclared names.
 fn em_token(name: &str) -> f64 {
     resolve(name, Palette::Dark)
         .strip_suffix("em")
