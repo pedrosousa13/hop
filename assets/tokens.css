@@ -39,7 +39,6 @@
   --hop-text-calc-result:  500 22px/28px   var(--hop-font-mono);
   --hop-text-title:        500 14px/20px   var(--hop-font-sans);
   --hop-text-subtitle:     400 12.5px/18px var(--hop-font-sans);
-  --hop-text-path:         400 11.5px/16px var(--hop-font-mono);
   --hop-text-timestamp:    400 11px/14px   var(--hop-font-mono);
   --hop-text-hint-label:   500 11px/14px   var(--hop-font-sans);
   --hop-text-hint-key:     500 11px/14px   var(--hop-font-mono);
@@ -47,7 +46,6 @@
   --hop-text-empty:        400 13.5px/20px var(--hop-font-sans);
   --hop-text-error:        500 13.5px/20px var(--hop-font-sans);
 
-  --hop-tracking-path:     -0.01em;
   --hop-tracking-hint:      0.02em;
   --hop-tracking-section:   0.08em;
 

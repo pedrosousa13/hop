@@ -141,15 +141,22 @@ listview > row:hover {
    semantic alias `tokens.css`'s SEMANTIC LAYER promotes specifically for a
    subtitle-tier ramp step, resolving under both palettes with no new token.
 
-   This is the row anatomy's *only* subtitle treatment. The v1 visual spec
-   also names an 11.5px mono treatment for a path-shaped subtitle, but
-   `ItemSubtitle` carries no flag saying which treatment applies, and
-   `Item.kind` is not a sound basis to infer one (a `File` item's subtitle
-   need not be a path, and a non-`File` item's might be) — issue #196's own
-   triage settled that every subtitle gets this one proportional rule, full
-   stop, and named issue #206 as the one that could someday teach the
-   protocol to carry the distinction. `--hop-text-path`/`--hop-tracking-path`
-   are deliberately not referenced anywhere in this file.
+   This is the row anatomy's *only* subtitle treatment, full stop — settled,
+   not provisional. An earlier draft of the v1 visual spec also named an
+   11.5px mono treatment for a path-shaped subtitle, but `ItemSubtitle`
+   carries no flag saying which treatment applies, and `Item.kind` is not a
+   sound basis to infer one (a `File` item's subtitle need not be a path,
+   and a non-`File` item's might be) — this codebase's allowed-scheme
+   precedent commits it to an allow-list for exactly this shape of guess,
+   never an inference. Issue #206 evaluated adding that signal to the
+   protocol and closed the question the other way: the mono-path treatment
+   is dropped from v1, not deferred, so there is no pending protocol change
+   this rule is waiting on. The spec's row anatomy has been amended to
+   match — it now names one subtitle treatment, not two. The two type-scale
+   tokens that existed solely to encode the dropped treatment were deleted
+   from `tokens.css` outright rather than left unreferenced here, so this
+   file's absence of a reference to them is not "not yet" — those tokens no
+   longer exist to reference.
 
    `ui::row::build` gives the subtitle label the widget name
    `hop-row-subtitle` (its own `SUBTITLE_CHILD_NAME` constant) and also adds

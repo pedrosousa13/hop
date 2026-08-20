@@ -72,8 +72,32 @@ which would compete for the same vertical space recents need.
 ## The six states
 
 Row anatomy: 26px icon · title (14px proportional) · subtitle (12.5px
-proportional, or 11.5px mono for a path) · right-aligned action hint (11px).
-Base row height 56px, ~5 visible, radii 10px.
+proportional) · right-aligned action hint (11px). Base row height 56px, ~5
+visible, radii 10px.
+
+**Subtitle gets one treatment, not two.** An earlier draft of this anatomy
+also named an 11.5px mono face "for a path." Issue #196's triage rejected
+inferring that treatment from the item's `Kind` and split the open question
+to #206; #206 weighed adding protocol surface to carry the signal instead
+and settled on dropping the treatment from v1, definitively — not deferred,
+and not a flag left for some future issue to flip. Three reasons, all
+independent:
+
+- **No protocol signal selects it.** `ItemSubtitle` is validated single-line
+  text with no discriminant saying which treatment its contents want.
+- **Inferring "path" from the item's `Kind` is unsound in both directions.**
+  A `File` item's subtitle need not be a path, and a non-`File` item's might
+  be one. `CONTEXT.md`'s allowed-scheme precedent commits this codebase to
+  an allow-list for exactly this shape of guess, never an inference — so
+  `Kind::File` is not a basis to render mono either.
+- **The mono face does not currently render as mono anyway.** Neither
+  bundled typeface is installed yet (#198), so even where the treatment
+  would have applied, the distinction it draws is invisible today. A
+  treatment nobody can see is a weak reason to add protocol surface for it.
+
+Every subtitle renders in the one proportional treatment above. Should a
+concrete need for a path-styled subtitle appear later, it is a fresh design
+decision to make then, not a dormant capability to switch back on.
 
 | State | Must communicate | Borrowed from | Designed against |
 | --- | --- | --- | --- |
