@@ -1,2 +1,21 @@
+# Pinned, not `channel = "stable"`. An unpinned `stable` moves on its own — Rust
+# 1.98.0 (2026-08-18) stabilised `clippy::chunks_exact_to_as_chunks`, and CI's
+# `-D warnings` turned that into a build failure on `main` with no commit
+# touching the flagged line (issue #223). A pin makes a compiler upgrade a
+# reviewed diff (bump the version here, watch what breaks under it) instead of
+# a surprise red build the next time upstream ships a release.
+#
+# This file, not `.github/workflows/ci.yml`'s `dtolnay/rust-toolchain@...`
+# step, is what actually selects the toolchain `cargo` uses: rustup resolves a
+# `rust-toolchain.toml` override in the working directory ahead of whatever
+# `rustup default` last set, and the action only ever calls `rustup default`
+# (see its `action.yml`) — never `RUSTUP_TOOLCHAIN` or `+toolchain`, either of
+# which would outrank this file. Verified locally: with the global rustup
+# default forced to a different installed version (1.86.0), `rustc --version`
+# inside this repo still reported the version pinned here, unaffected. The
+# workflow's own toolchain step is pinned to the same version (rather than
+# left on `@stable`) so the two mechanisms agree and CI never needs to
+# auto-install a second toolchain mid-run; this file remains the one that
+# would win if they ever disagreed again.
 [toolchain]
-channel = "stable"
+channel = "1.98.0"
