@@ -64,16 +64,39 @@
 //!   `base` because they are unconditional too); [`Palette::Dark`] never
 //!   consults the overlay at all.
 //! - **The `@media (prefers-reduced-motion: reduce)` block** — including the
-//!   third `:root` nested inside it — is skipped entirely, on purpose. It
-//!   redefines the motion-duration tokens, but nothing in this crate reads
-//!   `Gtk.Settings:gtk-enable-animations` or otherwise consumes a
-//!   reduced-motion signal yet (reduced motion is explicitly out of scope
-//!   for the issue this change belongs to), so folding it into `base`
-//!   unconditionally would silently apply the *reduced*-motion durations
-//!   regardless of the user's actual system preference — worse than not
-//!   modelling it at all. When reduced-motion support is built, it should
-//!   get its own overlay table shaped like `light_overlay`, selected the
-//!   same way — not be retrofitted into `base`.
+//!   third `:root` nested inside it — parses into its own overlay table,
+//!   [`TokenTable::reduced_motion_overlay`], shaped exactly like
+//!   `light_overlay` and selected the same way: [`resolve_motion`] checks it
+//!   first for [`Motion::Reduced`] and falls back to `base` for names it does
+//!   not redeclare; [`Motion::Full`] never consults it. It is *not* folded
+//!   into `base` — the reasoning [`light_overlay`] gets above applies
+//!   identically here: doing so would make the reduced-motion durations win
+//!   unconditionally, regardless of which [`Motion`] a caller actually asked
+//!   for. What changed since this comment used to call the block "skipped
+//!   entirely" is only that something now exists to read a motion signal
+//!   and pass it through ([`resolve_motion`]'s own doc comment) — the
+//!   fail-safe this parser enforces (a caller must ask for reduced motion by
+//!   name; nothing infers it) is exactly the same shape as before, just
+//!   reachable now instead of dead.
+//!
+//!   The `@media` block is structurally unlike every other block this parser
+//!   walks: its own selector, `@media (prefers-reduced-motion: reduce)`,
+//!   carries no declarations directly — its body is one more nested `:root`
+//!   block, which is what actually holds the `--name: value;` pairs.
+//!   [`TokenTable::parse`] special-cases that one selector by *string
+//!   equality* before it ever reaches [`classify_selector`], and hands its
+//!   body to [`TokenTable::parse_reduced_motion_media`], a second,
+//!   independent block-walking loop that treats a `:root` it finds as the
+//!   reduced-motion overlay rather than `base`. Nothing else about block
+//!   parsing changes: [`classify_selector`] still maps every other selector
+//!   exactly as before, and — critically — that second loop only ever runs
+//!   for the body of a block whose selector matched
+//!   `@media (prefers-reduced-motion: reduce)` verbatim. A `:root` nested
+//!   inside any *other* block that [`classify_selector`] returns `Skip` for
+//!   (there are none in `tokens.css` today, but nothing prevents one being
+//!   added) is never specially descended into — the outer loop still treats
+//!   that whole block, nested contents included, as one opaque skipped unit,
+//!   via [`find_matching_brace`], exactly as it always has.
 //! - **The five `.hop-honesty*` rule blocks** are skipped entirely: they are
 //!   component rules (`opacity: 1;`, `color: var(--hop-fg);`, `min-width:
 //!   24px;`), not `--custom-property` *declarations*, so they have no
@@ -106,6 +129,28 @@ pub enum Palette {
     Light,
 }
 
+/// Which of `tokens.css`'s two motion states to resolve a motion token
+/// against. Full is the unconditional `MOTION` block's own values; Reduced is
+/// the `@media (prefers-reduced-motion: reduce)` overlay. See this module's
+/// top-level doc comment for how each variant treats the parsed
+/// [`TokenTable`].
+///
+/// Deliberately **not** folded into [`Palette`] as a combined
+/// `(Palette, Motion)` enum or a fourth `Palette` variant: the two axes do
+/// not overlap in `tokens.css` — no motion token is palette-scoped, and no
+/// palette-scoped token has a reduced-motion override — so a fused type
+/// would force every palette-only caller ([`crate::stylesheet::resolve`]
+/// among them) to also supply a motion state it has no use for and no
+/// opinion about. Kept separate, [`resolve`] stays exactly the two-argument
+/// function it already was, and [`resolve_motion`] is the independent entry
+/// point motion-aware callers use instead. See [`resolve_motion`]'s own doc
+/// comment for the full shape of that split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    Full,
+    Reduced,
+}
+
 /// A parsed, unresolved view of `assets/tokens.css`: every `--name: value;`
 /// declaration this module cares about, sorted into the two tables the
 /// module doc comment describes. Values are stored exactly as written —
@@ -117,6 +162,12 @@ struct TokenTable {
     /// `.hop-theme-light`'s redeclarations, consulted only for
     /// [`Palette::Light`], checked before falling back to `base`.
     light_overlay: HashMap<String, String>,
+    /// The `@media (prefers-reduced-motion: reduce)` block's nested
+    /// `:root`'s redeclarations, consulted only for [`Motion::Reduced`],
+    /// checked before falling back to `base` — the same overlay-then-base
+    /// shape `light_overlay` uses for the palette axis, applied to the
+    /// independent motion axis. See this module's top-level doc comment.
+    reduced_motion_overlay: HashMap<String, String>,
 }
 
 /// Parsed once, on first use, and kept for the process's lifetime — parsing
@@ -125,11 +176,18 @@ struct TokenTable {
 /// re-run.
 static TABLE: LazyLock<TokenTable> = LazyLock::new(|| TokenTable::parse(TOKENS_CSS));
 
+/// The one selector `TokenTable::parse` special-cases *before*
+/// [`classify_selector`] ever sees it — see this module's top-level doc
+/// comment, the `@media` bullet, for why this block cannot be classified the
+/// same way every other block is.
+const REDUCED_MOTION_MEDIA_SELECTOR: &str = "@media (prefers-reduced-motion: reduce)";
+
 impl TokenTable {
     fn parse(css: &str) -> Self {
         let stripped = strip_comments(css);
         let mut base = HashMap::new();
         let mut light_overlay = HashMap::new();
+        let mut reduced_motion_overlay = HashMap::new();
 
         let mut rest: &str = &stripped;
         while let Some(open_rel) = rest.find('{') {
@@ -137,10 +195,14 @@ impl TokenTable {
             let close_rel = find_matching_brace(rest, open_rel);
             let body = &rest[open_rel + 1..close_rel];
 
-            match classify_selector(selector) {
-                BlockKind::Base => parse_declarations(body, &mut base),
-                BlockKind::LightOverlay => parse_declarations(body, &mut light_overlay),
-                BlockKind::Skip => {}
+            if selector == REDUCED_MOTION_MEDIA_SELECTOR {
+                Self::parse_reduced_motion_media(body, &mut reduced_motion_overlay);
+            } else {
+                match classify_selector(selector) {
+                    BlockKind::Base => parse_declarations(body, &mut base),
+                    BlockKind::LightOverlay => parse_declarations(body, &mut light_overlay),
+                    BlockKind::Skip => {}
+                }
             }
 
             rest = &rest[close_rel + 1..];
@@ -149,13 +211,80 @@ impl TokenTable {
         Self {
             base,
             light_overlay,
+            reduced_motion_overlay,
+        }
+    }
+
+    /// Walks the `@media (prefers-reduced-motion: reduce)` block's own body
+    /// — everything between its outer braces — the same way [`Self::parse`]
+    /// walks the top level of the file: find a `{`, read its selector, find
+    /// the matching `}`. `tokens.css` only ever puts one block in here (the
+    /// nested `:root`), but this loops rather than assuming exactly one, for
+    /// the same "don't special-case a count that happens to be 1 today"
+    /// reason [`substitute_vars`]'s own doc comment gives.
+    ///
+    /// This is a second, independent loop rather than a recursive call back
+    /// into [`Self::parse`] with an extra parameter, on purpose: it is the
+    /// mechanism that keeps a nested `:root` elsewhere in the file (inside
+    /// some *other*, still-`Skip`-classified block) from ever being
+    /// reclassified. [`Self::parse`]'s own loop only ever calls this
+    /// function for the one block whose selector matched
+    /// `REDUCED_MOTION_MEDIA_SELECTOR` by exact string equality; every other
+    /// block — including a hypothetical future one with its own nested
+    /// `:root` — still goes through [`classify_selector`] and, for anything
+    /// that classifies as `Skip`, is never opened at all: its body, nested
+    /// blocks included, is skipped as one opaque unit via
+    /// [`find_matching_brace`], exactly as before this function existed.
+    fn parse_reduced_motion_media(body: &str, out: &mut HashMap<String, String>) {
+        let mut rest = body;
+        while let Some(open_rel) = rest.find('{') {
+            let selector = rest[..open_rel].trim();
+            let close_rel = find_matching_brace(rest, open_rel);
+            let inner_body = &rest[open_rel + 1..close_rel];
+
+            if selector == ":root" {
+                parse_declarations(inner_body, out);
+            }
+            // Anything else nested in here (there is nothing else today)
+            // stays unparsed, matching classify_selector's `Skip` default
+            // for every selector besides `:root` and `.hop-theme-light`.
+
+            rest = &rest[close_rel + 1..];
+        }
+    }
+
+    /// `palette`'s [`Overlay`]: `light_overlay` for [`Palette::Light`], none
+    /// for [`Palette::Dark`] — [`Palette::Dark`] never consults an overlay
+    /// at all, exactly as [`raw_from`]'s doc comment on the old
+    /// `Palette`-only version of this lookup described.
+    fn palette_overlay(&self, palette: Palette) -> Overlay<'_> {
+        match palette {
+            Palette::Light => Some(&self.light_overlay),
+            Palette::Dark => None,
+        }
+    }
+
+    /// `motion`'s [`Overlay`]: `reduced_motion_overlay` for
+    /// [`Motion::Reduced`], none for [`Motion::Full`] — the motion-axis
+    /// mirror of [`Self::palette_overlay`].
+    fn motion_overlay(&self, motion: Motion) -> Overlay<'_> {
+        match motion {
+            Motion::Reduced => Some(&self.reduced_motion_overlay),
+            Motion::Full => None,
         }
     }
 }
 
-/// What a top-level (or `@media`-nested) block's selector means for the
-/// token table. See this module's top-level doc comment for the reasoning
-/// behind each arm.
+/// What a top-level block's selector means for the token table. See this
+/// module's top-level doc comment for the reasoning behind each arm.
+///
+/// Only ever consulted for a block whose selector is *not*
+/// `REDUCED_MOTION_MEDIA_SELECTOR` — `TokenTable::parse` special-cases that
+/// one selector, by exact string match, before it reaches this function at
+/// all, because that block's own `:root` must become the reduced-motion
+/// overlay rather than `Base`. Every other selector, including a nested
+/// `:root` inside some *other* skipped block, is still classified here
+/// exactly as before.
 enum BlockKind {
     Base,
     LightOverlay,
@@ -201,8 +330,13 @@ fn strip_comments(css: &str) -> String {
 /// Given the index of a `{` in `s`, returns the index of the `}` that closes
 /// it, counting nested braces so a block containing another block — the
 /// `@media` block's nested `:root { ... }` is the only case `tokens.css`
-/// actually has — is skipped as one unit rather than stopping at the first
-/// `}`, which would be the *inner* block's own close.
+/// actually has — is bounded as one unit rather than stopping at the first
+/// `}`, which would be the *inner* block's own close. Used both by
+/// `TokenTable::parse`'s top-level loop (where, for every selector besides
+/// `REDUCED_MOTION_MEDIA_SELECTOR`, that unit is then either parsed whole or
+/// skipped whole per `classify_selector`) and by
+/// `TokenTable::parse_reduced_motion_media`'s own loop over the `@media`
+/// block's body.
 fn find_matching_brace(s: &str, open_at: usize) -> usize {
     let bytes = s.as_bytes();
     let mut depth = 1u32;
@@ -247,40 +381,52 @@ fn parse_declarations(body: &str, out: &mut HashMap<String, String>) {
     }
 }
 
-/// Looks up `name`'s declaration in `table` for `palette`, **unresolved** —
-/// a value that is itself `var(--x)` is returned as that literal text, not
-/// followed. [`resolve`] is the chain-following counterpart; [`font_token`]
-/// is the one caller that needs this unresolved form, because it must split
-/// a `<weight> <size>/<line> var(--family)` shorthand into pieces *before*
-/// the trailing piece is resolved — resolving the whole shorthand first
-/// would inline the family stack's own internal whitespace
-/// (`"Inter", -apple-system, ...`) into the string being split, breaking the
-/// assumption that the shorthand has exactly one whitespace-delimited
-/// trailing token.
+/// Which of a [`TokenTable`]'s overlays (if any) a lookup should prefer over
+/// `base` — the one thing [`Palette`]'s light/dark split and [`Motion`]'s
+/// full/reduced split have in common structurally, even though the two enums
+/// stay independent everywhere a caller can see. [`raw_from`],
+/// [`resolve_from`], [`resolve_with_path`], and [`substitute_vars`] are all
+/// written against this shared shape rather than against `Palette`
+/// specifically (as they were before this module gained a second axis) —
+/// otherwise the `var()`-chain-following and cycle-detection logic in
+/// [`resolve_with_path`]/[`substitute_vars`] would need a second, near-
+/// identical copy for motion, and a subtle fix to the cycle guard would have
+/// to be remembered twice. [`resolve`] and [`resolve_motion`] each compute
+/// their own `Overlay` from the enum they actually take and hand it to this
+/// shared core; the fusion stops at that boundary; no public function here
+/// takes both a [`Palette`] and a [`Motion`].
+type Overlay<'a> = Option<&'a HashMap<String, String>>;
+
+/// Looks up `name`'s declaration in `table`, preferring `overlay` (if given)
+/// and falling back to `base`, **unresolved** — a value that is itself
+/// `var(--x)` is returned as that literal text, not followed. [`resolve`] is
+/// the chain-following counterpart; [`font_token`] is the one caller that
+/// needs this unresolved form, because it must split a
+/// `<weight> <size>/<line> var(--family)` shorthand into pieces *before* the
+/// trailing piece is resolved — resolving the whole shorthand first would
+/// inline the family stack's own internal whitespace (`"Inter",
+/// -apple-system, ...`) into the string being split, breaking the assumption
+/// that the shorthand has exactly one whitespace-delimited trailing token.
 ///
 /// Panics naming `name` and the file if neither table has it — a missing
 /// token is a build-time programming error to catch immediately, in the
 /// same spirit as every panic in this module.
-fn raw_from<'a>(table: &'a TokenTable, name: &str, palette: Palette) -> &'a str {
-    let value = match palette {
-        Palette::Light => table
-            .light_overlay
-            .get(name)
-            .or_else(|| table.base.get(name)),
-        Palette::Dark => table.base.get(name),
-    };
+fn raw_from<'a>(table: &'a TokenTable, name: &str, overlay: Overlay<'a>) -> &'a str {
+    let value = overlay
+        .and_then(|o| o.get(name))
+        .or_else(|| table.base.get(name));
     value
         .map(String::as_str)
         .unwrap_or_else(|| panic!("assets/tokens.css has no `--{name}` declaration"))
 }
 
-/// [`raw_from`] against the module's real, parsed [`TABLE`]. `TABLE` is a
-/// `'static` item, so a borrow into it — including the transitive borrow
-/// this returns — is itself `'static`, which is what lets
+/// [`raw_from`] against the module's real, parsed [`TABLE`], for `palette`.
+/// `TABLE` is a `'static` item, so a borrow into it — including the
+/// transitive borrow this returns — is itself `'static`, which is what lets
 /// [`font_token`] hand its `family` field a `&'static str` without owning a
 /// copy.
 fn raw(name: &str, palette: Palette) -> &'static str {
-    raw_from(&TABLE, name, palette)
+    raw_from(&TABLE, name, TABLE.palette_overlay(palette))
 }
 
 /// Resolves `name` to a concrete value under `palette`, following every
@@ -290,13 +436,43 @@ fn raw(name: &str, palette: Palette) -> &'static str {
 /// name with no declaration, and panics naming the whole cycle if a chain
 /// ever revisits a name it has already started resolving, rather than
 /// recursing forever — see `resolve_with_path`'s own doc comment for how.
+///
+/// Takes only a [`Palette`] — no [`Motion`] parameter — on purpose: this is
+/// the entry point every existing, palette-only caller
+/// ([`crate::stylesheet::resolve`], [`px_token`], [`hex_token`],
+/// [`font_token`], [`em_token`]) already uses, and none of them has any use
+/// for a motion state. It structurally cannot return a reduced-motion value:
+/// it never looks at [`TokenTable::reduced_motion_overlay`] at all. A caller
+/// that does need the reduced-motion axis uses [`resolve_motion`] instead.
 pub fn resolve(name: &str, palette: Palette) -> String {
-    resolve_from(&TABLE, name, palette)
+    resolve_from(&TABLE, name, TABLE.palette_overlay(palette))
 }
 
-fn resolve_from(table: &TokenTable, name: &str, palette: Palette) -> String {
+/// Resolves `name` to a concrete value under `motion`, following every
+/// `var(--other-name)` reference the declaration contains, exactly the way
+/// [`resolve`] does for the palette axis — same chain-following, same
+/// missing-token and cycle panics, same [`TABLE`].
+///
+/// Takes only a [`Motion`] — no [`Palette`] parameter — for the mirror-image
+/// reason [`resolve`] takes only a [`Palette`]: no motion token is
+/// palette-scoped (`.hop-theme-light` never redeclares a `--hop-duration-*`,
+/// `--hop-delay-*`, or `--hop-ease-*` name), so there is no palette axis for
+/// a motion lookup to consult. Under [`Motion::Full`] this never looks at
+/// [`TokenTable::reduced_motion_overlay`] at all, the same way [`resolve`]
+/// under [`Palette::Dark`] never looks at `light_overlay` — a caller must
+/// explicitly ask for [`Motion::Reduced`] to ever see one of the six
+/// `@media` overrides; nothing here infers it from anywhere else. That is
+/// the guard this module's top-level doc comment says the old
+/// "skip the `@media` block entirely" behaviour existed to provide, now
+/// reachable instead of dead: it still requires an explicit ask, just one
+/// this function can finally satisfy.
+pub fn resolve_motion(name: &str, motion: Motion) -> String {
+    resolve_from(&TABLE, name, TABLE.motion_overlay(motion))
+}
+
+fn resolve_from<'a>(table: &'a TokenTable, name: &str, overlay: Overlay<'a>) -> String {
     let mut path = Vec::new();
-    resolve_with_path(table, name, palette, &mut path)
+    resolve_with_path(table, name, overlay, &mut path)
 }
 
 /// `path` holds the names currently being resolved, outermost first — the
@@ -308,10 +484,14 @@ fn resolve_from(table: &TokenTable, name: &str, palette: Palette) -> String {
 /// into a panic that names every link in the loop instead of an unbounded
 /// recursion that would eventually blow the stack — the difference the
 /// brief for this module requires: "detected, not hit as a stack overflow."
-fn resolve_with_path(
-    table: &TokenTable,
+///
+/// `overlay` is threaded through unchanged across the whole recursive chain
+/// — a single [`resolve`]/[`resolve_motion`] call resolves entirely against
+/// one axis's overlay, never switching partway through a `var()` chain.
+fn resolve_with_path<'a>(
+    table: &'a TokenTable,
     name: &str,
-    palette: Palette,
+    overlay: Overlay<'a>,
     path: &mut Vec<String>,
 ) -> String {
     if let Some(pos) = path.iter().position(|seen| seen.as_str() == name) {
@@ -324,8 +504,8 @@ fn resolve_with_path(
     }
 
     path.push(name.to_string());
-    let raw_value = raw_from(table, name, palette);
-    let resolved = substitute_vars(table, raw_value, palette, path);
+    let raw_value = raw_from(table, name, overlay);
+    let resolved = substitute_vars(table, raw_value, overlay, path);
     path.pop();
     resolved
 }
@@ -337,10 +517,10 @@ fn resolve_with_path(
 /// assuming that, so a future declaration combining more than one — a
 /// shorthand mixing a literal with a referenced colour, say — resolves
 /// correctly too.
-fn substitute_vars(
-    table: &TokenTable,
+fn substitute_vars<'a>(
+    table: &'a TokenTable,
     value: &str,
-    palette: Palette,
+    overlay: Overlay<'a>,
     path: &mut Vec<String>,
 ) -> String {
     let mut out = String::with_capacity(value.len());
@@ -352,7 +532,7 @@ fn substitute_vars(
             .find(')')
             .unwrap_or_else(|| panic!("assets/tokens.css has an unterminated `var()` reference"));
         let inner_name = after_marker[..close].trim();
-        out.push_str(&resolve_with_path(table, inner_name, palette, path));
+        out.push_str(&resolve_with_path(table, inner_name, overlay, path));
         rest = &after_marker[close + 1..];
     }
     out.push_str(rest);
@@ -370,7 +550,10 @@ fn substitute_vars(
 /// `.hop-theme-light` redeclares, so resolving against [`Palette::Dark`]
 /// always agrees with [`Palette::Light`] here — there is no palette
 /// parameter to thread through for values that structurally cannot differ
-/// by palette.
+/// by palette. Motion-invariant for the same reason, one axis over: this
+/// calls [`resolve`], not [`resolve_motion`], so it never consults
+/// [`TokenTable::reduced_motion_overlay`] regardless of which token it is
+/// asked for — there is no motion parameter to thread through either.
 fn px_token(name: &str) -> i32 {
     let value = resolve(name, Palette::Dark);
     let digits: String = value
@@ -450,8 +633,8 @@ fn bad_token(name: &str, expected: &str) -> ! {
 /// resolve. Routed through [`resolve`] anyway, rather than a bespoke direct
 /// lookup, so this module has exactly one lookup path rather than two. See
 /// each `LazyLock`'s own doc comment for why its particular literal was the
-/// one chosen. Also palette-invariant, for the same reason [`px_token`]'s
-/// doc comment gives.
+/// one chosen. Also palette-invariant and motion-invariant, for the same
+/// reasons [`px_token`]'s doc comment gives for both.
 fn hex_token(name: &str) -> (u8, u8, u8) {
     let value = resolve(name, Palette::Dark);
     let expected = "a bare `#rrggbb` value";
@@ -493,7 +676,10 @@ pub struct FontToken {
 /// block alongside the `--hop-tracking-*` and `--hop-font-*` tokens it
 /// references — none of the three families is among those 12, so there is
 /// no light-palette declaration for `resolve` to ever prefer over the dark
-/// one here.
+/// one here. Motion-invariant too, for the structural reason [`px_token`]'s
+/// doc comment gives: both lookups below go through `raw`/`resolve`, never
+/// `resolve_motion`, so [`TokenTable::reduced_motion_overlay`] never enters
+/// the picture regardless of `name`.
 fn font_token(name: &str) -> FontToken {
     let raw = raw(name, Palette::Dark);
     let expected = "`<weight> <N>px/<N>px var(--hop-font-*)`";
@@ -553,7 +739,8 @@ fn font_token(name: &str) -> FontToken {
 /// unconditionally, palette-invariant for the same reason
 /// [`font_token`]'s doc comment gives: every `--hop-tracking-*` name lives
 /// only in the first, unconditional `:root` block, not among
-/// `.hop-theme-light`'s 12 redeclared names.
+/// `.hop-theme-light`'s 12 redeclared names. Motion-invariant for the same
+/// reason [`px_token`]'s doc comment gives: `resolve`, not `resolve_motion`.
 fn em_token(name: &str) -> f64 {
     resolve(name, Palette::Dark)
         .strip_suffix("em")
@@ -720,7 +907,9 @@ mod tests {
         // proves `resolve` actually walks a chain rather than special-casing
         // "exactly one hop", the way `raw`/`font_token` used to have to.
         let table = TokenTable::parse(":root { --a: var(--b); --b: var(--c); --c: 3px; }");
-        assert_eq!(resolve_from(&table, "a", Palette::Dark), "3px");
+        // `None`: no overlay, i.e. base-only — the same axis-agnostic
+        // resolution `Palette::Dark` and `Motion::Full` both reduce to.
+        assert_eq!(resolve_from(&table, "a", None), "3px");
     }
 
     #[test]
@@ -743,7 +932,7 @@ mod tests {
         // path-tracking guard actually catches the cycle instead of hitting
         // the stack limit.
         let table = TokenTable::parse(":root { --a: var(--b); --b: var(--a); }");
-        resolve_from(&table, "a", Palette::Dark);
+        resolve_from(&table, "a", None);
     }
 
     #[test]
@@ -773,5 +962,109 @@ mod tests {
         // resolve a bare ramp name like `hop-icon-size` — it is not present
         // in the light overlay at all.
         assert_eq!(resolve("hop-icon-size", Palette::Light), "26px");
+    }
+
+    /// Every duration and easing curve `assets/tokens.css`'s unconditional
+    /// `MOTION` block declares, alongside the literal that block gives it.
+    /// Read directly from the file (see this module's top doc comment for
+    /// the line numbers) rather than assumed — this is the fixture every
+    /// motion test below is pinned against.
+    const UNCONDITIONAL_MOTION: &[(&str, &str)] = &[
+        ("hop-duration-open", "140ms"),
+        ("hop-duration-close", "110ms"),
+        ("hop-duration-sel", "90ms"),
+        ("hop-duration-state", "120ms"),
+        ("hop-duration-resolve", "100ms"),
+        ("hop-duration-fast", "80ms"),
+        ("hop-delay-hint", "40ms"),
+        ("hop-ease-out", "cubic-bezier(0.16, 1, 0.3, 1)"),
+        ("hop-ease-in", "cubic-bezier(0.4, 0, 1, 1)"),
+        ("hop-ease-sel", "cubic-bezier(0.22, 1, 0.36, 1)"),
+        ("hop-ease-std", "cubic-bezier(0.4, 0, 0.2, 1)"),
+    ];
+
+    /// The six durations `assets/tokens.css`'s `@media
+    /// (prefers-reduced-motion: reduce)` block overrides, and the value it
+    /// overrides each to. `--hop-duration-fast` is deliberately absent —
+    /// that is the one duration the block does not touch — and no easing
+    /// curve appears here at all, because the block never mentions one.
+    const REDUCED_MOTION_OVERRIDES: &[(&str, &str)] = &[
+        ("hop-duration-open", "85ms"),
+        ("hop-duration-close", "85ms"),
+        ("hop-duration-sel", "1ms"),
+        ("hop-duration-state", "1ms"),
+        ("hop-duration-resolve", "1ms"),
+        ("hop-delay-hint", "0ms"),
+    ];
+
+    #[test]
+    fn full_motion_resolves_every_duration_and_easing_to_the_unconditional_value() {
+        for (name, expected) in UNCONDITIONAL_MOTION {
+            assert_eq!(
+                resolve_motion(name, Motion::Full),
+                *expected,
+                "under full motion, --{name} should resolve to the unconditional block's value"
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_motion_resolves_the_six_overridden_durations_to_the_media_blocks_values() {
+        for (name, expected) in REDUCED_MOTION_OVERRIDES {
+            assert_eq!(
+                resolve_motion(name, Motion::Reduced),
+                *expected,
+                "under reduced motion, --{name} should resolve to the @media block's override"
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_motion_leaves_the_untouched_duration_and_every_easing_curve_unchanged() {
+        // The exact test that would catch a "reduced motion means shorter
+        // everywhere" implementation: `--hop-duration-fast` and all four
+        // `--hop-ease-*` curves have no entry in
+        // `REDUCED_MOTION_OVERRIDES` and must still resolve to their
+        // unconditional value under `Motion::Reduced`.
+        let untouched: Vec<&(&str, &str)> = UNCONDITIONAL_MOTION
+            .iter()
+            .filter(|(name, _)| !REDUCED_MOTION_OVERRIDES.iter().any(|(n, _)| n == name))
+            .collect();
+        // Sanity-check the fixture itself: exactly one duration and all four
+        // easing curves should be untouched (11 unconditional - 6 overridden
+        // = 5).
+        assert_eq!(untouched.len(), 5);
+
+        for (name, expected) in untouched {
+            assert_eq!(
+                resolve_motion(name, Motion::Reduced),
+                *expected,
+                "under reduced motion, --{name} was not one of the six overrides and must be \
+                 unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_colour_token_resolves_identically_under_both_motion_states() {
+        // `--hop-accent` has no reduced-motion override at all — motion and
+        // palette are independent axes, so `resolve_motion` must fall back
+        // to the same base value for it regardless of `Motion`.
+        assert_eq!(
+            resolve_motion("hop-accent", Motion::Full),
+            resolve_motion("hop-accent", Motion::Reduced),
+        );
+    }
+
+    #[test]
+    fn a_motion_token_resolves_identically_under_both_palettes() {
+        // `--hop-duration-open` is not among `.hop-theme-light`'s
+        // redeclared names, so `resolve` must fall back to the same base
+        // value for it under either palette — the palette axis must not
+        // interfere with a motion token's own value.
+        assert_eq!(
+            resolve("hop-duration-open", Palette::Dark),
+            resolve("hop-duration-open", Palette::Light),
+        );
     }
 }
