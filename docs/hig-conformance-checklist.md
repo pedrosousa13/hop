@@ -56,11 +56,15 @@ claim:
 | **Not yet satisfied** | Checked; does not hold yet. Named as a gap, not filed as a bug — M3's remaining slices own closing it. |
 | **Unknown** | Not checked, or checkable only by a human/setting this pass did not have. Recorded as unknown rather than guessed. |
 
-Every status below was determined by reading the build at commit `7a6f99b`
-(`hop-gtk: mode label and consumed-marker highlight`, #192) — by source
-inspection, by running the existing test suite, and in a few cases by
-producing a `--screenshot` capture. Where a status could not be determined
-this way, it says so rather than guessing.
+Every status below was determined by reading the build at commit `0fc1c92`
+(`docs: correct theme contract's presence claim for GTK`, #211) — by source
+inspection, by running the existing test suite, and by producing several
+real `--screenshot` captures against a live `hopd` serving this machine's own
+installed applications (not a stub or a fixture — see item 1 for how that was
+done and what it did and did not settle). Where a status could not be
+determined this way, it says so rather than guessing. This is a full re-pass:
+every item below was re-checked against this commit, not left quoting an
+earlier one, per the issue that requested this refresh (#202).
 
 ---
 
@@ -93,11 +97,56 @@ visible in a PNG) but not fully — telling deliberate symbolic rendering apart
 from an icon that merely happens to be one colour needs a source read
 alongside the capture, not the capture alone.
 
-**Status: not yet satisfied — no subject exists to check.** `ui/row.rs`'s row
-widget is a single `gtk::Label` populated with only a title; there is no icon
-widget anywhere in the row layout, chrome or content (verified by reading
-`apps/hop-gtk/src/ui/row.rs` in full at `7a6f99b`). This item has nothing to
-pass or fail yet.
+**Status: satisfied, verified — for the one icon category this UI currently
+has.** Issue #190 turned `ui/row.rs`'s row widget from a bare `gtk::Label`
+into a `gtk::Box` carrying a leading `gtk::Image` (`ui::row::build`,
+`ui::row::resolve_icon`); `bind` resolves it from `item.icon: Option<IconSpec>`
+in the three-way split `resolve_icon`'s own doc comment names — `None` clears
+the widget, `IconSpec::Name` hands the lookup to
+`gtk::Image::set_icon_name`, `IconSpec::Path` decodes the file itself via
+`load_path_texture` (gated by `icon_roots::ALLOWED_ICON_ROOTS`, issue #93)
+and falls back to the literal `"image-missing"` icon name on any failure.
+
+A results-state capture was produced end to end, against a real, unmodified
+`hopd` serving this machine's actual installed applications (the `apps`
+provider, `crates/hopd/src/apps.rs`, indexing real `.desktop` files under
+`/usr/share/applications` and `~/.local/share/applications` — not a fixture
+or a stub host): `gtk4-broadwayd :42` as the headless backend,
+`hop-gtk --screenshot out.png --query <text>` exactly as the CI smoke test
+and this item's own Check both call for. Three queries were captured and
+inspected as PNGs:
+
+- `--query code` returned two real rows. "Visual Studio Code" renders its
+  actual brand icon (a blue/teal glyph) via `IconSpec::Name("vscode")` — a
+  successful theme lookup, confirmed by reading `code.desktop`'s own
+  `Icon=vscode` line. "T3 Code" (a locally installed AppImage,
+  `~/.local/share/applications/t3code.desktop`, `Icon=t3code`) also resolves
+  through `IconSpec::Name`, but the name lookup fails — this machine's icon
+  cache was never updated for the user icon directory that actually holds
+  `t3code.png` — and GTK's own built-in fallback glyph renders instead: a
+  cream/tan document-with-warning-triangle icon, two flat colours, not a
+  `-symbolic`-suffixed lookup and not recoloured to match text the way a
+  true symbolic icon is. It is a resolution failure, not a violation of this
+  item's rule: the element is still content (an app's own icon slot), and
+  GTK's non-symbolic fallback for a missing name is itself non-symbolic.
+- `--query gitkraken` returned "GitKraken", whose `Icon=/usr/share/pixmaps/gitkraken.png`
+  line makes it an `IconSpec::Path` case — `/usr/share/pixmaps` is one of
+  `icon_roots::ALLOWED_ICON_ROOTS`' permitted roots, confirmed by reading
+  that module. The captured row shows the real, full-colour kraken logo,
+  proving the `Path` arm's decode-and-permit path renders a genuine
+  full-colour content icon end to end, not only that the code compiles.
+
+Pairing the visual read with the source read: every icon-bearing element
+across all three captures is content (an item's own icon), none renders
+`-symbolic` or single-tone-by-construction, and the one fallback case is a
+resolution failure that still renders non-symbolically. **No chrome icon
+exists anywhere in this UI to test the rule's other half against** — a grep
+across `apps/hop-gtk/src` for `gtk::Image`/`set_icon_name`/`icon-name`
+construction finds exactly one call site, `ui::row::build`'s leading icon;
+the query entry, the mode label, the hint chips, and the selection indicator
+carry no icon of their own. So "no chrome icon renders full-colour" holds
+because there is no chrome icon yet to violate it, not because one was
+checked and found compliant — recorded plainly rather than glossed over.
 
 ---
 
@@ -131,16 +180,56 @@ function) but no such script exists in this repo. Not capture-verifiable on
 its own — see 2's overall status below for why a capture of the *running
 app* does not currently prove this.
 
-**Status: partially satisfied.** The ratios recorded in `tokens.css`'s
-comments are consistent with the visual design spec's own account of the
-2026-08-19 pass (two corrected failures, one false-positive investigated and
-dismissed, all documented in place) — I did not re-derive every ratio
-myself, but found no internal inconsistency between the two documents. That
-half is plausible, not confirmed. The other half is confirmed, not
-plausible: **no `gtk::CssProvider` is installed anywhere in `hop-gtk`**, so
-the palette does not reach the screen today — see item 6 below for the full
-account and the issue tracking it; this item shares its cause exactly and
-does not repeat the evidence.
+**Status: partially satisfied — the palette now reaches the screen, and one
+concrete contrast failure was found in it.** The ratios recorded in
+`tokens.css`'s comments are still consistent with the visual design spec's
+own account of the 2026-08-19 pass (two corrected failures, one
+false-positive investigated and dismissed, all documented in place) — I did
+not re-derive every ratio myself, so that half remains plausible rather than
+independently confirmed.
+
+What changed since `7a6f99b` is the other half: issue #193 installed
+`style::install`'s `gtk::CssProvider`, and this pass confirmed by pixel
+sampling a live capture (`--query code`, dark palette, the default this
+environment resolves to — see item 7 below for why the light palette could
+not be forced live) that several tokens really do reach the screen at their
+documented values, not merely in theory: an unselected row's background
+sampled exactly `#121214`, matching `--hop-bg`/`--hop-neutral-950`; the
+selected row's composited fill sampled exactly `#2f2719`, matching
+`--hop-accent-subdued`'s own comment ("composites to #2f2719") to the byte;
+a hint chip's background sampled exactly `#202024`, matching `--hop-bg-hover`.
+That is real, not plausible, confirmation for the tokens it covers.
+
+A genuine, previously-unrecorded contrast failure turned up while checking
+the rest: `assets/stylesheet.css`'s `.hop-row-hint-key` rule sets
+`color: {{hop-accent}}` — the bare, palette-invariant ramp literal
+(`#e3a83b`), not `{{hop-sel-bar}}` or any other name `.hop-theme-light`
+redeclares. Reading `apps/hop-gtk/src/tokens.rs`'s `raw_from`: a
+`Palette::Light` lookup checks `.hop-theme-light`'s overlay first, but that
+overlay only redeclares the eleven SEMANTIC LAYER names (`--hop-bg`,
+`--hop-sel-bar`, and the rest) — `--hop-accent` itself is not among them, so
+a light-palette resolution of `--hop-accent` falls through to the same dark
+literal a dark-palette resolution gets. The result: under the light palette,
+the hint-key glyph ("Enter") would render in the *dark* accent, `#e3a83b`,
+against the light paper background (`#faf9f6`), rather than the committed
+light accent `#875c0f` item 7 below describes. Computing WCAG contrast from
+those two hex values (the same relative-luminance formula this item's own
+Verifiability note treats as "automatable in principle") gives ≈2.0:1 —
+against the 4.5:1 text floor this item's own pass condition sets, and against
+`--hop-accent-light`'s own documented "5.13:1 on paper" the rule intends
+instead. This was checked by arithmetic, not by a live light-palette capture:
+this pass tried to force one (`gsettings set
+org.gnome.desktop.interface color-scheme prefer-light`, then re-captured)
+and got a byte-identical PNG to the dark-palette capture — this sandboxed,
+portal-less headless environment does not appear to let
+`adw::StyleManager::default().is_dark()` see that setting at all (`style.rs`'s
+own doc comment already names dependence on desktop portal/GSettings
+plumbing this crate does not itself provide), so a live light-mode render
+was not achievable here; see item 7's own note on the same limitation. The
+arithmetic itself does not depend on that capture, though — it follows
+directly from the hex values `tokens.css` and `resolve`'s own logic commit
+to. Worth a follow-up issue; not filed here per this pass's own scope (see
+"What to do" in #202).
 
 #### 2b. Screen-reader labels on rows and actions
 
@@ -165,9 +254,22 @@ calls them for this purpose today).
 
 **Status: not yet satisfied.** No `set_accessible_role`, `update_property`,
 or any GTK accessibility API call exists anywhere in `apps/hop-gtk/src`
-(verified by grep — zero hits). `ui/row.rs` carries only a title; there is
-no subtitle, no action hint, and no accessible-name assembly to check. The
-query entry's role and `ACTIVE_DESCENDANT` wiring do not exist.
+(verified by grep — zero hits, unchanged from `7a6f99b`). This is worth
+re-deriving rather than carrying forward, because what there now is to *not*
+expose has grown: issue #196 gave the row a real subtitle
+(`ui::row::resolve_subtitle`, hidden rather than reserved when absent — see
+that module's "The absent case" section) and issue #197 gave it a real
+right-aligned action hint pairing the item's default-action label with
+`Keymap::activate_binding_display`'s key glyph. Both render correctly on
+screen (confirmed in item 1's captures above — every row shows "Open" +
+"Enter"), but neither is wired into any accessible name: there is still no
+concatenated accessible name covering title, subtitle, and default action,
+no `SET_SIZE`/`POS_IN_SET`, no `DESCRIBED_BY` for the row's action set. The
+query entry's `GTK_ACCESSIBLE_ROLE_SEARCH_BOX` and `ACTIVE_DESCENDANT`
+wiring still do not exist either. So this item moves from "nothing exists to
+expose" to "real content exists and none of it is exposed" — a different,
+more concrete gap than the one recorded at `7a6f99b`, not the same one
+restated.
 
 #### 2c. System font scaling
 
@@ -187,19 +289,36 @@ of that setting for a headless capture is unverified, so this is not
 currently capture-verifiable even in principle without more work.
 
 **Status: not yet satisfied, with a concrete conflict on record.**
-`ui/row.rs::build()` calls `label.set_height_request(*tokens::ROW_HEIGHT_PX)`
-— a fixed height reserved *before* any content is known, by that module's
-own design, to stop an async result from shifting layout when it lands. That
-is the opposite of "row height is computed from measured content", which the
-visual design spec commits to specifically for elevated scaling. Separately,
-`ui/mode_label.rs`'s typography is set via
-`pango::AttrSize::new_size_absolute`, which that function's own doc comment
-says yields "a device pixel count rather than a value further scaled by the
-display's own point-to-pixel conversion" — by the file's own account, that
-text does not participate in the display's own scaling conversion. Whether
-`text-scaling-factor` specifically still reaches it through some other layer
-is not something I determined; recorded as a real tension for a reviewer to
-weigh, not as a settled verdict either way.
+`ui/row.rs::build()` still calls `container.set_height_request(*tokens::ROW_HEIGHT_PX)`
+— a fixed height reserved on the row's outer `gtk::Box` *before* any content
+is known, by that module's own design (now covering the icon, text column,
+and hint too, not only a title label), to stop an async result from shifting
+layout when it lands. That is the opposite of "row height is computed from
+measured content", which the visual design spec commits to specifically for
+elevated scaling — unchanged in substance from `7a6f99b`, re-confirmed by
+reading the current file in full. No code anywhere in the crate grows the
+window's height, or reads `text-scaling-factor`/`org.gnome.desktop.interface`
+at all (grep for both finds nothing) — the ~80%-of-monitor growth cap the
+visual spec commits to is unbuilt, not merely unverified.
+
+One piece of the previous pass's evidence does not survive re-reading and is
+retracted rather than carried forward: it cited `ui/mode_label.rs` setting
+its typography via `pango::AttrSize::new_size_absolute`, which that
+function's own doc comment said bypassed the display's scaling conversion.
+Issue #193 removed that Rust-side Pango code outright — `ui/mode_label.rs`'s
+own doc comment now (section "CSS supersedes the Pango stand-in") explains
+why: keeping both would have made the equivalent CSS rule permanently dead,
+since GTK applies a label's `set_attributes` on top of, not instead of, its
+resolved CSS style. The mode label's typography is `.hop-mode-label`'s CSS
+`font: {{font:hop-text-section}}` rule now, a plain pixel size in a
+`gtk::CssProvider`-loaded stylesheet — a structurally different mechanism
+from the removed Pango attribute, and whether GTK's CSS `px` font sizing
+itself scales with `text-scaling-factor` is a real, open question this pass
+did not determine either way (the same environment limitation item 2a and
+item 7 name — no reachable portal/GSettings plumbing to drive the setting
+live here) rather than something to assume settled by the old, now-incorrect
+citation. Recorded as unknown for that specific question, not as a bypass
+that no longer exists in the code.
 
 ---
 
@@ -227,12 +346,19 @@ verification needs a human watching a live build with the setting toggled,
 or an automated check reading the applied CSS transition/animation
 properties against the setting; neither exists in this repo today.
 
-**Status: not yet satisfied — no subject exists to check.** No animation,
-transition, or read of `gtk-enable-animations` exists anywhere in
-`apps/hop-gtk/src` (verified by grep). The six states and their motion are
-fully specified in the visual design spec but the window currently presents
-and dismisses with no implemented open/close transition at all. There is
-nothing yet to honour or violate the setting.
+**Status: not yet satisfied — no subject exists to check.** Re-confirmed at
+this commit: no animation, transition, or read of `gtk-enable-animations`
+exists anywhere in `apps/hop-gtk/src` (grep for all three finds nothing, the
+same zero result as at `7a6f99b`). Neither #196, #197, nor #193 touched
+motion — the subtitle and hint appear/disappear by a plain
+`set_visible(true/false)` (`ui::row::resolve_subtitle`, `ui::row::resolve_hint`/
+`clear_hint`), never a transition, and the CSS provider #193 installed loads
+declarative colour/font rules, not `transition`/`@keyframes` (GTK's CSS has
+no such at-rule regardless — see `assets/stylesheet.css`'s own top comment).
+The six states and their motion are fully specified in the visual design
+spec but the window still presents and dismisses with no implemented
+open/close transition at all. There is nothing yet to honour or violate the
+setting.
 
 ---
 
@@ -266,13 +392,21 @@ exercisable by any automated test in this environment; it needs a human at a
 keyboard on a live build. Not capture-verifiable at all — a screenshot is one
 frame, and can at best show the *result* of a keypress a human already made.
 
-**Status: likely satisfied, not independently verified end-to-end.** The
-keymap covers all ten actions with defaults, is attached at
-`PropagationPhase::Capture` so it can intercept before GTK's own default
-bindings, and is loaded from `config.toml`. I did not personally drive the
-live app keyboard-only through every action (in particular, confirming
-`SecondaryAction`'s dispatched effect end-to-end) — recorded as unknown
-rather than assumed satisfied, per the verifiability gap above.
+**Status: likely satisfied, not independently verified end-to-end.**
+Re-confirmed at this commit: the keymap still covers all ten actions with
+defaults (`Action::ALL`, unchanged), is still attached at
+`PropagationPhase::Capture` (`ui::window::HopWindow::wire_keyboard`) so it
+can intercept before GTK's own default bindings, and is still loaded from
+`config.toml` (`Keymap::load`). Issue #197 added `Keymap::binding_for` and
+`Keymap::activate_binding_display` — read for this pass — but both are pure
+lookups over the same resolved binding table `resolve`/`dispatch_action`
+already used at `7a6f99b`; neither changes what the keymap covers or how it
+dispatches, only what a caller can ask it after the fact. I did not
+personally drive the live app keyboard-only through every action this pass
+either (in particular, confirming `SecondaryAction`'s dispatched effect
+end-to-end) — recorded as unknown rather than assumed satisfied, per the
+verifiability gap above, which itself still holds: GTK4 still exposes no
+synthetic-key-event constructor on any backend, broadway included.
 
 ---
 
@@ -311,16 +445,22 @@ for widget type — grep `ui/window.rs` for `adw::ApplicationWindow` versus any
 `adw::Dialog`/`adw::AlertDialog` construction. Both are cheap, mechanical
 checks with no ambiguity.
 
-**Status: satisfied, verified.** `ui/window.rs::HopWindow::build` constructs
-an `adw::ApplicationWindow` (never a dialog type — grep confirms no
-`adw::Dialog`/`adw::AlertDialog` reference anywhere in the crate).
-`tokens.rs`'s own unit test pins `*tokens::WINDOW_SIZE_PX` — parsed live out
-of `assets/tokens.css` — to `(400, 500)`. `layer_shell.rs` configures the
-overlay layer with no anchors ("a centered popup rather than an
-edge-anchored panel") where the compositor supports `zwlr_layer_shell_v1`,
-and falls back to an ordinary centered top-level window — not fullscreen —
-everywhere else, GNOME/Mutter included, by design rather than as a degraded
-case.
+**Status: satisfied, verified.** Re-confirmed at this commit:
+`ui/window.rs::HopWindow::build` still constructs an `adw::ApplicationWindow`
+(never a dialog type — grep confirms no `adw::Dialog`/`adw::AlertDialog`
+reference anywhere in the crate, unchanged). `tokens.rs`'s own unit test
+still pins `*tokens::WINDOW_SIZE_PX` — parsed live out of `assets/tokens.css`
+— to `(400, 500)`, and this pass's own `--screenshot` captures (item 1 above)
+independently confirm it: every PNG produced this pass measures exactly
+400×500 pixels. `layer_shell.rs` still configures the overlay layer with no
+anchors ("a centered popup rather than an edge-anchored panel") where the
+compositor supports `zwlr_layer_shell_v1`, and falls back to an ordinary
+centered top-level window — not fullscreen — everywhere else, GNOME/Mutter
+included, by design rather than as a degraded case. No titlebar/`HeaderBar`
+is set on the window either (`adw::ApplicationWindow::builder()` never calls
+`.titlebar(...)`, and every capture this pass produced shows no window-chrome
+bar) — consistent with "a compact popup", not an unfinished dialog waiting
+for its header.
 
 ---
 
@@ -349,28 +489,83 @@ possible, and font family in particular (Iosevka/Inter versus a system
 fallback) can be subtle at a small capture size and is safer confirmed by
 also checking that the bundled-font GResource path is actually reached.
 
-**Status: not yet satisfied — a specific, current gap.** There is no
-`gtk::CssProvider` installed anywhere in `hop-gtk` (same grep as item 2a:
-zero hits for `CssProvider`, `add_provider_for_display`, or
-`STYLE_PROVIDER_PRIORITY` in `apps/hop-gtk/src` outside comments describing
-the absence). `tokens.rs`'s own doc comment states this outright:
-`assets/tokens.css` is parsed today only for a handful of structural pixel
-values (row height, window size); it is not loaded as a GTK stylesheet, and
-"a real stylesheet pass that hardcodes literal values out of it is
-explicitly named as future work, not this issue's to start." The one place a
-token-derived value is actually painted is `ui/mode_label.rs`, which sets
-Pango attributes directly from `tokens::MODE_LABEL_RGB`/`MODE_LABEL_FONT` —
-bypassing CSS, and by that file's own comment, a stand-in until the real
-provider lands. So as of `7a6f99b`, the running window is still
-substantially painted with Adwaita's stock defaults — window chrome, row
-background, the selection indicator's fill — and only the mode label's
-colour and typography are token-derived, by a mechanism other than the one
-the contract eventually describes. This is a real, present conformance gap
-against this item, not a hypothetical one; recording it here per this
-issue's scope, not fixing it. Tracked as issue #193 ("hop-gtk installs no
-`CssProvider`, so `tokens.css` never paints the window"), filed from this
-finding — item 2a and item 7 fail on this same absent provider and are not
-separate causes.
+**Status: partially satisfied — the cause named at `7a6f99b` is closed, and
+a different, more specific set of gaps replaces it.** Issue #193 installed a
+real `gtk::CssProvider` (`style::install`, called from both `run_interactive`
+and `run_screenshot`'s `connect_startup`), loading `assets/stylesheet.css`
+resolved against `tokens.css` at `gtk::STYLE_PROVIDER_PRIORITY_APPLICATION`.
+This pass confirmed the provider is not merely installed but actually
+governing pixels, the same pixel-sampling this item's own Verifiability note
+calls "visually obvious": a resting row's background sampled exactly
+`#121214` (`--hop-bg`), a selected row's composited fill sampled exactly
+`#2f2719` (`--hop-accent-subdued`'s own documented composite), and a hint
+chip's background sampled exactly `#202024` (`--hop-bg-hover`) — three
+surfaces genuinely tracing to their tokens, not stock Adwaita, confirmed
+against a live capture rather than assumed from the stylesheet's text alone.
+
+But "a provider now exists" is not "every themeable surface passes", and
+this pass's own captures surface several concrete surfaces that still fall
+back to an un-tokenized Adwaita default, each checked against this item's own
+pass condition rather than waved through on the provider's existence:
+
+- **Most of the window, in the state a user sees most often.** An
+  empty-query capture (`--screenshot out.png`, no `--query`) shows almost the
+  entire window body — everywhere the `gtk::ListView` widget's own base CSS
+  node is visible, not covered by an actual `row` child — filled with a flat
+  `rgb(30, 30, 30)`, sampled consistently across a wide area (bottom-left,
+  bottom-right, and directly below the last real row in the results
+  capture). That value matches neither `--hop-bg` (`#121214` = `rgb(18, 18,
+  20)`) nor `--hop-bg-hover` (`#202024` = `rgb(32, 32, 36)`) — it reads as
+  libadwaita's own stock dark `window`/`view` background, showing through
+  because `assets/stylesheet.css` styles `window.background` and
+  `listview > row` but never the `listview` node itself, so any area the
+  list view owns but no realized row covers still paints Adwaita's default.
+  Since the empty-query state is the window's default, most-often-seen
+  state, this is not a cosmetic corner case.
+- **The query entry.** The zoomed capture (item 1's `--query code` PNG)
+  shows the entry's background as `rgb(40, 40, 42)` — a fourth colour,
+  matching none of `--hop-bg`/`--hop-bg-hover`/`--hop-fg` — and its focus
+  outline as a violet-blue ring, GTK/Adwaita's own stock `entry:focus`
+  colour, not `--hop-accent`/`--hop-sel-ring` in any form. No `entry`
+  selector exists anywhere in `assets/stylesheet.css` — grep confirms it —
+  so this is not a rendering bug, it is an un-styled surface exactly as the
+  pass condition describes.
+- **The row title's own typography.** `assets/tokens.css` declares
+  `--hop-text-title: 500 14px/20px var(--hop-font-sans)` specifically for
+  this label, but no selector in `assets/stylesheet.css` targets
+  `ui::row::TITLE_CHILD_NAME`/`hop-row-title` at all — only `.hop-row-subtitle`,
+  `.hop-row-hint-label`, and `.hop-row-hint-key` exist for row text. The
+  title inherits `window.background`'s `color`/`font-family` (so it is at
+  least the right colour and typeface stack, not wrong) but its weight,
+  exact size, and any tracking are whatever GTK's default label styling
+  gives a plain `gtk::Label` — `--hop-text-title` is declared and unused.
+- **The window's own shape.** `--hop-radius-lg` ("the window panel") and
+  `--hop-shadow-window`/`--hop-shadow-window-light` are declared in
+  `tokens.css` but referenced by no selector in `assets/stylesheet.css` —
+  the rounded corner visible in every capture this pass produced is
+  Adwaita's own default client-side-decoration shape, not a hop value.
+- **The declared brand fonts, on this machine.** `fc-list` on the machine
+  this pass ran on shows neither "Inter" nor "Iosevka"/"Iosevka Term"
+  installed, and `apps/hop-gtk` bundles no GResource of its own (no
+  `gresource`/`register_resource`/font-map call anywhere in the crate) — this
+  item's own Verifiability note already flagged font family as needing
+  exactly that check. So every capture this pass produced, including the
+  ones confirming correct *colour* above, rendered every label in a
+  fallback system font, not hop's declared identity type; the CSS
+  `font-family` chain is correctly wired (confirmed by reading it) but its
+  actual on-screen effect for typeface, specifically, was not something this
+  pass could observe.
+
+Row background and row-hover, the selection indicator's fill, the hint
+chips' colours and backgrounds, the subtitle's colour, and the mode label's
+full typography (weight/size/family/tracking/colour, all now via
+`.hop-mode-label`'s CSS rule rather than the removed Pango stand-in — see
+item 2c) do trace to tokens, confirmed by source and, where a live example
+existed to capture, by pixel sampling. The gaps above are named as what they
+are: real and specific, not a residue of "no provider yet." Worth a
+follow-up issue for the window/listview background gap in particular, since
+it dominates the most commonly seen state; not filed here per this pass's
+own scope.
 
 ---
 
@@ -401,31 +596,59 @@ diffed — not yet produced) and for "is the accent ever used on body text"
 (visual inspection of any capture). Source-verifiable for "is
 `accent-color` ever read at all" (grep).
 
-**Status: partially satisfied, mostly unbuilt.** No code in `apps/hop-gtk`
-reads a desktop accent-color setting (grep found nothing), so "never follows
-the desktop" holds — trivially, since there's nothing yet that could follow
-it. But the accent itself is barely wired in: `ui/window.rs` adds the
-`hop-selection-indicator` CSS class to the selection indicator widget, but
-per item 6 above there is no stylesheet installed to give that class its
-amber fill — so today the selection indicator does not yet render the
-committed accent colour at all. The commitment is real and precise in
-`tokens.css`; its render path does not exist yet.
+**Status: partially satisfied — real progress since `7a6f99b`, one clause
+still fully unbuilt.** No code in `apps/hop-gtk` reads a desktop accent-color
+setting (grep found nothing, unchanged), so "never follows the desktop"
+still holds trivially. What changed is the middle clause: at `7a6f99b`, the
+selection indicator's CSS class existed with no stylesheet to give it a
+fill; issue #193 closed that. This pass's own pixel sample of a selected row
+(item 6 above) reads exactly `#2f2719` — `--hop-accent-subdued`'s own
+documented composite, to the byte — so the selection indicator now genuinely
+renders the committed accent, confirmed live rather than assumed. The hint
+chip's key glyph (`.hop-row-hint-key`, issue #197) also renders in
+`--hop-accent`, visible as amber "Enter"/"Open" text in every capture this
+pass produced, and per that rule's own comment this is a deliberate use of
+the accent's reservation ("action hints"), not an exception to
+"never for body text" — a key glyph is a short badge naming a physical key,
+not prose.
+
+The focus ring clause is not partially built, it is entirely absent: grep
+for "focus" across `apps/hop-gtk/src` finds no CSS class, no widget, and no
+`--hop-sel-ring`/`--hop-accent-ring` reference anywhere outside `tokens.css`
+itself — `assets/stylesheet.css`'s own `.hop-selection-indicator` comment
+says so directly ("`--hop-sel-ring`... deliberately NOT used here yet...
+Left for whichever follow-up adds a real border/ring-width token"). This
+pass's own zoomed capture of the focused query entry shows a violet-blue
+outline — GTK/Adwaita's stock `entry:focus` ring, not hop's accent in any
+form — which is the concrete, on-screen shape of that absence, not only a
+grep result.
+
+One more thing surfaced while checking this item, cross-referenced rather
+than repeated in full: item 2a above found that `.hop-row-hint-key`'s
+`color: {{hop-accent}}` resolves to the *dark* accent literal even under the
+light palette (`.hop-theme-light` never redeclares `--hop-accent`), so a
+light-mode hint glyph would render `#e3a83b`, not the committed light accent
+`#875c0f` this item's own "the break" section names. That is a contrast
+failure first and an accent-fidelity slip second — see item 2a for the
+arithmetic and why a live light-palette capture could not be forced in this
+environment.
 
 ---
 
-## Summary, at commit `7a6f99b`
+## Summary, at commit `0fc1c92`
 
 | # | Item | Kind | Status |
 | --- | --- | --- | --- |
-| 1 | Icon language | Binding | Not yet satisfied — no icons exist to check |
-| 2a | Contrast-checked palette | Binding | Partially satisfied — paper values plausible, on-screen application confirmed absent (see 6) |
-| 2b | Screen-reader labels | Binding | Not yet satisfied |
-| 2c | System font scaling | Binding | Not yet satisfied — active conflict on record |
+| 1 | Icon language | Binding | Satisfied, verified — for content icons, the only kind this UI has; no chrome icon exists yet to test the rule's other half |
+| 2a | Contrast-checked palette | Binding | Partially satisfied — several tokens confirmed reaching the screen at their exact documented values; one real contrast failure found (hint-key glyph under the light palette, ≈2.0:1) |
+| 2b | Screen-reader labels | Binding | Not yet satisfied — real subtitle and hint content now exists (#196, #197) and none of it is exposed |
+| 2c | System font scaling | Binding | Not yet satisfied — the row's fixed-height reservation still conflicts with it; the previous mode-label evidence is retracted (that code was removed by #193) |
 | 3 | Reduced motion | Binding | Not yet satisfied — no motion exists to check |
 | 4 | Full keyboard operability | Binding | Likely satisfied — not independently verified end-to-end |
 | 5 | Window model | Deliberately broken | Satisfied, verified |
-| 6 | Stock widget styling | Deliberately broken | Not yet satisfied — no stylesheet installed (#193) |
-| 7 | Accent colour | Deliberately broken | Partially satisfied — never follows the desktop; not yet rendered |
+| 6 | Stock widget styling | Deliberately broken | Partially satisfied — the provider (#193) exists and several surfaces confirmed tokenized; the window/listview base background (most of the default empty state), the query entry, the row title's typography, and the window's own shape remain stock Adwaita |
+| 7 | Accent colour | Deliberately broken | Partially satisfied — never follows the desktop; the selection indicator and hint-key glyph now genuinely render the accent (pixel-confirmed); the focus ring is entirely unbuilt, confirmed stock Adwaita blue on screen |
 
-None of the above is this issue's to fix — see #183's own scope. Recorded so
-the reviewer of the next frontend slice knows exactly what it inherits.
+None of the above is this issue's to fix — see #183's own scope, and #202's
+(the issue that requested this refresh pass). Recorded so the reviewer of
+the next frontend slice knows exactly what it inherits.
