@@ -111,6 +111,19 @@ tempfile.workspace = true
 # `libfontconfig` at runtime instead of linking it at compile time, which
 # would need its own justification and is not what was verified while
 # building this issue.
+#
+# "No vendored C source" is not "nothing else comes along": this crate pulls
+# in two Rust dependencies of its own, unconditionally, whichever side of the
+# `dlopen` feature above is taken — `[dependencies.dlib]` in
+# `yeslogic-fontconfig-sys`'s own `Cargo.toml` carries no `optional = true`,
+# and the `dlopen` feature above is an empty `[]` that does not even gate
+# dlib's own `dlopen` feature, so `dlib` 0.5.3 (MIT) builds every time this
+# crate does, and pulls in `libloading` 0.8.9 (ISC) under it, the crate `dlib`
+# uses to load symbols by name. Both are already on `deny.toml`'s allow
+# list — MIT and ISC are two of the five licenses it names — so nothing needs
+# adding there for either. `cargo tree -i dlib` and `cargo tree -i libloading`
+# each show the single path down from `hop-gtk` through
+# `yeslogic-fontconfig-sys`, and re-check this claim.
 yeslogic-fontconfig-sys = "6.0.1"
 
 [build-dependencies]

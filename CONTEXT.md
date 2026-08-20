@@ -628,17 +628,21 @@ as crates of their own that the lint does not reach — the comment beside
 `unsafe_code` in the root `Cargo.toml` carries the detail, and it is the reason
 this rule is stated about compiled code rather than about the whole tree. What
 the lint guarantees is not zero `unsafe`, but that every block is declared: as
-of issue #182 there are seven in the tree, two of them in production code —
+of issue #198 there are eight in the tree, three of them in production code —
 `hopd::server`'s `OwnedFd::from_raw_fd`, taking ownership of a
-systemd-activated socket descriptor (issue #62), and `hop-gtk`'s `ui::window`,
+systemd-activated socket descriptor (issue #62); `hop-gtk`'s `ui::window`,
 setting `XDG_ACTIVATION_TOKEN` immediately before the `present()` that reads it
-back, on the GTK main thread (issue #179) — and five test-only
-`libc::mkfifo`/`pre_exec` calls, in `hop-protocol::content`, `hop-protocol`'s
-own `config_file` (promoted out of `hopd::config` by issue #182), `hopd::config`,
-`hopd`'s `tests/activation.rs`, and `hopd::apps`. Each carries its own narrow
-`#[expect(unsafe_code)]` on the statement rather than
+back, on the GTK main thread (issue #179); and `hop-gtk`'s
+`fonts::register_with_fontconfig`, calling `FcConfigAppFontAddDir` to register
+the crate's bundled typefaces, since no safe binding reaches that call on the
+pango/fontconfig versions this workspace targets (issue #198) — and five
+test-only `libc::mkfifo`/`pre_exec` calls, in `hop-protocol::content`,
+`hop-protocol`'s own `config_file` (promoted out of `hopd::config` by issue
+#182), `hopd::config`, `hopd`'s `tests/activation.rs`, and `hopd::apps`. Each
+carries its own narrow `#[expect(unsafe_code)]` on the statement rather than
 `#[allow]` on the module, so a second `unsafe` beside it still fails, and the
 exception warns itself out of existence once its call goes — which CI's
 `-D warnings` turns into an error. `deny` and not `forbid`, so a genuine FFI
 need can annotate one call with a `SAFETY:` comment instead of weakening the
-line for the whole workspace.
+line for the whole workspace — the fontconfig block above is that need
+exercised, not an exception to it.
