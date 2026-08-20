@@ -82,8 +82,63 @@ async-channel = "2"
 # (`tokio::runtime::Builder::new_current_thread`) is enough.
 tokio = { workspace = true, features = ["net", "io-util"] }
 
-[dev-dependencies]
+# Issue #198's `fonts` module materializes the five bundled font faces to
+# real files on disk, in a directory it holds for the process's lifetime —
+# see that module's own doc comment for why disk, not memory (fontconfig
+# 2.15.0 here has no `FcConfigAppFontAddMemFile`), and why a fresh
+# `tempfile`-random directory under `$XDG_RUNTIME_DIR` rather than a fixed
+# path (`--screenshot`'s `NON_UNIQUE` flag means several `hop-gtk` processes
+# can run at once; a fixed path would let them collide). This promotes
+# `tempfile` out of `[dev-dependencies]`, where it already lived as a
+# test-only helper (`icon_roots.rs`'s own test module, still its biggest
+# consumer) — production code now depends on the identical collision-safe
+# random-suffix behavior those tests already relied on, not a second,
+# differently-vetted temp-directory mechanism.
 tempfile.workspace = true
+
+# The FFI call `fonts::register_with_fontconfig` needs to reach
+# `FcConfigAppFontAddDir` — issue #198's maintainer-approved waiver of "no
+# new `unsafe`" for exactly this call site (`fonts.rs`'s own doc comment,
+# "Registering with fontconfig", has the full argument for why no safe
+# alternative exists on this machine's pango/fontconfig versions). MIT,
+# already on `deny.toml`'s allow list. Raw bindings only — no vendored C
+# source, no bundled `libfontconfig`: its `build.rs` runs `pkg-config` to
+# link the system's own `libfontconfig.so` at compile time, the same
+# mechanism every other `-sys` crate this workspace already depends on
+# (`gtk4-layer-shell`, and every gtk-rs `-sys` crate underneath `gtk`/`adw`
+# above) uses to find GTK4's own libraries. Left on this crate's default
+# features — its `dlopen` feature would switch it to `dlopen(3)`-loading
+# `libfontconfig` at runtime instead of linking it at compile time, which
+# would need its own justification and is not what was verified while
+# building this issue.
+#
+# "No vendored C source" is not "nothing else comes along": this crate pulls
+# in two Rust dependencies of its own, unconditionally, whichever side of the
+# `dlopen` feature above is taken — `[dependencies.dlib]` in
+# `yeslogic-fontconfig-sys`'s own `Cargo.toml` carries no `optional = true`,
+# and the `dlopen` feature above is an empty `[]` that does not even gate
+# dlib's own `dlopen` feature, so `dlib` 0.5.3 (MIT) builds every time this
+# crate does, and pulls in `libloading` 0.8.9 (ISC) under it, the crate `dlib`
+# uses to load symbols by name. Both are already on `deny.toml`'s allow
+# list — MIT and ISC are two of the five licenses it names — so nothing needs
+# adding there for either. `cargo tree -i dlib` and `cargo tree -i libloading`
+# each show the single path down from `hop-gtk` through
+# `yeslogic-fontconfig-sys`, and re-check this claim.
+yeslogic-fontconfig-sys = "6.0.1"
+
+[build-dependencies]
+# Issue #198's `build.rs` — this crate's first — compiles
+# `assets/hop-gtk.gresource.xml` into the `.gresource` blob `src/fonts.rs`
+# embeds with `gio::resources_register_include!`. MIT, already on
+# `deny.toml`'s workspace-wide allow list, so this adds nothing new to
+# `cargo deny check licenses`. See `build.rs`'s own doc comment for what
+# this crate's one function, `compile_resources`, does and does not handle
+# (in particular: the `glib-compile-resources` version this machine's
+# `$PATH` happens to resolve first, and why that was verified rather than
+# worked around).
+glib-build-tools = "0.22"
+
+[dev-dependencies]
 # Not called directly by any test in this crate: declaring it here is what
 # guarantees `cargo test -p hop-gtk` on its own builds the `hopd` binary
 # before this crate's tests run, which `tests/headless_smoke.rs` needs since

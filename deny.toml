@@ -41,8 +41,13 @@
 # maintained. If that command ever prints a name whose license is not already on
 # the allow list, this paragraph is what has to be re-argued.
 #
-# None is depended on directly; all of them arrive under `tempfile`, itself only
-# a dev-dependency. `tempfile` reaches `windows-sys` by three paths at once —
+# None is depended on directly; all of them arrive under `tempfile`. (Issue
+# #198 promoted `tempfile` itself from a dev-only dependency to a real one of
+# `hop-gtk` — `apps/hop-gtk/Cargo.toml`'s own comment on it has the reason —
+# but that changes nothing about the four crates named here: they were, and
+# remain, reachable only through `tempfile`'s own dependency tree, on every
+# platform this project ships, dev-only or not.) `tempfile` reaches
+# `windows-sys` by three paths at once —
 # directly, through `errno`, and through `rustix`, which is `tempfile`'s *Unix*
 # syscall backend and carries the Windows bindings for the other side of its own
 # `cfg` (`cargo tree -i windows-sys --target all` shows all three parents) — and

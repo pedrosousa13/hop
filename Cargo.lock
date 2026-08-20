@@ -135,6 +135,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlib"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -405,6 +414,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glib-build-tools"
+version = "0.22.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9871f38b67853c358b8190f77b9f878eb27d933a950f1045b244c4559a9f5f0"
+
+[[package]]
 name = "glib-macros"
 version = "0.22.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -623,6 +638,7 @@ dependencies = [
  "async-channel",
  "gio",
  "glib",
+ "glib-build-tools",
  "gtk4",
  "gtk4-layer-shell",
  "hop-protocol",
@@ -632,6 +648,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]
@@ -737,6 +754,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -1254,6 +1281,17 @@ name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "yeslogic-fontconfig-sys"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d8b8abf912b9a29ff112e1671c97c33636903d13a69712037190e6805af4f76"
+dependencies = [
+ "dlib",
+ "once_cell",
+ "pkg-config",
+]
 
 [[package]]
 name = "zmij"
