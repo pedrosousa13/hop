@@ -32,8 +32,10 @@
   /* ==========================================================
      TYPE SCALE
      Mono is reserved for text that is literally machine text:
-     what you typed, what was computed, where a file lives, and
-     when data was fetched. Everything else is proportional.
+     what you typed, what was computed, what key runs the
+     selected action, and when data was fetched. A path-shaped
+     subtitle was considered for v1 and dropped (#206).
+     Everything else is proportional.
      ========================================================== */
   --hop-text-input:        500 20px/26px   var(--hop-font-mono);
   --hop-text-calc-result:  500 22px/28px   var(--hop-font-mono);

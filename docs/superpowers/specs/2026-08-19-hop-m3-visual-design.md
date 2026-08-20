@@ -20,10 +20,12 @@ maintainer made. It does **not** re-open D1–D8, and it does not restate §8 or
 ## The direction: editorial dark, mono as signature
 
 A proportional face carries titles and subtitles. **Monospace is reserved for
-text that is literally machine text**: what you typed, what was computed, where
-a file lives, and when data was fetched. That is what §8a means by "a launcher
-brand lives in its mono" — the mono is load-bearing rather than total, and it
-sits exactly where the eye lands first.
+text that is literally machine text**: what you typed, what was computed, what
+key runs the selected action, and when data was fetched. A path-shaped
+subtitle was weighed for this list too and dropped from v1, definitively —
+"Subtitle gets one treatment, not two," below, records why. That is what §8a
+means by "a launcher brand lives in its mono" — the mono is load-bearing
+rather than total, and it sits exactly where the eye lands first.
 
 Rejected alternatives, both coherent, neither chosen:
 
