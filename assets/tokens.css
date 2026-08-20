@@ -56,13 +56,13 @@
      Ratios are against --hop-neutral-950 unless noted.
      ========================================================== */
   --hop-neutral-950: #121214; /* window background                        */
-  --hop-neutral-900: #18181c; /* row surface                              */
+  --hop-neutral-900: #18181c; /* unconsumed — v1 ruled flush-until-hover in #204; ramp step kept for scale completeness, see stylesheet.css's ROW SURFACE comment */
   --hop-neutral-800: #202024; /* row hover                                */
   --hop-neutral-700: #2b2b31; /* raised surface                           */
   --hop-neutral-600: #3a3a41; /* hairline; decorative, exempt from 3:1    */
   --hop-neutral-500: #6a6a74; /* dimmed text          3.50:1  WAS #55555e (2.54:1, failed 3:1) */
   --hop-neutral-400: #8f8e95; /* path / timestamp     5.77:1; 4.54:1 on the selected row       */
-  --hop-neutral-300: #b4b3b8; /* subtitle             8.98:1; 8.50:1 on the row surface        */
+  --hop-neutral-300: #b4b3b8; /* subtitle             8.98:1; 8.50:1 against --hop-neutral-900, itself unconsumed — #204 */
   --hop-neutral-100: #f4f3f1; /* title / query       16.87:1                                   */
 
   /* ==========================================================
@@ -71,14 +71,15 @@
      --hop-neutral-0-light unless noted.
      ========================================================== */
   --hop-neutral-0-light:   #faf9f6; /* window background                  */
-  --hop-neutral-50-light:  #f3f1ec; /* row surface                        */
+  --hop-neutral-50-light:  #f3f1ec; /* unconsumed — the light-ramp mirror of --hop-neutral-900,
+                                       same #204 ruling: no light-mode row surface was invented */
   --hop-neutral-100-light: #eae7df; /* row hover                          */
   --hop-neutral-200-light: #e2ded3; /* raised surface                     */
   --hop-neutral-300-light: #d8d3c5; /* hairline                           */
   --hop-neutral-400-light: #b9b3a0; /* strong border / disabled           */
   --hop-neutral-600-light: #6a6559; /* path / timestamp  5.51:1; 4.84:1 on the selected row
                                        WAS #706b5d — 4.43:1 on the selected row, failed 4.5:1 */
-  --hop-neutral-700-light: #4f4b41; /* subtitle          8.26:1; 7.70:1 on the row surface    */
+  --hop-neutral-700-light: #4f4b41; /* subtitle          8.26:1; 7.70:1 against --hop-neutral-50-light, itself unconsumed */
   --hop-neutral-900-light: #211f1a; /* title / query    15.64:1                                */
 
   /* ==========================================================
