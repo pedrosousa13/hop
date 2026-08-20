@@ -133,6 +133,36 @@ listview > row:hover {
 }
 
 /* ============================================================
+   .hop-row-subtitle — `ui/row.rs` (issue #196)
+   Owns the row's subtitle label's typography: `font:` from
+   `--hop-text-subtitle` (12.5px proportional, per the `{{font:...}}` form —
+   see PLACEHOLDER SYNTAX above and `.hop-honesty .hop-honesty-text`'s own
+   rule below for the direct precedent), colour from `--hop-fg-2` — the
+   semantic alias `tokens.css`'s SEMANTIC LAYER promotes specifically for a
+   subtitle-tier ramp step, resolving under both palettes with no new token.
+
+   This is the row anatomy's *only* subtitle treatment. The v1 visual spec
+   also names an 11.5px mono treatment for a path-shaped subtitle, but
+   `ItemSubtitle` carries no flag saying which treatment applies, and
+   `Item.kind` is not a sound basis to infer one (a `File` item's subtitle
+   need not be a path, and a non-`File` item's might be) — issue #196's own
+   triage settled that every subtitle gets this one proportional rule, full
+   stop, and named issue #206 as the one that could someday teach the
+   protocol to carry the distinction. `--hop-text-path`/`--hop-tracking-path`
+   are deliberately not referenced anywhere in this file.
+
+   `ui::row::build` gives the subtitle label the widget name
+   `hop-row-subtitle` (its own `SUBTITLE_CHILD_NAME` constant) and also adds
+   it as a CSS style class via the exact same string, which is what makes
+   this selector match — see that constant's own doc comment for why one
+   name serves both jobs.
+   ============================================================ */
+.hop-row-subtitle {
+  font: {{font:hop-text-subtitle}};
+  color: {{hop-fg-2}};
+}
+
+/* ============================================================
    .hop-mode-label — `ui/mode_label.rs:74`
    Owns this label's full typography now: weight/size/family from
    `--hop-text-section`, tracking from `--hop-tracking-section`, colour from

@@ -86,7 +86,8 @@ use hop_gtk::tokens;
 use hop_gtk::ui::row;
 use hop_gtk::ui::view::{self, Node};
 use hop_protocol::{
-    Action, ActionId, ActionKind, IconName, IconPath, IconSpec, Item, ItemId, ItemTitle, Kind,
+    Action, ActionId, ActionKind, IconName, IconPath, IconSpec, Item, ItemId, ItemSubtitle,
+    ItemTitle, Kind,
 };
 
 /// Set on the re-exec'd child so it knows to run [`run_assertions`]
@@ -680,6 +681,134 @@ fn run_assertions() {
     );
 
     println!("row icon assertions passed");
+
+    // --- issue #196: the subtitle. Continues binding the exact same
+    // recycled slot the sections above already proved recycling for, so
+    // every assertion below is also, incidentally, one more round of that
+    // same proof.
+
+    // The structural claim behind "the subtitle renders beneath the title,
+    // not beside it": title and subtitle must share one parent — the
+    // vertical text-column `gtk::Box` `ui::row::build` nests inside the
+    // outer horizontal container — and that parent must be a *different*
+    // widget than the icon's own parent (the outer container itself). A
+    // regression that flattened the layout back to one `append` per widget
+    // onto `container` would give the subtitle the icon's exact parent,
+    // which the first assertion below would catch; a regression that used
+    // a horizontal box for the nested column would fail the second.
+    let title = row::title_widget(&container).expect("title widget must still resolve");
+    let subtitle =
+        row::subtitle_widget(&container).expect("build must give the row a named subtitle label");
+    let title_parent = title.parent().expect("title must have a parent widget");
+    let subtitle_parent = subtitle
+        .parent()
+        .expect("subtitle must have a parent widget");
+    assert_eq!(
+        title_parent, subtitle_parent,
+        "title and subtitle must share one parent — the vertical text column"
+    );
+    let container_widget = container.clone().upcast::<gtk::Widget>();
+    assert_ne!(
+        title_parent, container_widget,
+        "the text column must be a distinct nested Box, not the outer row container itself \
+         the icon is a direct child of"
+    );
+    let text_column = title_parent
+        .downcast::<gtk::Box>()
+        .expect("the text column must itself be a gtk::Box");
+    assert_eq!(
+        text_column.orientation(),
+        gtk::Orientation::Vertical,
+        "the text column must stack its two children vertically — title over subtitle, not \
+         beside it"
+    );
+    assert_eq!(
+        text_column.parent(),
+        Some(container_widget),
+        "the text column itself must be the outer row container's second child, alongside the \
+         icon"
+    );
+
+    // `item_a` (bound at the very top of the icon section above) carries
+    // `subtitle: None` — this is the first assertion this file makes about
+    // what that bind actually did to the subtitle widget. See
+    // `ui::row::bind`'s own doc comment for the deliberately-chosen rule
+    // this pins: an absent subtitle hides the widget entirely rather than
+    // leaving it visible with empty text, which would sit the title above
+    // a blank gap instead of letting it recover the row's full height.
+    assert!(
+        !subtitle.is_visible(),
+        "a row bound to an item with subtitle: None must hide the subtitle widget entirely, \
+         not just clear its text"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "a hidden subtitle must not change the row's reserved layout"
+    );
+
+    let subtitled_item = item_with_subtitle(20, "has a subtitle", "a real subtitle line");
+    view::bind(&stack, &Node::for_item(subtitled_item.clone()));
+    assert_eq!(
+        subtitle.text(),
+        "a real subtitle line",
+        "a row bound to an item with Some(subtitle) must show its text"
+    );
+    assert!(
+        subtitle.is_visible(),
+        "a row bound to an item with Some(subtitle) must show the subtitle widget"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "a bound subtitle must not change the row's reserved layout — row height and icon slot \
+         stay exactly as ui::row::build reserved them"
+    );
+
+    // Recycling, proven specifically across bind-with-subtitle then
+    // rebind-without: same widget instance, previous text gone — the
+    // acceptance criterion this issue's brief names explicitly.
+    view::bind(&stack, &Node::for_item(item_a.clone()));
+    assert_eq!(
+        row::subtitle_widget(&container).as_ref(),
+        Some(&subtitle),
+        "rebinding to an item without a subtitle must reuse the exact same subtitle widget \
+         instance, never destroy and rebuild it"
+    );
+    assert_eq!(
+        subtitle.text(),
+        "",
+        "rebinding without a subtitle must clear the previous item's subtitle text"
+    );
+    assert!(
+        !subtitle.is_visible(),
+        "rebinding without a subtitle must hide the widget again, not leave the previous \
+         item's subtitle visible"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "rebinding away from a subtitle must not change the row's reserved layout either"
+    );
+
+    // `unbind`'s own symmetry with the title and icon: clears the text and
+    // hides the widget, so a recycled row about to be rebound to a
+    // different node type someday would not carry a stale subtitle
+    // forward.
+    view::bind(&stack, &Node::for_item(subtitled_item.clone()));
+    assert!(subtitle.is_visible());
+    view::unbind(&stack, &Node::for_item(subtitled_item));
+    assert_eq!(
+        subtitle.text(),
+        "",
+        "unbind must clear the subtitle text, symmetrically with the title and icon"
+    );
+    assert!(
+        !subtitle.is_visible(),
+        "unbind must hide the subtitle widget, symmetrically with clearing its text"
+    );
+
+    println!("row subtitle assertions passed");
 }
 
 /// The row's reserved layout: the container's own measured height, and the
@@ -779,6 +908,17 @@ fn icon_path(path: &std::path::Path) -> IconPath {
 fn item_with_icon(n: usize, title: &str, spec: IconSpec) -> Item {
     let mut item = test_item(n, title);
     item.icon = Some(spec);
+    item
+}
+
+/// A tiny [`Item`] carrying `subtitle` as its `Some(ItemSubtitle)`, `icon`
+/// left `None` — the icon section above already exercises every `IconSpec`
+/// arm, so the subtitle section has no reason to combine the two.
+fn item_with_subtitle(n: usize, title: &str, subtitle: &str) -> Item {
+    let mut item = test_item(n, title);
+    item.subtitle = Some(
+        ItemSubtitle::new(subtitle).expect("test subtitle must pass ItemSubtitle's own rules"),
+    );
     item
 }
 
