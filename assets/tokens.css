@@ -135,6 +135,17 @@
      right-aligned action hint, inside the 56px --hop-row-h above. */
   --hop-icon-size:           26px;
 
+  /* The two locked dimensions `.hop-honesty .hop-skeleton`'s own rule
+     below already commits to as bare literals ("A skeleton bar with no
+     width collapses to invisible, which is the same lie as hiding it.
+     Dimensions are locked, not just opacity."). Named here, unchanged,
+     so a GTK-CSS consumer (hop-gtk's own stylesheet) can reference the
+     exact locked values through `--hop-*` like every other design value
+     in this file, instead of duplicating them as an unnamed literal or
+     substituting a numerically-different token. */
+  --hop-skeleton-min-w:       24px;
+  --hop-skeleton-min-h:        9px;
+
   /* ==========================================================
      MOTION
      Open decelerates (arriving); close accelerates (dismissing).

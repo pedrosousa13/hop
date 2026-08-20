@@ -237,19 +237,21 @@ listview > row:hover {
 /* `tokens.css`'s own comment on this rule: "A skeleton bar with no width
    collapses to invisible, which is the same lie as hiding it. Dimensions
    are locked, not just opacity." Its own values, `min-width: 24px;
-   min-height: 9px;`, are literal in `tokens.css` itself — not `--name`
-   tokens, since `.hop-honesty` is a component rule block TokenTable::parse
-   deliberately skips (see `tokens.rs`'s own module doc comment), so there is
-   no `--hop-*` name `tokens::resolve` could ever look either value up by.
-   `--hop-space-6` is an exact match for 24px, used verbatim below. No
-   spacing-scale step is an exact match for 9px; `--hop-space-2` (8px) is the
-   nearest one, used here as a disclosed one-pixel approximation rather than
-   either a literal (forbidden — every size in this file must come through a
-   token) or a silently-omitted property (which would leave the "minimum
-   dimensions" honesty category only half-authored). Whoever gives
-   `tokens.css` a dedicated skeleton-dimension token should retarget this
-   line to it instead of leaving the approximation standing. */
+   min-height: 9px;`, used to be literal in `tokens.css` itself — not
+   `--name` tokens, since `.hop-honesty` is a component rule block
+   TokenTable::parse deliberately skips (see `tokens.rs`'s own module doc
+   comment) — so an earlier version of this rule sourced `min-width` from
+   the numerically-equal but semantically unrelated `--hop-space-6` and
+   approximated `min-height` with `--hop-space-2` (8px), one pixel short of
+   the 9px `docs/theme-token-contract.md` actually locks. That approximation
+   silently downgraded a locked guarantee below its already-committed value,
+   which is a real defect, not a disclosed shortcut — review caught it.
+   `tokens.css` now names both dimensions directly, unchanged
+   (`--hop-skeleton-min-w: 24px`, `--hop-skeleton-min-h: 9px`), right next
+   to this same rule's own comment there — naming a value `tokens.css`
+   already committed to is not re-opening it. Both are referenced verbatim
+   below: no approximation, no repurposed token. */
 .hop-honesty .hop-skeleton {
-  min-width: {{hop-space-6}};
-  min-height: {{hop-space-2}};
+  min-width: {{hop-skeleton-min-w}};
+  min-height: {{hop-skeleton-min-h}};
 }
