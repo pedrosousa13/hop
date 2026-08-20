@@ -295,6 +295,37 @@ mod tests {
         );
     }
 
+    /// Issue #214's audit turned up a second instance of the same defect
+    /// shape: `.hop-mode-label`'s `color:` named `{{hop-neutral-400}}`, a
+    /// raw ramp entry `.hop-theme-light` never overlays, so both `resolve`
+    /// calls below produced the identical `.hop-mode-label` rule — the mode
+    /// label rendered the dark ramp's grey on light paper regardless of
+    /// theme. This test fails against that bug (`dark_rule == light_rule`)
+    /// and passes once the rule is repointed at `--hop-fg-3`, the existing
+    /// semantic alias for this exact ramp tier.
+    #[test]
+    fn mode_label_colour_differs_between_palettes() {
+        let dark = resolve(Palette::Dark);
+        let light = resolve(Palette::Light);
+
+        let dark_rule = extract_rule(&dark, ".hop-mode-label");
+        let light_rule = extract_rule(&light, ".hop-mode-label");
+
+        assert_ne!(
+            dark_rule, light_rule,
+            "the mode label's colour must differ between palettes — got the \
+             same rule under both: {dark_rule}"
+        );
+        assert!(
+            dark_rule.contains("color: #8f8e95;"),
+            "dark mode label should resolve to the dark ramp's grey, got: {dark_rule}"
+        );
+        assert!(
+            light_rule.contains("color: #6a6559;"),
+            "light mode label should resolve to the light ramp's grey, got: {light_rule}"
+        );
+    }
+
     /// Finds `selector`'s first `{ ... }` block in `sheet` (a resolved
     /// stylesheet, comments already stripped by `resolve`), inclusive of
     /// the braces — the slice `hint_key_glyph_colour_differs_between_palettes`

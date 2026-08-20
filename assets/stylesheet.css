@@ -245,8 +245,21 @@ listview > row:hover {
    .hop-mode-label — `ui/mode_label.rs:74`
    Owns this label's full typography now: weight/size/family from
    `--hop-text-section`, tracking from `--hop-tracking-section`, colour from
-   `--hop-neutral-400` — see `tokens::MODE_LABEL_RGB`'s own doc comment
-   (`apps/hop-gtk/src/tokens.rs`) for why that particular ramp step.
+   `--hop-fg-3` — see `tokens::MODE_LABEL_RGB`'s own doc comment
+   (`apps/hop-gtk/src/tokens.rs`) for why that particular ramp step. The
+   ramp step's own reasoning is unchanged by naming it this way — under the
+   dark palette `--hop-fg-3` *is* that step, declared as `var(--hop-neutral-
+   400)` — so nothing about dark-mode rendering moves. This rule used to
+   name `--hop-neutral-400` directly, though, and a rule naming a raw ramp
+   entry resolves to the dark literal under *both* palettes, the same trap
+   `listview > row`'s own comment above documents for `--hop-neutral-900`:
+   `.hop-theme-light` never overlays a bare ramp name, only the semantic
+   layer's aliases. Issue #214 fixed the identical defect for the action
+   hint's key glyph (`.hop-row-hint-key` above, `--hop-accent` repointed to
+   `--hop-hint-accent`); this rule gets the same treatment here, repointed
+   at the semantic alias `--hop-fg-3` already carries for this exact tier —
+   `.hop-theme-light` overlays it with `--hop-neutral-600-light`, the light
+   ramp's own entry at the matching ~5.5:1 contrast step.
 
    Until this issue, `ui::mode_label::build` set these same four properties
    itself, in Rust, as a `pango::AttrList` via `gtk::Label::set_attributes` —
@@ -266,7 +279,7 @@ listview > row:hover {
 .hop-mode-label {
   font: {{font:hop-text-section}};
   letter-spacing: {{hop-tracking-section}};
-  color: {{hop-neutral-400}};
+  color: {{hop-fg-3}};
 }
 
 /* ============================================================
