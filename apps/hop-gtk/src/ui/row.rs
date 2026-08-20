@@ -188,18 +188,47 @@
 //! still go through the exact same one function regardless of how deep its
 //! target widget now sits.
 //!
-//! # `build` and `bind` never animate
+//! # `build` and `bind` do not blindly animate
 //!
 //! A `GtkListView` factory reuses the *same* row widget across many
 //! different items as the list is scrolled — that reuse is the whole point
 //! (recycling, not destroy-and-rebuild), and it holds just as much now that
 //! [`bind`] is called from `ui::view::bind`'s dispatch rather than straight
-//! from a `connect_bind` signal handler. An entrance animation wired into
-//! [`bind`] would therefore replay every time a recycled row is bound to a
-//! new item, i.e. on every scroll step, not just when a row is first shown
-//! to the user. Neither function below starts one, or anything that could
-//! grow into one by accident — both are a straight-line read of a field
-//! into a widget.
+//! from a `connect_bind` signal handler. Before issue #207, neither
+//! function below started an animation, or anything that could grow into
+//! one by accident — both were a straight-line read of a field into a
+//! widget, and this section's title said so outright: "`build` and `bind`
+//! *never* animate."
+//!
+//! # Issue #207: the one narrow exception, and why it does not violate the
+//! rule above
+//!
+//! [`bind`] now can start the hint's entrance fade — but only on a
+//! *genuine* not-shown-to-shown transition for the widget currently bound,
+//! never merely because `bind` ran. The hazard this section used to warn
+//! against — an entrance animation wired into `bind` replaying on every
+//! scroll step — is exactly the failure mode [`sync_hint_shown_class`]
+//! exists to rule out: `ui::view::build`'s own factory calls `unbind` before
+//! every `bind` that reassigns a recycled slot's item (`ui::view::unbind`'s
+//! doc comment confirms this against `SignalListItemFactory`'s own
+//! semantics), and [`unbind`]/[`clear_hint`] reset the hint chips'
+//! *visibility* on every one of those — but deliberately **never** touch
+//! [`HINT_SHOWN_CLASS`]. That class is this widget's own persistent memory
+//! of "was the hint genuinely showing the last time `bind` decided," and it
+//! survives the unbind/bind pair untouched specifically so [`bind`] can
+//! tell "stayed shown across a recycle" (no class churn, no fade) apart
+//! from "genuinely just appeared" (class absent, then added, fade plays) —
+//! without reaching for `unsafe` GObject qdata (this crate denies
+//! `unsafe_code`) to store that memory anywhere else. See [`bind`]'s own
+//! doc comment, "the recycling constraint", for the mechanism in full, and
+//! [`hint_entered_shown`]'s doc comment for the pure decision at its core.
+//!
+//! [`build`] itself is unchanged by this: it still never animates anything,
+//! and the CSS class it *does* add ([`HINT_CHILD_NAME`], now doubled as a
+//! style class too — see that constant's own doc comment) only ever
+//! establishes the hint's base, un-shown `opacity: 0` state
+//! (`assets/stylesheet.css`'s `.hop-row-hint` rule), never the `-shown`
+//! modifier that actually triggers a transition.
 
 use std::io::Read;
 
@@ -263,13 +292,42 @@ const TITLE_CHILD_NAME: &str = "hop-row-title";
 /// and the subtitle simply are not the same shape of problem.
 const SUBTITLE_CHILD_NAME: &str = "hop-row-subtitle";
 
-/// The widget name [`build`] gives the hint's own horizontal `gtk::Box` —
-/// the third direct child of the outer row container, issue #197. Not a
-/// CSS class: nothing styles the wrapper itself, only its two chip children
-/// below, so this name exists solely for [`hint_widget`]'s lookup, the same
-/// single-identity shape [`ICON_CHILD_NAME`]/[`TITLE_CHILD_NAME`] already
-/// use.
+/// The widget name — and, since issue #207, the CSS class too — [`build`]
+/// gives the hint's own horizontal `gtk::Box`, the third direct child of
+/// the outer row container (issue #197). Single identity until issue #207:
+/// nothing styled the wrapper itself, only its two chip children below, so
+/// this name existed solely for [`hint_widget`]'s lookup, the same
+/// single-identity shape [`ICON_CHILD_NAME`]/[`TITLE_CHILD_NAME`] still use.
+/// Issue #207 doubled it — the same reasoning [`SUBTITLE_CHILD_NAME`]'s own
+/// doc comment gives, applied here for the first time to this widget:
+/// `assets/stylesheet.css`'s `.hop-row-hint` rule (base, un-shown
+/// `opacity: 0`) needs a selector to style the wrapper by, and
+/// [`find_named_child`] still needs the same string as a name, so one
+/// constant serves both rather than risking the two drifting apart.
 const HINT_CHILD_NAME: &str = "hop-row-hint";
+
+/// The CSS class [`bind`] adds to the hint's wrapper on a genuine
+/// not-shown-to-shown transition, and leaves alone (never removes, and
+/// never redundantly re-adds) for as long as the hint stays shown across
+/// however many later binds recycle this same widget — see [`bind`]'s own
+/// doc comment, "the recycling constraint," and this module's "Issue #207"
+/// top-level doc section for the full mechanism this class is the load-
+/// bearing piece of.
+///
+/// Doing double duty, deliberately, the same way [`HINT_CHILD_NAME`] now
+/// does: it is both the trigger `assets/stylesheet.css`'s
+/// `.hop-row-hint.hop-row-hint-shown` rule matches on (what actually plays
+/// the entrance fade) *and* the one piece of state this recycled widget
+/// carries across an `unbind`/`bind` pair that [`unbind`] never resets —
+/// unlike the hint chips' own visibility, which it does — making it this
+/// mechanism's substitute for the `unsafe` GObject qdata storage this
+/// crate's `unsafe_code = "deny"` lint rules out.
+///
+/// `pub` for the same reason [`icon_widget`] is: `tests/view_tree_renderer.rs`
+/// reads this class back via [`gtk::Widget::has_css_class`] to prove the
+/// recycling distinction directly, at the level of observable widget state
+/// rather than animation timing or pixels.
+pub const HINT_SHOWN_CLASS: &str = "hop-row-hint-shown";
 
 /// The widget name and CSS class [`build`] gives the hint's label chip
 /// (e.g. "Open") — doubled identity, matching [`SUBTITLE_CHILD_NAME`]'s own
@@ -406,6 +464,14 @@ pub fn build() -> gtk::Box {
     // alignment property of its own needed here.
     let hint = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::HINT_CHIP_GAP_PX);
     hint.set_widget_name(HINT_CHILD_NAME);
+    // Issue #207: the base, un-shown `opacity: 0` state
+    // `assets/stylesheet.css`'s `.hop-row-hint` rule declares — see
+    // `HINT_CHILD_NAME`'s own doc comment for why this reuses that name
+    // rather than a third, separate class. `HINT_SHOWN_CLASS` is
+    // deliberately *not* added here: a freshly built row's hint starts
+    // un-shown, exactly like its two chips below, and only [`bind`] ever
+    // adds the `-shown` modifier, on a genuine transition.
+    hint.add_css_class(HINT_CHILD_NAME);
     hint.set_valign(gtk::Align::Center);
     hint.set_margin_start(*tokens::HINT_MARGIN_START_PX);
 
@@ -620,6 +686,44 @@ fn resolve_icon(icon: &gtk::Image, spec: Option<&IconSpec>) {
 /// has to import [`crate::keymap::Action`] to reach into one. See
 /// `ui::view::Node`'s own doc comment for the full account of what used to
 /// be threaded through here instead, and why.
+///
+/// # Issue #207: the recycling constraint
+///
+/// [`resolve_hint`] alone decides *whether* the hint ends up shown for this
+/// bind; this function is where the *separate* decision of whether that
+/// counts as a fade-worthy entrance gets made, by comparing the hint's
+/// shown state immediately before and immediately after [`resolve_hint`]
+/// runs:
+///
+/// - `was_shown`, read from [`HINT_SHOWN_CLASS`]'s presence on `hint`
+///   *before* `resolve_hint` touches anything. This is the widget's own
+///   memory of "was the hint genuinely showing the last time this function
+///   decided" — see [`HINT_SHOWN_CLASS`]'s own doc comment for why a CSS
+///   class, of all things, is what carries that memory across an
+///   `unbind`/`bind` pair, when [`unbind`] resets the chips' own visibility
+///   on every one of those.
+/// - `now_shown`, read from `hint_key`'s own visibility immediately *after*
+///   `resolve_hint` runs. [`resolve_hint`]'s "both halves or neither" rule
+///   (its own doc comment) means `hint_key` is visible if and only if the
+///   hint just resolved to non-empty — a signal independent of
+///   [`should_show_label_chip`]'s responsive collapse, which only ever
+///   toggles `hint_label`, never `hint_key`. So this reads "does the hint
+///   slot have content", not "is the full two-chip hint currently wide
+///   enough to show both chips" — the two are deliberately different
+///   questions, and only the first is what an entrance fade should key on.
+///
+/// [`hint_entered_shown`] turns that pair into the one decision that
+/// matters: `was_shown = false, now_shown = true` is the *only* case that
+/// starts the fade (by adding [`HINT_SHOWN_CLASS`], which is what makes
+/// `assets/stylesheet.css`'s `.hop-row-hint.hop-row-hint-shown` rule match
+/// and its `transition:` play). Every other combination — stayed shown
+/// across a recycle (`true, true`), stayed hidden (`false, false`), or
+/// genuinely lost its hint (`true, false`) — either leaves the class alone
+/// or removes it via [`hint_left_shown`], never re-triggering a fade. This
+/// is what keeps a recycled row's rebind from replaying the entrance fade
+/// regardless of whether the new item's hint text differs from the old
+/// one's — the exact hazard this module's "Issue #207" top-level doc
+/// section names.
 pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str>) {
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return;
@@ -638,7 +742,48 @@ pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str
         hint_label_widget(container),
         hint_key_widget(container),
     ) {
+        let was_shown = hint.has_css_class(HINT_SHOWN_CLASS);
         resolve_hint(&hint, &hint_label, &hint_key, item, activate_key_display);
+        let now_shown = hint_key.is_visible();
+        sync_hint_shown_class(&hint, was_shown, now_shown);
+    }
+}
+
+/// Whether a hint that was in `was_shown`'s state before this bind and is
+/// now in `now_shown`'s state has just genuinely appeared — the one, pure
+/// decision at the core of [`bind`]'s "the recycling constraint" doc
+/// section, isolated here specifically so it can be unit-tested without
+/// `gtk::init()`, the same way [`default_action_label`]'s own tests below
+/// need no GTK — a plain truth table, not a GTK behavior.
+fn hint_entered_shown(was_shown: bool, now_shown: bool) -> bool {
+    now_shown && !was_shown
+}
+
+/// [`hint_entered_shown`]'s mirror: whether a hint that was shown has just
+/// genuinely gone away — [`sync_hint_shown_class`]'s other branch, and the
+/// one case besides "genuinely appeared" that changes
+/// [`HINT_SHOWN_CLASS`]'s presence at all.
+fn hint_left_shown(was_shown: bool, now_shown: bool) -> bool {
+    was_shown && !now_shown
+}
+
+/// Reconciles `hint`'s [`HINT_SHOWN_CLASS`] against [`bind`]'s own
+/// before/after read of the hint's shown state — see that function's doc
+/// comment, "the recycling constraint", for what `was_shown`/`now_shown`
+/// mean and why this is the one place either gets compared.
+///
+/// Only [`hint_entered_shown`] and [`hint_left_shown`] ever change the
+/// class; the two remaining combinations (stayed shown, stayed hidden) fall
+/// through to neither branch and leave it exactly as it was — no redundant
+/// `add_css_class` on a class already present, which matters here not for
+/// correctness (GTK's own `add_css_class` is itself idempotent) but for
+/// intent: this function's shape is the actual, auditable gate this
+/// mechanism relies on, not GTK's incidental de-duplication.
+fn sync_hint_shown_class(hint: &gtk::Box, was_shown: bool, now_shown: bool) {
+    if hint_entered_shown(was_shown, now_shown) {
+        hint.add_css_class(HINT_SHOWN_CLASS);
+    } else if hint_left_shown(was_shown, now_shown) {
+        hint.remove_css_class(HINT_SHOWN_CLASS);
     }
 }
 
@@ -918,6 +1063,19 @@ fn clear_hint(hint_label: &gtk::Label, hint_key: &gtk::Label) {
 /// a row between the two, but it keeps this widget from ever holding stale
 /// application data it should not have. Symmetrical with [`bind`]: every
 /// property `bind` can set here, `unbind` resets.
+///
+/// # Issue #207: `HINT_SHOWN_CLASS` is the one deliberate exception to that
+/// symmetry
+///
+/// [`clear_hint`] resets the chips' own text and visibility here, same as
+/// always, but this function never touches [`HINT_SHOWN_CLASS`] on the
+/// hint's wrapper — not an oversight, the whole mechanism [`bind`]'s "the
+/// recycling constraint" doc section describes depends on it surviving
+/// this call untouched. If `unbind` cleared it too, every recycled row's
+/// next `bind` would see `was_shown = false` regardless of whether the
+/// hint had genuinely just been showing, which is exactly "did `bind` run"
+/// rather than "did the hint's own shown state genuinely transition" —
+/// the distinction this issue's brief is explicit must never be conflated.
 pub fn unbind(widget: &gtk::Widget) {
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return;
@@ -949,7 +1107,7 @@ mod tests {
     /// A minimal, GTK-free item — `default_action_label` touches only
     /// `hop_protocol::Item` fields, so this needs no `gtk::init()`, unlike
     /// almost everything else in this module (see this module's top doc
-    /// comment, "build and bind never animate", and
+    /// comment, "build and bind do not blindly animate", and
     /// `tests/view_tree_renderer.rs`'s own module doc for why the rest of
     /// this file's behavior can only be proven under a real broadway
     /// display).
@@ -994,5 +1152,71 @@ mod tests {
     fn default_action_label_is_none_when_the_item_has_no_actions_at_all() {
         let item = item_with_actions("open", vec![]);
         assert_eq!(default_action_label(&item), None);
+    }
+
+    /// [`hint_entered_shown`]/[`hint_left_shown`]'s full truth table —
+    /// issue #207's "the recycling constraint," exercised as pure logic
+    /// with no `gtk::init()` at all, the same GTK-free shape
+    /// `default_action_label`'s tests above use. This is the mechanism
+    /// itself, isolated from GTK's own CSS-class machinery entirely: a
+    /// widget-level proof that `bind` actually wires this decision to the
+    /// real [`HINT_SHOWN_CLASS`] lives in
+    /// `tests/view_tree_renderer.rs` instead, since that half needs a real
+    /// `gtk::Box` to call `has_css_class` on.
+    #[test]
+    fn hint_entered_shown_is_true_only_for_the_not_shown_to_shown_transition() {
+        assert!(
+            hint_entered_shown(false, true),
+            "not-shown to shown is exactly the genuine entrance this issue's fade exists for"
+        );
+        assert!(
+            !hint_entered_shown(true, true),
+            "shown to shown — a recycled row rebinding while the hint stays shown — must \
+             never read as an entrance, regardless of whether the bound item changed"
+        );
+        assert!(
+            !hint_entered_shown(false, false),
+            "not-shown to not-shown is no transition at all"
+        );
+        assert!(
+            !hint_entered_shown(true, false),
+            "shown to not-shown is the hint genuinely leaving, not entering"
+        );
+    }
+
+    #[test]
+    fn hint_left_shown_is_true_only_for_the_shown_to_not_shown_transition() {
+        assert!(
+            hint_left_shown(true, false),
+            "shown to not-shown is exactly when HINT_SHOWN_CLASS should be removed"
+        );
+        assert!(
+            !hint_left_shown(false, true),
+            "not-shown to shown is an entrance, not a departure"
+        );
+        assert!(
+            !hint_left_shown(true, true),
+            "shown to shown — stayed shown across a recycle — must not read as leaving"
+        );
+        assert!(
+            !hint_left_shown(false, false),
+            "not-shown to not-shown is no transition at all"
+        );
+    }
+
+    /// [`sync_hint_shown_class`] needs a real `gtk::Widget` to call
+    /// `add_css_class`/`remove_css_class`/`has_css_class` on, so its own
+    /// behavior — as opposed to the pure decision the two tests above
+    /// already pin — is proven in `tests/view_tree_renderer.rs` instead,
+    /// alongside `bind`'s real recycling behavior. Nothing here duplicates
+    /// that; this module's own `#[cfg(test)]` stays GTK-free by design
+    /// (see this file's own doc comment on why almost everything else in
+    /// this module needs a broadway display to test at all).
+    #[test]
+    fn hint_shown_class_name_matches_the_stylesheets_selector() {
+        // Pinned so a future rename of either side (this constant, or
+        // `assets/stylesheet.css`'s `.hop-row-hint-shown` selector) is a
+        // visible test failure rather than a silent drift between the two.
+        assert_eq!(HINT_SHOWN_CLASS, "hop-row-hint-shown");
     }
 }

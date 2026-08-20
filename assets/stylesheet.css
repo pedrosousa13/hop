@@ -22,7 +22,7 @@
  * "PLACEHOLDER SYNTAX" below for what it does about it.
  *
  * ============================================================
- * PLACEHOLDER SYNTAX — `{{name}}` and `{{font:name}}`
+ * PLACEHOLDER SYNTAX — `{{name}}`, `{{font:name}}`, and `{{motion:name}}`
  * ============================================================
  *
  * Every design value below is a `{{...}}` placeholder, never a literal —
@@ -43,6 +43,16 @@
  * text Task 1 already produced, and only then does one bounded string split
  * on `/` — see `stylesheet::font_shorthand_no_line_height`'s own doc comment.
  *
+ * `{{motion:name}}` — issue #207. Resolves `name` against
+ * `apps/hop-gtk/src/tokens.rs`'s `resolve_motion`, not `resolve`: the value
+ * varies by the live `Gtk.Settings:gtk-enable-animations` reading
+ * `apps/hop-gtk/src/style.rs` follows, never by palette. Used only by the
+ * `.hop-row-hint-shown` rule below, today — a placeholder with this prefix
+ * naming a token that has no reduced-motion override (most of MOTION's
+ * seven durations plus all four easing curves) is not an error; it simply
+ * resolves to the same unconditional value under both motion states, the
+ * same fall-through `resolve_motion`'s own doc comment describes.
+ *
  * Why `{{ }}` and not, say, `$name` or `%name%`: doubled curly braces never
  * occur in real GTK CSS — GTK CSS uses `{`/`}` solely as block delimiters,
  * always exactly one of each around real declarations, never doubled and
@@ -57,9 +67,10 @@
  *
  * `stylesheet::resolve` fails loudly on both ways this can go wrong: a
  * `{{` with no matching `}}` panics naming the dangling text (defensive —
- * this file has none), and any `{{name}}`/`{{font:name}}` naming a token
- * `tokens.css` does not declare panics through `tokens::resolve` itself,
- * which already names the missing token and the file. Nothing here degrades
+ * this file has none), and any `{{name}}`/`{{font:name}}`/`{{motion:name}}`
+ * naming a token `tokens.css` does not declare panics through
+ * `tokens::resolve`/`tokens::resolve_motion` itself, which already names the
+ * missing token and the file. Nothing here degrades
  * or silently emits an unsubstituted placeholder into the sheet handed to
  * GTK — that silent failure is the exact defect issue #193 exists to close.
  *
@@ -167,6 +178,57 @@ listview > row:hover {
 .hop-row-subtitle {
   font: {{font:hop-text-subtitle}};
   color: {{hop-fg-2}};
+}
+
+/* ============================================================
+   .hop-row-hint / .hop-row-hint-shown — `ui/row.rs` (issue #207)
+   The action hint's entrance fade: the design spec's Motion table gives it
+   80ms, ease-out, opacity only, with a 40ms delay before the fade starts
+   (`--hop-duration-fast`, `--hop-ease-out`, `--hop-delay-hint`). `.hop-row-hint`
+   is the base, un-shown state (`ui::row::build` gives the hint's own
+   wrapper `gtk::Box` this class, via `HINT_CHILD_NAME`, the same
+   doubled-identity precedent `.hop-row-subtitle` above documents);
+   `.hop-row-hint-shown` is added — `ui::row::bind`, `HINT_SHOWN_CLASS` — only
+   on a genuine not-shown-to-shown transition, never on every bind, which is
+   what keeps a recycled row's rebind from replaying this transition. See
+   `ui::row::bind`'s own doc comment, "the recycling constraint", for the
+   full mechanism; this rule only ever plays what that mechanism decides to
+   trigger.
+
+   `transition:` is declared on the *entered* rule, `.hop-row-hint-shown`
+   itself, matching the convention GTK's own bundled Adwaita stylesheet uses
+   throughout (e.g. `button:hover { ...; transition: all 200ms
+   cubic-bezier(...); }`) rather than on the base rule — GTK's CSS engine
+   resolves a transition from whichever rule matches at the moment the
+   animated property's computed value changes, so this is what animates the
+   `opacity: 0` → `opacity: 1` step and nothing else: `.hop-row-hint` itself
+   carries no `transition:`, so removing `.hop-row-hint-shown` again (the
+   hint's own item losing its default action) snaps back to `opacity: 0`
+   with no reverse fade — this issue's own scope is the *entrance* fade
+   only (see this file's own header, `{{motion:name}}` entry, and
+   `ui::row.rs`'s "Issue #207" doc section).
+
+   Every one of the three motion values below is a `{{motion:...}}`
+   placeholder, never a literal — the whole point of Task 1's motion axis is
+   that a value read here reaches the running window without a second,
+   hand-copied constant anywhere in this crate. Under reduced motion,
+   `--hop-delay-hint` resolves to `0ms` (one of the six `@media` overrides
+   `tokens.css`'s own REDUCED MOTION block names) while
+   `--hop-duration-fast` and `--hop-ease-out` are untouched — so the fade
+   still plays, opacity only, at its unchanged 80ms, just with no
+   anti-flicker delay in front of it. Widget presence/absence (the chips'
+   own `set_visible`) is unaffected either way — GTK has no `visibility`
+   property, per this file's own "PRESENCE IS NEVER EXPRESSED HERE" section
+   above, so this rule only ever animates the box's paint, never whether it
+   occupies layout.
+   ============================================================ */
+.hop-row-hint {
+  opacity: 0;
+}
+
+.hop-row-hint.hop-row-hint-shown {
+  opacity: 1;
+  transition: opacity {{motion:hop-duration-fast}} {{motion:hop-ease-out}} {{motion:hop-delay-hint}};
 }
 
 /* ============================================================

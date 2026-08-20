@@ -1,17 +1,31 @@
-//! Proves the real, shipped `assets/stylesheet.css` — resolved for both
-//! palettes — loads into a real [`gtk::CssProvider`] with **zero** parse
-//! errors. This is the single most important artifact of issue #193: GTK's
-//! CSS parser drops anything it cannot parse *silently* (confirmed during
-//! this issue's own triage — handing `assets/tokens.css` to a raw provider
-//! produced 20 silent parse errors, none of them visible anywhere without a
-//! `parsing-error` signal connected), which is exactly the failure mode that
-//! let hop ship with no working stylesheet for as long as it did. A test
-//! that only checks the *text* `stylesheet::resolve` produces — no leftover
-//! `{{`/`}}` marker, which `stylesheet.rs`'s own unit tests already pin —
-//! can never catch a placeholder that substituted cleanly into CSS GTK's
-//! parser still rejects for some other reason. Only handing the resolved
-//! text to a real `gtk::CssProvider` and watching its own `parsing-error`
-//! signal can catch that, which is what this file does.
+//! Proves the real, shipped `assets/stylesheet.css` — resolved for every
+//! combination of palette and motion state — loads into a real
+//! [`gtk::CssProvider`] with **zero** parse errors. This is the single most
+//! important artifact of issue #193: GTK's CSS parser drops anything it
+//! cannot parse *silently* (confirmed during this issue's own triage —
+//! handing `assets/tokens.css` to a raw provider produced 20 silent parse
+//! errors, none of them visible anywhere without a `parsing-error` signal
+//! connected), which is exactly the failure mode that let hop ship with no
+//! working stylesheet for as long as it did. A test that only checks the
+//! *text* `stylesheet::resolve` produces — no leftover `{{`/`}}` marker,
+//! which `stylesheet.rs`'s own unit tests already pin — can never catch a
+//! placeholder that substituted cleanly into CSS GTK's parser still rejects
+//! for some other reason. Only handing the resolved text to a real
+//! `gtk::CssProvider` and watching its own `parsing-error` signal can catch
+//! that, which is what this file does.
+//!
+//! Issue #207 extended the matrix this covers from the two palettes alone
+//! to the full 2×2 palette-by-motion combination, since that issue's own
+//! `{{motion:name}}` placeholder (`.hop-row-hint-shown`'s `transition:`
+//! declaration, in particular — real, GTK-parsed
+//! `transition-property`/`transition-duration`/`transition-timing-function`/
+//! `transition-delay` syntax, not something the leftover-placeholder check
+//! alone could ever validate) is exactly the kind of "substituted cleanly
+//! but still rejected by GTK's real parser" risk this file's whole reason
+//! to exist already names. This is the acceptance criterion's own
+//! "extended, not bypassed" — the existing two-palette assertion function
+//! now takes a [`Motion`] too, rather than a second, parallel function
+//! being added alongside it.
 //!
 //! # Re-exec under broadway
 //!
@@ -53,7 +67,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hop_gtk::stylesheet;
-use hop_gtk::tokens::Palette;
+use hop_gtk::tokens::{Motion, Palette};
 
 /// Set on the re-exec'd child so it knows to run [`run_assertions`]
 /// in-process instead of spawning a second child — see this file's module
@@ -103,7 +117,7 @@ impl Drop for BroadwayServer {
 }
 
 #[test]
-fn resolved_stylesheet_loads_with_zero_parse_errors_on_both_palettes() {
+fn resolved_stylesheet_loads_with_zero_parse_errors_on_both_palettes_and_both_motion_states() {
     if std::env::var_os(CHILD_MARKER).is_some() {
         run_assertions();
         return;
@@ -118,7 +132,7 @@ fn resolved_stylesheet_loads_with_zero_parse_errors_on_both_palettes() {
         .env("BROADWAY_DISPLAY", format!(":{}", broadway.display))
         .env(CHILD_MARKER, "1")
         .arg("--exact")
-        .arg("resolved_stylesheet_loads_with_zero_parse_errors_on_both_palettes")
+        .arg("resolved_stylesheet_loads_with_zero_parse_errors_on_both_palettes_and_both_motion_states")
         .arg("--nocapture")
         .output()
         .expect("failed to re-exec this test binary under the headless broadway display");
@@ -137,19 +151,22 @@ fn resolved_stylesheet_loads_with_zero_parse_errors_on_both_palettes() {
 fn run_assertions() {
     gtk::init().expect("gtk init under the broadway display this process's environment selects");
 
-    assert_zero_parse_errors(Palette::Dark);
-    assert_zero_parse_errors(Palette::Light);
+    for palette in [Palette::Dark, Palette::Light] {
+        for motion in [Motion::Full, Motion::Reduced] {
+            assert_zero_parse_errors(palette, motion);
+        }
+    }
 
-    println!("resolved stylesheet parses cleanly under both palettes");
+    println!("resolved stylesheet parses cleanly under both palettes and both motion states");
 }
 
-/// Resolves `assets/stylesheet.css` for `palette`, loads it into a fresh
-/// `gtk::CssProvider`, and fails with every collected parser diagnostic if
-/// its `parsing-error` signal fired even once. A `Vec` of messages, not
-/// just a count, is what this collects — a failure here should tell a
-/// developer exactly what GTK rejected and where, not just that something,
-/// somewhere, did not parse.
-fn assert_zero_parse_errors(palette: Palette) {
+/// Resolves `assets/stylesheet.css` for `palette` and `motion`, loads it
+/// into a fresh `gtk::CssProvider`, and fails with every collected parser
+/// diagnostic if its `parsing-error` signal fired even once. A `Vec` of
+/// messages, not just a count, is what this collects — a failure here
+/// should tell a developer exactly what GTK rejected and where, not just
+/// that something, somewhere, did not parse.
+fn assert_zero_parse_errors(palette: Palette, motion: Motion) {
     let provider = gtk::CssProvider::new();
     let messages: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let error_count = Rc::new(Cell::new(0u32));
@@ -163,13 +180,13 @@ fn assert_zero_parse_errors(palette: Palette) {
         }
     });
 
-    provider.load_from_string(&stylesheet::resolve(palette));
+    provider.load_from_string(&stylesheet::resolve(palette, motion));
 
     assert_eq!(
         error_count.get(),
         0,
         "expected zero gtk::CssProvider parse errors resolving assets/stylesheet.css under \
-         {palette:?}, got {}: {:#?}",
+         {palette:?}/{motion:?}, got {}: {:#?}",
         error_count.get(),
         messages.borrow(),
     );

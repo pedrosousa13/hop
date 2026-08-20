@@ -979,6 +979,123 @@ fn run_assertions() {
 
     println!("row action hint assertions passed");
 
+    // --- issue #207: the hint's entrance fade never replays on a bare
+    // recycle. Continues on the exact same recycled slot every section
+    // above already proved recycling for. This is the "observable state,
+    // not animation timing or pixels" proof the recycling constraint
+    // needs — `ui::row::HINT_SHOWN_CLASS`'s presence is what
+    // `assets/stylesheet.css`'s `.hop-row-hint.hop-row-hint-shown` rule
+    // matches on to actually play the entrance fade, and `ui::row::bind`'s
+    // own doc comment ("the recycling constraint") is the mechanism this
+    // section drives directly. `ui::row::tests::hint_entered_shown_*`/
+    // `hint_left_shown_*` (this crate's own `src/ui/row.rs`) already prove
+    // the pure decision table with no GTK at all; what only a real
+    // `gtk::Box` can prove is that `bind`/`unbind` actually wire that
+    // decision to a real widget's real CSS class, which is what this
+    // section does.
+    let hint = row::hint_widget(&container).expect("build must give the row a named hint wrapper");
+
+    // A known starting point, driven rather than assumed: bind an item
+    // with no hint at all first, so `HINT_SHOWN_CLASS` is genuinely absent
+    // going in regardless of this recycled row's own binding history
+    // above (every item bound in the icon and subtitle sections carries a
+    // real hint via `test_item`, so the class may already have been
+    // present long before this section ever ran).
+    let starts_with_no_hint = item_with_actions(40, "no hint to start this section from");
+    view::bind(
+        &stack,
+        &Node::for_item(starts_with_no_hint, activate_key_display.clone()),
+    );
+    assert!(
+        !hint.has_css_class(row::HINT_SHOWN_CLASS),
+        "starting baseline: the hint must not carry HINT_SHOWN_CLASS while genuinely un-shown"
+    );
+
+    // A genuine not-shown-to-shown transition: bind to an item with a real
+    // default action. This is the one case that adds the class.
+    view::bind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
+    assert!(
+        hint.has_css_class(row::HINT_SHOWN_CLASS),
+        "a genuine not-shown-to-shown transition must add HINT_SHOWN_CLASS — this is what \
+         makes assets/stylesheet.css's .hop-row-hint.hop-row-hint-shown rule match and play \
+         the entrance fade"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "adding the shown class must not change the row's reserved row height or icon slot — \
+         opacity is a paint property, not a layout one"
+    );
+
+    // GTK calls `unbind` before every `bind` that reassigns a recycled
+    // slot's item (`ui::view::unbind`'s own doc comment) — this stands in
+    // for that. It must clear the chips' own visibility (already proven
+    // above, "row action hint assertions") but, critically, never the
+    // class — see `ui::row::unbind`'s own doc comment, "the one deliberate
+    // exception to that symmetry."
+    view::unbind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
+    assert!(
+        hint.has_css_class(row::HINT_SHOWN_CLASS),
+        "unbind must never remove HINT_SHOWN_CLASS — it is this widget's own persistent \
+         memory of \"was the hint genuinely showing,\" and it has to survive unbind untouched \
+         so the next bind can tell a bare recycle apart from a genuine entrance"
+    );
+
+    // The recycle itself: rebind to a *different* item whose hint also
+    // resolves, but to different text ("Copy", not "Open") — proving the
+    // class tracks the hint's shown/hidden *state*, never its text, and
+    // therefore must not replay the fade here: the class was already
+    // present and must simply stay present, never observably removed and
+    // re-added.
+    let recycled_with_different_hint_text =
+        item_with_default_action_label(41, "second item, different hint text", "Copy");
+    view::bind(
+        &stack,
+        &Node::for_item(
+            recycled_with_different_hint_text,
+            activate_key_display.clone(),
+        ),
+    );
+    assert!(
+        hint.has_css_class(row::HINT_SHOWN_CLASS),
+        "a recycled row rebinding to a new item while the hint stays shown throughout must \
+         not replay the fade — the class must simply remain present, regardless of whether \
+         the new item's hint text differs from the old one's"
+    );
+    assert_eq!(
+        hint_label.text(),
+        "Copy",
+        "the recycled label must show the second item's own hint text — proving this really \
+         was a different item bound to the same widget, not the same item bound twice"
+    );
+
+    // The hint genuinely leaving: rebind to an item with no default action
+    // match at all. This is the one case besides the initial entrance that
+    // changes the class — removing it this time.
+    let hint_genuinely_leaves = item_with_actions(42, "hint genuinely leaves on this bind");
+    view::bind(
+        &stack,
+        &Node::for_item(hint_genuinely_leaves, activate_key_display.clone()),
+    );
+    assert!(
+        !hint.has_css_class(row::HINT_SHOWN_CLASS),
+        "a genuine shown-to-not-shown transition must remove HINT_SHOWN_CLASS"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "removing the shown class must not change the row's reserved row height or icon slot \
+         either"
+    );
+
+    println!("row hint entrance-fade recycling assertions passed (issue #207)");
+
     // --- issue #197: the responsive collapse. `assets/tokens.css`'s own
     // GEOMETRY note: "the action hint collapses to icon-only before it
     // would be pushed off-window." GTK has no CSS media query (confirmed
