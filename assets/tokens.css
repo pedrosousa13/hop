@@ -135,17 +135,6 @@
      right-aligned action hint, inside the 56px --hop-row-h above. */
   --hop-icon-size:           26px;
 
-  /* The two locked dimensions `.hop-honesty .hop-skeleton`'s own rule
-     below already commits to as bare literals ("A skeleton bar with no
-     width collapses to invisible, which is the same lie as hiding it.
-     Dimensions are locked, not just opacity."). Named here, unchanged,
-     so a GTK-CSS consumer (hop-gtk's own stylesheet) can reference the
-     exact locked values through `--hop-*` like every other design value
-     in this file, instead of duplicating them as an unnamed literal or
-     substituting a numerically-different token. */
-  --hop-skeleton-min-w:       24px;
-  --hop-skeleton-min-h:        9px;
-
   /* ==========================================================
      MOTION
      Open decelerates (arriving); close accelerates (dismissing).
@@ -231,18 +220,22 @@
 }
 /* A skeleton bar with no width collapses to invisible, which is
    the same lie as hiding it. Dimensions are locked, not just
-   opacity. Point at the two --hop-skeleton-min-* tokens above
-   (issue #193 Task 3 review) instead of repeating 24px/9px here as a
-   second, unlinked literal: `.hop-honesty` rule bodies are skipped by
-   TokenTable::parse (classify_selector only recognises `:root` and
-   `.hop-theme-light` as token-bearing selectors — see tokens.rs's own
-   module doc, "The five `.hop-honesty*` rule blocks"), so this var()
-   reference is never mistaken for a `--name: value;` declaration; it
-   is read here purely as this file's own web-CSS var() resolution,
-   the same as every other `.hop-honesty` rule below already does. */
+   opacity. These are bare literals, not `--name` tokens, on purpose:
+   docs/theme-token-contract.md's "Locked guarantees" section requires
+   presence, opacity, and dimensions to be "fixed declarations rather
+   than overridable custom properties" for exactly this reason — none
+   of the three may ever become theme-swappable. An earlier revision
+   named these two as `--hop-skeleton-min-w`/`-h` custom properties in
+   the `:root` block above; that was reverted (issue #193 Task 3
+   re-review) because a named, `:root`-declared property reads to a
+   theme author as part of the overridable token API this file
+   otherwise is, which is exactly what the contract forbids for this
+   category. See `assets/stylesheet.css`'s own copy of this rule for
+   the fuller account of why the same two literals are sanctioned to
+   appear here *and* there. */
 .hop-honesty .hop-skeleton {
-  min-width: var(--hop-skeleton-min-w);
-  min-height: var(--hop-skeleton-min-h);
+  min-width: 24px;
+  min-height: 9px;
 }
 
 /* ============================================================

@@ -234,24 +234,39 @@ listview > row:hover {
   font: {{font:hop-text-timestamp}};
 }
 
-/* `tokens.css`'s own comment on this rule: "A skeleton bar with no width
-   collapses to invisible, which is the same lie as hiding it. Dimensions
-   are locked, not just opacity." Its own values, `min-width: 24px;
-   min-height: 9px;`, used to be literal in `tokens.css` itself — not
-   `--name` tokens, since `.hop-honesty` is a component rule block
-   TokenTable::parse deliberately skips (see `tokens.rs`'s own module doc
-   comment) — so an earlier version of this rule sourced `min-width` from
-   the numerically-equal but semantically unrelated `--hop-space-6` and
-   approximated `min-height` with `--hop-space-2` (8px), one pixel short of
-   the 9px `docs/theme-token-contract.md` actually locks. That approximation
-   silently downgraded a locked guarantee below its already-committed value,
-   which is a real defect, not a disclosed shortcut — review caught it.
-   `tokens.css` now names both dimensions directly, unchanged
-   (`--hop-skeleton-min-w: 24px`, `--hop-skeleton-min-h: 9px`), right next
-   to this same rule's own comment there — naming a value `tokens.css`
-   already committed to is not re-opening it. Both are referenced verbatim
-   below: no approximation, no repurposed token. */
+/* THE ONE SANCTIONED EXCEPTION to this file's own "no design value appears
+   as a literal in both the stylesheet and tokens.css" rule — read this
+   comment before "fixing" these two lines back into a `{{...}}` placeholder.
+
+   `docs/theme-token-contract.md`'s "Locked guarantees" section is
+   normative and says, verbatim: "Presence, opacity, and dimensions are
+   fixed declarations rather than overridable custom properties — that
+   absence of a token is deliberate, since none of the three may ever
+   become theme-swappable." Dimensions is one of the three; this rule's
+   `min-width`/`min-height` *are* that category, for exactly the skeleton
+   bar the contract's own worked example names ("the locked min-width/
+   min-height on `.hop-honesty .hop-skeleton`"). A named custom property in
+   `tokens.css`'s `:root` block — even one this file only ever reads,
+   never lets a user theme touch — reads to a theme author as part of the
+   overridable token API the rest of that file is, which is precisely what
+   the contract forbids for this category. So here the general "name every
+   design value, never repeat a literal" rule this issue otherwise enforces
+   yields to the contract: the contract wins, because it is normative and
+   this issue is not the one that gets to amend it (editing
+   docs/theme-token-contract.md is issue #199).
+
+   `tokens.css`'s own `.hop-honesty .hop-skeleton` rule carries the exact
+   same two literals, independently, for the identical reason — the two
+   files do not derive one from the other here, because there is no shared
+   token either could derive them *from* without recreating the forbidden
+   custom property. Both must read `min-width: 24px; min-height: 9px;`
+   forever, in lockstep, by hand: if one changes, change the other to
+   match, and if a difference between them means to be justified, it is
+   already the wrong fix. (An earlier revision *did* name these as
+   `--hop-skeleton-min-w`/`-h` custom properties, which is exactly the
+   violation the paragraph above describes — reverted in issue #193 Task 3
+   re-review, not a shortcut this file is inventing new.) */
 .hop-honesty .hop-skeleton {
-  min-width: {{hop-skeleton-min-w}};
-  min-height: {{hop-skeleton-min-h}};
+  min-width: 24px;
+  min-height: 9px;
 }
