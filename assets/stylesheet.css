@@ -109,6 +109,49 @@ window.background {
 }
 
 /* ============================================================
+   LIST VIEW GROUND — issue #215
+   `listview` is `GtkListView`'s own single CSS node, confirmed against the
+   Gtk-4.0 gir's "CSS nodes" section for GtkListView, the same source the
+   ROW SURFACE comment just below cites for `listview > row`: "`GtkListView`
+   uses a single CSS node named `listview`." — its own sentence, not
+   paraphrased. That doc's node tree draws `row` as the *only* child
+   (`listview ├── row[.activatable]`, plus an optional `rubberband` node
+   during a drag-select nothing in this crate uses), so there is no
+   intermediate node between `listview` and `row` for this rule to worry
+   about missing.
+
+   There *is* one more widget between the window and this node in
+   `ui::window::build` — a `gtk::ScrolledWindow` wraps the `gtk::ListView` —
+   but it introduces no CSS node of its own that paints over this one.
+   `GtkScrolledWindow`'s class documentation, in its general prose *before*
+   the "CSS nodes" heading (that heading's own section names only
+   `scrolledwindow`, `overshoot`/`undershoot`, and `junction`, and says
+   nothing about `GtkViewport` or `GtkScrollable`): a child that implements
+   the `GtkScrollable` interface (`GtkListView` does — confirmed the same
+   gir file's `<implements name="Scrollable"/>` on the `ListView` class) is
+   "added directly. For other types of widget, [GtkViewport] acts as an
+   adaptor" — so no `GtkViewport` is inserted for a `GtkScrollable` child —
+   confirmed against `ui::window::build` itself,
+   `gtk::ScrolledWindow::builder().child(&list_view)`, never
+   `set_child`-ing a `Viewport` in between. So `listview` is genuinely the
+   node that owns the area a resting/hovered row does not cover, not one of
+   several candidates.
+
+   Before this rule existed, that area fell through to libadwaita's stock
+   background — confirmed on screen by the conformance pass that filed this
+   issue: an empty-query capture sampled a flat `rgb(30, 30, 30)` across the
+   whole list-view area, matching neither `--hop-bg` nor `--hop-bg-hover`.
+   The empty-query state is the launcher's default, most-often-seen state,
+   so this was not a cosmetic corner case. `{{hop-bg}}` here is the same
+   window-ground token `window.background` above already paints — this rule
+   makes the list view's own ground continuous with the window's, exactly
+   like a resting row already is (see ROW SURFACE below).
+   ============================================================ */
+listview {
+  background-color: {{hop-bg}};
+}
+
+/* ============================================================
    ROW SURFACE
    `listview > row` is GtkListView's own generated per-item CSS node
    (confirmed the same way: the Gtk-4.0 gir's "CSS nodes" section for
