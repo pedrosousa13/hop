@@ -82,6 +82,7 @@
 //! `motion_setting.rs`: 450, `font_resolution.rs`: 500.
 
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hop_gtk::stylesheet;
@@ -104,7 +105,21 @@ struct BroadwayServer {
 
 impl BroadwayServer {
     fn start() -> Self {
-        let display = 600 + (std::process::id() % 5000);
+        // Unlike every other `tests/*.rs` broadway file, which carries
+        // exactly one `#[test]`, this file carries three — and Rust runs a
+        // test binary's tests on parallel threads by default, all sharing
+        // one process id. A plain `600 + (process::id() % 5000)`, copied
+        // from those single-test files, therefore hands all three the *same*
+        // display and races three `gtk4-broadwayd` instances onto it; the
+        // losers fail with a bare "Failed to initialize GTK". That is a
+        // race, so it survived local runs and only surfaced in CI, where
+        // fewer cores and slower spawns lose it reliably. The per-server
+        // counter is what makes the number unique per *test*, not merely
+        // per process — the pid term still separates concurrent `cargo
+        // test` runs from each other.
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let display =
+            600 + (std::process::id() % 5000) + NEXT.fetch_add(1, Ordering::Relaxed) * 5001;
         let child = Command::new("gtk4-broadwayd")
             .arg(format!(":{display}"))
             .stdout(Stdio::null())
