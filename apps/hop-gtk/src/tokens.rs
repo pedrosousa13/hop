@@ -680,7 +680,17 @@ pub struct FontToken {
 /// doc comment gives: both lookups below go through `raw`/`resolve`, never
 /// `resolve_motion`, so [`TokenTable::reduced_motion_overlay`] never enters
 /// the picture regardless of `name`.
-fn font_token(name: &str) -> FontToken {
+///
+/// `pub(crate)`, as of issue #198 — [`crate::fonts`]'s own test suite reuses
+/// this exact parse (weight, size, resolved family) to prove the bundled
+/// `assets/fonts/*.ttf` faces cover every weight `assets/tokens.css`'s type
+/// scale actually asks for, rather than writing a second, independent
+/// `<weight> <size>/<line> var(--hop-font-*)` parser in `fonts.rs` that
+/// could silently drift from this one's own idea of the grammar. See
+/// [`text_token_names`], the other half of that reuse: the list of
+/// `--hop-text-*` names to call this function with, read out of the same
+/// already-parsed [`TABLE`] this function itself reads from.
+pub(crate) fn font_token(name: &str) -> FontToken {
     let raw = raw(name, Palette::Dark);
     let expected = "`<weight> <N>px/<N>px var(--hop-font-*)`";
     let mut parts = raw.split_whitespace();
@@ -729,6 +739,49 @@ fn font_token(name: &str) -> FontToken {
         line_height_px,
         family,
     }
+}
+
+/// Every `--hop-text-*` declaration name `assets/tokens.css` actually has —
+/// issue #198's [`crate::fonts`] test suite's enumeration of "which type-scale
+/// tokens exist", read out of the already-parsed [`TABLE`] rather than a
+/// hardcoded list of the ten names this file happens to declare today.
+///
+/// That distinction is the whole point: a hardcoded list can only ever be
+/// checked against itself, so it would keep passing forever even the day an
+/// eleventh `--hop-text-*` token is added with a weight `assets/fonts/`
+/// carries no `.ttf` for — exactly the silent-drift failure mode issue #198
+/// exists to close for the two font *families*, which this extends to their
+/// *weights* too. Reading the names back out of `TABLE.base` instead means
+/// the font bundle's own test (`crate::fonts`'s
+/// `bundled_faces_cover_every_weight_tokens_css_declares`) is checking
+/// against `assets/tokens.css` itself, transitively, through the one parse
+/// this module already performs — not a second, independent copy of it.
+///
+/// `TABLE.base` rather than also consulting `light_overlay` or
+/// `reduced_motion_overlay`: every `--hop-text-*` name lives only in the
+/// first, unconditional `:root` block (this function's own doc comment on
+/// [`font_token`] establishes that already, for the "palette-invariant"
+/// claim), so a name that exists at all exists in `base`.
+///
+/// `#[cfg(test)]`: nothing outside a test calls this today — [`font_token`]
+/// itself stays a plain, always-compiled `pub(crate)` function because
+/// [`MODE_LABEL_FONT`] is a real, non-test caller, but this enumeration
+/// exists solely so `crate::fonts`'s own test module can ask "which
+/// `--hop-text-*` tokens exist" without hardcoding the answer — see this
+/// function's own doc comment above. Leaving it uncompiled outside `cargo
+/// test` is what keeps `cargo build -p hop-gtk`'s ordinary, non-test lib
+/// target free of the `dead_code` warning a `pub(crate)` function with no
+/// production caller would otherwise earn, without reaching for
+/// `#[allow(dead_code)]` to silence a warning that is, outside of tests,
+/// entirely accurate.
+#[cfg(test)]
+pub(crate) fn text_token_names() -> Vec<&'static str> {
+    TABLE
+        .base
+        .keys()
+        .filter(|name| name.starts_with("hop-text-"))
+        .map(String::as_str)
+        .collect()
 }
 
 /// `--hop-tracking-*`: an `em` letter-spacing token, e.g.

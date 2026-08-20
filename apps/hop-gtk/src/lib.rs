@@ -15,6 +15,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod fonts;
 mod icon_roots;
 pub mod ipc;
 pub mod keymap;

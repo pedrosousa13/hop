@@ -49,7 +49,7 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # block declared rather than smuggled in: the lint covers normal compilation
 # of both members — `src/` and `#[cfg(test)]` code alike — so each one needs
 # its own narrow `#[expect(unsafe_code)]` at the statement to build at all.
-# As of issue #182 there are seven: that one production block, plus five
+# As of issue #198 there are eight: that one production block, plus five
 # test-only `libc::mkfifo`/`pre_exec` calls in `hop-protocol::content`,
 # `hop-protocol`'s own `config_file` (the config-file read promoted out of
 # `hopd::config` by issue #182), `hopd::config`, `hopd`'s
@@ -57,9 +57,16 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # identical FIFO-open hazard `hopd::config` closes for the config file,
 # closed here for a `.desktop` candidate), plus a second production block —
 # `hop-gtk`'s `ui::window`, setting `XDG_ACTIVATION_TOKEN` before `present()`
-# reads it back, on the GTK main thread. Each `expect` is itself the proof
-# the lint reaches where it's written: were it not firing there, the
-# unfulfilled expectation would warn, and CI's `-D warnings` would fail.
+# reads it back, on the GTK main thread — plus a third production block,
+# `hop-gtk`'s `fonts::register_with_fontconfig`, calling
+# `FcConfigAppFontAddDir` to register the crate's bundled typefaces (issue
+# #198's own comment thread records the maintainer's approval of this
+# specific exception to "no new `unsafe`", since no safe binding reaches
+# this call on the pango/fontconfig versions this workspace targets — see
+# `apps/hop-gtk/src/fonts.rs`'s doc comment, "Registering with
+# fontconfig"). Each `expect` is itself the proof the lint reaches where
+# it's written: were it not firing there, the unfulfilled expectation would
+# warn, and CI's `-D warnings` would fail.
 #
 # What it does not cover is doc tests. Cargo hands `--deny=unsafe_code` to
 # rustdoc — visible in `cargo test -p hop-protocol --doc -v` — but rustdoc

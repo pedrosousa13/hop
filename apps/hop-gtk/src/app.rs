@@ -66,7 +66,7 @@ use gtk::prelude::*;
 
 use crate::icon_roots;
 use crate::ipc::{self, IpcEvent};
-use crate::{cli, screenshot, style, ui};
+use crate::{cli, fonts, screenshot, style, ui};
 
 /// GNOME reverse-DNS convention; unregistered (no publisher claims this
 /// prefix on Flathub or similar) since v1 has not shipped anywhere that
@@ -107,6 +107,55 @@ const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// same code the `Usage` arm above already uses, per that decision: no new
 /// error channel, no new exit code.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
+    // Forces issue #198's bundled-font registration to run now, before a
+    // single other line of this function executes. This has to be the
+    // *first* statement in `run`, not merely somewhere before
+    // `adw::Application::new` below: `fonts.rs`'s own doc comment
+    // ("Registering with fontconfig", "The ordering hazard") explains why
+    // there is no recovery if this loses the race against Pango
+    // constructing its first font map — `pango_fc_font_map_config_changed`,
+    // the reload entry point that would otherwise fix a late registration,
+    // is not exposed anywhere in the Rust `pango` bindings. Nothing this
+    // function or anything it calls does before this line is known,
+    // *today*, to touch Pango — but that is a fact about the current
+    // contents of `icon_roots::ALLOWED_ICON_ROOTS`'s initializer and
+    // `cli::parse`, not an invariant either of them promises to keep, and a
+    // future change to either that happened to construct so much as a
+    // `pango::Layout` would silently reintroduce the exact defect this
+    // issue exists to close. Going first removes the question entirely
+    // instead of relying on an audit of what two unrelated functions
+    // currently do.
+    //
+    // This is deliberately not inside `install_stylesheet`'s
+    // `connect_startup`, even though that is where `style::install` (the
+    // other one-time-per-display setup this crate does) lives. `app.rs`'s
+    // own `install_stylesheet` doc comment already establishes that
+    // `connect_startup` fires only after `GtkApplication`'s own default
+    // handler has run — which is *after* `adw::Application::new` has built
+    // the underlying `GApplication`/`GtkApplication` C objects `run_interactive`
+    // and `run_screenshot` each construct below, and therefore not
+    // provably before Pango's first font map. `style::install` can afford
+    // that ordering because a `gtk::CssProvider` reload is fully general —
+    // GTK re-cascades style at any point, live, which is `style.rs`'s own
+    // whole mechanism for a runtime dark/light switch. Font registration
+    // has no equivalent live-reload path (again: `pango_fc_font_map_config_changed`
+    // is unreachable from Rust), so it cannot use the same, later hook
+    // `install_stylesheet` safely can.
+    //
+    // Failure is handled exactly like every other fallible startup step
+    // below (`socket_path`, `keymap::Keymap::load`): `eprintln!` and refuse
+    // to start, rather than letting `hop-gtk` run with the bundled faces
+    // silently unregistered. A silent fallback to whatever system font
+    // fontconfig's ordinary search happens to resolve `"Inter"` or
+    // `"Iosevka Term"` to instead is the exact defect issue #198 exists to
+    // close — see `fonts.rs`'s own module doc, "Computed once, not per
+    // lookup", for the identical argument made about `FontsError` as a
+    // type rather than a comment.
+    if let Err(err) = fonts::bundle() {
+        eprintln!("hop-gtk: {err}");
+        return ExitCode::FAILURE;
+    }
+
     // Forces issue #93's icon allow-list to compute now, from this
     // process's own environment, rather than lazily on whatever thread
     // first binds a row carrying an `IconSpec::Path` icon.
