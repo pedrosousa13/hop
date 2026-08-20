@@ -231,10 +231,18 @@
 }
 /* A skeleton bar with no width collapses to invisible, which is
    the same lie as hiding it. Dimensions are locked, not just
-   opacity. */
+   opacity. Point at the two --hop-skeleton-min-* tokens above
+   (issue #193 Task 3 review) instead of repeating 24px/9px here as a
+   second, unlinked literal: `.hop-honesty` rule bodies are skipped by
+   TokenTable::parse (classify_selector only recognises `:root` and
+   `.hop-theme-light` as token-bearing selectors — see tokens.rs's own
+   module doc, "The five `.hop-honesty*` rule blocks"), so this var()
+   reference is never mistaken for a `--name: value;` declaration; it
+   is read here purely as this file's own web-CSS var() resolution,
+   the same as every other `.hop-honesty` rule below already does. */
 .hop-honesty .hop-skeleton {
-  min-width: 24px;
-  min-height: 9px;
+  min-width: var(--hop-skeleton-min-w);
+  min-height: var(--hop-skeleton-min-h);
 }
 
 /* ============================================================

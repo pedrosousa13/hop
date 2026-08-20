@@ -76,8 +76,9 @@
 //!   same way — not be retrofitted into `base`.
 //! - **The five `.hop-honesty*` rule blocks** are skipped entirely: they are
 //!   component rules (`opacity: 1;`, `color: var(--hop-fg);`, `min-width:
-//!   24px;`), not `--custom-property` *declarations*, so they have no
-//!   business in a token table regardless of how they are reached.
+//!   var(--hop-skeleton-min-w);`), not `--custom-property` *declarations*,
+//!   so they have no business in a token table regardless of how they are
+//!   reached.
 //!   [`classify_selector`] only recognises `:root` and `.hop-theme-light` as
 //!   token-bearing selectors; every other selector — honesty rules included
 //!   — is `Skip` by construction, not by an incidental syntax mismatch (a
