@@ -392,7 +392,7 @@ exercisable by any automated test in this environment; it needs a human at a
 keyboard on a live build. Not capture-verifiable at all — a screenshot is one
 frame, and can at best show the *result* of a keypress a human already made.
 
-**Status: likely satisfied, not independently verified end-to-end.**
+**Status: unknown, not independently verified end-to-end.**
 Re-confirmed at this commit: the keymap still covers all ten actions with
 defaults (`Action::ALL`, unchanged), is still attached at
 `PropagationPhase::Capture` (`ui::window::HopWindow::wire_keyboard`) so it
@@ -644,7 +644,7 @@ environment.
 | 2b | Screen-reader labels | Binding | Not yet satisfied — real subtitle and hint content now exists (#196, #197) and none of it is exposed |
 | 2c | System font scaling | Binding | Not yet satisfied — the row's fixed-height reservation still conflicts with it; the previous mode-label evidence is retracted (that code was removed by #193) |
 | 3 | Reduced motion | Binding | Not yet satisfied — no motion exists to check |
-| 4 | Full keyboard operability | Binding | Likely satisfied — not independently verified end-to-end |
+| 4 | Full keyboard operability | Binding | Unknown — not independently verified end-to-end |
 | 5 | Window model | Deliberately broken | Satisfied, verified |
 | 6 | Stock widget styling | Deliberately broken | Partially satisfied — the provider (#193) exists and several surfaces confirmed tokenized; the window/listview base background (most of the default empty state), the query entry, the row title's typography, and the window's own shape remain stock Adwaita |
 | 7 | Accent colour | Deliberately broken | Partially satisfied — never follows the desktop; the selection indicator and hint-key glyph now genuinely render the accent (pixel-confirmed); the focus ring is entirely unbuilt, confirmed stock Adwaita blue on screen |
