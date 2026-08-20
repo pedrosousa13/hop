@@ -170,6 +170,20 @@
   --hop-sel-fill:  var(--hop-accent-subdued);
   --hop-sel-ring:  var(--hop-accent-ring);
   --hop-sel-bar:   var(--hop-accent);
+  /* The accent, palette-aware — issue #214. `--hop-accent` itself is a ramp
+     literal, declared only in the unconditional block above, so a rule that
+     asks for it by that name gets the dark value under both palettes; this
+     is the semantic-layer alias that actually resolves per palette, the
+     same shape `--hop-bg`/`--hop-bg-hover`/`--hop-fg`* already have. Named
+     for what it *is* (the accent, ready to use anywhere within its
+     reservation below) rather than for `--hop-sel-bar`'s specific role,
+     because pointing a non-selection consumer — the action hint's key
+     glyph, today — at the selection bar's own name would read as a mistake
+     inviting a "fix" back to the broken literal. Consumed today by
+     `assets/stylesheet.css`'s `.hop-row-hint-key` rule; any future consumer
+     must stay inside the accent's three-element reservation above
+     (selection indicator, focus ring, action hints — never body text). */
+  --hop-hint-accent: var(--hop-accent);
   --hop-shadow:    var(--hop-shadow-window);
 }
 
@@ -184,6 +198,7 @@
   --hop-sel-fill:  var(--hop-accent-light-subdued);
   --hop-sel-ring:  var(--hop-accent-light-ring);
   --hop-sel-bar:   var(--hop-accent-light);
+  --hop-hint-accent: var(--hop-accent-light);
   --hop-shadow:    var(--hop-shadow-window-light);
 }
 

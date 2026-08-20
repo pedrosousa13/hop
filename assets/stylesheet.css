@@ -183,9 +183,9 @@ listview > row:hover {
    carry their distinct roles: radius (`--hop-radius-sm`, tokens.css's own
    "hint chips" comment, for the label; `--hop-radius-full`, its "key glyph
    pill" comment, for the key) and colour (`--hop-fg-2` for the label,
-   `--hop-accent` for the key).
+   `--hop-hint-accent` for the key).
 
-   `--hop-accent` on the key glyph, not the label, is deliberate:
+   The accent on the key glyph, not the label, is deliberate:
    `tokens.css`'s own header reserves that colour for exactly three things
    — "the selection indicator, the focus ring, and action hints" — and
    also says, in the same breath, "Never for body text." The label chip's
@@ -196,6 +196,24 @@ listview > row:hover {
    focus ring already are. Using the accent there is this element
    *exercising* its reservation, not an exception carved into the
    never-for-body-text rule.
+
+   `--hop-hint-accent`, not the bare `--hop-accent` ramp name, is what this
+   rule asks for — issue #214. `--hop-accent` is declared only in
+   `tokens.css`'s unconditional ramp block, so a rule naming it directly
+   resolves to the dark literal under *both* palettes, the same trap
+   `listview > row`'s own comment above documents for `--hop-neutral-900`.
+   `--hop-hint-accent` is the semantic-layer alias `tokens.css` now carries
+   for exactly this: declared once in the base `:root` block as
+   `var(--hop-accent)` and again in `.hop-theme-light` as
+   `var(--hop-accent-light)`, the same two-declaration shape `--hop-bg`,
+   `--hop-bg-hover`, and every `--hop-fg*` alias already have. It is not
+   named after `--hop-sel-bar` — the existing alias that happens to already
+   resolve the accent correctly per palette — on purpose: pointing a key
+   glyph at the selection bar's own name would read as a mistake and invite
+   a later "fix" back to the broken `--hop-accent` spelling. No new colour
+   was introduced to make this work; both `--hop-accent` and
+   `--hop-accent-light` already existed with their own contrast
+   annotations, and neither was changed.
 
    `ui::row::build` gives each chip a widget name and, via the exact same
    string, this selector's class — the doubled-identity precedent
@@ -217,7 +235,7 @@ listview > row:hover {
 .hop-row-hint-key {
   font: {{font:hop-text-hint-key}};
   letter-spacing: {{hop-tracking-hint}};
-  color: {{hop-accent}};
+  color: {{hop-hint-accent}};
   background-color: {{hop-bg-hover}};
   border-radius: {{hop-radius-full}};
   padding: {{hop-space-1}} {{hop-space-2}};
