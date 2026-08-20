@@ -177,10 +177,15 @@ fn find_named_child<W: IsA<gtk::Widget>>(container: &gtk::Box, name: &str) -> Op
 /// image [`bind`]'s `Path` arm treats identically: all three collapse to
 /// "set `image-missing`", per this issue's brief.
 ///
-/// [`IconPath::open_regular_file`] is the only opener this crate uses (see
-/// this crate's global constraint on that point): it is the one path in
-/// `hop-protocol` that makes the syscall confirming what was opened is
-/// actually a regular file rather than a FIFO, a device, or a directory.
+/// [`IconPath::open_regular_file`] is the only opener this crate uses —
+/// issue #190's agent brief named it the one call that issue's work may use
+/// to open an icon file ("no second opener is introduced anywhere in the
+/// crate"), and the reason behind that rule is concrete, not just a house
+/// preference someone wrote down: it is the one path in `hop-protocol` that
+/// makes the syscall confirming what was opened is actually a regular file
+/// rather than a FIFO, a device, or a directory — every GTK/GDK
+/// path-taking helper (`gtk::Image::from_file`, `set_from_file`,
+/// `gdk::Texture::from_file`/`from_filename`) bypasses that check entirely.
 /// Nothing here — and nothing reachable from here — opens `path` any other
 /// way.
 fn load_path_texture(path: &IconPath) -> Option<gdk::Texture> {

@@ -386,14 +386,19 @@ fn run_assertions() {
 
     // `IconSpec::Path`, a real, decodable image file written to a
     // `tempfile` directory and opened through
-    // `IconPath::open_regular_file` — the one opener this crate is allowed
-    // to use, per this crate's global constraint. `TINY_PNG` is a valid,
-    // minimal 1x1 PNG, so `load_path_texture` inside `resolve_icon` should
-    // reach its success path: a decoded `gdk::Texture` set as the image's
+    // `IconPath::open_regular_file` — the one opener issue #190's agent
+    // brief names as this crate's sole allowed way to open an icon file
+    // ("no second opener is introduced anywhere in the crate"); see
+    // `load_path_texture`'s own doc comment in row.rs for why that
+    // restriction exists. `LARGE_ICON_PNG` is a valid, decodable 256x256
+    // PNG, replacing a 1x1 pixel this test used before review — see its own
+    // doc comment for what that change does and does not buy this
+    // assertion — so `load_path_texture` inside `resolve_icon` should reach
+    // its success path: a decoded `gdk::Texture` set as the image's
     // paintable.
     let icon_dir = tempfile::tempdir().expect("failed to create a tempdir for a test icon file");
     let real_icon_path = icon_dir.path().join("icon.png");
-    std::fs::write(&real_icon_path, TINY_PNG).expect("failed to write the test icon file");
+    std::fs::write(&real_icon_path, LARGE_ICON_PNG).expect("failed to write the test icon file");
     let path_item = item_with_icon(
         7,
         "has a real icon file",
@@ -408,8 +413,9 @@ fn run_assertions() {
     assert_eq!(
         row_layout(&container, &icon),
         baseline_layout,
-        "a resolved icon file must not change the row's reserved layout, even though the \
-         decoded texture's own intrinsic size (1x1) has nothing to do with the reserved size"
+        "a resolved icon file must not change the row's reserved layout — held here by \
+         ui::row::build's unconditional icon.set_size_request(ICON_SIZE_PX, ICON_SIZE_PX), not \
+         by this image's size (see LARGE_ICON_PNG's doc comment)"
     );
 
     // `IconSpec::Path` pointing at a directory: `open_regular_file` refuses
@@ -507,15 +513,65 @@ fn row_layout(container: &gtk::Box, icon: &gtk::Image) -> (i32, i32, i32) {
     (container_height, icon_width, icon_height)
 }
 
-/// A tiny, valid 1x1 transparent PNG (the shortest well-formed PNG there
-/// is) — decoded directly against `gdk::Texture::from_bytes` while writing
-/// this file, to confirm the "resolves" half of the `Path` arm's coverage
-/// exercises a real decode rather than a format this format-agnostic
-/// decoder happens to reject.
-const TINY_PNG: &[u8] = &[
-    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0,
-    0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5, 1, 1,
-    39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+/// A valid, decodable, solid-colour 256x256 grayscale PNG — replacing the
+/// 1x1 pixel this test used before review flagged that a 1x1 image cannot
+/// tell a correctly-reserved icon slot apart from a regression that
+/// dropped its clamp: a 1x1 decoded texture never asks a `gtk::Image` for
+/// more than [`tokens::ICON_SIZE_PX`] (26px) regardless of what is or
+/// isn't clamping it, so the `row_layout` assertion at this constant's one
+/// call site would have passed identically either way. A realistically
+/// large image is the fixture a reviewer expects here regardless, and it
+/// is what actually exercises `load_path_texture`'s decode path the way a
+/// real icon file would.
+///
+/// What growing this image does *not* do, verified empirically while
+/// fixing this (a throwaway probe run directly against `gtk::Image` on
+/// this machine's GTK 4.14.5/broadway; the readout is kept in this crate's
+/// task-2 fix report, `.superpowers/sdd/issue-190-row-icon/task-2-report.md`,
+/// since a future reader re-deriving this from scratch should not have to):
+/// give the `row_layout` assertion below the power to catch a regression
+/// that drops `ui::row::build`'s [`gtk::Image::set_pixel_size`] call
+/// specifically. `gtk::Image::measure` for `Paintable` storage never
+/// consults the paintable's own intrinsic size in this GTK version at
+/// all — an image with *no* `size_request` and *no* `pixel_size` showing
+/// this exact 256x256 texture still measures a 16x16 natural size, not
+/// 256x256, and `icon.set_size_request(ICON_SIZE_PX, ICON_SIZE_PX)` (also
+/// in `build`, unconditional, independent of which `IconSpec` arm ran) is
+/// on its own already sufficient to pin the measured size regardless of
+/// `set_pixel_size` or of this image's size. Dropping `set_pixel_size`
+/// alone left every assertion in this file passing; only dropping *both*
+/// calls together moved the measurement — and it moved on the very first,
+/// icon-less baseline capture above, not specifically on this resolved
+/// `Path` case. So no image size can make this one assertion regression-test
+/// `set_pixel_size` in isolation; what it does buy is a decode exercised on
+/// a realistic size instead of a degenerate one, and one less place where a
+/// future `gtk::Image` replaced by something that *does* read intrinsic
+/// paintable size (e.g. `gtk::Picture`) would go unnoticed.
+///
+/// Generated by a throwaway Python script (`zlib.compress` over 256
+/// identical grayscale scanlines, wrapped in hand-built IHDR/IDAT/IEND
+/// chunks with their own CRC32s), not checked in as a dependency:
+/// `hop-gtk` has no image-encoding crate anywhere in its dependency graph,
+/// and pulling one in just to synthesize one test fixture would be a
+/// heavier addition than the fixture is worth. A solid-colour image
+/// compresses to a few hundred bytes even at 256x256 — this literal is
+/// 368 bytes despite decoding to an image (256*256 = 65536 pixels)
+/// roughly 65,000 times larger than the 1x1 pixel it replaces.
+const LARGE_ICON_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 1, 0, 0, 0, 1, 0, 8, 0, 0,
+    0, 0, 121, 25, 247, 186, 0, 0, 1, 55, 73, 68, 65, 84, 120, 218, 237, 208, 1, 1, 0, 0, 8, 195,
+    160, 71, 95, 116, 131, 8, 17, 88, 207, 77, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8, 16, 32, 64, 128, 0, 1, 2, 4, 8,
+    168, 3, 249, 124, 7, 129, 166, 92, 59, 145, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
 
 /// Builds an [`IconName`] from a plain `&str`, panicking on a value that
