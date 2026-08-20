@@ -1,7 +1,8 @@
 //! Builds and populates the `Row` node's widget: one reusable horizontal
-//! container per visible slot's `Row` page — a leading icon and a stacked
-//! title/subtitle text column — populated and cleared as the list scrolls,
-//! never destroyed and rebuilt. Acceptance criterion 4.
+//! container per visible slot's `Row` page — a leading icon, a stacked
+//! title/subtitle text column, and a trailing action hint — populated and
+//! cleared as the list scrolls, never destroyed and rebuilt. Acceptance
+//! criterion 4.
 //!
 //! Before issue #181's view-tree seam, this module *was* the `GtkListView`
 //! factory outright — its `build` constructed the factory, and its
@@ -115,6 +116,60 @@
 //! (`row_layout`) holding identical across every bind in that section
 //! regardless of which state the subtitle is in.
 //!
+//! # Issue #197: the trailing action hint
+//!
+//! [`build`]'s outer, horizontal `container` gets a *third* direct child —
+//! the hint, a small `gtk::Box` holding a label chip ("Open") and a
+//! key-glyph chip ("Enter") — appended after the text column issue #196
+//! introduced. Two placements were considered for where that third child
+//! attaches:
+//!
+//! - **Nested inside the text column**, as a third stacked row under the
+//!   subtitle. Rejected: the text column's entire reason to exist is
+//!   stacking title *over* subtitle in a single visual line each — the
+//!   hint is not a third line of text about the item, it is a
+//!   right-aligned affordance that belongs at the row's trailing edge,
+//!   vertically centred across the *whole* row, exactly like the icon at
+//!   the leading edge. Nesting it in the column would put it under the
+//!   subtitle instead of beside the pair, which is not the v1 row anatomy
+//!   ("26px icon · title · subtitle · right-aligned action hint" — see
+//!   `tokens.css`'s own GEOMETRY comment).
+//! - **A third direct child of `container`**, alongside `icon` and
+//!   `text_column`. Chosen: `text_column`'s `hexpand(true)` (already set,
+//!   for issue #196) claims every pixel of width neither the fixed icon
+//!   slot nor this hint uses, so appending the hint *after* the column is
+//!   already sufficient to push it flush right — no alignment property of
+//!   its own is needed on the hint, the same "hexpand carries the trailing
+//!   child" trick the title relied on before #196 nested it.
+//!
+//! Two chips, not one glued-together label, because `assets/tokens.css`
+//! pairs `--hop-text-hint-label` with `--hop-text-hint-key` — the label and
+//! the key glyph are typographically distinct (proportional vs mono), which
+//! only two separate widgets and two separate stylesheet rules can express.
+//! See [`resolve_hint`]'s own doc comment for the "both halves or neither"
+//! rule governing when either chip actually shows text, and
+//! [`should_show_label_chip`]'s for the responsive collapse that can hide
+//! the label chip specifically, independent of that rule, once both halves
+//! already resolved.
+//!
+//! `hop_protocol::item::Action` is the only `Action` vocabulary this module
+//! ever names — see [`default_action_label`]'s own doc comment for the
+//! distinction from `crate::keymap::Action`, `CONTEXT.md`'s **Action**
+//! glossary entry, and this issue's own brief, all of which flag conflating
+//! the two as the obvious mistake for exactly this issue's own element.
+//! Issue #197 review, finding 3, is what keeps `crate::keymap::Action` from
+//! ever needing to be named here at all, rather than merely under a
+//! disambiguating alias: [`resolve_hint`] used to call
+//! `keymap.binding_for(`[`crate::keymap::Action::Activate`]`)` itself,
+//! which meant this module imported `crate::keymap::Action` (aliased
+//! `KeymapAction`) purely to spell that one call. That lookup now lives on
+//! [`crate::keymap::Keymap::activate_binding_display`] instead, called once
+//! by `ui::view::build` rather than once per bind here — see that method's
+//! own doc comment, and `ui::view::Node`'s, for the full account — so
+//! [`resolve_hint`] receives the already-formatted display string as a
+//! plain `Option<&str>` and this module has had no reason to import
+//! `crate::keymap` at all since.
+//!
 //! # `find_named_child` now searches descendants, not only direct children
 //!
 //! Before this issue, [`find_named_child`] only ever needed to look at
@@ -208,6 +263,28 @@ const TITLE_CHILD_NAME: &str = "hop-row-title";
 /// and the subtitle simply are not the same shape of problem.
 const SUBTITLE_CHILD_NAME: &str = "hop-row-subtitle";
 
+/// The widget name [`build`] gives the hint's own horizontal `gtk::Box` —
+/// the third direct child of the outer row container, issue #197. Not a
+/// CSS class: nothing styles the wrapper itself, only its two chip children
+/// below, so this name exists solely for [`hint_widget`]'s lookup, the same
+/// single-identity shape [`ICON_CHILD_NAME`]/[`TITLE_CHILD_NAME`] already
+/// use.
+const HINT_CHILD_NAME: &str = "hop-row-hint";
+
+/// The widget name and CSS class [`build`] gives the hint's label chip
+/// (e.g. "Open") — doubled identity, matching [`SUBTITLE_CHILD_NAME`]'s own
+/// reasoning: `assets/stylesheet.css`'s `.hop-row-hint-label` rule needs a
+/// selector, and [`find_named_child`] needs a name, and one string serves
+/// both rather than risking the two drifting apart.
+const HINT_LABEL_CHILD_NAME: &str = "hop-row-hint-label";
+
+/// The widget name and CSS class [`build`] gives the hint's key-glyph chip
+/// (e.g. "Enter") — [`HINT_LABEL_CHILD_NAME`]'s pairing, styled by
+/// `assets/stylesheet.css`'s `.hop-row-hint-key` rule with the mono
+/// treatment `--hop-text-hint-key` names, distinct from the label chip's
+/// proportional one.
+const HINT_KEY_CHILD_NAME: &str = "hop-row-hint-key";
+
 /// The `Row` page's leading icon, reached out of `container` (the `gtk::Box`
 /// [`build`] returns) by the name [`build`] gave it — see [`find_named_child`]
 /// for why a name search is used instead of trusting append order.
@@ -238,6 +315,28 @@ pub fn title_widget(container: &gtk::Box) -> Option<gtk::Label> {
 /// why that nesting needed no second lookup path.
 pub fn subtitle_widget(container: &gtk::Box) -> Option<gtk::Label> {
     find_named_child(container, SUBTITLE_CHILD_NAME)
+}
+
+/// The `Row` page's action hint — the outer `gtk::Box` wrapping the label
+/// and key-glyph chips, added by issue #197. See this module's "Issue
+/// #197" doc section for why it is the outer row container's third direct
+/// child, a sibling of the icon and the text column, rather than nested
+/// inside the text column the way it would be if it stacked under the
+/// title/subtitle instead of sitting beside them.
+pub fn hint_widget(container: &gtk::Box) -> Option<gtk::Box> {
+    find_named_child(container, HINT_CHILD_NAME)
+}
+
+/// The hint's label chip (e.g. "Open") — [`hint_widget`]'s wrapper's first
+/// child.
+pub fn hint_label_widget(container: &gtk::Box) -> Option<gtk::Label> {
+    find_named_child(container, HINT_LABEL_CHILD_NAME)
+}
+
+/// The hint's key-glyph chip (e.g. "Enter") — [`hint_widget`]'s wrapper's
+/// second child.
+pub fn hint_key_widget(container: &gtk::Box) -> Option<gtk::Label> {
+    find_named_child(container, HINT_KEY_CHILD_NAME)
 }
 
 /// Builds one `Row` node's widget: a horizontal `gtk::Box` holding a
@@ -292,6 +391,43 @@ pub fn build() -> gtk::Box {
     text_column.append(&subtitle);
 
     container.append(&text_column);
+
+    // The action hint — issue #197. A third, direct child of the outer
+    // horizontal `container`, a sibling of `icon` and `text_column`, never
+    // nested inside `text_column`: the text column's whole purpose (see
+    // "Issue #196" above) is stacking title *over* subtitle, and the hint
+    // is neither — it belongs beside that stack, at the row's trailing
+    // edge, vertically centred in the row exactly as the icon is, not one
+    // more line stacked underneath the subtitle. `text_column`'s own
+    // `hexpand(true)` (set above) is what pushes this hint flush right:
+    // the column claims every pixel of horizontal space neither the fixed
+    // icon slot nor this hint uses, so appending the hint last, after the
+    // column, is what puts it at the row's trailing edge with no explicit
+    // alignment property of its own needed here.
+    let hint = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::HINT_CHIP_GAP_PX);
+    hint.set_widget_name(HINT_CHILD_NAME);
+    hint.set_valign(gtk::Align::Center);
+    hint.set_margin_start(*tokens::HINT_MARGIN_START_PX);
+
+    // Both chips start invisible, exactly like the subtitle above and for
+    // the identical reason: the very first bind a freshly built row gets
+    // might resolve to `resolve_hint`'s "neither" branch (see that
+    // function's own doc comment, "both halves or neither"), and that
+    // empty-slot behaviour has to hold from the first bind onward, not
+    // only from the second one.
+    let hint_label = gtk::Label::new(None);
+    hint_label.set_widget_name(HINT_LABEL_CHILD_NAME);
+    hint_label.add_css_class(HINT_LABEL_CHILD_NAME);
+    hint_label.set_visible(false);
+    hint.append(&hint_label);
+
+    let hint_key = gtk::Label::new(None);
+    hint_key.set_widget_name(HINT_KEY_CHILD_NAME);
+    hint_key.add_css_class(HINT_KEY_CHILD_NAME);
+    hint_key.set_visible(false);
+    hint.append(&hint_key);
+
+    container.append(&hint);
 
     container
 }
@@ -468,14 +604,23 @@ fn resolve_icon(icon: &gtk::Image, spec: Option<&IconSpec>) {
     }
 }
 
-/// Populates `widget` (built by [`build`]) with `item`'s title and icon.
-/// `widget` is typed as a bare `gtk::Widget` rather than `gtk::Box` because
-/// its caller, `ui::view::bind`, reaches it back out of a `gtk::Stack` page
-/// by name — `gtk::Stack::child_by_name` hands back the general widget type
-/// regardless of what was added, so the downcast belongs here, next to the
-/// one place that knows a `Row` page's widget is actually the `gtk::Box`
-/// [`build`] returns.
-pub fn bind(widget: &gtk::Widget, item: &Item) {
+/// Populates `widget` (built by [`build`]) with `item`'s title, subtitle,
+/// icon, and — issue #197 — its action hint, paired with
+/// `activate_key_display`. `widget` is typed as a bare `gtk::Widget` rather
+/// than `gtk::Box` because its caller, `ui::view::bind`, reaches it back out
+/// of a `gtk::Stack` page by name — `gtk::Stack::child_by_name` hands back
+/// the general widget type regardless of what was added, so the downcast
+/// belongs here, next to the one place that knows a `Row` page's widget is
+/// actually the `gtk::Box` [`build`] returns.
+///
+/// `activate_key_display` is `Option<&str>`, not `&Keymap`, as of issue
+/// #197 review, finding 3: this function needs only the one value the
+/// key-glyph chip renders — [`crate::keymap::Keymap::activate_binding_display`]'s
+/// answer, already resolved to text — never `Keymap` itself, so it never
+/// has to import [`crate::keymap::Action`] to reach into one. See
+/// `ui::view::Node`'s own doc comment for the full account of what used to
+/// be threaded through here instead, and why.
+pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str>) {
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return;
     };
@@ -487,6 +632,13 @@ pub fn bind(widget: &gtk::Widget, item: &Item) {
     }
     if let Some(icon) = icon_widget(container) {
         resolve_icon(&icon, item.icon.as_ref());
+    }
+    if let (Some(hint), Some(hint_label), Some(hint_key)) = (
+        hint_widget(container),
+        hint_label_widget(container),
+        hint_key_widget(container),
+    ) {
+        resolve_hint(&hint, &hint_label, &hint_key, item, activate_key_display);
     }
 }
 
@@ -522,6 +674,241 @@ fn resolve_subtitle(subtitle: &gtk::Label, text: Option<&ItemSubtitle>) {
     }
 }
 
+/// Finds `item`'s own label for its *default* action — the
+/// `hop_protocol::item::Action` in `item.actions` whose `id` matches
+/// `item.default_action`, per `CONTEXT.md`'s **Action** glossary entry.
+/// This is the item-wire vocabulary `Action` (`hop_protocol::item::Action`),
+/// never `crate::keymap::Action` — this module's brief is explicit that
+/// `CONTEXT.md` flags conflating the two `Action` types as the obvious
+/// mistake for exactly this issue, and (since issue #197 review, finding 3
+/// — see this module's top doc comment) this module does not even import
+/// `crate::keymap::Action` any more to have the chance: the only other
+/// `Action`-shaped value [`resolve_hint`] touches is a plain `Option<&str>`
+/// display string, already resolved by
+/// [`crate::keymap::Keymap::activate_binding_display`] before it ever
+/// reaches this module.
+///
+/// [`hop_protocol::Item`] carries no such lookup itself —
+/// `Item::default_action` is a bare `ActionId`, and matching it against
+/// `Item::actions` is left to whoever needs the matching `Action`'s own
+/// fields (here, its `label`). `None` covers the one malformed case a wire
+/// peer could still produce despite every bound already enforced on each
+/// field individually: `default_action` naming an id absent from `actions`
+/// entirely. Nothing here trusts a provider to keep the two in sync, or
+/// invents a placeholder label — [`resolve_hint`] treats this exactly like
+/// a keymap with no binding for `Activate`: the row's hint slot renders
+/// empty, never a panic and never a half-populated hint.
+fn default_action_label(item: &Item) -> Option<&str> {
+    item.actions
+        .iter()
+        .find(|action| action.id == item.default_action)
+        .map(|action| action.label.as_str())
+}
+
+/// Whether [`resolve_hint`]'s label chip should render alongside the key
+/// glyph, or the hint should collapse to the key glyph alone — issue #197's
+/// responsive collapse, `assets/tokens.css`'s own GEOMETRY note: "the
+/// action hint collapses to icon-only before it would be pushed
+/// off-window."
+///
+/// # Why this reads the top-level surface, not the row's own allocation
+///
+/// GTK has no CSS media query — confirmed against a real, installed GTK
+/// 4.14's CSS parser (`assets/stylesheet.css`'s own top doc comment makes
+/// the identical finding for `:root`/`var()`/`@media`) — so nothing in
+/// `assets/stylesheet.css` can express "collapse below N px" at all; this
+/// has to come from real widget/window geometry read in Rust, per this
+/// issue's brief.
+///
+/// `hint`'s own `gtk::Widget::native()` → `gtk::Native::surface()` →
+/// `gdk::Surface::width()` chain reads the top-level window's *actual*,
+/// currently-allocated pixel width directly from GDK — available the
+/// moment the window is realized, independent of whether `hint`'s own
+/// `gtk::Box` has been through a layout pass yet. A row's own
+/// `gtk::Widget::width()` was considered and rejected: `GtkListView`
+/// allocates a bound row's widget *after* `bind` runs (bind decides what
+/// the row shows; allocation sizes it in response), so a freshly bound
+/// row's own width reads back whatever a *previous* bind's content
+/// allocated, or `0` for a row that has never been allocated at all — a
+/// staler and strictly less useful number than the surface's, which is
+/// current regardless of where this particular row sits in its own
+/// bind/allocate cycle.
+///
+/// # Why this returns `true` (never collapse) with no surface to measure
+///
+/// A `hint` never yet added under a realized top-level window —
+/// `tests/view_tree_renderer.rs`'s own "brief tests" section, which drives
+/// `ui::view::bind` directly against a manufactured `gtk::ListItem` never
+/// added to any window — has no honest answer to "is the window
+/// constrained": collapsing by default would be a guess, and showing the
+/// full hint by default is what every real, normally-sized window
+/// (`--hop-window-w`'s own 400px) needs anyway. Same reasoning for a
+/// surface reporting `0` or less, which `gdk::Surface::width()` can return
+/// before its first real allocation.
+///
+/// # The threshold itself: measured, not guessed
+///
+/// This issue's brief is explicit that the collapse width must be
+/// "deriv[ed] ... from measured geometry rather than pick[ed as] a
+/// literal." The needed width is `ICON_SIZE_PX` (the row's other
+/// fixed-size element, per `ui::row::build`'s own "the icon slot" doc
+/// section) plus `hint_label`'s and `hint_key`'s own *natural* widths,
+/// read fresh via [`gtk::Widget::measure`] — the same measurement
+/// `tests/view_tree_renderer.rs`'s `row_layout` helper already trusts over
+/// a `width_request` getter, for the identical reason: `measure` reflects
+/// what the real, installed stylesheet's font/padding/tracking rules
+/// (`--hop-text-hint-label`, `--hop-text-hint-key`, `--hop-tracking-hint`,
+/// the chip padding) actually produce for `hint_label`'s and `hint_key`'s
+/// *current* text, not a number typed into this function by hand — plus
+/// [`tokens::HINT_CHIP_GAP_PX`] (the horizontal spacing [`build`] gives
+/// `hint`, its `gtk::Box::new` constructor argument, between the label chip
+/// and the key chip) and [`tokens::HINT_MARGIN_START_PX`] (`hint`'s own
+/// `set_margin_start`, in [`build`]) — both fixed pixel amounts `hint`
+/// carries unconditionally, present whether or not the label chip is
+/// showing, so both count against the same budget the two chips'
+/// own widths do. Review on this issue's original PR caught that this sum
+/// used to stop at the two chips' widths alone, undercounting the hint's
+/// real on-screen footprint by roughly `HINT_CHIP_GAP_PX +
+/// HINT_MARGIN_START_PX` (about 20px) — enough that the chip stayed visible
+/// past the width at which it was actually being pushed off-window, the
+/// wrong direction to err in for a collapse this note requires to happen
+/// *before* that, not after. The title and subtitle are deliberately left
+/// out of this sum: both ellipsize (`ui::row::build`'s `EllipsizeMode::End`),
+/// so neither has a minimum width this function would need to protect —
+/// the one thing that cannot shrink and does not ellipsize is the hint
+/// itself (its own gap and margin included), which is exactly the element
+/// `assets/tokens.css`'s note says must not be "pushed off-window."
+///
+/// # Statelessness: why `hint_label` must already be visible when measured
+///
+/// [`gtk::Widget::measure`] returns `0` for a widget whose own
+/// [`gtk::Widget::is_visible`] is `false`, confirmed directly against this
+/// crate's real, installed GTK 4.14 while fixing the review finding above
+/// (a throwaway probe measured a realized, invisible `gtk::Label` and read
+/// back `0`, then `set_visible(true)` and the label's own real natural
+/// width). `hint_label`'s visibility going into a bind is whatever the
+/// *previous* bind on this recycled row decided — GTK's own list-view
+/// recycling means that is not "nothing," the way a freshly built widget's
+/// would be, on every bind after the first — so measuring it as this
+/// function is entered, before this bind's own decision has been written
+/// back to it, would silently substitute `0` for a collapsed row's real
+/// label width and answer a different `needed` than a row that arrives at
+/// the identical width having never collapsed. That is precisely the
+/// "different answer depending on what the hint currently shows" defect
+/// this function's contract rules out — the same shape of hazard the
+/// rejected "measure the `hint` container itself" alternative has, just
+/// reached through the label widget's own visibility rather than through
+/// its container's child-exclusion, and just as able to make a real
+/// recycled row's hint render wrong. [`resolve_hint`] is what forces
+/// `hint_label` visible immediately before calling this function, for
+/// exactly this reason — see that function's own comment on the call site.
+/// `hint_key` needs no equivalent treatment: [`resolve_hint`] already sets
+/// it visible unconditionally, every bind, before this function ever runs.
+///
+/// `tests/view_tree_renderer.rs`'s "issue #197 code review, finding 1"
+/// section proves both halves of this doc comment together: a width chosen
+/// to satisfy the old (chip-widths-only) sum but not this one must
+/// collapse, and it must collapse identically whether the row arrives
+/// there having never collapsed or having just collapsed and widened back.
+fn should_show_label_chip(
+    hint: &gtk::Widget,
+    hint_label: &gtk::Label,
+    hint_key: &gtk::Label,
+) -> bool {
+    let Some(surface_width) = hint
+        .native()
+        .and_then(|native| native.surface())
+        .map(|surface| surface.width())
+    else {
+        return true;
+    };
+    if surface_width <= 0 {
+        return true;
+    }
+
+    let (_, label_natural, _, _) = hint_label.measure(gtk::Orientation::Horizontal, -1);
+    let (_, key_natural, _, _) = hint_key.measure(gtk::Orientation::Horizontal, -1);
+    let needed = *tokens::ICON_SIZE_PX
+        + label_natural
+        + key_natural
+        + *tokens::HINT_CHIP_GAP_PX
+        + *tokens::HINT_MARGIN_START_PX;
+    surface_width >= needed
+}
+
+/// Resolves the row's right-aligned action hint onto its two chip widgets —
+/// issue #197. Pairs [`default_action_label`]'s answer (the label chip)
+/// with `activate_key_display` (the key glyph — already resolved, by the
+/// time this function ever sees it, through [`Binding`]'s own
+/// [`fmt::Display`] convention; see `crate::keymap`'s doc comment on that
+/// `impl` for the spelling rules, and
+/// [`crate::keymap::Keymap::activate_binding_display`]'s own doc comment
+/// for where and how often that resolution actually runs — not on every
+/// bind, as of issue #197 review, finding 3), and applies
+/// [`should_show_label_chip`]'s responsive collapse once both are known to
+/// exist.
+///
+/// [`Binding`]: crate::keymap::Binding
+///
+/// # "Both halves or neither" — never a half-populated hint
+///
+/// This issue's brief is explicit: "An item with no default action, or a
+/// keymap where `binding_for(Activate)` returns `None`, renders an *empty*
+/// hint slot — not a half-populated one." A key glyph with no label reads
+/// as an orphaned, meaningless badge; a label with no key glyph promises a
+/// keyboard shortcut that does not exist. Both are worse than showing
+/// nothing, so this function only ever writes `hint_label`/`hint_key` once
+/// it holds *both* answers — the `let (Some(label), Some(key)) = (...)
+/// else` below is the one place that rule is enforced, before either
+/// widget is touched. `activate_key_display` being `None` here means
+/// exactly what `keymap.binding_for(Activate)` being `None` used to mean
+/// before finding 3's change moved that lookup out of this function: the
+/// caller already asked the keymap once, up front, and got no answer.
+fn resolve_hint(
+    hint: &gtk::Box,
+    hint_label: &gtk::Label,
+    hint_key: &gtk::Label,
+    item: &Item,
+    activate_key_display: Option<&str>,
+) {
+    let label = default_action_label(item);
+
+    let (Some(label), Some(key)) = (label, activate_key_display) else {
+        clear_hint(hint_label, hint_key);
+        return;
+    };
+
+    hint_label.set_text(label);
+    hint_key.set_text(key);
+    hint_key.set_visible(true);
+
+    // `hint_label` is forced visible *before* `should_show_label_chip`
+    // measures it, immediately overwritten below by that function's real
+    // answer — never left at whatever visibility a previous bind on this
+    // recycled row happened to leave it in. See
+    // `should_show_label_chip`'s own doc comment, "Statelessness: why
+    // `hint_label` must already be visible when measured", for why an
+    // invisible label chip would otherwise measure as `0` width and corrupt
+    // the very decision this call is about to make. `hint_key` needs no
+    // matching line: it was already set visible, unconditionally, two
+    // lines above.
+    hint_label.set_visible(true);
+    hint_label.set_visible(should_show_label_chip(
+        hint.upcast_ref::<gtk::Widget>(),
+        hint_label,
+        hint_key,
+    ));
+}
+
+/// Clears and hides both of the hint's chips — [`resolve_hint`]'s "neither"
+/// branch, and [`unbind`]'s own symmetry with the title, subtitle, and icon.
+fn clear_hint(hint_label: &gtk::Label, hint_key: &gtk::Label) {
+    hint_label.set_text("");
+    hint_label.set_visible(false);
+    hint_key.set_text("");
+    hint_key.set_visible(false);
+}
+
 /// Clears whatever [`bind`] last put in `widget`.
 ///
 /// Clearing the title and the icon on unbind (rather than leaving whatever
@@ -543,5 +930,69 @@ pub fn unbind(widget: &gtk::Widget) {
     }
     if let Some(icon) = icon_widget(container) {
         icon.clear();
+    }
+    if let (Some(hint_label), Some(hint_key)) =
+        (hint_label_widget(container), hint_key_widget(container))
+    {
+        clear_hint(&hint_label, &hint_key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use hop_protocol::{Action, ActionId, ActionKind, ItemId, ItemTitle, Kind};
+
+    use super::*;
+
+    /// A minimal, GTK-free item — `default_action_label` touches only
+    /// `hop_protocol::Item` fields, so this needs no `gtk::init()`, unlike
+    /// almost everything else in this module (see this module's top doc
+    /// comment, "build and bind never animate", and
+    /// `tests/view_tree_renderer.rs`'s own module doc for why the rest of
+    /// this file's behavior can only be proven under a real broadway
+    /// display).
+    fn item_with_actions(default_action: &str, actions: Vec<(&str, &str)>) -> Item {
+        Item {
+            id: ItemId::new("test:1").unwrap(),
+            kind: Kind::Action,
+            title: ItemTitle::new("test item").unwrap(),
+            subtitle: None,
+            icon: None,
+            actions: actions
+                .into_iter()
+                .map(|(id, label)| Action {
+                    id: ActionId::new(id).unwrap(),
+                    kind: ActionKind::Open,
+                    label: label.to_string(),
+                })
+                .collect(),
+            default_action: ActionId::new(default_action).unwrap(),
+            copy_text: None,
+            append_to_end: false,
+            provider: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn default_action_label_finds_the_matching_action() {
+        let item = item_with_actions("open", vec![("open", "Open"), ("copy", "Copy")]);
+        assert_eq!(default_action_label(&item), Some("Open"));
+    }
+
+    #[test]
+    fn default_action_label_is_none_when_the_id_matches_no_action() {
+        // The malformed case this function's own doc comment names: a
+        // `default_action` naming an id `actions` does not carry — nothing
+        // here should invent a label or panic.
+        let item = item_with_actions("archive", vec![("open", "Open")]);
+        assert_eq!(default_action_label(&item), None);
+    }
+
+    #[test]
+    fn default_action_label_is_none_when_the_item_has_no_actions_at_all() {
+        let item = item_with_actions("open", vec![]);
+        assert_eq!(default_action_label(&item), None);
     }
 }

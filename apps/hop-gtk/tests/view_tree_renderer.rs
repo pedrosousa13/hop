@@ -82,6 +82,7 @@ use std::time::Duration;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 
+use hop_gtk::keymap::{Action as KeymapAction, Keymap};
 use hop_gtk::tokens;
 use hop_gtk::ui::row;
 use hop_gtk::ui::view::{self, Node};
@@ -198,6 +199,23 @@ fn run_assertions() {
     std::fs::create_dir_all(&icon_root)
         .expect("failed to create the allowed icon root this child was handed");
 
+    // The §8 default keymap, and — issue #197 review, finding 3 — its
+    // `Activate` binding's display string, resolved exactly once here
+    // rather than per `Node::for_item` call, exactly as
+    // `ui::view::build` now does (see that function's own doc comment).
+    // Every `Node::for_item` call below threads a clone of the small
+    // `Option<String>` this produces, not the `Keymap` itself, matching
+    // what `ui::view::bind`/`ui::view::unbind` actually receive from a
+    // real factory. One shared value, built once, rather than a fresh
+    // `Keymap::defaults()` at every call site: this file's own "issue
+    // #197" sections below rely on `activate_key_display` answering the
+    // same binding's display text (`"Enter"`, per §8's `Return` default)
+    // throughout, and a single `let` makes that an invariant of the
+    // test's own setup rather than something every assertion has to trust
+    // independently.
+    let keymap = Keymap::defaults();
+    let activate_key_display = keymap.activate_binding_display();
+
     // --- brief test 1: the slot's child after setup is the dispatch
     // container, not a bare label. Driven through the real factory
     // `ui::view::build` returns — the same one `ui::window::HopWindow`
@@ -211,7 +229,7 @@ fn run_assertions() {
     // `SignalHandlerId`, which only backs an actual `g_signal_connect`), so
     // emitting it by hand exercises the exact closure production wires in,
     // not a copy of its logic.
-    let factory = view::build();
+    let factory = view::build(keymap.clone());
     let list_item: gtk::ListItem = glib::Object::new();
     factory.emit_by_name::<()>("setup", &[&list_item]);
 
@@ -255,7 +273,10 @@ fn run_assertions() {
     // real, working entry point — calling it drives the exact same
     // dispatch, recycling, and rendering behavior a hand-built `Node::Row`
     // would, through every assertion below.
-    view::bind(&stack, &Node::for_item(item_a.clone()));
+    view::bind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
     assert_eq!(
         stack.visible_child_name().as_deref(),
         Some("row"),
@@ -276,7 +297,10 @@ fn run_assertions() {
         "the rendered row must show the bound item's title"
     );
 
-    view::bind(&stack, &Node::for_item(item_b.clone()));
+    view::bind(
+        &stack,
+        &Node::for_item(item_b.clone(), activate_key_display.clone()),
+    );
     let widget_after_second_bind = stack
         .visible_child()
         .expect("a page must still be the stack's visible child after the second bind");
@@ -308,7 +332,10 @@ fn run_assertions() {
     // bound, exactly what `list_item.item()` would still return inside a
     // real `connect_unbind` handler at this point — is what this test can
     // do to stand in for that handler's own call.
-    view::unbind(&stack, &Node::for_item(item_b.clone()));
+    view::unbind(
+        &stack,
+        &Node::for_item(item_b.clone(), activate_key_display.clone()),
+    );
     assert_eq!(
         label_after_first_bind.text(),
         "",
@@ -349,7 +376,10 @@ fn run_assertions() {
     // one of these three numbers — that is what makes this assertion one
     // that actually fails on a layout shift rather than one that could
     // pass by construction.
-    view::bind(&stack, &Node::for_item(item_a.clone()));
+    view::bind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
     let baseline_layout = row_layout(&container, &icon);
     assert_eq!(
         baseline_layout,
@@ -373,7 +403,10 @@ fn run_assertions() {
         "has a real icon name",
         IconSpec::Name(icon_name("folder")),
     );
-    view::bind(&stack, &Node::for_item(folder_item.clone()));
+    view::bind(
+        &stack,
+        &Node::for_item(folder_item.clone(), activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
     assert_eq!(icon.icon_name().as_deref(), Some("folder"));
     assert_eq!(
@@ -407,7 +440,10 @@ fn run_assertions() {
         "name the theme lacks",
         IconSpec::Name(icon_name(missing_name)),
     );
-    view::bind(&stack, &Node::for_item(missing_name_item));
+    view::bind(
+        &stack,
+        &Node::for_item(missing_name_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
     assert_eq!(
         icon.icon_name().as_deref(),
@@ -456,7 +492,10 @@ fn run_assertions() {
         "has a real icon file",
         IconSpec::Path(icon_path(&real_icon_path)),
     );
-    view::bind(&stack, &Node::for_item(path_item));
+    view::bind(
+        &stack,
+        &Node::for_item(path_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::Paintable);
     assert!(
         icon.paintable().is_some(),
@@ -486,7 +525,10 @@ fn run_assertions() {
         "path is a directory",
         IconSpec::Path(icon_path(&icon_root)),
     );
-    view::bind(&stack, &Node::for_item(dir_item));
+    view::bind(
+        &stack,
+        &Node::for_item(dir_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
     assert_eq!(icon.icon_name().as_deref(), Some("image-missing"));
     assert_eq!(
@@ -509,7 +551,10 @@ fn run_assertions() {
         "path decodes to nothing",
         IconSpec::Path(icon_path(&garbage_path)),
     );
-    view::bind(&stack, &Node::for_item(garbage_item));
+    view::bind(
+        &stack,
+        &Node::for_item(garbage_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
     assert_eq!(icon.icon_name().as_deref(), Some("image-missing"));
     assert_eq!(
@@ -539,7 +584,10 @@ fn run_assertions() {
         "path resolves outside every allowed icon root",
         IconSpec::Path(icon_path(&outside_icon_path)),
     );
-    view::bind(&stack, &Node::for_item(outside_item));
+    view::bind(
+        &stack,
+        &Node::for_item(outside_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
     assert_eq!(
         icon.icon_name().as_deref(),
@@ -568,7 +616,10 @@ fn run_assertions() {
         "symlink under an allowed root leads outside every one",
         IconSpec::Path(icon_path(&escaping_link)),
     );
-    view::bind(&stack, &Node::for_item(escaping_item));
+    view::bind(
+        &stack,
+        &Node::for_item(escaping_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
     assert_eq!(
         icon.icon_name().as_deref(),
@@ -602,7 +653,10 @@ fn run_assertions() {
         "ordinary themed icon reached through a symlink",
         IconSpec::Path(icon_path(&themed_link)),
     );
-    view::bind(&stack, &Node::for_item(themed_item));
+    view::bind(
+        &stack,
+        &Node::for_item(themed_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::Paintable);
     assert!(
         icon.paintable().is_some(),
@@ -628,7 +682,10 @@ fn run_assertions() {
         "proc self mem",
         IconSpec::Path(icon_path(std::path::Path::new("/proc/self/mem"))),
     );
-    view::bind(&stack, &Node::for_item(procfs_item));
+    view::bind(
+        &stack,
+        &Node::for_item(procfs_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
     assert_eq!(
         icon.icon_name().as_deref(),
@@ -654,7 +711,10 @@ fn run_assertions() {
     // were ever dropped from `resolve_icon`'s `None` arm and the previous
     // bind's icon silently kept showing.
     let blank_item = item_with_icon_none(10, "icon removed on rebind");
-    view::bind(&stack, &Node::for_item(blank_item));
+    view::bind(
+        &stack,
+        &Node::for_item(blank_item, activate_key_display.clone()),
+    );
     assert_eq!(
         icon.storage_type(),
         gtk::ImageType::Empty,
@@ -671,9 +731,15 @@ fn run_assertions() {
     // node type someday would not carry this row's icon forward by
     // accident. Rebind to an item with a real icon first so there is
     // something for `unbind` to actually clear.
-    view::bind(&stack, &Node::for_item(folder_item));
+    view::bind(
+        &stack,
+        &Node::for_item(folder_item, activate_key_display.clone()),
+    );
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
-    view::unbind(&stack, &Node::for_item(folder_item_for_unbind()));
+    view::unbind(
+        &stack,
+        &Node::for_item(folder_item_for_unbind(), activate_key_display.clone()),
+    );
     assert_eq!(
         icon.storage_type(),
         gtk::ImageType::Empty,
@@ -748,7 +814,10 @@ fn run_assertions() {
     );
 
     let subtitled_item = item_with_subtitle(20, "has a subtitle", "a real subtitle line");
-    view::bind(&stack, &Node::for_item(subtitled_item.clone()));
+    view::bind(
+        &stack,
+        &Node::for_item(subtitled_item.clone(), activate_key_display.clone()),
+    );
     assert_eq!(
         subtitle.text(),
         "a real subtitle line",
@@ -768,7 +837,10 @@ fn run_assertions() {
     // Recycling, proven specifically across bind-with-subtitle then
     // rebind-without: same widget instance, previous text gone — the
     // acceptance criterion this issue's brief names explicitly.
-    view::bind(&stack, &Node::for_item(item_a.clone()));
+    view::bind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
     assert_eq!(
         row::subtitle_widget(&container).as_ref(),
         Some(&subtitle),
@@ -795,9 +867,15 @@ fn run_assertions() {
     // hides the widget, so a recycled row about to be rebound to a
     // different node type someday would not carry a stale subtitle
     // forward.
-    view::bind(&stack, &Node::for_item(subtitled_item.clone()));
+    view::bind(
+        &stack,
+        &Node::for_item(subtitled_item.clone(), activate_key_display.clone()),
+    );
     assert!(subtitle.is_visible());
-    view::unbind(&stack, &Node::for_item(subtitled_item));
+    view::unbind(
+        &stack,
+        &Node::for_item(subtitled_item, activate_key_display.clone()),
+    );
     assert_eq!(
         subtitle.text(),
         "",
@@ -809,6 +887,522 @@ fn run_assertions() {
     );
 
     println!("row subtitle assertions passed");
+
+    // --- issue #197: the action hint. Continues binding the exact same
+    // recycled slot every section above already proved recycling for.
+
+    // `item_a`'s own default action ("open", per `test_item`) resolves to
+    // its `Action`'s label, "Open"; `keymap`'s §8 default binding for
+    // `KeymapAction::Activate` is `Return`, which `Binding`'s own
+    // `fmt::Display` convention spells "Enter" (`crate::keymap`'s doc
+    // comment on that `impl` names the rule). Rebinding to `item_a` here
+    // proves both chips render together, paired correctly.
+    view::bind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
+    let hint_label = row::hint_label_widget(&container)
+        .expect("build must give the row a named hint label chip");
+    let hint_key =
+        row::hint_key_widget(&container).expect("build must give the row a named hint key chip");
+    let expected_key_text = keymap
+        .binding_for(KeymapAction::Activate)
+        .expect("the §8 default keymap must answer Activate")
+        .to_string();
+    assert_eq!(
+        hint_label.text(),
+        "Open",
+        "the hint's label chip must show the item's own default-action label"
+    );
+    assert!(hint_label.is_visible());
+    assert_eq!(
+        hint_key.text(),
+        expected_key_text,
+        "the hint's key chip must show the key that runs keymap::Action::Activate"
+    );
+    assert!(hint_key.is_visible());
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "a resolved action hint must not change the row's reserved row height or icon slot"
+    );
+
+    // The "both halves or neither" rule (`ui::row::resolve_hint`'s own doc
+    // comment), from the item side: `default_action` naming an id absent
+    // from `actions` entirely — the malformed case
+    // `ui::row::default_action_label`'s own doc comment names. Both chips
+    // must go empty, not a key glyph left standing with no label (the
+    // keymap side of this same rule is not independently reachable through
+    // `Keymap`'s own public construction API: `Keymap::defaults` seeds
+    // every `keymap::Action` including `Activate`, and a `config.toml`
+    // rebinding can only override an action's key, never remove it, so
+    // `binding_for(Activate)` cannot actually answer `None` for any
+    // `Keymap` this crate can build today — `resolve_hint`'s own `let
+    // (Some(label), Some(key)) = (...) else` treats both cases identically
+    // regardless).
+    let stale_default_action_item = item_with_actions(31, "default action names no real action");
+    view::bind(
+        &stack,
+        &Node::for_item(stale_default_action_item, activate_key_display.clone()),
+    );
+    assert_eq!(hint_label.text(), "");
+    assert!(!hint_label.is_visible());
+    assert_eq!(hint_key.text(), "");
+    assert!(!hint_key.is_visible());
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "an empty hint slot must not change the row's reserved layout either"
+    );
+
+    // `unbind`'s own symmetry with the title, subtitle, and icon: clears
+    // and hides both chips, so a recycled row about to be rebound to a
+    // different item someday would not carry a stale hint forward.
+    view::bind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
+    assert!(hint_label.is_visible());
+    assert!(hint_key.is_visible());
+    view::unbind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
+    assert_eq!(
+        hint_label.text(),
+        "",
+        "unbind must clear the hint label text, symmetrically with the title, subtitle, and icon"
+    );
+    assert!(!hint_label.is_visible());
+    assert_eq!(hint_key.text(), "");
+    assert!(!hint_key.is_visible());
+
+    println!("row action hint assertions passed");
+
+    // --- issue #197: the responsive collapse. `assets/tokens.css`'s own
+    // GEOMETRY note: "the action hint collapses to icon-only before it
+    // would be pushed off-window." GTK has no CSS media query (confirmed
+    // against a real GTK 4.14 parser — `assets/stylesheet.css`'s own top
+    // doc comment makes the identical finding), so
+    // `ui::row::should_show_label_chip`'s collapse can only be proven
+    // against a real, mapped top-level window's actual pixel width — never
+    // against the disconnected `stack`/`list_item` every section above has
+    // driven, which is exactly why every hint assertion above (never added
+    // to a window) already exercised `should_show_label_chip`'s own
+    // documented "no surface → never collapse" default without this file
+    // having said so explicitly until now.
+    //
+    // This drives `ui::row::build`/`ui::row::bind` directly, deliberately
+    // skipping `ui::view`'s dispatch `gtk::Stack`/`gtk::ListItem`
+    // apparatus: that machinery is already proven, independently, by every
+    // section above, and reusing it here would mean parenting the same
+    // `gtk::Stack` under both a bare `gtk::ListItem` (from `setup`) and a
+    // real `gtk::Window` — two parents for one widget, which GTK refuses.
+    // `row::bind`'s own signature (`&gtk::Widget`, `&Item`, `&Keymap`) asks
+    // for nothing `ui::view::bind` does not already have in hand, so
+    // calling it directly here proves the identical production code path.
+    let (window_w, window_h) = *tokens::WINDOW_SIZE_PX;
+
+    let (wide_window, wide_label, wide_key) =
+        realized_hint_row(activate_key_display.as_deref(), &item_a, window_w, window_h);
+    assert!(
+        wide_label.is_visible(),
+        "at the crate's own default window width both hint chips must show"
+    );
+    assert!(wide_key.is_visible());
+    wide_window.close();
+
+    // A genuinely constrained width, not an assumed literal: probed
+    // directly against this same real broadway display, before writing the
+    // assertion below, by requesting a series of small
+    // `gtk::Window::set_default_size` widths for an otherwise-empty window
+    // and reading back `gdk::Surface::width()` once mapped. Every request
+    // at or under roughly 200px settled at the *same* floor regardless of
+    // how small it asked — this GTK/broadway combination refuses to map a
+    // toplevel narrower than that, a real environmental constraint this
+    // test reproduces rather than a number invented for the assertion.
+    // `narrow_width` below asks for less than that floor on purpose, so
+    // whatever the environment actually grants is the narrowest real
+    // surface this process can produce — the genuine "as constrained as a
+    // window can get here" case `should_show_label_chip`'s own doc comment
+    // says this issue must be proven against.
+    let narrow_width = 80;
+
+    // That floor is comfortably wide enough for `item_a`'s own short
+    // "Open"/key-glyph hint to keep showing both chips — which is exactly
+    // what the very first assertion in this section already proved is not
+    // itself evidence of a working collapse (a hint that never needs more
+    // room than the floor grants would show both chips at *any* width,
+    // collapsed logic present or not). What actually drives the hint past
+    // that floor is a *long* default-action label — the one part of the
+    // hint `tokens.css` gives no fixed size at all: an
+    // `hop_protocol::item::Action::label` is provider-supplied prose, and a
+    // long one is exactly the "before it would be pushed off-window" case
+    // `tokens.css`'s GEOMETRY note names.
+    let long_label_item = item_with_default_action_label(
+        41,
+        "an item whose default action has an unusually long label",
+        "Copy the full absolute path to the clipboard as plain text",
+    );
+    let (narrow_window, narrow_label, narrow_key) = realized_hint_row(
+        activate_key_display.as_deref(),
+        &long_label_item,
+        narrow_width,
+        window_h,
+    );
+    assert!(
+        !narrow_label.is_visible(),
+        "at a real constrained window width, a long enough default-action label must collapse \
+         away rather than overflow the row"
+    );
+    assert!(
+        narrow_key.is_visible(),
+        "the key glyph pill must remain even once the label chip collapses"
+    );
+    assert_eq!(narrow_key.text(), expected_key_text);
+    narrow_window.close();
+
+    println!("row action hint responsive collapse assertions passed");
+
+    // --- issue #197 code review, finding 1: the collapse threshold must
+    // count the hint's own inter-chip gap (`tokens::HINT_CHIP_GAP_PX`) and
+    // margin-start (`tokens::HINT_MARGIN_START_PX`) — both always present,
+    // together roughly 20px — not just the icon and the two chips' natural
+    // widths. See `ui::row::should_show_label_chip`'s own doc comment for
+    // the full argument. This section proves two things the sections above
+    // do not: (a) a width that satisfies the *old*, undercounting sum but
+    // not the corrected one actually collapses, rather than only ever
+    // testing widths so narrow any reasonable threshold would collapse
+    // there; and (b) the decision is stateless — the exact same target
+    // width gives the exact same answer whether the row arrives at it
+    // having never collapsed, or having just collapsed and widened back —
+    // which rules out an implementation whose answer depends on what the
+    // hint currently shows (e.g. measuring the hint container itself,
+    // which excludes an already-hidden label chip from its own natural
+    // width) rather than only on the width and the item.
+
+    // A moderately long label — long enough that its own natural width, once
+    // combined with the icon and the key glyph, clears this environment's
+    // real floor width by a comfortable margin (see `narrow_width`'s own
+    // comment above for how that floor was found), so every width this
+    // section requests below is honored as asked rather than silently
+    // clamped up to that floor.
+    let gap_margin_item = item_with_default_action_label(
+        51,
+        "an item whose default action label exercises the gap/margin threshold",
+        "Copy the full path to the clipboard as text",
+    );
+
+    // The real footprint, measured (not guessed) at a generous width where
+    // nothing collapses — the same `gtk::Widget::measure` call
+    // `should_show_label_chip` itself makes on these two widgets, read
+    // directly here so the crossover width below is derived from this
+    // environment's actual font metrics rather than a literal.
+    let (measure_window, measure_label, measure_key) = realized_hint_row(
+        activate_key_display.as_deref(),
+        &gap_margin_item,
+        600,
+        window_h,
+    );
+    assert!(
+        measure_label.is_visible(),
+        "test bug: a 600px window must be wide enough to show both chips for this item, or the \
+         measurements below prove nothing about the real threshold"
+    );
+    let (_, label_natural, _, _) = measure_label.measure(gtk::Orientation::Horizontal, -1);
+    let (_, key_natural, _, _) = measure_key.measure(gtk::Orientation::Horizontal, -1);
+
+    // The real, mapped surface a `window_width` request produces is not
+    // `window_width` itself — confirmed directly while writing this test,
+    // against this same real broadway display: a `gtk::ScrolledWindow`
+    // reserves a fixed amount of extra horizontal space beyond whatever
+    // width its own `set_size_request` and the toplevel's
+    // `set_default_size` are given (28px in this environment, presumably
+    // scrollbar/frame chrome — the exact source does not matter to what
+    // this test needs from it, only that it is a fixed offset, not a
+    // percentage or a function of the row's own content). `width_offset`
+    // measures that gap once here, from the one request
+    // (`realized_hint_row`'s `600`) this section already makes for an
+    // unrelated reason, and every width this section requests below is
+    // pre-compensated by it, so the *actual* surface width `should_show_label_chip`
+    // reads back matches the pixel value this test's own arithmetic
+    // reasons about, not the raw request that produced it.
+    let debug_actual_600 = measure_label
+        .root()
+        .and_then(|r| r.native())
+        .and_then(|n| n.surface())
+        .map(|s| s.width())
+        .expect("the calibration window must report a real mapped surface width");
+    let width_offset = debug_actual_600 - 600;
+    measure_window.close();
+
+    let old_needed = *tokens::ICON_SIZE_PX + label_natural + key_natural;
+    let new_needed = old_needed + *tokens::HINT_CHIP_GAP_PX + *tokens::HINT_MARGIN_START_PX;
+    assert!(
+        old_needed > 220,
+        "test bug: {gap_margin_item:?}'s label must be long enough that old_needed \
+         ({old_needed}px) clears this environment's real floor width, or the crossover width \
+         below would be silently clamped up to that floor instead of testing the threshold at \
+         all"
+    );
+
+    // The crossover width: exactly the *old*, undercounting threshold. The
+    // pre-fix sum's own `surface_width >= needed` check is trivially
+    // satisfied here (`old_needed >= old_needed`), so a pre-fix
+    // implementation shows the label chip at this width even though the
+    // hint's real footprint (`new_needed`, `HINT_CHIP_GAP_PX` +
+    // `HINT_MARGIN_START_PX` wider) does not actually fit — exactly the
+    // "roughly 20px past the width at which it actually overflows" defect
+    // this section exists to catch. The fixed implementation must collapse
+    // here instead.
+    let crossover_width = old_needed;
+
+    let container = row::build();
+    let hint_label = row::hint_label_widget(&container)
+        .expect("build must give this row a named hint label chip");
+    let hint_key =
+        row::hint_key_widget(&container).expect("build must give this row a named hint key chip");
+
+    // Step 1: wide — the label shows, never having collapsed at all.
+    let (window1, scrolled1) = realize_container_at_width(
+        &container,
+        activate_key_display.as_deref(),
+        &gap_margin_item,
+        600,
+        window_h,
+    );
+    assert!(
+        hint_label.is_visible(),
+        "test bug: a 600px window must show the label chip for this item"
+    );
+    window1.close();
+    scrolled1.set_child(None::<&gtk::Widget>);
+
+    // Step 2: narrow enough to force a real collapse.
+    let (window2, scrolled2) = realize_container_at_width(
+        &container,
+        activate_key_display.as_deref(),
+        &gap_margin_item,
+        narrow_width,
+        window_h,
+    );
+    assert!(
+        !hint_label.is_visible(),
+        "test bug: the row must actually collapse at the environment's floor width, or the \
+         re-widen assertions below prove nothing about recovering from a real collapse"
+    );
+    window2.close();
+    scrolled2.set_child(None::<&gtk::Widget>);
+
+    // Step 3: the crossover width — proves both halves of this section at
+    // once. The threshold fix (the primary defect): this width satisfies
+    // the old sum but not the corrected one, so the label chip must stay
+    // collapsed. Statelessness (the hazard the review flagged): the row
+    // arrives here having *just* collapsed at `narrow_width`, exactly the
+    // history a container-measurement implementation would answer
+    // differently for than a fresh bind at this same width — and the
+    // decision here must match what a fresh bind at `crossover_width` would
+    // give regardless.
+    let (window3, scrolled3) = realize_container_at_width(
+        &container,
+        activate_key_display.as_deref(),
+        &gap_margin_item,
+        crossover_width - width_offset,
+        window_h,
+    );
+    let actual_crossover_surface_width = container
+        .native()
+        .and_then(|n| n.surface())
+        .map(|s| s.width());
+    assert_eq!(
+        actual_crossover_surface_width,
+        Some(crossover_width),
+        "test bug: width_offset ({width_offset}px) must land the real surface exactly on \
+         crossover_width, or the assertion below is not actually testing the crossover point it \
+         claims to"
+    );
+    assert!(
+        !hint_label.is_visible(),
+        "at exactly the old, undercounting threshold ({crossover_width}px), the label chip must \
+         already have collapsed — its real footprint needs {new_needed}px once the inter-chip \
+         gap and the hint's own margin-start are counted, not just {old_needed}px — and this \
+         must hold even though the row was just shown wide, then collapsed narrow, immediately \
+         before this bind: the same width must give the same answer regardless of what the hint \
+         currently shows"
+    );
+    assert!(
+        hint_key.is_visible(),
+        "the key glyph must remain even once the label chip collapses at the crossover width"
+    );
+    window3.close();
+    scrolled3.set_child(None::<&gtk::Widget>);
+
+    // Step 4: a genuine re-widen, all the way back out — the chip must
+    // still be able to come back once there is genuinely enough room again,
+    // ruling out an implementation that can never re-expand once collapsed
+    // (the container-measurement hazard `should_show_label_chip`'s own doc
+    // comment records rejecting).
+    let (window4, _scrolled4) = realize_container_at_width(
+        &container,
+        activate_key_display.as_deref(),
+        &gap_margin_item,
+        600,
+        window_h,
+    );
+    assert!(
+        hint_label.is_visible(),
+        "the label chip must be able to re-expand once genuinely widened, not stay collapsed \
+         forever once it has collapsed once"
+    );
+    window4.close();
+
+    println!("row action hint collapse-threshold and statelessness assertions passed");
+}
+
+/// Parents `container` (already built via [`row::build`]) under a fresh,
+/// real, presented `gtk::Window` sized to `window_width` × `window_height`,
+/// waits for that window to report a genuine mapped surface width under
+/// broadway, then binds it to `item` — the bind
+/// [`row::should_show_label_chip`] actually measures against, since a bind
+/// made before the window has real geometry sees no surface at all (see
+/// that function's own "no surface → never collapse" doc section). Returns
+/// the window and the `gtk::ScrolledWindow` wrapping `container`, so a
+/// caller reusing the same `container` across more than one call can
+/// `close()` the window and then `scrolled.set_child(None::<&gtk::Widget>)`
+/// to unparent `container` before handing it to a second call — a widget
+/// cannot have two parents at once, and `close()` alone only hides a
+/// window, it does not clear its child.
+///
+/// Issue #197 review, finding 1: split out of what used to be
+/// `realized_hint_row`'s own body so the collapse-threshold section below
+/// can realize the *same* `container` — and therefore the same
+/// `hint_label`/`hint_key` widget instances, with whatever visibility state
+/// a previous bind left them in — at a sequence of different widths, which
+/// is exactly what proving [`row::should_show_label_chip`]'s statelessness
+/// needs and what `realized_hint_row`'s original one-shot shape could not
+/// provide.
+fn realize_container_at_width(
+    container: &gtk::Box,
+    activate_key_display: Option<&str>,
+    item: &Item,
+    window_width: i32,
+    window_height: i32,
+) -> (gtk::Window, gtk::ScrolledWindow) {
+    // Wrapped in a `gtk::ScrolledWindow` — matching production
+    // (`ui::window::HopWindow::build` wraps its real `GtkListView` in one
+    // too) — rather than making `container` the window's direct child.
+    // `GtkScrolledWindow::propagate-natural-width` defaults to `false` in
+    // GTK4: unlike a plain `gtk::Window`, whose minimum size is always at
+    // least its child's own minimum requested size (confirmed directly
+    // while writing this test — a bare `container` as the window's direct
+    // child left the window unable to shrink below roughly 215px even when
+    // asked for 80, because nothing bounded the title label's own minimum
+    // width), a scrolled window can be sized *smaller* than its child's
+    // natural width, clipping rather than forcing the toplevel to grow.
+    // That is exactly the real geometry constraint this test needs to
+    // reproduce: a window narrower than its content demands, which is the
+    // one situation `should_show_label_chip` exists to react to.
+    let scrolled = gtk::ScrolledWindow::builder().child(container).build();
+    // `min-content-width` defaults to `-1` ("unset"), which — confirmed
+    // directly while writing this test, against a real broadway display —
+    // still lets the row's own minimum content width (the title label's
+    // ellipsized minimum, plus the icon and hint) propagate up into the
+    // window's own minimum size even with `propagate-natural-width` at its
+    // GTK4 default of `false`. Pinning it to `1` here is what actually
+    // decouples the scrolled window's reported minimum from its child's,
+    // so `scrolled.set_size_request` below is not silently overridden by
+    // whatever `container` happens to demand.
+    scrolled.set_min_content_width(1);
+    scrolled.set_size_request(window_width, window_height);
+
+    let window = gtk::Window::new();
+    window.set_default_size(window_width, window_height);
+    window.set_child(Some(&scrolled));
+    window.present();
+
+    assert!(
+        wait_until(
+            || {
+                container
+                    .native()
+                    .and_then(|native| native.surface())
+                    .is_some_and(|surface| surface.width() > 0)
+            },
+            Duration::from_secs(5),
+        ),
+        "the test window never reported a real, mapped surface width under broadway"
+    );
+
+    // Bind (or rebind) now that the window has a real surface — this is the
+    // bind `should_show_label_chip` actually measures against; see that
+    // function's own doc comment for why the collapse decision is only
+    // ever as fresh as the most recent bind.
+    row::bind(
+        container.upcast_ref::<gtk::Widget>(),
+        item,
+        activate_key_display,
+    );
+
+    (window, scrolled)
+}
+
+/// Builds and binds one `Row` widget inside a real, presented `gtk::Window`
+/// sized to `window_width` × `window_height` — a single-shot wrapper around
+/// [`realize_container_at_width`] for the (common) case that only needs one
+/// width and never reuses the row afterward. Returns the window (so the
+/// caller can `close()` it) and the hint's two chip widgets.
+fn realized_hint_row(
+    activate_key_display: Option<&str>,
+    item: &Item,
+    window_width: i32,
+    window_height: i32,
+) -> (gtk::Window, gtk::Label, gtk::Label) {
+    let container = row::build();
+    let hint_label = row::hint_label_widget(&container)
+        .expect("build must give this row a named hint label chip");
+    let hint_key =
+        row::hint_key_widget(&container).expect("build must give this row a named hint key chip");
+    let (window, _scrolled) = realize_container_at_width(
+        &container,
+        activate_key_display,
+        item,
+        window_width,
+        window_height,
+    );
+    (window, hint_label, hint_key)
+}
+
+/// Pumps the real GLib main context, sleeping briefly between checks, until
+/// `condition` returns `true` or `timeout` elapses — returns whether it
+/// succeeded.
+///
+/// A bare, non-blocking `glib::MainContext::iteration(false)` spin was
+/// tried first and rejected, for the same reason `app::capture_once_mapped`'s
+/// own doc comment gives for rejecting the identical shape there: a
+/// headless backend "maps and (re-)size-allocates a surface asynchronously,
+/// on the main loop's own schedule," so a non-blocking spin "does nothing
+/// when nothing is already pending" — it can return immediately having
+/// drained zero sources, long before the broadway socket has actually
+/// delivered the configure event this function's callers wait on. This
+/// drains whatever is already queued and then yields real wall-clock time
+/// (a short `std::thread::sleep`, not a spin) for more of it to arrive over
+/// the socket, repeating until `condition` holds or `timeout` is spent —
+/// the same "retry across real elapsed time, not just pump the loop"
+/// approach `capture_once_mapped` documents choosing, adapted to this
+/// file's synchronous `#[test]` body rather than an `async` one.
+fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let ctx = glib::MainContext::default();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        while ctx.iteration(false) {}
+        if condition() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// The row's reserved layout: the container's own measured height, and the
@@ -928,6 +1522,38 @@ fn item_with_subtitle(n: usize, title: &str, subtitle: &str) -> Item {
 /// one icon state, named.
 fn item_with_icon_none(n: usize, title: &str) -> Item {
     test_item(n, title)
+}
+
+/// A tiny [`Item`] whose `default_action` names an id absent from `actions`
+/// entirely — the malformed case `ui::row::default_action_label`'s own doc
+/// comment names, and the item-side half of this issue's "both halves or
+/// neither" hint rule (see `ui::row::resolve_hint`'s own doc comment).
+/// `test_item`'s own default action ("open") is deliberately not reused
+/// here as the mismatch, so a future change to `test_item` could not
+/// accidentally make this item's `default_action` start matching again
+/// without this function's own literal changing too.
+fn item_with_actions(n: usize, title: &str) -> Item {
+    let mut item = test_item(n, title);
+    item.default_action = ActionId::new("archive").unwrap();
+    item
+}
+
+/// A tiny [`Item`] whose *only* action is its own default action, carrying
+/// `label` verbatim — the responsive-collapse section's own fixture, which
+/// needs a default-action label long enough to actually exceed a real
+/// window's available width, unlike every other item this file builds
+/// (`test_item`'s own "Open" is deliberately short, so the hint content
+/// itself was never the thing making the row's other layout assertions
+/// hold).
+fn item_with_default_action_label(n: usize, title: &str, label: &str) -> Item {
+    let mut item = test_item(n, title);
+    item.actions = vec![Action {
+        id: ActionId::new("open").unwrap(),
+        kind: ActionKind::Open,
+        label: label.to_string(),
+    }];
+    item.default_action = ActionId::new("open").unwrap();
+    item
 }
 
 /// The exact item [`run_assertions`]'s `unbind` call at the end of the icon

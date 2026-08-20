@@ -171,6 +171,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -383,8 +384,17 @@ impl Action {
 /// it. Never constructed with a spelling that failed to parse —
 /// [`Binding::parse`] is the only constructor, and it returns `None` for
 /// anything it cannot turn into both halves.
+///
+/// `pub`, as of issue #197, so [`Keymap::binding_for`]'s answer can be held
+/// by a caller outside this module — `ui::row`'s action hint, in this
+/// issue's phase B. Both fields stay private, and the only constructor
+/// ([`Binding::parse`]) stays module-private too, so nothing outside this
+/// module can build a `Binding` `Binding::parse` itself would have refused.
+/// A caller outside this module gets an opaque, already-valid handle: a
+/// value to hold and to format through [`Binding`]'s [`fmt::Display`] impl,
+/// never something to pattern-match or reconstruct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Binding {
+pub struct Binding {
     key: gdk::Key,
     modifiers: gdk::ModifierType,
 }
@@ -421,6 +431,155 @@ impl Binding {
         let key = gdk::Key::from_name(key_name)?;
         Some(Binding { key, modifiers })
     }
+}
+
+/// How a [`Binding`] is spelled back to a user — the row action hint's key
+/// glyph (issue #197's phase A; the widget that shows it is phase B's).
+/// This is deliberately a separate function from [`Keymap::binding_for`]
+/// itself: `assets/tokens.css` already pairs `--hop-text-hint-label` with
+/// `--hop-text-hint-key` because the hint's item-supplied label and its key
+/// glyph are two typographic elements with two separate rules, and a
+/// reverse lookup that answered with one glued-together string (say,
+/// `"Enter · Open"`) would make that pairing impossible for whichever
+/// widget renders the hint to apply. [`Keymap::binding_for`] hands back the
+/// [`Binding`] itself; this `Display` impl is the one place that turns it
+/// into text, so every call site renders it identically instead of each
+/// inventing its own spelling.
+///
+/// # The convention
+///
+/// **Modifiers first, key last, `+`-joined** — `Ctrl+K`, not `K+Ctrl` and
+/// not a bare `⌃K`. Three sub-rules, each picked over an alternative for a
+/// stated reason:
+///
+/// - **Words, not symbols, for modifiers.** `Ctrl`, `Shift`, `Alt`, `Super`
+///   — not `⌃ ⇧ ⌥ ⌘`. Those four glyphs are Apple's own iconography for keys
+///   this crate does not target — §8's spec is written for a GNOME/Linux
+///   desktop, and `Cargo.toml` pins this crate to GTK 4.14 / libadwaita 1.5
+///   for that platform specifically. GNOME's own apps spell modifiers as
+///   words in their own accelerator UI, and a word needs no special font to
+///   render, unlike `⌘`, which several common UI fonts simply have no glyph
+///   for.
+/// - **`Ctrl`, never `Control`.** [`Binding::parse`] accepts both spellings
+///   in `config.toml` (see this module's doc comment, "The config schema
+///   chosen for a binding") because a user typing a config value should not
+///   have to remember which one this module picked; display has no such
+///   audience-of-one-typing-it-once constraint, so it picks the shorter of
+///   the two, matching the word length of `Shift`/`Alt`/`Super` rather than
+///   standing out as the one long word among four short ones.
+/// - **Fixed order — Ctrl, Shift, Alt, Super — regardless of the order a
+///   user wrote them in `config.toml`.** [`Binding::parse`] folds every
+///   modifier into one `gdk::ModifierType` bitmask, so the order a user
+///   typed them in is already gone by the time this function ever sees a
+///   `Binding` — there is no "as-written" order left to preserve, only a
+///   choice of which fixed order to impose. This picks the same order
+///   [`Binding::parse`]'s own `match` already lists the four modifier words
+///   in, rather than inventing a second, unrelated order for display to
+///   disagree with for no reason.
+///
+/// **Non-printable keys get a short, familiar rendering, not GDK's own
+/// keysym spelling.** [`gdk::Key::name`] is queried first — the same table
+/// [`Binding::parse`] itself reads from, so anything that parsed also
+/// names — and then translated by [`key_display`]:
+///
+/// - `Return` → `Enter`, `Escape` → `Esc`: GDK's own keysym names for these
+///   two are accurate but not how either key is normally labeled in
+///   run-of-the-mill desktop UI copy.
+/// - The four arrows → `↑ ↓ ← →`: GDK spells these `Up`/`Down`/`Left`/`Right`,
+///   indistinguishable in plain text from `Home`/`End`/`Tab`; the glyphs are
+///   the one place this convention departs from "words, not symbols" above,
+///   because an arrow *is* a symbol first and a word only second — no
+///   reader parses "Up" as fast as ↑ in a dense two-word hint chip.
+/// - `Page_Up` / `Page_Down` → `Page Up` / `Page Down`: GDK's underscore is
+///   config-grammar punctuation ([`Binding::parse`]'s own multi-word key
+///   names use it because TOML values are plain strings with no natural word
+///   break), not something a reader should see.
+/// - `Home`, `End`, `Tab`, `Menu` (the remaining §8 defaults) are already
+///   the exact word a UI would show, so they pass through unchanged.
+/// - Anything else this table does not name — every other key a user's own
+///   `config.toml` could rebind an action to — falls back to GDK's own
+///   keysym name with underscores turned into spaces: not a polished label
+///   for every one of GDK's hundreds of keysyms, but always something
+///   readable, and never a panic. A single-character keysym name (every
+///   letter and digit — none of §8's own ten defaults, but a rebinding
+///   could use one) is upper-cased, `k` → `K`, matching how a shortcut is
+///   conventionally written even though the physical key is unshifted.
+///
+/// # Why not `gtk::accelerator_get_label`
+///
+/// GTK already ships a function that does something like this
+/// (`gtk_accelerator_get_label`, bound as `gtk::accelerator_get_label`). It
+/// was deliberately not used here: its output is locale-translated (GTK
+/// looks the modifier names up through its own gettext catalog) and
+/// platform-conditional (it renders Apple's symbol glyphs when GTK detects a
+/// macOS-style keyboard), so the same binding can render different text on
+/// two machines running the identical `hop-gtk` binary — precisely the
+/// "different answer on two runs" defect issue #197's brief calls out for
+/// the *lookup* half, extended here to the *display* half. It would also be
+/// the first call in this module requiring GTK to be initialized: every
+/// test in this file today runs under a plain `cargo test`, with no
+/// `gtk::init()` and no display connection (see the doc comment on
+/// `defaults_cover_every_action_with_its_documented_key` for why that
+/// matters), and this convention keeps that property.
+impl fmt::Display for Binding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const MODIFIER_WORDS: [(gdk::ModifierType, &str); 4] = [
+            (gdk::ModifierType::CONTROL_MASK, "Ctrl"),
+            (gdk::ModifierType::SHIFT_MASK, "Shift"),
+            (gdk::ModifierType::ALT_MASK, "Alt"),
+            (gdk::ModifierType::SUPER_MASK, "Super"),
+        ];
+
+        for (bit, word) in MODIFIER_WORDS {
+            if self.modifiers.contains(bit) {
+                write!(f, "{word}+")?;
+            }
+        }
+
+        write!(f, "{}", key_display(self.key))
+    }
+}
+
+/// The non-modifier half of [`Binding`]'s [`fmt::Display`] convention — see
+/// that impl's own doc comment for the full rationale. A free function,
+/// not a `Binding` method, because it operates on a bare [`gdk::Key`] with
+/// no modifiers in scope, matching the shape [`gdk::Key::name`] itself has.
+fn key_display(key: gdk::Key) -> String {
+    /// GDK's own keysym spelling → this convention's display spelling, for
+    /// every §8 default whose GDK name reads worse than a short, familiar
+    /// alternative. Checked before the generic fallback below.
+    const NAMED: [(&str, &str); 6] = [
+        ("Return", "Enter"),
+        ("Escape", "Esc"),
+        ("Up", "↑"),
+        ("Down", "↓"),
+        ("Left", "←"),
+        ("Right", "→"),
+    ];
+
+    let Some(name) = key.name() else {
+        // Unreachable for any `Binding` this module actually constructs —
+        // `Binding::parse` only ever succeeds via `gdk::Key::from_name`,
+        // whose result names itself by definition — but `gdk::Key::name`'s
+        // own signature returns `Option`, and this function does not get to
+        // assume its caller can only ever hold a `Binding` this module
+        // built (see `Binding`'s own doc comment: it is `pub` precisely so
+        // outside code can hold one). A readable, non-panicking fallback
+        // costs nothing.
+        return format!("Key({key:?})");
+    };
+    let name = name.as_str();
+
+    if let Some((_, glyph)) = NAMED.iter().find(|(spelling, _)| *spelling == name) {
+        return (*glyph).to_string();
+    }
+
+    let mut chars = name.chars();
+    if let (Some(only), None) = (chars.next(), chars.next()) {
+        return only.to_ascii_uppercase().to_string();
+    }
+
+    name.replace('_', " ")
 }
 
 /// Modifier bits [`Keymap::lookup`] treats as meaningful, out of everything
@@ -558,6 +717,11 @@ pub enum KeymapError {
 #[derive(Debug, Clone)]
 pub struct Keymap {
     bindings: HashMap<(gdk::Key, gdk::ModifierType), Action>,
+
+    /// The same bindings `bindings` inverts from, kept the other way round
+    /// as well — see [`Keymap::binding_for`]'s doc comment for why this
+    /// field, rather than a scan over `bindings`, is what answers it.
+    by_action: HashMap<Action, Binding>,
 }
 
 impl Keymap {
@@ -566,8 +730,10 @@ impl Keymap {
     /// the plan: absence is the documented default, not an error) and as
     /// the starting point [`parse_table`] overrides one action at a time.
     pub fn defaults() -> Keymap {
+        let by_action = default_bindings();
         Keymap {
-            bindings: build_lookup(default_bindings()),
+            bindings: build_lookup(&by_action),
+            by_action,
         }
     }
 
@@ -654,6 +820,88 @@ impl Keymap {
         let modifiers = modifiers & relevant_modifiers();
         self.bindings.get(&(key, modifiers)).copied()
     }
+
+    /// The reverse of [`Keymap::lookup`]: given an [`Action`], the one
+    /// [`Binding`] that runs it — `None` if nothing does. New for issue
+    /// #197's row action hint, which needs to answer "what key runs
+    /// [`Action::Activate`]?", the opposite direction [`Keymap::lookup`]
+    /// answers.
+    ///
+    /// # Why this can never depend on `HashMap` iteration order
+    ///
+    /// #197's brief is explicit that this must never be answered by
+    /// scanning `bindings` (the key-press-keyed map [`Keymap::lookup`]
+    /// queries) for the first entry whose value equals `action` — a
+    /// `HashMap`'s iteration order is seeded per-instance from
+    /// `RandomState`, so a scan answering from a map that (hypothetically)
+    /// held more than one binding for the same action could name a
+    /// different one on every process launch, or even between two
+    /// `Keymap`s built from the identical `config.toml` within the same
+    /// run.
+    ///
+    /// This answers from `by_action` instead, which makes the guarantee
+    /// structural rather than defended by a tie-break rule: [`default_bindings`]
+    /// and [`parse_table`] both build it by *inserting one [`Binding`] per
+    /// [`Action`] key* — `HashMap::insert` on a key already present
+    /// overwrites, it never keeps both — so `by_action` cannot hold two
+    /// bindings for one action at all, regardless of insertion order,
+    /// regardless of the map's own iteration order, regardless of what
+    /// `config.toml` says. There is exactly one value at
+    /// `by_action[action]` or there is none; a `HashMap::get` on an
+    /// action-shaped key is the entire implementation. This is the
+    /// stronger of the two claims this module could make —
+    /// "deterministic because the data structure only admits one answer"
+    /// rather than "deterministic because a scan is sorted before it picks
+    /// a winner" — and it costs nothing extra: `by_action` already had to
+    /// exist as an intermediate value in [`Keymap::defaults`] and
+    /// [`parse_table`] before [`build_lookup`] inverted it into `bindings`;
+    /// this only keeps it instead of discarding it.
+    ///
+    /// Two different actions bound to the identical key spelling is a
+    /// related but separate hazard: `bindings` can only hold one action per
+    /// key, so [`Keymap::lookup`] — the *forward* direction — would
+    /// silently prefer whichever action [`build_lookup`]'s
+    /// `HashMap::collect` happened to insert last for that key, itself
+    /// dependent on `HashMap` iteration order for the same underlying
+    /// reason this function's own answer must not be. That hazard lives
+    /// entirely in `lookup`'s forward map, is pre-existing, and is out of
+    /// scope here: conflict detection between two actions sharing a key is
+    /// M6's, per this module's own top doc comment ("The config schema
+    /// chosen for a binding").
+    pub fn binding_for(&self, action: Action) -> Option<Binding> {
+        self.by_action.get(&action).copied()
+    }
+
+    /// The display string for whichever [`Binding`] runs [`Action::Activate`]
+    /// — [`Keymap::binding_for`]`(Action::Activate)`, formatted through
+    /// [`Binding`]'s own [`fmt::Display`] convention, or `None` if nothing
+    /// runs it. Issue #197 review, finding 3: `ui::row`'s action hint needs
+    /// exactly this one value, and it is invariant for as long as the
+    /// `Keymap` it was read from does not change — which, for any one
+    /// `GtkListView` factory built by `ui::view::build`, is the whole
+    /// factory's lifetime, since a `Keymap` is loaded once at startup and
+    /// never mutated afterward.
+    ///
+    /// This method exists so `ui::view::build` can resolve that one value
+    /// *once*, before any row is ever bound, and hand the small
+    /// already-formatted `String` to its `connect_bind`/`connect_unbind`
+    /// closures instead of the whole `Keymap` — seeing this method's own
+    /// name is enough to make that call, `ui::view` never has to import or
+    /// name [`Action`] itself to do it, which is what makes this the third
+    /// option `ui::view::Node`'s own doc comment records choosing over
+    /// carrying a whole `Keymap`: a bare "pre-resolve a display string in
+    /// `ui::view::bind`" was rejected there specifically because computing
+    /// it would have required `ui::view` to call
+    /// [`Keymap::binding_for`]`(Action::Activate)` itself, naming
+    /// [`Action`] in a module that otherwise never has to know it exists.
+    /// Wrapping that lookup and the [`fmt::Display`] formatting in one
+    /// method here removes that requirement without giving up the
+    /// once-per-factory resolution — see `ui::view::Node`'s own doc comment
+    /// for the full account of what this replaced and why.
+    pub fn activate_binding_display(&self) -> Option<String> {
+        self.binding_for(Action::Activate)
+            .map(|binding| binding.to_string())
+    }
 }
 
 /// Builds every action's default binding, keyed by action — the map
@@ -679,13 +927,17 @@ fn default_bindings() -> HashMap<Action, Binding> {
 }
 
 /// Inverts an action-keyed binding map into the key-press-keyed lookup table
-/// [`Keymap::lookup`] actually queries.
+/// [`Keymap::lookup`] actually queries. Takes `bindings` by reference,
+/// rather than consuming it, so [`Keymap::defaults`] and [`parse_table`]
+/// can keep the action-keyed map afterward too — see [`Keymap::binding_for`]'s
+/// doc comment for why that retained map, not a scan over this function's
+/// output, is what answers the reverse lookup.
 fn build_lookup(
-    bindings: HashMap<Action, Binding>,
+    bindings: &HashMap<Action, Binding>,
 ) -> HashMap<(gdk::Key, gdk::ModifierType), Action> {
     bindings
-        .into_iter()
-        .map(|(action, binding)| ((binding.key, binding.modifiers), action))
+        .iter()
+        .map(|(&action, &binding)| ((binding.key, binding.modifiers), action))
         .collect()
 }
 
@@ -743,7 +995,8 @@ fn parse_table(path: &Path, text: &str) -> Result<Keymap, KeymapError> {
     }
 
     Ok(Keymap {
-        bindings: build_lookup(resolved),
+        bindings: build_lookup(&resolved),
+        by_action: resolved,
     })
 }
 
@@ -1053,5 +1306,234 @@ mod tests {
             ),
             Some(Action::Dismiss)
         );
+    }
+
+    // --- Issue #197: the reverse lookup (`Action` -> `Binding`) ---
+
+    /// Criterion 1: the reverse lookup answers every default action with the
+    /// exact binding [`Action::default_spelling`] parses to — proven
+    /// against [`Binding::parse`] directly rather than a hand-written
+    /// [`Binding`] literal, since its fields stay private even now that the
+    /// type itself is `pub`.
+    #[test]
+    fn binding_for_answers_the_binding_that_runs_each_default_action() {
+        let keymap = Keymap::defaults();
+        for action in Action::ALL {
+            let expected = Binding::parse(action.default_spelling());
+            assert_eq!(
+                keymap.binding_for(action),
+                expected,
+                "binding_for({action:?}) did not answer its documented default binding"
+            );
+        }
+    }
+
+    /// A `config.toml` rebinding must show up on the reverse lookup exactly
+    /// as it shows up on the forward one — `binding_for` is not a second,
+    /// independently-wrong source of truth about what an action is bound to.
+    #[test]
+    fn binding_for_reflects_a_config_rebinding() {
+        let (keymap, _dir) = keymap_from_text("[keymap]\nsecondary_action = \"ctrl+k\"\n");
+        assert_eq!(
+            keymap.binding_for(Action::SecondaryAction),
+            Binding::parse("ctrl+k")
+        );
+    }
+
+    /// Criterion 1's explicit `None` case. Unreachable through this
+    /// module's own public constructors — [`Keymap::defaults`] and
+    /// `parse_table` both build `by_action` total over [`Action::ALL`], so
+    /// neither can ever produce a `Keymap` missing an action — but the brief
+    /// asks for coverage of the `None` arm regardless. This constructs a
+    /// `Keymap` directly (private-field access, same module tree) with an
+    /// empty `by_action` to prove that arm is implemented and correct, not
+    /// merely unreachable-and-untested.
+    #[test]
+    fn binding_for_answers_none_when_the_action_keyed_map_has_no_entry() {
+        let keymap = Keymap {
+            bindings: HashMap::new(),
+            by_action: HashMap::new(),
+        };
+        assert_eq!(keymap.binding_for(Action::Activate), None);
+    }
+
+    // --- Issue #197 code review, finding 3: `activate_binding_display` ---
+
+    /// The §8 default keymap binds `Activate` to `Return`, which
+    /// [`Binding`]'s own `Display` convention spells `Enter` — the same
+    /// pairing `display_spells_return_as_enter` pins for `Binding` directly,
+    /// checked here through the method `ui::row` actually calls.
+    #[test]
+    fn activate_binding_display_answers_the_activate_bindings_display_string() {
+        let keymap = Keymap::defaults();
+        assert_eq!(keymap.activate_binding_display().as_deref(), Some("Enter"));
+    }
+
+    /// A config rebinding of `activate` must show up here exactly as it
+    /// shows up on `binding_for` itself — this method is a thin wrapper,
+    /// not a second, independently-wrong source of truth.
+    #[test]
+    fn activate_binding_display_reflects_a_config_rebinding() {
+        let (keymap, _dir) = keymap_from_text("[keymap]\nactivate = \"ctrl+j\"\n");
+        assert_eq!(keymap.activate_binding_display().as_deref(), Some("Ctrl+J"));
+    }
+
+    /// Criterion 1's explicit `None` case, carried through this method —
+    /// unreachable through this module's own public constructors for the
+    /// same reason `binding_for_answers_none_when_the_action_keyed_map_has_no_entry`
+    /// gives, and proven the same way: a `Keymap` built directly, bypassing
+    /// both public constructors, with an empty `by_action`.
+    #[test]
+    fn activate_binding_display_is_none_when_nothing_runs_activate() {
+        let keymap = Keymap {
+            bindings: HashMap::new(),
+            by_action: HashMap::new(),
+        };
+        assert_eq!(keymap.activate_binding_display(), None);
+    }
+
+    /// `binding_for` must not depend on `HashMap` iteration order — see its
+    /// own doc comment for the full argument, and issue #197 review's
+    /// finding on this test's earlier version below for why this shape,
+    /// specifically, is what actually proves it.
+    ///
+    /// # Why a plain "rebuild `Keymap::defaults()` many times" loop cannot
+    /// catch the hazard this test is named for
+    ///
+    /// An earlier version of this test rebuilt `Keymap::defaults()` 64
+    /// times and asserted `binding_for(Action::Activate)` never varied —
+    /// framed as catching a regression to a `bindings`-scanning
+    /// implementation. Review caught that it cannot: `by_action` is a
+    /// `HashMap<Action, Binding>`, so *structurally* at most one binding
+    /// exists per action (`HashMap::insert` on a key already present
+    /// overwrites, never holds both) — with `Keymap::defaults()`'s data,
+    /// there is only ever one candidate for a scan to find too, so a naive
+    /// scan-based `binding_for` would pass that exact test just as reliably
+    /// as the real, correct one. The test exercised no data shape a scan
+    /// and a `by_action` lookup could actually disagree about.
+    ///
+    /// # The shape that does disagree: two different actions, one key
+    ///
+    /// [`Keymap::binding_for`]'s own doc comment names this directly: two
+    /// *different* [`Action`]s bound to the identical key spelling is
+    /// representable (`[keymap]` places no constraint against it — conflict
+    /// detection between two actions sharing a key is explicitly M6's, per
+    /// this module's top doc comment, "The config schema chosen for a
+    /// binding") and is exactly where a forward-map scan gets interesting.
+    /// `bindings` is keyed by `(gdk::Key, gdk::ModifierType)`, so it can
+    /// hold only *one* action for one shared key: `build_lookup`'s
+    /// `HashMap::collect` silently drops whichever of the two colliding
+    /// actions loses that key's single slot, and *which one* loses depends
+    /// on `resolved`'s own bucket iteration order — seeded from a fresh
+    /// `RandomState` on every `Keymap` this module builds. A scan-based
+    /// `binding_for(action)` (walk `bindings` for the first entry whose
+    /// value equals `action`) would therefore answer the *losing* action's
+    /// query with `None` on some rebuilds and `Some(the shared binding)` on
+    /// others, flipping across independent rebuilds of the identical
+    /// `config.toml` text — the actual regression this test's name promises
+    /// to catch, checked directly below against a config that rebinds
+    /// [`Action::SecondaryAction`] onto [`Action::Activate`]'s own §8
+    /// default key, "Return".
+    ///
+    /// `by_action` cannot exhibit this: it is built by
+    /// `resolved.insert(action, binding)`, one entry per `Action` key,
+    /// unconditionally — neither colliding action's own entry is ever at
+    /// risk of being overwritten by the other's, since they are inserted
+    /// under two different `Action` keys, not one shared key the way
+    /// `bindings` sees it. Both keep answering their own (identical)
+    /// binding on every one of the 64 rebuilds below, regardless of
+    /// `resolved`'s bucket order.
+    #[test]
+    fn binding_for_is_stable_even_when_two_different_actions_share_one_key() {
+        // `Action::Activate`'s own §8 default is "Return" — rebinding
+        // `SecondaryAction` to that identical spelling, rather than to a
+        // key neither action already uses, is what actually produces the
+        // two-actions-one-key collision this test needs: a `[keymap]`
+        // table naming an unused key would leave `bindings` with two
+        // independent entries, not one colliding pair, and would prove
+        // nothing beyond what `binding_for_answers_the_binding_that_runs_each_default_action`
+        // already does.
+        let text = "[keymap]\nsecondary_action = \"Return\"\n";
+        let expected = Binding::parse("Return");
+
+        for _ in 0..64 {
+            let (keymap, _dir) = keymap_from_text(text);
+            assert_eq!(
+                keymap.binding_for(Action::Activate),
+                expected,
+                "Activate's own binding must not be disturbed by SecondaryAction sharing its key"
+            );
+            assert_eq!(
+                keymap.binding_for(Action::SecondaryAction),
+                expected,
+                "SecondaryAction must still answer its own (shared) binding on every rebuild — a \
+                 scan-based implementation over the forward `bindings` map would lose this \
+                 answer on whichever rebuilds `resolved`'s random bucket order made Activate win \
+                 the shared key's one slot in `bindings`"
+            );
+        }
+    }
+
+    // --- Issue #197: rendering a `Binding` as text ---
+
+    /// See `impl Display for Binding`'s own doc comment for the convention;
+    /// each test below pins one clause of it.
+    #[test]
+    fn display_spells_return_as_enter() {
+        assert_eq!(Binding::parse("Return").unwrap().to_string(), "Enter");
+    }
+
+    #[test]
+    fn display_spells_escape_as_esc() {
+        assert_eq!(Binding::parse("Escape").unwrap().to_string(), "Esc");
+    }
+
+    #[test]
+    fn display_spells_arrow_keys_as_glyphs() {
+        assert_eq!(Binding::parse("Up").unwrap().to_string(), "↑");
+        assert_eq!(Binding::parse("Down").unwrap().to_string(), "↓");
+        assert_eq!(Binding::parse("Left").unwrap().to_string(), "←");
+        assert_eq!(Binding::parse("Right").unwrap().to_string(), "→");
+    }
+
+    #[test]
+    fn display_spells_page_up_and_page_down_with_a_space_not_an_underscore() {
+        assert_eq!(Binding::parse("Page_Up").unwrap().to_string(), "Page Up");
+        assert_eq!(
+            Binding::parse("Page_Down").unwrap().to_string(),
+            "Page Down"
+        );
+    }
+
+    #[test]
+    fn display_leaves_home_end_tab_and_menu_as_gdks_own_spelling() {
+        assert_eq!(Binding::parse("Home").unwrap().to_string(), "Home");
+        assert_eq!(Binding::parse("End").unwrap().to_string(), "End");
+        assert_eq!(Binding::parse("Tab").unwrap().to_string(), "Tab");
+        assert_eq!(Binding::parse("Menu").unwrap().to_string(), "Menu");
+    }
+
+    #[test]
+    fn display_uppercases_a_bare_printable_key() {
+        assert_eq!(Binding::parse("k").unwrap().to_string(), "K");
+    }
+
+    #[test]
+    fn display_orders_modifiers_ctrl_shift_alt_super_regardless_of_config_order() {
+        assert_eq!(
+            Binding::parse("shift+ctrl+super+alt+k")
+                .unwrap()
+                .to_string(),
+            "Ctrl+Shift+Alt+Super+K"
+        );
+    }
+
+    #[test]
+    fn display_spells_the_long_config_form_control_the_same_as_ctrl() {
+        assert_eq!(
+            Binding::parse("control+k").unwrap().to_string(),
+            Binding::parse("ctrl+k").unwrap().to_string()
+        );
+        assert_eq!(Binding::parse("control+k").unwrap().to_string(), "Ctrl+K");
     }
 }
