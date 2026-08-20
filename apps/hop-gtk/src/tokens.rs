@@ -62,6 +62,18 @@ fn px_token(name: &str) -> i32 {
 /// skeleton's no-layout-shift requirement.
 pub static ROW_HEIGHT_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-row-h"));
 
+/// `--hop-icon-size`, in pixels: the fixed side length of the icon slot every
+/// row reserves at its leading edge, whether or not an item's icon resolves
+/// — the same reserved-space discipline `ROW_HEIGHT_PX` documents, applied to
+/// the row's other load-bearing dimension. 26px is not this crate's choice to
+/// make; it is the icon size the M3 visual spec's row anatomy fixes as one
+/// term of a 56px row (`docs/superpowers/specs/2026-08-19-hop-m3-visual-design.md`,
+/// "Row anatomy: 26px icon · title ... Base row height 56px"), so it is read
+/// out of `tokens.css` rather than retyped as a bare `26` here, for the exact
+/// drift reason this module's top-level doc comment gives for `ROW_HEIGHT_PX`
+/// itself.
+pub static ICON_SIZE_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-icon-size"));
+
 /// `--hop-window-w`, `--hop-window-h`, in pixels: the pre-built window's
 /// starting size, before §8a's design pass owns sizing outright.
 pub static WINDOW_SIZE_PX: LazyLock<(i32, i32)> =
@@ -260,6 +272,16 @@ mod tests {
         // here rather than a silent behavior change nobody asked this test
         // to catch.
         assert_eq!(*ROW_HEIGHT_PX, 56);
+    }
+
+    #[test]
+    fn icon_size_matches_tokens_css() {
+        // Pinned to the literal in `assets/tokens.css` at the time this was
+        // written, for the same reason `row_height_matches_tokens_css` pins
+        // 56: a future edit to that file should be a visible test failure
+        // here, not a silent behavior change nobody asked this test to
+        // catch.
+        assert_eq!(*ICON_SIZE_PX, 26);
     }
 
     #[test]
