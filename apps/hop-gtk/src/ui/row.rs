@@ -152,11 +152,23 @@
 //! the label chip specifically, independent of that rule, once both halves
 //! already resolved.
 //!
-//! `keymap::Action` and `hop_protocol::item::Action` meet at exactly this
-//! element and nowhere else in this module — see [`default_action_label`]'s
-//! own doc comment for how [`resolve_hint`] keeps the two apart in both
-//! code and naming, per this issue's own brief and `CONTEXT.md`'s
-//! **Action** glossary entry.
+//! `hop_protocol::item::Action` is the only `Action` vocabulary this module
+//! ever names — see [`default_action_label`]'s own doc comment for the
+//! distinction from `crate::keymap::Action`, `CONTEXT.md`'s **Action**
+//! glossary entry, and this issue's own brief, all of which flag conflating
+//! the two as the obvious mistake for exactly this issue's own element.
+//! Issue #197 review, finding 3, is what keeps `crate::keymap::Action` from
+//! ever needing to be named here at all, rather than merely under a
+//! disambiguating alias: [`resolve_hint`] used to call
+//! `keymap.binding_for(`[`crate::keymap::Action::Activate`]`)` itself,
+//! which meant this module imported `crate::keymap::Action` (aliased
+//! `KeymapAction`) purely to spell that one call. That lookup now lives on
+//! [`crate::keymap::Keymap::activate_binding_display`] instead, called once
+//! by `ui::view::build` rather than once per bind here — see that method's
+//! own doc comment, and `ui::view::Node`'s, for the full account — so
+//! [`resolve_hint`] receives the already-formatted display string as a
+//! plain `Option<&str>` and this module has had no reason to import
+//! `crate::keymap` at all since.
 //!
 //! # `find_named_child` now searches descendants, not only direct children
 //!
@@ -197,7 +209,6 @@ use gtk::{gdk, glib};
 use hop_protocol::{IconPath, IconSpec, Item, ItemSubtitle};
 
 use crate::icon_roots;
-use crate::keymap::{Action as KeymapAction, Keymap};
 use crate::tokens;
 
 /// GTK's own stand-in icon for "something was supposed to be here and
@@ -594,14 +605,22 @@ fn resolve_icon(icon: &gtk::Image, spec: Option<&IconSpec>) {
 }
 
 /// Populates `widget` (built by [`build`]) with `item`'s title, subtitle,
-/// icon, and — issue #197 — its action hint, resolved against `keymap`.
-/// `widget` is typed as a bare `gtk::Widget` rather than `gtk::Box` because
-/// its caller, `ui::view::bind`, reaches it back out of a `gtk::Stack` page
-/// by name — `gtk::Stack::child_by_name` hands back the general widget type
-/// regardless of what was added, so the downcast belongs here, next to the
-/// one place that knows a `Row` page's widget is actually the `gtk::Box`
-/// [`build`] returns.
-pub fn bind(widget: &gtk::Widget, item: &Item, keymap: &Keymap) {
+/// icon, and — issue #197 — its action hint, paired with
+/// `activate_key_display`. `widget` is typed as a bare `gtk::Widget` rather
+/// than `gtk::Box` because its caller, `ui::view::bind`, reaches it back out
+/// of a `gtk::Stack` page by name — `gtk::Stack::child_by_name` hands back
+/// the general widget type regardless of what was added, so the downcast
+/// belongs here, next to the one place that knows a `Row` page's widget is
+/// actually the `gtk::Box` [`build`] returns.
+///
+/// `activate_key_display` is `Option<&str>`, not `&Keymap`, as of issue
+/// #197 review, finding 3: this function needs only the one value the
+/// key-glyph chip renders — [`crate::keymap::Keymap::activate_binding_display`]'s
+/// answer, already resolved to text — never `Keymap` itself, so it never
+/// has to import [`crate::keymap::Action`] to reach into one. See
+/// `ui::view::Node`'s own doc comment for the full account of what used to
+/// be threaded through here instead, and why.
+pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str>) {
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return;
     };
@@ -619,7 +638,7 @@ pub fn bind(widget: &gtk::Widget, item: &Item, keymap: &Keymap) {
         hint_label_widget(container),
         hint_key_widget(container),
     ) {
-        resolve_hint(&hint, &hint_label, &hint_key, item, keymap);
+        resolve_hint(&hint, &hint_label, &hint_key, item, activate_key_display);
     }
 }
 
@@ -659,11 +678,15 @@ fn resolve_subtitle(subtitle: &gtk::Label, text: Option<&ItemSubtitle>) {
 /// `hop_protocol::item::Action` in `item.actions` whose `id` matches
 /// `item.default_action`, per `CONTEXT.md`'s **Action** glossary entry.
 /// This is the item-wire vocabulary `Action` (`hop_protocol::item::Action`),
-/// never [`crate::keymap::Action`] — [`resolve_hint`] imports that one under
-/// the alias [`KeymapAction`] specifically so the two are never spelled the
-/// same identifier anywhere in this module, per this issue's brief:
-/// "`CONTEXT.md` flags [conflating the two `Action` types] as the obvious
-/// mistake for exactly this issue."
+/// never `crate::keymap::Action` — this module's brief is explicit that
+/// `CONTEXT.md` flags conflating the two `Action` types as the obvious
+/// mistake for exactly this issue, and (since issue #197 review, finding 3
+/// — see this module's top doc comment) this module does not even import
+/// `crate::keymap::Action` any more to have the chance: the only other
+/// `Action`-shaped value [`resolve_hint`] touches is a plain `Option<&str>`
+/// display string, already resolved by
+/// [`crate::keymap::Keymap::activate_binding_display`] before it ever
+/// reaches this module.
 ///
 /// [`hop_protocol::Item`] carries no such lookup itself —
 /// `Item::default_action` is a bare `ActionId`, and matching it against
@@ -736,13 +759,57 @@ fn default_action_label(item: &Item) -> Option<&str> {
 /// what the real, installed stylesheet's font/padding/tracking rules
 /// (`--hop-text-hint-label`, `--hop-text-hint-key`, `--hop-tracking-hint`,
 /// the chip padding) actually produce for `hint_label`'s and `hint_key`'s
-/// *current* text, not a number typed into this function by hand. The
-/// title and subtitle are deliberately left out of this sum: both
-/// ellipsize (`ui::row::build`'s `EllipsizeMode::End`), so neither has a
-/// minimum width this function would need to protect — the one thing that
-/// cannot shrink and does not ellipsize is the hint itself, which is
-/// exactly the element `assets/tokens.css`'s note says must not be "pushed
-/// off-window."
+/// *current* text, not a number typed into this function by hand — plus
+/// [`tokens::HINT_CHIP_GAP_PX`] (the horizontal spacing [`build`] gives
+/// `hint`, its `gtk::Box::new` constructor argument, between the label chip
+/// and the key chip) and [`tokens::HINT_MARGIN_START_PX`] (`hint`'s own
+/// `set_margin_start`, in [`build`]) — both fixed pixel amounts `hint`
+/// carries unconditionally, present whether or not the label chip is
+/// showing, so both count against the same budget the two chips'
+/// own widths do. Review on this issue's original PR caught that this sum
+/// used to stop at the two chips' widths alone, undercounting the hint's
+/// real on-screen footprint by roughly `HINT_CHIP_GAP_PX +
+/// HINT_MARGIN_START_PX` (about 20px) — enough that the chip stayed visible
+/// past the width at which it was actually being pushed off-window, the
+/// wrong direction to err in for a collapse this note requires to happen
+/// *before* that, not after. The title and subtitle are deliberately left
+/// out of this sum: both ellipsize (`ui::row::build`'s `EllipsizeMode::End`),
+/// so neither has a minimum width this function would need to protect —
+/// the one thing that cannot shrink and does not ellipsize is the hint
+/// itself (its own gap and margin included), which is exactly the element
+/// `assets/tokens.css`'s note says must not be "pushed off-window."
+///
+/// # Statelessness: why `hint_label` must already be visible when measured
+///
+/// [`gtk::Widget::measure`] returns `0` for a widget whose own
+/// [`gtk::Widget::is_visible`] is `false`, confirmed directly against this
+/// crate's real, installed GTK 4.14 while fixing the review finding above
+/// (a throwaway probe measured a realized, invisible `gtk::Label` and read
+/// back `0`, then `set_visible(true)` and the label's own real natural
+/// width). `hint_label`'s visibility going into a bind is whatever the
+/// *previous* bind on this recycled row decided — GTK's own list-view
+/// recycling means that is not "nothing," the way a freshly built widget's
+/// would be, on every bind after the first — so measuring it as this
+/// function is entered, before this bind's own decision has been written
+/// back to it, would silently substitute `0` for a collapsed row's real
+/// label width and answer a different `needed` than a row that arrives at
+/// the identical width having never collapsed. That is precisely the
+/// "different answer depending on what the hint currently shows" defect
+/// this function's contract rules out — the same shape of hazard the
+/// rejected "measure the `hint` container itself" alternative has, just
+/// reached through the label widget's own visibility rather than through
+/// its container's child-exclusion, and just as able to make a real
+/// recycled row's hint render wrong. [`resolve_hint`] is what forces
+/// `hint_label` visible immediately before calling this function, for
+/// exactly this reason — see that function's own comment on the call site.
+/// `hint_key` needs no equivalent treatment: [`resolve_hint`] already sets
+/// it visible unconditionally, every bind, before this function ever runs.
+///
+/// `tests/view_tree_renderer.rs`'s "issue #197 code review, finding 1"
+/// section proves both halves of this doc comment together: a width chosen
+/// to satisfy the old (chip-widths-only) sum but not this one must
+/// collapse, and it must collapse identically whether the row arrives
+/// there having never collapsed or having just collapsed and widened back.
 fn should_show_label_chip(
     hint: &gtk::Widget,
     hint_label: &gtk::Label,
@@ -761,17 +828,25 @@ fn should_show_label_chip(
 
     let (_, label_natural, _, _) = hint_label.measure(gtk::Orientation::Horizontal, -1);
     let (_, key_natural, _, _) = hint_key.measure(gtk::Orientation::Horizontal, -1);
-    let needed = *tokens::ICON_SIZE_PX + label_natural + key_natural;
+    let needed = *tokens::ICON_SIZE_PX
+        + label_natural
+        + key_natural
+        + *tokens::HINT_CHIP_GAP_PX
+        + *tokens::HINT_MARGIN_START_PX;
     surface_width >= needed
 }
 
 /// Resolves the row's right-aligned action hint onto its two chip widgets —
 /// issue #197. Pairs [`default_action_label`]'s answer (the label chip)
-/// with `keymap.binding_for(`[`KeymapAction::Activate`]`)`'s display string
-/// (the key glyph, via [`Binding`]'s own [`fmt::Display`] convention — see
-/// `crate::keymap`'s doc comment on that `impl` for the spelling rules), and
-/// applies [`should_show_label_chip`]'s responsive collapse once both are
-/// known to exist.
+/// with `activate_key_display` (the key glyph — already resolved, by the
+/// time this function ever sees it, through [`Binding`]'s own
+/// [`fmt::Display`] convention; see `crate::keymap`'s doc comment on that
+/// `impl` for the spelling rules, and
+/// [`crate::keymap::Keymap::activate_binding_display`]'s own doc comment
+/// for where and how often that resolution actually runs — not on every
+/// bind, as of issue #197 review, finding 3), and applies
+/// [`should_show_label_chip`]'s responsive collapse once both are known to
+/// exist.
 ///
 /// [`Binding`]: crate::keymap::Binding
 ///
@@ -785,27 +860,39 @@ fn should_show_label_chip(
 /// nothing, so this function only ever writes `hint_label`/`hint_key` once
 /// it holds *both* answers — the `let (Some(label), Some(key)) = (...)
 /// else` below is the one place that rule is enforced, before either
-/// widget is touched.
+/// widget is touched. `activate_key_display` being `None` here means
+/// exactly what `keymap.binding_for(Activate)` being `None` used to mean
+/// before finding 3's change moved that lookup out of this function: the
+/// caller already asked the keymap once, up front, and got no answer.
 fn resolve_hint(
     hint: &gtk::Box,
     hint_label: &gtk::Label,
     hint_key: &gtk::Label,
     item: &Item,
-    keymap: &Keymap,
+    activate_key_display: Option<&str>,
 ) {
     let label = default_action_label(item);
-    let key = keymap
-        .binding_for(KeymapAction::Activate)
-        .map(|binding| binding.to_string());
 
-    let (Some(label), Some(key)) = (label, key) else {
+    let (Some(label), Some(key)) = (label, activate_key_display) else {
         clear_hint(hint_label, hint_key);
         return;
     };
 
     hint_label.set_text(label);
-    hint_key.set_text(&key);
+    hint_key.set_text(key);
     hint_key.set_visible(true);
+
+    // `hint_label` is forced visible *before* `should_show_label_chip`
+    // measures it, immediately overwritten below by that function's real
+    // answer — never left at whatever visibility a previous bind on this
+    // recycled row happened to leave it in. See
+    // `should_show_label_chip`'s own doc comment, "Statelessness: why
+    // `hint_label` must already be visible when measured", for why an
+    // invisible label chip would otherwise measure as `0` width and corrupt
+    // the very decision this call is about to make. `hint_key` needs no
+    // matching line: it was already set visible, unconditionally, two
+    // lines above.
+    hint_label.set_visible(true);
     hint_label.set_visible(should_show_label_chip(
         hint.upcast_ref::<gtk::Widget>(),
         hint_label,

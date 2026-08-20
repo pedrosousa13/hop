@@ -871,6 +871,37 @@ impl Keymap {
     pub fn binding_for(&self, action: Action) -> Option<Binding> {
         self.by_action.get(&action).copied()
     }
+
+    /// The display string for whichever [`Binding`] runs [`Action::Activate`]
+    /// — [`Keymap::binding_for`]`(Action::Activate)`, formatted through
+    /// [`Binding`]'s own [`fmt::Display`] convention, or `None` if nothing
+    /// runs it. Issue #197 review, finding 3: `ui::row`'s action hint needs
+    /// exactly this one value, and it is invariant for as long as the
+    /// `Keymap` it was read from does not change — which, for any one
+    /// `GtkListView` factory built by `ui::view::build`, is the whole
+    /// factory's lifetime, since a `Keymap` is loaded once at startup and
+    /// never mutated afterward.
+    ///
+    /// This method exists so `ui::view::build` can resolve that one value
+    /// *once*, before any row is ever bound, and hand the small
+    /// already-formatted `String` to its `connect_bind`/`connect_unbind`
+    /// closures instead of the whole `Keymap` — seeing this method's own
+    /// name is enough to make that call, `ui::view` never has to import or
+    /// name [`Action`] itself to do it, which is what makes this the third
+    /// option `ui::view::Node`'s own doc comment records choosing over
+    /// carrying a whole `Keymap`: a bare "pre-resolve a display string in
+    /// `ui::view::bind`" was rejected there specifically because computing
+    /// it would have required `ui::view` to call
+    /// [`Keymap::binding_for`]`(Action::Activate)` itself, naming
+    /// [`Action`] in a module that otherwise never has to know it exists.
+    /// Wrapping that lookup and the [`fmt::Display`] formatting in one
+    /// method here removes that requirement without giving up the
+    /// once-per-factory resolution — see `ui::view::Node`'s own doc comment
+    /// for the full account of what this replaced and why.
+    pub fn activate_binding_display(&self) -> Option<String> {
+        self.binding_for(Action::Activate)
+            .map(|binding| binding.to_string())
+    }
 }
 
 /// Builds every action's default binding, keyed by action — the map
@@ -1326,18 +1357,120 @@ mod tests {
         assert_eq!(keymap.binding_for(Action::Activate), None);
     }
 
-    /// `binding_for` must not depend on `HashMap` iteration order — see its
-    /// own doc comment for the full argument. `HashMap`'s default
-    /// `RandomState` reseeds on every `HashMap::new()`/`collect()`, so
-    /// rebuilding `Keymap::defaults()` many times exercises many distinct
-    /// iteration orders over `bindings`; if `binding_for` were (wrongly) a
-    /// scan over that map instead of a `by_action` lookup, this is the test
-    /// likely to catch it flipping between runs.
+    // --- Issue #197 code review, finding 3: `activate_binding_display` ---
+
+    /// The §8 default keymap binds `Activate` to `Return`, which
+    /// [`Binding`]'s own `Display` convention spells `Enter` — the same
+    /// pairing `display_spells_return_as_enter` pins for `Binding` directly,
+    /// checked here through the method `ui::row` actually calls.
     #[test]
-    fn binding_for_is_stable_across_many_independently_built_keymaps() {
-        let first = Keymap::defaults().binding_for(Action::Activate);
+    fn activate_binding_display_answers_the_activate_bindings_display_string() {
+        let keymap = Keymap::defaults();
+        assert_eq!(keymap.activate_binding_display().as_deref(), Some("Enter"));
+    }
+
+    /// A config rebinding of `activate` must show up here exactly as it
+    /// shows up on `binding_for` itself — this method is a thin wrapper,
+    /// not a second, independently-wrong source of truth.
+    #[test]
+    fn activate_binding_display_reflects_a_config_rebinding() {
+        let (keymap, _dir) = keymap_from_text("[keymap]\nactivate = \"ctrl+j\"\n");
+        assert_eq!(keymap.activate_binding_display().as_deref(), Some("Ctrl+J"));
+    }
+
+    /// Criterion 1's explicit `None` case, carried through this method —
+    /// unreachable through this module's own public constructors for the
+    /// same reason `binding_for_answers_none_when_the_action_keyed_map_has_no_entry`
+    /// gives, and proven the same way: a `Keymap` built directly, bypassing
+    /// both public constructors, with an empty `by_action`.
+    #[test]
+    fn activate_binding_display_is_none_when_nothing_runs_activate() {
+        let keymap = Keymap {
+            bindings: HashMap::new(),
+            by_action: HashMap::new(),
+        };
+        assert_eq!(keymap.activate_binding_display(), None);
+    }
+
+    /// `binding_for` must not depend on `HashMap` iteration order — see its
+    /// own doc comment for the full argument, and issue #197 review's
+    /// finding on this test's earlier version below for why this shape,
+    /// specifically, is what actually proves it.
+    ///
+    /// # Why a plain "rebuild `Keymap::defaults()` many times" loop cannot
+    /// catch the hazard this test is named for
+    ///
+    /// An earlier version of this test rebuilt `Keymap::defaults()` 64
+    /// times and asserted `binding_for(Action::Activate)` never varied —
+    /// framed as catching a regression to a `bindings`-scanning
+    /// implementation. Review caught that it cannot: `by_action` is a
+    /// `HashMap<Action, Binding>`, so *structurally* at most one binding
+    /// exists per action (`HashMap::insert` on a key already present
+    /// overwrites, never holds both) — with `Keymap::defaults()`'s data,
+    /// there is only ever one candidate for a scan to find too, so a naive
+    /// scan-based `binding_for` would pass that exact test just as reliably
+    /// as the real, correct one. The test exercised no data shape a scan
+    /// and a `by_action` lookup could actually disagree about.
+    ///
+    /// # The shape that does disagree: two different actions, one key
+    ///
+    /// [`Keymap::binding_for`]'s own doc comment names this directly: two
+    /// *different* [`Action`]s bound to the identical key spelling is
+    /// representable (`[keymap]` places no constraint against it — conflict
+    /// detection between two actions sharing a key is explicitly M6's, per
+    /// this module's top doc comment, "The config schema chosen for a
+    /// binding") and is exactly where a forward-map scan gets interesting.
+    /// `bindings` is keyed by `(gdk::Key, gdk::ModifierType)`, so it can
+    /// hold only *one* action for one shared key: `build_lookup`'s
+    /// `HashMap::collect` silently drops whichever of the two colliding
+    /// actions loses that key's single slot, and *which one* loses depends
+    /// on `resolved`'s own bucket iteration order — seeded from a fresh
+    /// `RandomState` on every `Keymap` this module builds. A scan-based
+    /// `binding_for(action)` (walk `bindings` for the first entry whose
+    /// value equals `action`) would therefore answer the *losing* action's
+    /// query with `None` on some rebuilds and `Some(the shared binding)` on
+    /// others, flipping across independent rebuilds of the identical
+    /// `config.toml` text — the actual regression this test's name promises
+    /// to catch, checked directly below against a config that rebinds
+    /// [`Action::SecondaryAction`] onto [`Action::Activate`]'s own §8
+    /// default key, "Return".
+    ///
+    /// `by_action` cannot exhibit this: it is built by
+    /// `resolved.insert(action, binding)`, one entry per `Action` key,
+    /// unconditionally — neither colliding action's own entry is ever at
+    /// risk of being overwritten by the other's, since they are inserted
+    /// under two different `Action` keys, not one shared key the way
+    /// `bindings` sees it. Both keep answering their own (identical)
+    /// binding on every one of the 64 rebuilds below, regardless of
+    /// `resolved`'s bucket order.
+    #[test]
+    fn binding_for_is_stable_even_when_two_different_actions_share_one_key() {
+        // `Action::Activate`'s own §8 default is "Return" — rebinding
+        // `SecondaryAction` to that identical spelling, rather than to a
+        // key neither action already uses, is what actually produces the
+        // two-actions-one-key collision this test needs: a `[keymap]`
+        // table naming an unused key would leave `bindings` with two
+        // independent entries, not one colliding pair, and would prove
+        // nothing beyond what `binding_for_answers_the_binding_that_runs_each_default_action`
+        // already does.
+        let text = "[keymap]\nsecondary_action = \"Return\"\n";
+        let expected = Binding::parse("Return");
+
         for _ in 0..64 {
-            assert_eq!(Keymap::defaults().binding_for(Action::Activate), first);
+            let (keymap, _dir) = keymap_from_text(text);
+            assert_eq!(
+                keymap.binding_for(Action::Activate),
+                expected,
+                "Activate's own binding must not be disturbed by SecondaryAction sharing its key"
+            );
+            assert_eq!(
+                keymap.binding_for(Action::SecondaryAction),
+                expected,
+                "SecondaryAction must still answer its own (shared) binding on every rebuild — a \
+                 scan-based implementation over the forward `bindings` map would lose this \
+                 answer on whichever rebuilds `resolved`'s random bucket order made Activate win \
+                 the shared key's one slot in `bindings`"
+            );
         }
     }
 
