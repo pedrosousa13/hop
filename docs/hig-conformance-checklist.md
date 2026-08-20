@@ -346,19 +346,60 @@ verification needs a human watching a live build with the setting toggled,
 or an automated check reading the applied CSS transition/animation
 properties against the setting; neither exists in this repo today.
 
-**Status: not yet satisfied — no subject exists to check.** Re-confirmed at
-this commit: no animation, transition, or read of `gtk-enable-animations`
-exists anywhere in `apps/hop-gtk/src` (grep for all three finds nothing, the
-same zero result as at `7a6f99b`). Neither #196, #197, nor #193 touched
-motion — the subtitle and hint appear/disappear by a plain
-`set_visible(true/false)` (`ui::row::resolve_subtitle`, `ui::row::resolve_hint`/
-`clear_hint`), never a transition, and the CSS provider #193 installed loads
-declarative colour/font rules, not `transition`/`@keyframes` (GTK's CSS has
-no such at-rule regardless — see `assets/stylesheet.css`'s own top comment).
-The six states and their motion are fully specified in the visual design
-spec but the window still presents and dismisses with no implemented
-open/close transition at all. There is nothing yet to honour or violate the
-setting.
+**Status: partially satisfied — a real subject now exists for exactly one of
+the six motion-table rows; the other five remain unbuilt.** Issue #207 gave
+this crate its first motion: `apps/hop-gtk/src/style.rs` reads
+`gtk::Settings::default()`'s `gtk-enable-animations` property at startup
+(before the action hint's first paint, from the same `connect_startup`
+handler that installs the stylesheet) and subscribes to its
+`notify::gtk-enable-animations` signal, so a live flip of the setting
+re-resolves and reloads the installed `gtk::CssProvider` with no restart —
+the same live-subscription shape `style.rs` already used for the palette
+axis, now proven for motion too by `apps/hop-gtk/tests/motion_setting.rs`,
+which drives the setting through its own public setter and confirms the
+*same* installed provider's serialized CSS changes. This is GTK's own
+setting, read directly — no portal call, no direct read of
+`org.gnome.desktop.interface`'s `enable-animations` key — matching
+`assets/tokens.css`'s own `@media` comment naming `gtk-enable-animations` as
+the source of truth.
+
+The one row this issue wires motion into is the action hint's entrance fade:
+`assets/stylesheet.css`'s `.hop-row-hint.hop-row-hint-shown` rule declares
+`transition: opacity {{motion:hop-duration-fast}} {{motion:hop-ease-out}}
+{{motion:hop-delay-hint}};`, every value resolved through
+`apps/hop-gtk/src/tokens.rs`'s `resolve_motion` rather than hand-copied.
+Under the full-motion setting this resolves to 80ms, `--hop-ease-out`, and a
+40ms delay (confirmed via `gtk::CssProvider::to_str()`'s own serialized
+`transition-duration: 80ms;`/`transition-delay: 40ms;` in
+`stylesheet.rs`'s and `motion_setting.rs`'s own tests); under reduced motion
+the delay collapses to `0ms` (one of the six `@media` overrides
+`assets/tokens.css`'s own block names) while the 80ms duration and the
+easing curve survive unchanged — the fade still plays, opacity only, just
+without the anti-flicker delay, exactly the "reduced motion is not shorter
+everywhere" rule this document's own item-3 check already named.
+`apps/hop-gtk/src/ui/row.rs`'s `bind` plays that fade only on a genuine
+not-shown-to-shown transition for the row currently on screen — never on a
+bare recycle, regardless of whether a recycled row's new item's hint text
+differs from the old one's — a distinction `tests/view_tree_renderer.rs`'s
+own "issue #207" section exercises directly against
+`ui::row::HINT_SHOWN_CLASS`'s presence on a real widget.
+
+**What this status does not claim:** the other five motion-table rows —
+window open/close, selection move, skeleton→resolved, state change — are
+exactly as unbuilt as they were before this issue. None of #193, #196, #197,
+or #207 gave the window an open/close transition, the selection indicator a
+movement transition, or the skeleton/state crossfade its own transition;
+`apps/hop-gtk/src/ui/window.rs` still presents and dismisses with no
+animation of any kind. The mechanism issue #207 built — `tokens::Motion`,
+`tokens::resolve_motion`, `stylesheet.rs`'s `{{motion:name}}` placeholder,
+and `style.rs`'s live subscription — is reusable for all five, but none of
+them consume it yet, and this item's status is not to be read as "reduced
+motion is honoured" in general, only as "one real, live-verified subject now
+exists to check, where before this issue there was none." Per this item's
+own **Verifiability** note above, only the endpoints of that one subject's
+transition are capture-verifiable; no test in this repo claims to have
+proven its path or timing, only its resolved duration/delay/easing values
+and the correctness of when it is triggered.
 
 ---
 
@@ -643,7 +684,7 @@ environment.
 | 2a | Contrast-checked palette | Binding | Partially satisfied — several tokens confirmed reaching the screen at their exact documented values; one real contrast failure found (hint-key glyph under the light palette, ≈2.0:1) |
 | 2b | Screen-reader labels | Binding | Not yet satisfied — real subtitle and hint content now exists (#196, #197) and none of it is exposed |
 | 2c | System font scaling | Binding | Not yet satisfied — the row's fixed-height reservation still conflicts with it; the previous mode-label evidence is retracted (that code was removed by #193) |
-| 3 | Reduced motion | Binding | Not yet satisfied — no motion exists to check |
+| 3 | Reduced motion | Binding | Partially satisfied (updated by #207, after this table's own `0fc1c92` snapshot) — a real, live-verified subject exists for the action hint's entrance fade; the other five motion-table rows (window open/close, selection move, skeleton→resolved, state change) remain exactly as unbuilt as at `0fc1c92` — see item 3's own section above for the full account |
 | 4 | Full keyboard operability | Binding | Unknown — not independently verified end-to-end |
 | 5 | Window model | Deliberately broken | Satisfied, verified |
 | 6 | Stock widget styling | Deliberately broken | Partially satisfied — the provider (#193) exists and several surfaces confirmed tokenized; the window/listview base background (most of the default empty state), the query entry, the row title's typography, and the window's own shape remain stock Adwaita |

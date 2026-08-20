@@ -17,44 +17,59 @@
 //! layout finding the source tree.
 //!
 //! This module's own job is narrow on purpose: find every `{{...}}`
-//! placeholder in the template and substitute it, via [`crate::tokens::resolve`],
-//! for a palette-resolved value. It does not re-parse `tokens.css`, re-walk
-//! `var()` chains, or re-implement any of the fail-loudly behaviour Task 1's
+//! placeholder in the template and substitute it, via [`crate::tokens::resolve`]
+//! or — issue #207 — [`crate::tokens::resolve_motion`], for a palette- or
+//! motion-resolved value. It does not re-parse `tokens.css`, re-walk `var()`
+//! chains, or re-implement any of the fail-loudly behaviour Task 1's
 //! [`crate::tokens`] module already has — every placeholder resolves through
-//! that module's one real `resolve` function, so a missing token or a `var()`
-//! cycle referenced from this file panics exactly the way it already does for
-//! every other caller.
+//! that module's own `resolve`/`resolve_motion` functions, so a missing
+//! token or a `var()` cycle referenced from this file panics exactly the way
+//! it already does for every other caller.
 //!
 //! See `assets/stylesheet.css`'s own top doc comment for the placeholder
-//! syntax itself (`{{name}}` and `{{font:name}}`) and why it was chosen —
-//! that account belongs next to the file it describes, not duplicated here.
+//! syntax itself (`{{name}}`, `{{font:name}}`, and `{{motion:name}}`) and why
+//! it was chosen — that account belongs next to the file it describes, not
+//! duplicated here.
 //!
 //! # The public surface
 //!
 //! [`resolve`] is the one function this module exports: give it a
-//! [`crate::tokens::Palette`], get back the *full*, concrete stylesheet text
-//! for that palette, with every placeholder substituted. Nothing here reads
-//! from or writes to a `gtk::Display`, constructs a `gtk::CssProvider`, or
-//! knows anything about libadwaita's colour-scheme signal — installing the
-//! provider, re-resolving on a colour-scheme change, and guarding parse
-//! errors are a later issue's job (issue #193's own plan, Task 3), which
-//! needs exactly this one call — "the full stylesheet text, resolved for
-//! palette P" — and nothing else from this module to do it.
+//! [`crate::tokens::Palette`] and a [`crate::tokens::Motion`], get back the
+//! *full*, concrete stylesheet text for that palette and motion state, with
+//! every placeholder substituted. Nothing here reads from or writes to a
+//! `gtk::Display`, constructs a `gtk::CssProvider`, or knows anything about
+//! libadwaita's colour-scheme signal or GTK's `gtk-enable-animations` setting
+//! — installing the provider, re-resolving on a live change to either axis,
+//! and guarding parse errors are `style.rs`'s job (issue #193's own plan,
+//! Task 3, and issue #207's own Task 2), which needs exactly this one call —
+//! "the full stylesheet text, resolved for palette P and motion M" — and
+//! nothing else from this module to do it.
 
-use crate::tokens::{self, Palette};
+use crate::tokens::{self, Motion, Palette};
 
 /// The full contents of the repo's `assets/stylesheet.css`, bundled into the
 /// binary at compile time — see this module's top doc comment for why that
 /// matches `tokens.rs`'s own precedent.
 const STYLESHEET_TEMPLATE: &str = include_str!("../../../assets/stylesheet.css");
 
-/// Resolves hop's real stylesheet for `palette`: every `{{name}}` and
-/// `{{font:name}}` placeholder in `assets/stylesheet.css` substituted for its
-/// concrete, palette-resolved value. The result is ready to hand to a
+/// Resolves hop's real stylesheet for `palette` and `motion`: every
+/// `{{name}}`, `{{font:name}}`, and — issue #207 — `{{motion:name}}`
+/// placeholder in `assets/stylesheet.css` substituted for its concrete,
+/// palette- or motion-resolved value. The result is ready to hand to a
 /// `gtk::CssProvider::load_from_string` — see this module's top doc comment
 /// for what installing that provider is (deliberately) not this module's job.
-pub fn resolve(palette: Palette) -> String {
-    resolve_template(STYLESHEET_TEMPLATE, palette)
+///
+/// Two independent axes, not fused into one: `palette` and `motion` are
+/// [`crate::tokens::Palette`] and [`crate::tokens::Motion`], the same pair
+/// [`tokens::resolve`]/[`tokens::resolve_motion`] keep separate — see
+/// [`Motion`]'s own doc comment for why. A `{{name}}` placeholder only ever
+/// consults `palette` (through [`tokens::resolve`]), and a `{{motion:name}}`
+/// placeholder only ever consults `motion` (through
+/// [`tokens::resolve_motion`]); nothing in this file's placeholder syntax can
+/// ask for both at once, because no single token in `assets/tokens.css` is
+/// declared on both axes.
+pub fn resolve(palette: Palette, motion: Motion) -> String {
+    resolve_template(STYLESHEET_TEMPLATE, palette, motion)
 }
 
 /// [`resolve`] against an arbitrary `template` string rather than the real,
@@ -79,7 +94,7 @@ pub fn resolve(palette: Palette) -> String {
 /// resolved sheet this module hands out is exactly what a leftover-
 /// placeholder check (or a human comparing dark against light) needs to
 /// look at, nothing extra to filter back out.
-fn resolve_template(template: &str, palette: Palette) -> String {
+fn resolve_template(template: &str, palette: Palette, motion: Motion) -> String {
     let code_only = strip_comments(template);
     let mut out = String::with_capacity(code_only.len());
     let mut rest: &str = &code_only;
@@ -94,7 +109,7 @@ fn resolve_template(template: &str, palette: Palette) -> String {
             )
         });
         let inner = after[..end].trim();
-        out.push_str(&resolve_placeholder(inner, palette));
+        out.push_str(&resolve_placeholder(inner, palette, motion));
         rest = &after[end + "}}".len()..];
     }
     out.push_str(rest);
@@ -124,15 +139,25 @@ fn strip_comments(css: &str) -> String {
     out
 }
 
-/// Resolves one placeholder's inner text (`name`, or `font:name`) to its
-/// concrete value. Panics naming the token — via [`tokens::resolve`], which
-/// already does this — if `name` has no declaration in `assets/tokens.css`
-/// under `palette`, or if it is a `var()` cycle.
-fn resolve_placeholder(inner: &str, palette: Palette) -> String {
-    match inner.strip_prefix("font:") {
-        Some(name) => font_shorthand_no_line_height(&tokens::resolve(name.trim(), palette)),
-        None => tokens::resolve(inner, palette),
+/// Resolves one placeholder's inner text (`name`, `font:name`, or —
+/// issue #207 — `motion:name`) to its concrete value. Panics naming the
+/// token — via [`tokens::resolve`]/[`tokens::resolve_motion`], which already
+/// does this — if `name` has no declaration in `assets/tokens.css` under
+/// `palette`/`motion`, or if it is a `var()` cycle.
+///
+/// `motion:` is checked before the bare, no-prefix arm (the same order
+/// `font:` already used) so a name that happens to start with neither
+/// prefix falls through to the plain `{{name}}` form exactly as before this
+/// issue — adding a second prefix does not change what an un-prefixed
+/// placeholder means.
+fn resolve_placeholder(inner: &str, palette: Palette, motion: Motion) -> String {
+    if let Some(name) = inner.strip_prefix("font:") {
+        return font_shorthand_no_line_height(&tokens::resolve(name.trim(), palette));
     }
+    if let Some(name) = inner.strip_prefix("motion:") {
+        return tokens::resolve_motion(name.trim(), motion);
+    }
+    tokens::resolve(inner, palette)
 }
 
 /// Reshapes a resolved `--hop-text-*` value — `<weight> <size>px/<line>px
@@ -186,19 +211,25 @@ mod tests {
     /// shipped stylesheet, once resolved, must contain no leftover `{{`/`}}`
     /// marker anywhere — every placeholder [`resolve`] finds in the real
     /// file must actually have been substituted, not merely attempted.
+    ///
+    /// Issue #207 extends this from the two palettes alone to the full
+    /// 2×2 palette-by-motion matrix, since `{{motion:name}}` is a second,
+    /// independent placeholder prefix this same scan has to resolve
+    /// cleanly under both [`Motion`] states — extending the existing guard
+    /// rather than adding a separate, narrower one, per this issue's own
+    /// brief.
     #[test]
     fn resolved_real_stylesheet_has_no_leftover_placeholder() {
-        let dark = resolve(Palette::Dark);
-        assert!(
-            !dark.contains("{{") && !dark.contains("}}"),
-            "the dark-resolved stylesheet still contains a `{{{{`/`}}}}` marker"
-        );
-
-        let light = resolve(Palette::Light);
-        assert!(
-            !light.contains("{{") && !light.contains("}}"),
-            "the light-resolved stylesheet still contains a `{{{{`/`}}}}` marker"
-        );
+        for palette in [Palette::Dark, Palette::Light] {
+            for motion in [Motion::Full, Motion::Reduced] {
+                let resolved = resolve(palette, motion);
+                assert!(
+                    !resolved.contains("{{") && !resolved.contains("}}"),
+                    "the {palette:?}/{motion:?}-resolved stylesheet still contains a \
+                     `{{{{`/`}}}}` marker"
+                );
+            }
+        }
     }
 
     /// A placeholder naming a token `assets/tokens.css` does not declare
@@ -211,6 +242,7 @@ mod tests {
         resolve_template(
             ".x { color: {{hop-this-token-does-not-exist}}; }",
             Palette::Dark,
+            Motion::Full,
         );
     }
 
@@ -222,6 +254,19 @@ mod tests {
         resolve_template(
             ".x { font: {{font:hop-this-token-does-not-exist}}; }",
             Palette::Dark,
+            Motion::Full,
+        );
+    }
+
+    /// The `{{motion:...}}` form — issue #207 — must fail exactly the same
+    /// way, via [`tokens::resolve_motion`] rather than [`tokens::resolve`].
+    #[test]
+    #[should_panic(expected = "hop-this-token-does-not-exist")]
+    fn motion_placeholder_naming_a_missing_token_panics() {
+        resolve_template(
+            ".x { transition-duration: {{motion:hop-this-token-does-not-exist}}; }",
+            Palette::Dark,
+            Motion::Full,
         );
     }
 
@@ -232,7 +277,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "no matching")]
     fn unterminated_placeholder_panics() {
-        resolve_template(".x { color: {{hop-bg; }", Palette::Dark);
+        resolve_template(".x { color: {{hop-bg; }", Palette::Dark, Motion::Full);
     }
 
     /// The same real stylesheet, resolved under each palette, must actually
@@ -243,8 +288,8 @@ mod tests {
     /// `light_palette_resolves_a_semantic_token_to_the_light_ramp` test.
     #[test]
     fn resolved_real_stylesheet_differs_between_palettes() {
-        let dark = resolve(Palette::Dark);
-        let light = resolve(Palette::Light);
+        let dark = resolve(Palette::Dark, Motion::Full);
+        let light = resolve(Palette::Light, Motion::Full);
         assert_ne!(
             dark, light,
             "the light-resolved stylesheet must differ from the dark one \
@@ -274,8 +319,8 @@ mod tests {
     /// at a semantic-layer alias with a light-palette entry.
     #[test]
     fn hint_key_glyph_colour_differs_between_palettes() {
-        let dark = resolve(Palette::Dark);
-        let light = resolve(Palette::Light);
+        let dark = resolve(Palette::Dark, Motion::Full);
+        let light = resolve(Palette::Light, Motion::Full);
 
         let dark_rule = extract_rule(&dark, ".hop-row-hint-key");
         let light_rule = extract_rule(&light, ".hop-row-hint-key");
@@ -305,8 +350,8 @@ mod tests {
     /// semantic alias for this exact ramp tier.
     #[test]
     fn mode_label_colour_differs_between_palettes() {
-        let dark = resolve(Palette::Dark);
-        let light = resolve(Palette::Light);
+        let dark = resolve(Palette::Dark, Motion::Full);
+        let light = resolve(Palette::Light, Motion::Full);
 
         let dark_rule = extract_rule(&dark, ".hop-mode-label");
         let light_rule = extract_rule(&light, ".hop-mode-label");
@@ -323,6 +368,46 @@ mod tests {
         assert!(
             light_rule.contains("color: #6a6559;"),
             "light mode label should resolve to the light ramp's grey, got: {light_rule}"
+        );
+    }
+
+    /// Issue #207's own consumer-level proof that the motion axis actually
+    /// threads all the way from [`tokens::resolve_motion`] through this
+    /// module's `{{motion:name}}` placeholder into real, resolved CSS text
+    /// — `tokens.rs`'s own tests already prove `resolve_motion` itself is
+    /// motion-aware in isolation; this proves this module does not drop
+    /// that awareness on the way to a stylesheet.
+    ///
+    /// Pins every acceptance-criterion detail at once: the fade's duration
+    /// (80ms, `--hop-duration-fast`, untouched by the `@media` block) and
+    /// easing curve (`--hop-ease-out`) are identical under both motion
+    /// states, while only the delay (`--hop-duration-hint`) collapses to
+    /// `0ms` under [`Motion::Reduced`] — "the delay disappears, the fade
+    /// does not," per this issue's own brief.
+    #[test]
+    fn hint_fade_uses_the_token_resolved_duration_easing_and_delay() {
+        let full = resolve(Palette::Dark, Motion::Full);
+        let reduced = resolve(Palette::Dark, Motion::Reduced);
+
+        let full_rule = extract_rule(&full, ".hop-row-hint.hop-row-hint-shown");
+        let reduced_rule = extract_rule(&reduced, ".hop-row-hint.hop-row-hint-shown");
+
+        assert_ne!(
+            full_rule, reduced_rule,
+            "the hint fade's rule must differ between motion states — got the same rule \
+             under both: {full_rule}"
+        );
+
+        assert!(
+            full_rule.contains("transition: opacity 80ms cubic-bezier(0.16, 1, 0.3, 1) 40ms;"),
+            "under full motion the fade should carry the token-resolved 80ms duration, \
+             ease-out curve, and 40ms delay, got: {full_rule}"
+        );
+        assert!(
+            reduced_rule.contains("transition: opacity 80ms cubic-bezier(0.16, 1, 0.3, 1) 0ms;"),
+            "under reduced motion the same 80ms duration and ease-out curve must survive \
+             unchanged (--hop-duration-fast has no @media override), with only the delay \
+             collapsing to 0ms (one of the six overrides), got: {reduced_rule}"
         );
     }
 
@@ -365,7 +450,11 @@ mod tests {
     /// synthetic string the test above uses.
     #[test]
     fn font_placeholder_resolves_to_the_gtk_accepted_shorthand_form() {
-        let resolved = resolve_template(".x { font: {{font:hop-text-error}}; }", Palette::Dark);
+        let resolved = resolve_template(
+            ".x { font: {{font:hop-text-error}}; }",
+            Palette::Dark,
+            Motion::Full,
+        );
         assert!(
             resolved.contains("font: 500 13.5px \"Inter\""),
             "expected the 3-field shorthand with no `/<line-height>` segment, got: {resolved}"
