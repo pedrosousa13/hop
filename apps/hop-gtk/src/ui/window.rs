@@ -71,6 +71,7 @@ use hop_protocol::{ExecOutcome, Item};
 use crate::ipc::{CommandSender, IpcCommand, IpcEvent};
 use crate::keymap::{Action, Keymap};
 use crate::tokens;
+use crate::ui::offline_indicator::OfflineIndicator;
 use crate::ui::{marker_highlight, mode_label, model, view};
 
 /// Rows moved per [`Action::PageUp`]/[`Action::PageDown`]. A fixed step
@@ -109,6 +110,11 @@ pub struct HopWindow {
     indicator: gtk::Widget,
     scrolled: gtk::ScrolledWindow,
     status: gtk::Label,
+    /// Issue #200's own first honesty-critical widget — see
+    /// `ui::offline_indicator`'s module doc for what it is and
+    /// [`HopWindow::apply_event`] for the one place it is ever shown or
+    /// hidden.
+    offline_indicator: OfflineIndicator,
     cmd_tx: CommandSender,
 }
 
@@ -203,9 +209,19 @@ impl HopWindow {
         status.set_visible(false);
         status.set_wrap(true);
 
+        // Issue #200's offline indicator — built once, alongside every other
+        // widget here, and starts hidden (`OfflineIndicator::build`'s own doc
+        // comment). Placed directly after `status` and before the results
+        // `overlay`, the same connection-state neighbourhood `status`
+        // itself occupies, since both report on the state of the link to
+        // `hopd` — see `HopWindow::apply_event`'s `IpcEvent::Disconnected`
+        // arm for the one place this ever becomes visible.
+        let offline_indicator = OfflineIndicator::build();
+
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&entry_overlay);
         content.append(&status);
+        content.append(&offline_indicator.widget);
         content.append(&overlay);
 
         let window = adw::ApplicationWindow::builder()
@@ -228,6 +244,7 @@ impl HopWindow {
             indicator: indicator.upcast(),
             scrolled,
             status,
+            offline_indicator,
             cmd_tx,
         };
 
@@ -446,12 +463,60 @@ impl HopWindow {
         match event {
             IpcEvent::Connected => {
                 self.status.set_visible(false);
+                self.offline_indicator.apply(None);
             }
             IpcEvent::ConnectFailed(reason) => {
                 self.set_status(&format!("Can't reach hopd: {reason}"));
             }
             IpcEvent::Disconnected => {
+                // Issue #200: `IpcEvent::Disconnected` — a connection that
+                // *was* established and has now been lost, `ipc`'s own
+                // reconnect loop already retrying in the background (per
+                // that event's own doc comment) — is the offline indicator's
+                // event, not only `.hop-status`'s. `IpcEvent::ConnectFailed`
+                // (never yet connected at all) deliberately keeps its own,
+                // separate `.hop-status` treatment above, unchanged: this
+                // issue's own brief scopes it to one widget, the offline
+                // indicator, and treats the error row (which
+                // `ConnectFailed`/`Error` most naturally belong to) as
+                // explicitly out of scope — see `ui::offline_indicator`'s
+                // module doc comment for why the two are not the same
+                // signal.
+                //
+                // A code-review pass on this issue caught a real
+                // regression an earlier version of this arm introduced: it
+                // replaced `.hop-status`'s pre-existing "Lost connection to
+                // hopd, reconnecting…" text outright, rather than adding
+                // the offline indicator alongside it. Nothing in this
+                // issue's acceptance criteria asked for that replacement,
+                // and it quietly cost real information — the offline
+                // indicator's own words are fixed to the single, constant
+                // truth `OFFLINE_TEXT` names ("Offline"; see
+                // `ui::offline_indicator`'s own doc comment for why that
+                // string never varies), so a user who only saw the
+                // indicator could no longer tell "offline and hopd is
+                // actively retrying the connection" apart from "offline,
+                // full stop" — a distinction they could read directly off
+                // `.hop-status` before this branch touched this arm.
+                //
+                // Restored as a second signal *alongside* the offline
+                // indicator, not folded into the indicator's own wording:
+                // `OFFLINE_TEXT` is honesty-critical, locked text by the
+                // same contract that locks its colour and size (this
+                // issue's Fix 1), so it is exactly the wrong place to
+                // encode a transient, retry-loop-specific detail that has
+                // nothing to do with the truthfulness guarantee — the
+                // indicator's job is "are we offline right now", not "what
+                // is `ipc` doing about it". `.hop-status` already is the
+                // ordinary, non-locked surface this crate uses for
+                // connection prose (see `ConnectFailed`'s own arm above),
+                // so reusing it here for exactly the same kind of message
+                // reads as the smaller, more consistent change in code —
+                // one call to the method this arm already used before this
+                // issue existed, not a new literal grafted onto a
+                // deliberately-fixed honesty-critical string.
                 self.set_status("Lost connection to hopd, reconnecting…");
+                self.offline_indicator.apply(Some(&current_local_hh_mm()));
             }
             IpcEvent::Routed {
                 mode,
@@ -517,6 +582,45 @@ impl HopWindow {
             }
         }
     }
+}
+
+/// The current wall-clock time, formatted `HH:MM` in the local timezone —
+/// [`HopWindow::apply_event`]'s `IpcEvent::Disconnected` arm's one call
+/// site, and the only place in this crate that reads a clock at all.
+///
+/// Deliberately a plain, free function rather than a method: it takes no
+/// part of `self`, and giving it one would wrongly suggest the offline
+/// row's own "as of" wording depends on window state, when the real
+/// dependency is only ever "what time is it right now" — the same reason
+/// `ui::row`'s pure helpers (`hint_entered_shown`, `default_action_label`)
+/// are free functions rather than methods on a type that happens to be
+/// nearby.
+///
+/// # Why a degraded stamp, not a panic, on a formatting failure
+///
+/// [`glib::DateTime::now_local`] and [`glib::DateTime::format`] are both
+/// fallible ([`glib::BoolError`]) — GLib's own docs name a missing or
+/// broken timezone database as the realistic cause, an environment
+/// condition, not a programming error this crate's code caused. That is a
+/// different shape of failure than the ones this crate's "fail loudly"
+/// precedent (`tokens.rs`, `stylesheet.rs`, this module's own
+/// `gtk_enable_animations`) exists for: those all catch a *build-time*
+/// defect in a file this crate ships (a malformed token, a broken
+/// placeholder) that a panic surfaces to whoever broke it, immediately,
+/// long before a user could hit it. A broken system clock or timezone
+/// database is neither — hop did not cause it and cannot fix it, and it can
+/// only ever be discovered at runtime, on a real user's machine, the moment
+/// they lose their connection to `hopd`. Panicking there would turn "the
+/// clock is unavailable" into "the whole launcher crashes", which is a
+/// strictly worse honesty failure than a stamp that reads `"as of --:--"` —
+/// the row itself, and the words naming it offline, still render exactly
+/// as truthfully either way. Neither `.unwrap()` nor `.expect()` appears
+/// here, matching this crate's `clippy::unwrap_used` lint on a fallible
+/// runtime value.
+fn current_local_hh_mm() -> glib::GString {
+    glib::DateTime::now_local()
+        .and_then(|now| now.format("%H:%M"))
+        .unwrap_or_else(|_| glib::GString::from("--:--"))
 }
 
 /// Moves `indicator` to sit over `selection`'s current row, accounting for
@@ -731,17 +835,31 @@ mod tests {
     const CHILD_MARKER: &str = "HOP_GTK_WINDOW_TEST_CHILD";
 
     /// A spawned `gtk4-broadwayd`, killed on drop. Display number derived
-    /// from this process's own pid, offset from `tests/headless_smoke.rs`'s
-    /// and `tests/view_tree_renderer.rs`'s own ranges so parallel `cargo
-    /// test` runs of all three files do not collide on the same display.
+    /// from this process's own pid, offset by a caller-chosen `base` so
+    /// parallel `cargo test` runs of every other file under `tests/` — and,
+    /// since issue #200, a *second* `#[test]` fn in *this* file too — do
+    /// not collide on the same display. `base` used to be a hardcoded `400`
+    /// this struct alone knew; it is a parameter now because
+    /// `offline_indicator_reflects_connection_state` below needed its own,
+    /// distinct base (`450` was already `tests/motion_setting.rs`'s) rather
+    /// than sharing `400 + process::id()` with
+    /// `keyboard_and_mouse_dispatch_use_the_keymap_and_the_real_window` —
+    /// see this struct's own former "One test, one display" comment there
+    /// for why two `#[test]` fns computing the *identical* display number
+    /// (same base, same pid — `std::process::id()` is one value per test
+    /// *binary*, shared by every `#[test]` fn cargo runs as a thread inside
+    /// it) would race to bind the same broadway socket and one would fail.
+    /// Two different bases sidestep that without needing to merge this
+    /// file's now-two broadway-dependent tests into one function the way
+    /// that comment originally did.
     struct BroadwayServer {
         child: Child,
         display: u32,
     }
 
     impl BroadwayServer {
-        fn start() -> Self {
-            let display = 400 + (std::process::id() % 5000);
+        fn start(base: u32) -> Self {
+            let display = base + (std::process::id() % 5000);
             let child = Command::new("gtk4-broadwayd")
                 .arg(format!(":{display}"))
                 .stdout(Stdio::null())
@@ -791,7 +909,7 @@ mod tests {
     /// Re-execs this test binary under a headless `broadway` display and
     /// asserts the child's real-assertion run succeeded — see this module's
     /// doc comment.
-    fn run_under_broadway(test_name: &str) {
+    fn run_under_broadway(test_name: &str, base: u32) {
         if std::env::var_os(CHILD_MARKER).is_some() {
             // Already the re-exec'd child; the `#[test]` fn that called this
             // has already run its real assertions before reaching here in
@@ -799,7 +917,7 @@ mod tests {
             return;
         }
 
-        let broadway = BroadwayServer::start();
+        let broadway = BroadwayServer::start(base);
         let output = Command::new(std::env::current_exe().unwrap())
             .env("GDK_BACKEND", "broadway")
             .env("BROADWAY_DISPLAY", format!(":{}", broadway.display))
@@ -856,16 +974,29 @@ mod tests {
     // `BroadwayServer::start` derives its display number from
     // `std::process::id()`, which is identical for every `#[test]` fn in
     // this one binary (cargo runs them as threads within a single process,
-    // not separate processes), so two independently re-exec'd tests would
-    // race to bind the *same* broadway display and one would fail with
-    // "Unable to write to server" — verified directly while writing this
-    // suite: splitting these into two `#[test]` fns intermittently failed
-    // exactly that way under `cargo test --workspace`'s default parallelism.
-    // One test, one display, both checks.
+    // not separate processes), so two independently re-exec'd tests using
+    // the *same* base would race to bind the *same* broadway display and one
+    // would fail with "Unable to write to server" — verified directly while
+    // writing this suite: splitting these into two `#[test]` fns
+    // intermittently failed exactly that way under `cargo test
+    // --workspace`'s default parallelism. One test, one display, both
+    // checks — for these two specifically, since both exercise the same
+    // pre-built `HopWindow` construction path and neither needs anything
+    // the other's fixture does not already set up.
+    //
+    // `offline_indicator_reflects_connection_state` further down is issue #200's
+    // own, later addition, and deliberately does *not* join this function:
+    // it is a different, later concern (a widget's response to
+    // `IpcEvent`s, not keyboard/mouse dispatch), and — per
+    // `BroadwayServer::start`'s own updated doc comment — a distinct `base`
+    // is what actually resolves the collision this comment describes,
+    // making a second `#[test]` fn safe again without needing every
+    // GTK-dependent check in this file to share one function forever.
     #[test]
     fn keyboard_and_mouse_dispatch_use_the_keymap_and_the_real_window() {
         run_under_broadway(
             "ui::window::tests::keyboard_and_mouse_dispatch_use_the_keymap_and_the_real_window",
+            400,
         );
         if std::env::var_os(CHILD_MARKER).is_none() {
             return;
@@ -1140,5 +1271,80 @@ mod tests {
         );
 
         println!("stale marker span guard assertions passed");
+    }
+
+    /// Issue #200's own production-wiring proof: [`HopWindow::apply_event`]
+    /// is the one call site that ever shows or hides the offline indicator, and
+    /// this is what proves it actually does — not
+    /// `tests/honesty_locked_provider.rs`'s job, which builds an
+    /// [`OfflineIndicator`] directly and never touches `apply_event` at all. Uses
+    /// its own `BroadwayServer` at base `550` — the first base not already
+    /// claimed by another file under `tests/` or by this file's own first
+    /// test above (`400`) — rather than joining that test, per
+    /// `BroadwayServer::start`'s own updated doc comment.
+    #[test]
+    fn offline_indicator_reflects_connection_state() {
+        run_under_broadway(
+            "ui::window::tests::offline_indicator_reflects_connection_state",
+            550,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.OfflineIndicator");
+        // `gtk::Widget::is_visible` (unlike `set_visible`'s own paired
+        // property alone) also checks every ancestor's own visibility —
+        // and a pre-built `HopWindow`'s toplevel starts unpresented, itself
+        // not visible, per this whole crate's "pre-built hidden window"
+        // design (`app`'s own module doc). Without `present_with_token`
+        // here, *every* visibility assertion below — shown or hidden —
+        // would trivially read `false` regardless of what
+        // `OfflineIndicator::apply` actually did, proving nothing.
+        // `assert_dispatch_action_moves_selection_and_activates` above hits
+        // the identical requirement for `window.window.is_visible()` at its
+        // own Dismiss check.
+        window.present_with_token(None);
+
+        assert!(
+            !window.offline_indicator.widget.is_visible(),
+            "a freshly built window must not show the offline indicator before any IpcEvent has \
+             arrived — there is nothing honest to show yet"
+        );
+
+        window.apply_event(IpcEvent::Disconnected);
+        assert!(
+            window.offline_indicator.widget.is_visible(),
+            "IpcEvent::Disconnected must show the offline indicator"
+        );
+
+        // No privileged access to `OfflineIndicator`'s own private `stamp`
+        // field needed here — the same plain `first_child`/`next_sibling`
+        // widget-tree walk `tests/honesty_locked_provider.rs` already uses
+        // finds it back out: `OfflineIndicator::build`'s own doc comment fixes
+        // the stamp label as the container's second child, right after the
+        // (never-changing) text label.
+        let stamp_label = window
+            .offline_indicator
+            .widget
+            .first_child()
+            .and_then(|text| text.next_sibling())
+            .and_then(|stamp| stamp.downcast::<gtk::Label>().ok())
+            .expect("the offline indicator must have a stamp label as its second child");
+        assert!(
+            stamp_label.text().starts_with("as of "),
+            "the offline indicator's stamp must read \"as of HH:MM\" once shown, got: {:?}",
+            stamp_label.text()
+        );
+
+        window.apply_event(IpcEvent::Connected);
+        assert!(
+            !window.offline_indicator.widget.is_visible(),
+            "IpcEvent::Connected must hide the offline indicator again"
+        );
+
+        println!("the offline indicator shows on Disconnected and hides on Connected");
     }
 }

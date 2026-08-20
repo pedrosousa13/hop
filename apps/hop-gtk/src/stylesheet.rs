@@ -72,6 +72,113 @@ pub fn resolve(palette: Palette, motion: Motion) -> String {
     resolve_template(STYLESHEET_TEMPLATE, palette, motion)
 }
 
+/// The literal markers bracketing the honesty-critical block in
+/// `assets/stylesheet.css` — see that file's own "HONESTY-CRITICAL
+/// SELECTORS" section and its `HOP-HONESTY-LOCKED-BLOCK-START`/`-END`
+/// comment pair. Two `const`s, not one shared prefix a caller derives both
+/// from, because the two are searched for independently by
+/// [`locked_block_slice`] and giving each its own name makes a failure
+/// message ("missing `{START}`" vs "missing `{END}`") name the actual
+/// marker that went missing rather than a computed half of a shared string.
+///
+/// The two are not symmetric strings, and that asymmetry is deliberate.
+/// `assets/stylesheet.css`'s real `-START` sentinel is a long comment,
+/// explaining itself to a reader who lands on it directly in that file —
+/// this constant only needs to name it *uniquely*, not spell it in full, so
+/// it stops right after the text that makes it unique and leaves the rest
+/// (including that comment's own closing `*/`) for [`locked_block_slice`]
+/// to find separately. The `-END` sentinel carries no such prose — it is
+/// one short, self-closed comment — so this constant is simply that whole
+/// comment, `*/` included, and needs no second search to find where it ends.
+const LOCKED_BLOCK_START: &str = "/* HOP-HONESTY-LOCKED-BLOCK-START";
+const LOCKED_BLOCK_END: &str = "/* HOP-HONESTY-LOCKED-BLOCK-END */";
+
+/// Resolves *only* the honesty-critical block of hop's real stylesheet for
+/// `palette` and `motion` — `style.rs`'s second [`gtk::CssProvider`], the
+/// one it installs above `gtk::STYLE_PROVIDER_PRIORITY_USER`, loads exactly
+/// this text and nothing else.
+///
+/// [`gtk::CssProvider`]: https://docs.gtk.org/gtk4/class.CssProvider.html
+///
+/// # One source of text, not two
+///
+/// The obvious-looking alternative — author the locked declarations a
+/// second time, in a second file or a second Rust string literal, and load
+/// that into the second provider — was rejected before it was written:
+/// `assets/stylesheet.css`'s own header already forbids exactly this shape
+/// ("no design value appears as a literal in both the stylesheet and
+/// `tokens.css`"), and a hand-duplicated locked block is the identical
+/// hazard one file over — two texts that must agree forever, with nothing
+/// but a human's discipline keeping them in lockstep, the same drift risk
+/// that rule exists to close for every *other* value in this file. Worse
+/// here than most: the two literal dimensions on `.hop-honesty .hop-skeleton`
+/// (`24px`/`9px`) are already, deliberately, un-tokenized (per the contract's
+/// own "fixed declarations, not overridable custom properties" requirement
+/// — that rule's own comment in `assets/stylesheet.css` explains why), so
+/// there is no shared `--name` either copy could point at instead of
+/// repeating the literal outright. A second copy would have meant a third
+/// place carrying `24px`/`9px` by hand, on top of the two
+/// `assets/stylesheet.css`'s own comment already tracks against
+/// `assets/tokens.css`.
+///
+/// This function instead treats `assets/stylesheet.css` as the *only*
+/// place the locked block is ever written down: [`locked_block_slice`]
+/// finds the exact substring of the raw, unresolved template between the
+/// `HOP-HONESTY-LOCKED-BLOCK-START`/`-END` sentinel comments — the same
+/// four rules a reader sees inline in the "HONESTY-CRITICAL SELECTORS"
+/// section — and [`resolve_template`] resolves *that slice*, through the
+/// identical placeholder pipeline [`resolve`] uses for the whole file. If
+/// the ordinary sheet's honesty-critical rules ever change, this function's
+/// output changes with them automatically, because there is only the one
+/// piece of source text for both to read.
+pub fn resolve_locked_block(palette: Palette, motion: Motion) -> String {
+    resolve_template(locked_block_slice(STYLESHEET_TEMPLATE), palette, motion)
+}
+
+/// Finds the exact substring of `template` between the
+/// `HOP-HONESTY-LOCKED-BLOCK-START`/`-END` sentinel comments — the slice
+/// [`resolve_locked_block`] resolves — panicking naming whichever sentinel
+/// is missing, the same fail-loudly posture [`resolve_template`] already
+/// takes for a dangling `{{` (this is a build-time-checkable defect in
+/// `assets/stylesheet.css` itself, not a runtime condition to degrade
+/// around).
+///
+/// The returned slice starts *after* the `-START` marker's own closing
+/// `*/` is reached inside it (the marker text itself, `LOCKED_BLOCK_START`,
+/// stops short of `*/` on purpose — see that constant's own value — so this
+/// function finds the marker's own comment-closing `*/` itself, not
+/// `assets/stylesheet.css`'s next unrelated one) and ends *before* the
+/// `-END` marker begins, so neither sentinel comment is itself part of what
+/// gets resolved — only the four rules between them are. A caller comparing
+/// this slice's resolved output against [`resolve`]'s full-file output
+/// (see this module's `#[cfg(test)]` below) would otherwise see the two
+/// sentinel comments as a spurious difference having nothing to do with the
+/// declarations either actually cares about.
+fn locked_block_slice(template: &str) -> &str {
+    let after_start_marker = template.find(LOCKED_BLOCK_START).unwrap_or_else(|| {
+        panic!("assets/stylesheet.css is missing its {LOCKED_BLOCK_START:?} sentinel comment")
+    }) + LOCKED_BLOCK_START.len();
+    let start = after_start_marker
+        + template[after_start_marker..]
+            .find("*/")
+            .unwrap_or_else(|| {
+                panic!(
+                    "assets/stylesheet.css's {LOCKED_BLOCK_START:?} sentinel comment is never \
+                     closed with `*/`"
+                )
+            })
+        + "*/".len();
+    let end = template.find(LOCKED_BLOCK_END).unwrap_or_else(|| {
+        panic!("assets/stylesheet.css is missing its {LOCKED_BLOCK_END:?} sentinel comment")
+    });
+    assert!(
+        start <= end,
+        "assets/stylesheet.css's {LOCKED_BLOCK_START:?} sentinel must appear before its \
+         {LOCKED_BLOCK_END:?} pair, found the reverse"
+    );
+    &template[start..end]
+}
+
 /// [`resolve`] against an arbitrary `template` string rather than the real,
 /// bundled file — the seam the unit tests below use to exercise the missing-
 /// token and unterminated-placeholder failure paths without needing a
@@ -139,20 +246,59 @@ fn strip_comments(css: &str) -> String {
     out
 }
 
-/// Resolves one placeholder's inner text (`name`, `font:name`, or —
+/// Resolves one placeholder's inner text (`name`, `font:name`,
+/// `font-weight:name`, `font-size:name`, `font-family:name`, or —
 /// issue #207 — `motion:name`) to its concrete value. Panics naming the
 /// token — via [`tokens::resolve`]/[`tokens::resolve_motion`], which already
 /// does this — if `name` has no declaration in `assets/tokens.css` under
 /// `palette`/`motion`, or if it is a `var()` cycle.
 ///
-/// `motion:` is checked before the bare, no-prefix arm (the same order
-/// `font:` already used) so a name that happens to start with neither
-/// prefix falls through to the plain `{{name}}` form exactly as before this
-/// issue — adding a second prefix does not change what an un-prefixed
-/// placeholder means.
+/// # Why `font-weight:`/`font-size:`/`font-family:`, alongside `font:` —
+/// issue #200's code-review fix
+///
+/// `font:` alone was the whole placeholder vocabulary until a review of
+/// issue #200 found it over-locking `assets/stylesheet.css`'s honesty-
+/// critical block: [`resolve_locked_block`] extracts that block's rules
+/// verbatim and loads them into the second, above-user-priority provider,
+/// and a `font:` shorthand's very definition sets `font-family` alongside
+/// weight and size — GTK's own CSS spec, matching ordinary CSS-Fonts
+/// shorthand semantics here, gives `font:` no way to name weight and size
+/// without also naming (or resetting) family. Loading that shorthand into
+/// the locked provider therefore locked family too, which
+/// `docs/theme-token-contract.md:18-20` explicitly forbids: "the boundary
+/// is narrow. On honesty-critical elements, a user theme may still restyle
+/// the font family and accent, provided the element remains present and
+/// legible." Splitting the shorthand into three longhands — each resolved
+/// independently, through this same placeholder pipeline — is what lets
+/// `assets/stylesheet.css` put `font-weight:`/`font-size:` inside the
+/// locked block (contrast) and `font-family:` in the ordinary sheet only
+/// (never contested by the locked provider), rather than the whole
+/// three-in-one shorthand living only in the one place either the lock or
+/// the override would have to lose. See `assets/stylesheet.css`'s own
+/// comment on the `.hop-honesty-text`/`.hop-honesty-stamp` rules, right
+/// where the split actually lives, for the full account — including why
+/// the contract's own "as implemented today" paragraph (lines 69-71) still
+/// describes the pre-split, single-`font:` form and was deliberately left
+/// unedited (editing `docs/theme-token-contract.md`'s normative text is
+/// out of scope for this fix).
+///
+/// `motion:` is checked after the four `font`-prefixed arms and before the
+/// bare, no-prefix arm (the same relative position `font:` already held)
+/// so a name that happens to start with none of them falls through to the
+/// plain `{{name}}` form exactly as before either issue — adding more
+/// prefixes never changes what an un-prefixed placeholder means.
 fn resolve_placeholder(inner: &str, palette: Palette, motion: Motion) -> String {
     if let Some(name) = inner.strip_prefix("font:") {
         return font_shorthand_no_line_height(&tokens::resolve(name.trim(), palette));
+    }
+    if let Some(name) = inner.strip_prefix("font-weight:") {
+        return font_weight_only(&tokens::resolve(name.trim(), palette));
+    }
+    if let Some(name) = inner.strip_prefix("font-size:") {
+        return font_size_only(&tokens::resolve(name.trim(), palette));
+    }
+    if let Some(name) = inner.strip_prefix("font-family:") {
+        return font_family_only(&tokens::resolve(name.trim(), palette));
     }
     if let Some(name) = inner.strip_prefix("motion:") {
         return tokens::resolve_motion(name.trim(), motion);
@@ -179,28 +325,81 @@ fn resolve_placeholder(inner: &str, palette: Palette, motion: Motion) -> String 
 /// before this function ever runs), just the one bounded text transform GTK's
 /// narrower shorthand needs.
 ///
-/// Splits `raw` on ASCII whitespace into exactly three pieces
-/// (`splitn(3, ...)`, matching every `--hop-text-*` token's own shape: one
-/// weight, one `<size>/<line>` pair with no internal whitespace, then a
-/// family list that legitimately contains its own internal whitespace after
-/// each comma and must not be re-split) and drops the `/<line-height>` half
-/// of the middle piece. Falls back to returning `raw` unchanged, piece by
-/// piece, if a piece is missing — this function is only ever called on a
-/// `{{font:...}}` placeholder's already-resolved value, which is always one
-/// of `tokens.css`'s own `--hop-text-*` tokens, so a malformed input here
-/// would be a bug in `tokens.css` itself, not something this function should
-/// paper over by inventing a value; the caller (`resolve_placeholder`) does
-/// no validation of its own; a shape this function cannot make sense of
+/// [`split_font_token`] does the actual splitting — on ASCII whitespace,
+/// into exactly three pieces (`splitn(3, ...)`, matching every
+/// `--hop-text-*` token's own shape: one weight, one `<size>/<line>` pair
+/// with no internal whitespace, then a family list that legitimately
+/// contains its own internal whitespace after each comma and must not be
+/// re-split), already dropping the `/<line-height>` half of the middle
+/// piece — this function just rejoins the three fields `font:` actually
+/// wants. Falls back to an empty piece, not a panic, if one is missing —
+/// this function is only ever called on a `{{font:...}}` placeholder's
+/// already-resolved value, which is always one of `tokens.css`'s own
+/// `--hop-text-*` tokens, so a malformed input here would be a bug in
+/// `tokens.css` itself, not something this function should paper over by
+/// inventing a value; the caller (`resolve_placeholder`) does no
+/// validation of its own; a shape this function cannot make sense of
 /// simply best-effort passes each recognisable piece through, keeping any
-/// resulting CSS parse error visible rather than silently dropping the whole
-/// placeholder.
+/// resulting CSS parse error visible rather than silently dropping the
+/// whole placeholder.
 fn font_shorthand_no_line_height(raw: &str) -> String {
+    let (weight, size, family) = split_font_token(raw);
+    format!("{weight} {size} {family}")
+}
+
+/// Splits an already-resolved `--hop-text-*` value into its three
+/// meaningful fields — weight, `<size>` (the `/<line-height>` segment
+/// already dropped), and family-list — the one parse
+/// [`font_shorthand_no_line_height`], [`font_weight_only`],
+/// [`font_size_only`], and [`font_family_only`] all build on. Extracted
+/// once issue #200's code review added the latter three functions, so the
+/// four `{{font...}}` placeholder forms share one splitting rule and can
+/// never disagree about where one field ends and the next begins — the
+/// same "one source of truth, not four near-duplicates" reasoning this
+/// module's own doc comment already applies to `resolve_locked_block`
+/// versus a hand-duplicated second copy of the locked block's text.
+///
+/// Same whitespace-splitting shape [`font_shorthand_no_line_height`]
+/// always used, and the same deliberately permissive fallback: a piece
+/// this function cannot find is `""`, not a panic — see
+/// [`font_shorthand_no_line_height`]'s own doc comment for why a malformed
+/// input here would be a bug in `tokens.css` itself, not a condition this
+/// text transform should paper over.
+fn split_font_token(raw: &str) -> (&str, &str, &str) {
     let mut parts = raw.splitn(3, char::is_whitespace);
     let weight = parts.next().unwrap_or_default();
     let size_and_line = parts.next().unwrap_or_default();
     let family = parts.next().unwrap_or_default();
     let size = size_and_line.split('/').next().unwrap_or(size_and_line);
-    format!("{weight} {size} {family}")
+    (weight, size, family)
+}
+
+/// Resolves a `{{font-weight:name}}` placeholder — issue #200's code-review
+/// fix, [`resolve_placeholder`]'s own doc comment for the full "why a
+/// longhand, not the `font:` shorthand" account. Just the first of
+/// [`split_font_token`]'s three fields, as a `String` a caller can own the
+/// same way every other placeholder resolver in this file returns one.
+fn font_weight_only(raw: &str) -> String {
+    split_font_token(raw).0.to_string()
+}
+
+/// Resolves a `{{font-size:name}}` placeholder — the second of
+/// [`split_font_token`]'s three fields (the `/<line-height>` segment
+/// already stripped by that shared helper), for the identical reason
+/// [`font_weight_only`] exists.
+fn font_size_only(raw: &str) -> String {
+    split_font_token(raw).1.to_string()
+}
+
+/// Resolves a `{{font-family:name}}` placeholder — the third of
+/// [`split_font_token`]'s three fields. `assets/stylesheet.css`'s ordinary,
+/// application-priority `.hop-honesty-text`/`.hop-honesty-stamp` rules are
+/// this function's one call site: family is deliberately never resolved
+/// inside the `HOP-HONESTY-LOCKED-BLOCK-START`/`-END` sentinels, which is
+/// the entire point of splitting the shorthand in the first place — see
+/// [`resolve_placeholder`]'s own doc comment.
+fn font_family_only(raw: &str) -> String {
+    split_font_token(raw).2.to_string()
 }
 
 #[cfg(test)]
@@ -230,6 +429,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #200's own version of the guard above, narrowed to
+    /// `resolve_locked_block`'s output rather than the whole file — the
+    /// locked block goes through the identical `{{name}}`/`{{font:name}}`
+    /// placeholder pipeline [`resolve`] uses, so it needs the identical
+    /// proof that nothing substitutes cleanly on paper but leaves a marker
+    /// behind.
+    #[test]
+    fn resolved_locked_block_has_no_leftover_placeholder() {
+        for palette in [Palette::Dark, Palette::Light] {
+            for motion in [Motion::Full, Motion::Reduced] {
+                let resolved = resolve_locked_block(palette, motion);
+                assert!(
+                    !resolved.contains("{{") && !resolved.contains("}}"),
+                    "the {palette:?}/{motion:?}-resolved locked block still contains a \
+                     `{{{{`/`}}}}` marker"
+                );
+            }
+        }
+    }
+
+    /// [`resolve_locked_block`]'s whole reason to exist: its output must
+    /// carry exactly the four honesty-critical rules — `.hop-honesty`
+    /// itself, `.hop-honesty-text`, `.hop-honesty-stamp`, and
+    /// `.hop-honesty .hop-skeleton` — and *nothing* from the rest of the
+    /// file. The first half alone would pass for a function that
+    /// (incorrectly) returned the entire resolved sheet; the second half is
+    /// what actually proves this is the narrow, above-user-priority slice
+    /// `style.rs`'s second provider is allowed to carry, not the whole
+    /// sheet by another name — a hostile theme could otherwise contest
+    /// anything the *ordinary* provider styles, not just the locked
+    /// categories, exactly the failure this issue's brief calls out
+    /// ("raising the ordinary sheet's priority would silently revoke" the
+    /// contract's "everywhere outside the honesty-critical class"
+    /// guarantee).
+    #[test]
+    fn resolved_locked_block_carries_exactly_the_four_honesty_rules_and_nothing_else() {
+        let locked = resolve_locked_block(Palette::Dark, Motion::Full);
+
+        for must_contain in [
+            ".hop-honesty {",
+            ".hop-honesty .hop-honesty-text {",
+            ".hop-honesty .hop-honesty-stamp {",
+            ".hop-honesty .hop-skeleton {",
+            "opacity: 1;",
+            "min-width: 24px;",
+            "min-height: 9px;",
+        ] {
+            assert!(
+                locked.contains(must_contain),
+                "the locked block must contain {must_contain:?}, got:\n{locked}"
+            );
+        }
+
+        for must_not_contain in [
+            // A selector from well outside the honesty-critical section —
+            // proves the slice does not run past its own `-END` sentinel
+            // into the rest of the file.
+            ".hop-status",
+            ".hop-row-hint-label",
+            "window.background",
+            // The sentinel comments themselves must not survive into the
+            // resolved text — `resolve_template`'s comment-stripping
+            // already guarantees this for every `/* ... */` span, but this
+            // pins it for these two specifically, since a caller diffing
+            // this output against a hand-written expectation would
+            // otherwise see them as a spurious difference (this module's
+            // own doc comment on `locked_block_slice` makes the same
+            // point).
+            "HOP-HONESTY-LOCKED-BLOCK",
+        ] {
+            assert!(
+                !locked.contains(must_not_contain),
+                "the locked block must not contain {must_not_contain:?}, got:\n{locked}"
+            );
+        }
+    }
+
+    /// [`locked_block_slice`]'s own failure path: a template missing the
+    /// `-START` sentinel entirely must panic naming it, rather than
+    /// silently returning some other, wrong slice (or the whole string).
+    #[test]
+    #[should_panic(expected = "HOP-HONESTY-LOCKED-BLOCK-START")]
+    fn locked_block_slice_panics_when_the_start_sentinel_is_missing() {
+        locked_block_slice(".hop-honesty { opacity: 1; }\n/* HOP-HONESTY-LOCKED-BLOCK-END */");
+    }
+
+    /// The `-END` sentinel's identical failure path.
+    #[test]
+    #[should_panic(expected = "HOP-HONESTY-LOCKED-BLOCK-END")]
+    fn locked_block_slice_panics_when_the_end_sentinel_is_missing() {
+        locked_block_slice(
+            "/* HOP-HONESTY-LOCKED-BLOCK-START trailing prose */\n.hop-honesty { opacity: 1; }",
+        );
     }
 
     /// A placeholder naming a token `assets/tokens.css` does not declare
@@ -486,6 +780,54 @@ mod tests {
         assert!(
             resolved.contains("font: 500 13.5px \"Inter\""),
             "expected the 3-field shorthand with no `/<line-height>` segment, got: {resolved}"
+        );
+    }
+
+    /// [`font_weight_only`]/[`font_size_only`]/[`font_family_only`]'s own
+    /// unit coverage — issue #200's code-review fix — the same isolated-
+    /// from-`tokens::resolve` shape `font_shorthand_strips_the_line_height_segment`
+    /// above uses, proving each longhand extracts exactly its own field and
+    /// nothing else from the identical raw token text that test's shorthand
+    /// case already covers.
+    #[test]
+    fn font_longhand_helpers_each_extract_their_own_field() {
+        let raw = "500 13.5px/20px \"Inter\", -apple-system, \"Cantarell\", sans-serif";
+        assert_eq!(font_weight_only(raw), "500");
+        assert_eq!(font_size_only(raw), "13.5px");
+        assert_eq!(
+            font_family_only(raw),
+            "\"Inter\", -apple-system, \"Cantarell\", sans-serif"
+        );
+    }
+
+    /// The locked-block half of
+    /// `font_placeholder_resolves_to_the_gtk_accepted_shorthand_form` above:
+    /// `{{font-weight:name}}`/`{{font-size:name}}`, resolved end to end
+    /// against the real token table, must produce bare weight/size values
+    /// with no family and no `/<line-height>` segment — the exact shape
+    /// `assets/stylesheet.css`'s locked `.hop-honesty-text`/
+    /// `.hop-honesty-stamp` rules need so the above-user-priority provider
+    /// never contests `font-family`.
+    #[test]
+    fn font_weight_and_size_placeholders_resolve_with_no_family_or_line_height() {
+        let resolved = resolve_template(
+            ".x { font-weight: {{font-weight:hop-text-error}}; \
+             font-size: {{font-size:hop-text-error}}; }",
+            Palette::Dark,
+            Motion::Full,
+        );
+        assert!(
+            resolved.contains("font-weight: 500;"),
+            "expected the bare weight with no other field, got: {resolved}"
+        );
+        assert!(
+            resolved.contains("font-size: 13.5px;"),
+            "expected the bare size with the `/<line-height>` segment dropped, got: {resolved}"
+        );
+        assert!(
+            !resolved.contains("Inter"),
+            "a `{{{{font-weight:...}}}}`/`{{{{font-size:...}}}}` placeholder must never leak \
+             the family list into the resolved sheet, got: {resolved}"
         );
     }
 }
