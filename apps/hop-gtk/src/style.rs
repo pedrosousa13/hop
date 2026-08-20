@@ -132,7 +132,16 @@ use crate::tokens::Palette;
 /// decision this module's own doc comment explains. Called once per
 /// process, from a `connect_startup` handler — see `app.rs` for the two call
 /// sites and why both exist.
-pub fn install(display: &gtk::gdk::Display) {
+///
+/// Returns the installed [`gtk::CssProvider`] itself, so a caller can hold
+/// the exact live instance `follow_colour_scheme` is reloading. `app.rs`'s
+/// own call sites drop it (a colour-scheme change reloads the provider
+/// through the display it is already attached to; nothing in production
+/// code needs to touch it again after installing it), but a test that wants
+/// to prove the runtime colour-scheme hook actually fires needs a handle to
+/// the *same* provider to read back with [`gtk::CssProvider::to_str`] after
+/// driving a change — see `tests/style_colour_scheme.rs`.
+pub fn install(display: &gtk::gdk::Display) -> gtk::CssProvider {
     let provider = gtk::CssProvider::new();
     guard_parse_errors(&provider);
     reload(&provider, initial_palette());
@@ -143,7 +152,8 @@ pub fn install(display: &gtk::gdk::Display) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    follow_colour_scheme(provider);
+    follow_colour_scheme(provider.clone());
+    provider
 }
 
 /// The palette to load at startup, before any `notify::dark` has ever
