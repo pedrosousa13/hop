@@ -78,6 +78,7 @@ use gtk::{gdk, glib};
 
 use hop_protocol::{IconPath, IconSpec, Item};
 
+use crate::icon_roots;
 use crate::tokens;
 
 /// GTK's own stand-in icon for "something was supposed to be here and
@@ -173,9 +174,10 @@ fn find_named_child<W: IsA<gtk::Widget>>(container: &gtk::Box, name: &str) -> Op
 }
 
 /// Reads `path` and decodes it into a texture, or `None` on any failure —
-/// the open refused, the read failed, or the bytes did not decode as an
-/// image [`bind`]'s `Path` arm treats identically: all three collapse to
-/// "set `image-missing`", per this issue's brief.
+/// the open refused, the resolved target is outside every allowed icon
+/// root, the read failed, or the bytes did not decode as an image —
+/// [`bind`]'s `Path` arm treats all four identically: "set `image-missing`",
+/// per this issue's brief and issue #93's.
 ///
 /// [`IconPath::open_regular_file`] is the only opener this crate uses —
 /// issue #190's agent brief named it the one call that issue's work may use
@@ -188,8 +190,27 @@ fn find_named_child<W: IsA<gtk::Widget>>(container: &gtk::Box, name: &str) -> Op
 /// `gdk::Texture::from_file`/`from_filename`) bypasses that check entirely.
 /// Nothing here — and nothing reachable from here — opens `path` any other
 /// way.
+///
+/// # Issue #93: the allow-list check, right after the open
+///
+/// `open_regular_file` deliberately does not check that `path` sits under
+/// any allowed root — `IconPath`'s own doc comment names that as an
+/// obligation on whoever resolves the path, not something the wire
+/// contract can enforce (the roots are environment-dependent; see that
+/// type's "Where an icon is expected to live" section). This is the one
+/// place in `hop-gtk` — the client, and the process whose environment is
+/// authoritative — that resolves a path, so this is where that obligation
+/// is discharged: `icon_roots::ALLOWED_ICON_ROOTS.permits(&file)` runs on
+/// the descriptor `open_regular_file` already returned, before a single
+/// byte is read from it. See [`icon_roots::AllowedIconRoots::permits`] for
+/// the mechanism (resolving the open descriptor via `/proc/self/fd`, not
+/// re-resolving the path) and why it, rather than `openat2` or
+/// `O_NOFOLLOW`, was chosen.
 fn load_path_texture(path: &IconPath) -> Option<gdk::Texture> {
     let mut file = path.open_regular_file().ok()?;
+    if !icon_roots::ALLOWED_ICON_ROOTS.permits(&file) {
+        return None;
+    }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
     gdk::Texture::from_bytes(&glib::Bytes::from(&bytes)).ok()
@@ -211,7 +232,11 @@ fn load_path_texture(path: &IconPath) -> Option<gdk::Texture> {
 ///   like the `Name` arm's own fallback from a caller's point of view — a
 ///   promise that was broken renders the same as a lookup that came up
 ///   empty, distinct only from a promise that was never made (`None`,
-///   above).
+///   above). Issue #93's allow-list refusal — `path` opened but its
+///   resolved target sits outside every allowed icon root — is one more
+///   way [`load_path_texture`] can return `None`, not a fourth outcome this
+///   function has to know about: it reaches this arm's existing failure
+///   branch exactly like an open refusal or a decode failure would.
 fn resolve_icon(icon: &gtk::Image, spec: Option<&IconSpec>) {
     match spec {
         None => icon.clear(),

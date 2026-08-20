@@ -64,6 +64,7 @@ use std::time::Duration;
 use gio::prelude::*;
 use gtk::prelude::*;
 
+use crate::icon_roots;
 use crate::ipc::{self, IpcEvent};
 use crate::{cli, screenshot, style, ui};
 
@@ -106,6 +107,32 @@ const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// same code the `Usage` arm above already uses, per that decision: no new
 /// error channel, no new exit code.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
+    // Forces issue #93's icon allow-list to compute now, from this
+    // process's own environment, rather than lazily on whatever thread
+    // first binds a row carrying an `IconSpec::Path` icon.
+    // `icon_roots::ALLOWED_ICON_ROOTS` is a `LazyLock` — the same
+    // process-wide-constant-computed-once mechanism `tokens::ROW_HEIGHT_PX`
+    // and its siblings already use — so `LazyLock::force` changes nothing
+    // about *what* gets computed: an unforced first read from `ui::row`
+    // would run the identical closure. What this line buys is that the
+    // computation happens here, at the point this file's own doc comments
+    // already treat as this process's startup, instead of silently on
+    // whatever the first rendered row happens to be — see `icon_roots`'s
+    // module doc for the fuller argument for a process-global value over
+    // threading one through `ui::view::bind`/`ui::row::bind`.
+    //
+    // One call site here covers both run modes below: `run_interactive`
+    // and `run_screenshot` are both dispatched from this function, after
+    // this line, and a process whose `GApplication::run` only forwards its
+    // `activate` to an already-running primary instance (see this module's
+    // own top doc comment) exits before either mode's `connect_activate`
+    // handler — and therefore before any icon — is ever reached. So unlike
+    // `install_stylesheet`, which both `connect_startup` handlers register
+    // because each run mode needs its own GDK display styled, there is no
+    // second environment this would need to see: whichever mode actually
+    // runs, it runs in the same process this line already ran in.
+    std::sync::LazyLock::force(&icon_roots::ALLOWED_ICON_ROOTS);
+
     let parsed = cli::parse(args);
 
     let socket = match &parsed {

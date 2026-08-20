@@ -3,7 +3,7 @@
 Date: 2026-08-02
 Issue: [#53](https://github.com/pedrosousa13/hop/issues/53)
 Milestone: M2 — Daemon
-Status: Recorded; amended 2026-08-04, 2026-08-06, 2026-08-10, 2026-08-17, 2026-08-18, 2026-08-19
+Status: Recorded; amended 2026-08-04, 2026-08-06, 2026-08-10, 2026-08-17, 2026-08-18, 2026-08-19, 2026-08-20
 Decisions by: Pedro Sousa
 
 Two design forks are settled here —
@@ -142,7 +142,14 @@ this pass: closing a stale note is not the same claim as closing a gap, and
 nothing here asserts the latter where the code does not. **[Amended
 2026-08-18]** #98 is no longer a residual: the connection-level bounds below
 are implemented as same-uid robustness controls, not as a hostile-peer
-security boundary.
+security boundary. **[Amended 2026-08-20]** #93 is no longer a residual
+either: `hop-gtk`'s `icon_roots` module (`918c35f`) enforces the icon-path
+allow-list at `ui::row::load_path_texture`, the one place a `File`
+`IconPath::open_regular_file` returns is read. `hop-protocol` and `hopd` are
+unchanged — the enforcement is client-side only, deliberately, not a first
+half of a daemon-side check still to come. See T8 and "What the contract
+does not enforce" below for the full account of what closing it does and
+does not claim.
 
 **Amendment, 2026-08-18.** Issue #75's learning-lookup optimization changes
 T7's query-path cost claim. `MAX_QUERY_TEXT` remains the daemon's wire cap;
@@ -407,6 +414,50 @@ as it describes the derived one.
 
 Each changed passage below is marked **[Amended 2026-08-19]** in place, the
 same shape this document's other amendments already use.
+
+**Amendment, 2026-08-20.** Issue #93 landed (`918c35f`), closing T8's
+icon-path residual — the open half #24 deliberately split out when it left
+the allowed icon roots documented rather than enforced.
+
+`hop-gtk`'s new `icon_roots` module computes the roots once, at startup,
+from that process's own `$HOME`, `$XDG_DATA_HOME` and `$XDG_DATA_DIRS` —
+exactly the list `IconPath`'s own docs give. `AllowedIconRoots::permits`
+checks them against `/proc/self/fd/<n>` for the descriptor
+`IconPath::open_regular_file` already returned, at
+`ui::row::load_path_texture`, before a byte is read — the check and the open
+refer to the same file, with no second resolution of the path string and no
+window between them. A refusal falls back to `image-missing`, the same
+outcome `resolve_icon` already gives any other `Path`-arm failure.
+
+This is client-side only, and deliberately so, not a first half of a
+daemon-side check still to come. `crates/` is untouched: `hop-protocol` and
+`hopd` carry none of this, and `IconPath::open_regular_file` still opens a
+procfs file exactly as before —
+`a_procfs_file_is_opened_because_it_is_a_regular_file` still pins that. Two
+reasons, both recorded on issue #93 rather than invented here. First, there
+is no privilege differential to defend today: the confused-deputy shape T8
+names has value only when the deputy has access the attacker lacks, and
+every provider today is in-process Rust inside `hopd`, with exactly the
+client's own access. Second, and decisively, `hopd` cannot reliably compute
+the *client's* roots — it runs as a systemd `--user` socket-activated
+service and is not guaranteed to inherit the interactive session's
+`XDG_DATA_DIRS` (Flatpak/Snap entries included), so a daemon-side check
+could refuse a value the client would accept, or accept one it would
+refuse, which is worse than no check. That stops holding at the v3 Tier 2
+sandboxed-plugin tier, the first point at which a provider could genuinely
+have less filesystem access than the client rendering its output — a
+daemon-side check becomes real defence in depth there. Closing this residual
+today is not a claim about that later version of it.
+
+Five passages change, each marked **[Amended 2026-08-20]** in place: the
+"remaining residual findings" list this document's 2026-08-17 amendment
+already amended once for #98; the "unenforced-roots half is #93 and is
+open" sentence under "What the contract enforces today"; the matching
+sentence under "What this model does not cover"; T8's row, whose trailing
+"the icon-path half is untouched by this — #93 remains open" clause this
+amendment exists specifically to correct; and the #93 row in the Follow-up
+table. Each keeps its original claim intact and carries the annotation
+after it, the same discipline every amendment before this one has followed.
 
 ---
 
@@ -804,7 +855,14 @@ address, accepted copy text is still arbitrary text, and an accepted icon path
 names *somewhere* rather than somewhere an icon belongs. #24 closing is
 therefore only half of the icon story — the unenforced-roots half is
 [#93](https://github.com/pedrosousa13/hop/issues/93) and is open, and it is
-recorded under "What the contract does not enforce" below.
+recorded under "What the contract does not enforce" below. **[Amended
+2026-08-20]** #93 is now **closed** (`918c35f`), but not by changing this
+paragraph's claim: the roots remain unenforced *in the wire contract*,
+deliberately, for the reason already given — they are environment-dependent,
+so a frame valid on one machine would be invalid on another if the contract
+enforced them. What #93 closed is the client's side of the gap, in
+`hop-gtk`, not `content.rs`. See "What the contract does not enforce" below
+for the corrected account.
 
 **Structural rules that need no validator.** `IconSpec` is an externally tagged
 enum (`IconSpec` [Amended 2026-08-18]) whose two arms are `Name(IconName)` and
@@ -886,7 +944,10 @@ and handing fields to the bounded deserializers (`limits` module docs [Amended 2
   both-set and neither-set cases. **Partial by design, and the module says so
   rather than claiming otherwise. The residual is not closed with #24 — it is
   [#93](https://github.com/pedrosousa13/hop/issues/93), which is open**, split
-  out of #24 for exactly this half. The icon roots are documented, not enforced
+  out of #24 for exactly this half. **[Amended 2026-08-20]** #93 is now
+  **closed** (`918c35f`): `hop-gtk`'s `icon_roots` module enforces the roots
+  described below against the file `IconPath::open_regular_file` already
+  opened, at `ui::row::load_path_texture`. The icon roots are documented, not enforced
   — they depend on `XDG_DATA_DIRS` and on whether Flatpak or Snap is installed,
   so enforcing them inside the wire contract would make a frame valid on one
   machine and invalid on another — and a symlink under a root still leads out.
@@ -949,7 +1010,7 @@ exists yet.
 | T5 | `execute` naming an item the daemon never delivered | `execute` | Length bounds only | Decision 1, implemented by #59. **[Amended 2026-08-10]** #59 is now **closed** (`4c1aff4`): `connection.rs`'s Execute arm resolves `item_id` against `Exchange::delivered`, the retained set, and refuses with `ErrorCode::UnknownItem` (`ErrorDetail::Item`) otherwise — an id lost to the per-query cap and one the daemon never emitted are refused identically, deliberately (see Decision 1, "What the implementing slice settled") |
 | T6 | `execute` naming an action the item does not carry | `execute` | Nothing ties `action_id` to `Item.actions` | Decision 1's second half — see below. **[Amended 2026-08-10]** #59 (`4c1aff4`) is closed: the same arm checks `action_id` against the resolved item's `actions` and refuses with `ErrorCode::UnknownAction` (`ErrorDetail::Action`) if it is not among them |
 | T7 | Query-path cost amplification | `query` | `MAX_QUERY_TEXT` bounds one query's bytes at the daemon wire boundary; ranking is `O(atoms × items)` with 4.09 s measured (#46). `Learning::record` separately bounds stored normalized `selections` keys, while direct embedders own the upstream bound for lookup cost. **[Amended 2026-08-18]** | `Pipeline::assemble` prepares the routed term once and reuses the normalized learning lookup across candidate items, so there is no per-candidate lowercase copy. The wire cap remains `MAX_QUERY_TEXT`; direct embedders own lookup-cost bounds. **[Amended 2026-08-18]** #61 is now **closed** (`80b7ffd`), whose PR introduced `rank.rs`'s `MAX_TERM_CHARS` (256), truncating the term before `Pattern::new` is built. #46 is closed separately, by `85b4c2f`, which turned that fixed truncation into a configurable knob and added `hopd`'s loader enforcement (`config.rs`'s `validate_max_term_chars`). |
-| T8 | A provider aiming a command-shaped outcome at a client | `executed`, and `Item.icon` on `results` | Content rules on `CopyText`/`OpenUrl` (#23, closed) and on `IconName`/`IconPath` (#24, closed) | Residual on both halves, and an **open** issue owns each: `Item.copy_text` still reaches the clipboard as a bare bounded string ([#78](https://github.com/pedrosousa13/hop/issues/78), open), and an icon path is validated but not contained — the roots are documented, not enforced, so a regular file outside them still opens ([#93](https://github.com/pedrosousa13/hop/issues/93), open, split out of #24 for this half). **[Amended 2026-08-10]** #78 is now **closed** (PR [#133](https://github.com/pedrosousa13/hop/pull/133)): `Item.copy_text` is `Option<content::CopyText>`, and `CopyText`'s only constructors apply the same content rules #23 already put on `ExecOutcome::CopyText` — refused control characters and the length bound — to every value that exists, in-process or off the wire. `content.rs`'s module docs name the one thing that still differs between the two routes: which field a refusal names. The icon-path half is untouched by this — #93 remains open |
+| T8 | A provider aiming a command-shaped outcome at a client | `executed`, and `Item.icon` on `results` | Content rules on `CopyText`/`OpenUrl` (#23, closed) and on `IconName`/`IconPath` (#24, closed) | Residual on both halves, and an **open** issue owns each: `Item.copy_text` still reaches the clipboard as a bare bounded string ([#78](https://github.com/pedrosousa13/hop/issues/78), open), and an icon path is validated but not contained — the roots are documented, not enforced, so a regular file outside them still opens ([#93](https://github.com/pedrosousa13/hop/issues/93), open, split out of #24 for this half). **[Amended 2026-08-10]** #78 is now **closed** (PR [#133](https://github.com/pedrosousa13/hop/pull/133)): `Item.copy_text` is `Option<content::CopyText>`, and `CopyText`'s only constructors apply the same content rules #23 already put on `ExecOutcome::CopyText` — refused control characters and the length bound — to every value that exists, in-process or off the wire. `content.rs`'s module docs name the one thing that still differs between the two routes: which field a refusal names. The icon-path half is untouched by this — #93 remains open. **[Amended 2026-08-20]** #93 is now **closed** (`918c35f`): `hop-gtk`'s `icon_roots` module checks the resolved target of the file `IconPath::open_regular_file` already opened, against an allow-list computed once at startup from this process's own environment, at `ui::row::load_path_texture` — before a byte is read from it. This is client-side only, deliberately: `hop-protocol` and `hopd` are unchanged, `IconPath::open_regular_file` still opens a procfs file exactly as before (the test pinning that behavior is untouched), and the refusal happens one layer up, in the one process whose environment is authoritative for its own roots. Today there is no privilege differential a daemon-side check would defend — every provider is in-process Rust inside `hopd` with exactly the client's access — and `hopd`, as a systemd `--user` socket-activated service, cannot reliably compute the client's roots anyway; a daemon-side check could refuse what the client would accept or the reverse. That changes at the v3 Tier 2 sandboxed-plugin tier, the first point where a provider could genuinely have less filesystem access than the client rendering its output — closing this residual today is not a claim about that later version of it |
 | T9 | Keystrokes reaching the journal, then a shared bundle | Logging | No logging dependency. `QueryText` redacts (#27, closed) — **in `hop-protocol` only**. `route` takes a `&str` and the pre-#83 `RoutedQuery` (its pre-#83 `RoutedQuery::term` field [Amended 2026-08-18]) derives `Debug` over a plain `String` term, so the same text formats verbatim in `hop-core`; `RoutedQuery`'s type docs [Amended 2026-08-18] say not to treat one as safe to log ([#83](https://github.com/pedrosousa13/hop/issues/83), open). **[Amended 2026-08-10]** #83 is now **closed** (`8bd6550`): `RoutedQuery` (`RoutedQuery` [Amended 2026-08-18]) carries `term` and `raw` as `RoutedText`, which redacts under `Debug` the same way `QueryText` does, so the same text no longer formats verbatim in `hop-core`; `RoutedQuery`'s type docs [Amended 2026-08-18] state the change in place | Any added logging keeps the redacting type at the field, and #83 carries the redaction across the crate boundary rather than stopping at `route`. **[Amended 2026-08-10]** Landed — see the Today column |
 | T10 | The learning store as untrusted input on load | Disk | Read and parse are bounded (#37, closed by `96d5713`); the `version` is refused on mismatch and a future-dated timestamp clamped (#38, closed by `59fd5fe`); the version probe and the per-condition `LoadReport` are #43's (closed by `056893e`, which replaced #38's two per-branch checks); a persisted `count` is saturated at the boundary (#44, closed by `edb8258`). **Two residuals, one owner**: still no integrity check, so a plausible forged store passes all of it — and eviction still prefers a clamped future-dated entry, which `96d5713` left open and `59fd5fe` explicitly did not close (#88, open) **[Amended 2026-08-10]** #72 (`4f5acf9`, `0c50a98`, `9a595bb`) has since landed on this same load path — provider-scoped keys, manifest-gated plaintext — without touching either residual named here **[Amended 2026-08-17]** #88 has landed: the v2 envelope verifies an HMAC-SHA256 before bounds, clamping, retention or boosts, and unsigned v1 is refused as `UnrecognizedVersion`. The fixed sibling `learning.key` is initialized when the first save reaches key creation after parent setup; once fully written and synced, it remains durable across a later store-write failure and later saves reuse it. Missing, unreadable or wrong-length keys and mismatched tags fail closed with distinct integrity reports; option A detects store-only writes and stores copied without their key, while a process that can read the key remains outside this guarantee. | #88's integrity check, which is what lets a forged entry be *refused* rather than clamped, sequenced with #72 and with Decision 2 on the same load path. **[Amended 2026-08-10]** #72 has landed; #88's integrity check is still what's needed for either residual **[Amended 2026-08-17]** #88 has landed; this integrity-check requirement is satisfied. See the adjacent Today cell for the implemented envelope, key boundary and verification order. |
 | T11 | The learning store as a disclosure at rest | Disk | Fail-open id scrubbing (the pre-#39 `canonicalize_result_id` path, replaced by `persistence_key` in #39 and retired with `is_known_safe_shape` by #72) [Amended 2026-08-10] [Amended 2026-08-18]. **[Amended 2026-08-10]** Decision 2's shape half has landed (#39, `193dc4d`, `e83c373`): `persistence_key` (`learning.rs`) now sits between that scrubbing and disk — an id outside the three known-safe shapes persists as `sha256:<hex>` rather than unchanged. **[Amended 2026-08-10]** The shape half described above is retired, not merely extended: issue #72 (`4f5acf9`, `0c50a98`, `9a595bb`) deleted the known-safe-shape check outright and made `ProviderManifest::ids_are_safe_to_persist_in_the_clear` the sole authority — an id from an opted-in provider persists in the clear regardless of its shape, and an id from any other provider, including one presenting an `app:`-shaped id, hashes. | Decision 2. **[Amended 2026-08-10]** Shape half done; the manifest opt-in half is still open, riding with #72 **[Amended 2026-08-10]** Landed: the field exists, required with no default, and every production manifest (`apps.rs`, `calculator.rs`, `hopd::source::SkeletonProvider`) states it explicitly |
@@ -1582,7 +1643,7 @@ What has to be true for this model to describe reality rather than intent:
 | [#57](https://github.com/pedrosousa13/hop/issues/57), M5 providers | Whatever the manifest field's default turns out to be, applied to each built-in provider: either each one declares whether its ids are safe to persist in plaintext, or the default covers those that say nothing. **[Amended 2026-08-10]** Not "open until #39 decides the default": #39 landed the shape half only and explicitly deferred the manifest default to #72 (see the #39 row above) — open until #72 decides it **[Amended 2026-08-10]** #72 decided it: no default, the field required. Every built-in manifest states it explicitly — `apps.rs` and `hopd::source::SkeletonProvider` opt in, `calculator.rs` does not |
 | [#72](https://github.com/pedrosousa13/hop/issues/72) | **[Amended 2026-08-10] Landed.** The provider dimension the store key was missing (`4f5acf9`): `persistence_key` now folds `(provider, id)` into one key, by a composition proven injective in `provider_scoped_key`'s own doc comment, and `rank.rs`'s `Boosts::by_item_id` (`9a595bb`) carries the identical dimension in the ranker — closing T12 on both the persisted and in-memory sides. Alongside it, Decision 2's manifest half landed too (`0c50a98`): `ProviderManifest::ids_are_safe_to_persist_in_the_clear`, required with no default, is now the sole authority `persistence_key` consults, retiring the known-safe-shape check #39 landed rather than layering on top of it |
 | M3 (spec §8) | The empty-query view's behaviour for a provider that did not opt in — learned, ranked, and absent from that screen |
-| [#93](https://github.com/pedrosousa13/hop/issues/93) | The icon-root check #24 deliberately left out, and the open half of T8's pair: allowed roots computed at startup from `XDG_DATA_DIRS` and the icon theme spec's locations, enforced by whatever resolves the path, and checked against what the path resolves to rather than against the string |
+| [#93](https://github.com/pedrosousa13/hop/issues/93) | The icon-root check #24 deliberately left out, and the open half of T8's pair: allowed roots computed at startup from `XDG_DATA_DIRS` and the icon theme spec's locations, enforced by whatever resolves the path, and checked against what the path resolves to rather than against the string. **[Amended 2026-08-20]** **Closed** (`918c35f`): `hop-gtk`'s `icon_roots` module computes the roots once at startup from its own `$HOME`/`$XDG_DATA_HOME`/`$XDG_DATA_DIRS`, and `AllowedIconRoots::permits` checks them against `/proc/self/fd/<n>` for the descriptor `IconPath::open_regular_file` already returned — the opened file, not a second resolution of the path string — before `ui::row::load_path_texture` reads a byte. Client-side only: `hop-protocol` and `hopd` are unchanged, by design, for the reasons T8's row now gives |
 | [#83](https://github.com/pedrosousa13/hop/issues/83) | The open half of T9's pair: `RoutedQuery` holds the term as a plain `String` under a derived `Debug`, so the redaction `QueryText` applies in `hop-protocol` stops at `route`, which takes a `&str`. **[Amended 2026-08-10]** **Closed** (`8bd6550`): `RoutedQuery`'s `term` and `raw` are now `RoutedText`, which redacts under `Debug` the way `QueryText` does — see T9 |
 | [#88](https://github.com/pedrosousa13/hop/issues/88) | **[Amended 2026-08-17] Landed.** `hop-core` v2 learning envelopes carry an HMAC-SHA256 over the sorted version and entries, with a fixed sibling `learning.key`; verification precedes bounds and timestamp handling. Store-only writes and stores copied without the key fail closed; a process that can read the key remains outside option A's guarantee |
 | [#52](https://github.com/pedrosousa13/hop/issues/52) | The M2 sweep, auditing the code rather than inheriting this document's verdicts |
