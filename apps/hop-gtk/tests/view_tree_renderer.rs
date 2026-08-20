@@ -12,6 +12,32 @@
 //! whole sequence ever gets a different widget instance than the one
 //! before it.
 //!
+//! Issue #93 further extended the "--- issue #190" section's `Path`-arm
+//! coverage with the icon allow-list `ui::row::load_path_texture` now
+//! enforces (`icon_roots::ALLOWED_ICON_ROOTS`, in the crate's own
+//! `src/icon_roots.rs`): a path resolving outside every allowed icon root,
+//! a symlink under an allowed root that leads outside one, an ordinary
+//! themed icon reached through a symlink (still opens — the case that
+//! makes `O_NOFOLLOW` the wrong tool), and `/proc/self/mem` named
+//! literally. Doing that honestly, rather than by weakening the check for
+//! the test, required changing where this file's own fixture icon files
+//! live: they used to sit in a bare `tempfile::tempdir()`, which the
+//! allow-list now refuses on principle since nothing designates an
+//! arbitrary tempdir an icon root. This file's `#[test]` function now
+//! creates a *second* tempdir before re-exec'ing its child and hands it to
+//! the child as `XDG_DATA_HOME` (`Command::env`, which sets a child's
+//! environment and needs no `unsafe`, unlike mutating this process's own —
+//! see the section below), so the child's own `icon_roots::from_env`-driven
+//! computation genuinely includes it as an allowed root, rather than a
+//! test-only bypass of the real check. [`run_assertions`] then creates
+//! `$XDG_DATA_HOME/icons` inside it — the exact subdirectory
+//! `icon_roots::icon_roots` derives from that variable — and every fixture
+//! file the `Path`-arm coverage needs now lives there, alongside a handful
+//! deliberately placed outside it for the negative cases. The outer
+//! `#[test]` function holds the `TempDir` alive for the whole of the
+//! child's lifetime, exactly as [`BroadwayServer`] is held alive across the
+//! same `Command::output()` call.
+//!
 //! This is a different proof than `tests/headless_smoke.rs`'s: that test
 //! captures a rendered PNG and diffs two frames, which can show a title
 //! painted on screen but cannot show *which widget instance* is on screen,
@@ -123,10 +149,20 @@ fn setup_builds_a_dispatch_container_and_bind_recycles_the_row_widget() {
 
     let broadway = BroadwayServer::start();
 
+    // Stands in for the child's `$XDG_DATA_HOME`, so its own
+    // `icon_roots::from_env` computation includes `<this>/icons` as a real,
+    // startup-derived allowed root — see this file's module doc for why
+    // this exists and why it must be held alive (below) for the whole of
+    // the child's lifetime rather than dropped once `Command::env` has read
+    // its path.
+    let xdg_data_home = tempfile::tempdir()
+        .expect("failed to create a tempdir to stand in for the child's XDG_DATA_HOME");
+
     let output = Command::new(std::env::current_exe().unwrap())
         .env("GDK_BACKEND", "broadway")
         .env("BROADWAY_DISPLAY", format!(":{}", broadway.display))
         .env(CHILD_MARKER, "1")
+        .env("XDG_DATA_HOME", xdg_data_home.path())
         .arg("--exact")
         .arg("setup_builds_a_dispatch_container_and_bind_recycles_the_row_widget")
         .arg("--nocapture")
@@ -146,6 +182,20 @@ fn setup_builds_a_dispatch_container_and_bind_recycles_the_row_widget() {
 /// `BROADWAY_DISPLAY` are already set in its environment.
 fn run_assertions() {
     gtk::init().expect("gtk init under the broadway display this process's environment selects");
+
+    // The allowed icon root this process's own `icon_roots::from_env`
+    // computation derives from `$XDG_DATA_HOME` (set by the parent process
+    // above, on this child's environment, before it was spawned) — created
+    // here, inside the child, rather than by the parent, since it is this
+    // process's own `icon_roots::icon_roots` that decides the exact
+    // subdirectory name (`icons`) a root built this way has to have.
+    let xdg_data_home = std::env::var("XDG_DATA_HOME").expect(
+        "the parent process must set XDG_DATA_HOME on this child for issue #93's icon \
+         allow-list coverage below to have a real, startup-derived root to write fixtures into",
+    );
+    let icon_root = std::path::PathBuf::from(&xdg_data_home).join("icons");
+    std::fs::create_dir_all(&icon_root)
+        .expect("failed to create the allowed icon root this child was handed");
 
     // --- brief test 1: the slot's child after setup is the dispatch
     // container, not a bare label. Driven through the real factory
@@ -384,20 +434,21 @@ fn run_assertions() {
         "a theme miss must not change the row's reserved layout either"
     );
 
-    // `IconSpec::Path`, a real, decodable image file written to a
-    // `tempfile` directory and opened through
-    // `IconPath::open_regular_file` — the one opener issue #190's agent
-    // brief names as this crate's sole allowed way to open an icon file
-    // ("no second opener is introduced anywhere in the crate"); see
+    // `IconSpec::Path`, a real, decodable image file written under
+    // `icon_root` — an allowed icon root by construction (this file's
+    // module doc explains why it has to be, since issue #93) — and opened
+    // through `IconPath::open_regular_file` — the one opener issue #190's
+    // agent brief names as this crate's sole allowed way to open an icon
+    // file ("no second opener is introduced anywhere in the crate"); see
     // `load_path_texture`'s own doc comment in row.rs for why that
-    // restriction exists. `LARGE_ICON_PNG` is a valid, decodable 256x256
+    // restriction exists, and for issue #93's allow-list check this now
+    // also has to pass. `LARGE_ICON_PNG` is a valid, decodable 256x256
     // PNG, replacing a 1x1 pixel this test used before review — see its own
     // doc comment for what that change does and does not buy this
     // assertion — so `load_path_texture` inside `resolve_icon` should reach
     // its success path: a decoded `gdk::Texture` set as the image's
     // paintable.
-    let icon_dir = tempfile::tempdir().expect("failed to create a tempdir for a test icon file");
-    let real_icon_path = icon_dir.path().join("icon.png");
+    let real_icon_path = icon_root.join("icon.png");
     std::fs::write(&real_icon_path, LARGE_ICON_PNG).expect("failed to write the test icon file");
     let path_item = item_with_icon(
         7,
@@ -424,10 +475,15 @@ fn run_assertions() {
     // must set `image-missing` explicitly here — unlike the `Name` miss
     // case above, nothing about GTK's own rendering does this for a
     // `Paintable`-storage image, so `resolve_icon` has to do it itself.
+    // `icon_root` itself stands in for the directory: it is a real
+    // directory under an allowed root, and this case is about
+    // `open_regular_file`'s own regular-file check refusing it before
+    // issue #93's allow-list check would ever run, so which directory is
+    // used does not matter to what this assertion proves.
     let dir_item = item_with_icon(
         8,
         "path is a directory",
-        IconSpec::Path(icon_path(icon_dir.path())),
+        IconSpec::Path(icon_path(&icon_root)),
     );
     view::bind(&stack, &Node::for_item(dir_item));
     assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
@@ -444,7 +500,7 @@ fn run_assertions() {
     // distinct from the directory case above (that one never gets past
     // `open_regular_file` at all). Must land on the same `image-missing`
     // outcome.
-    let garbage_path = icon_dir.path().join("not-an-image.bin");
+    let garbage_path = icon_root.join("not-an-image.bin");
     std::fs::write(&garbage_path, b"this is not image data")
         .expect("failed to write the garbage test file");
     let garbage_item = item_with_icon(
@@ -460,6 +516,131 @@ fn run_assertions() {
         baseline_layout,
         "a decode failure must not change the row's reserved layout"
     );
+
+    // --- issue #93: the icon allow-list `ui::row::load_path_texture` now
+    // enforces on top of everything the section above already covers. Every
+    // fixture below sits under, or deliberately outside, `icon_root` — the
+    // allowed root this file's module doc explains how the parent process
+    // hands the child via `XDG_DATA_HOME`.
+
+    // A path that is a real, decodable image and would have rendered under
+    // the pre-#93 behavior, but sits in a plain tempdir this process's
+    // allow-list has no reason to trust: nothing designates an arbitrary
+    // directory an icon root just because a provider's `Icon=` line points
+    // at a file inside it. Must be refused, not opened.
+    let outside_dir =
+        tempfile::tempdir().expect("failed to create a tempdir outside every allowed icon root");
+    let outside_icon_path = outside_dir.path().join("icon.png");
+    std::fs::write(&outside_icon_path, LARGE_ICON_PNG)
+        .expect("failed to write the outside-root test icon file");
+    let outside_item = item_with_icon(
+        11,
+        "path resolves outside every allowed icon root",
+        IconSpec::Path(icon_path(&outside_icon_path)),
+    );
+    view::bind(&stack, &Node::for_item(outside_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
+    assert_eq!(
+        icon.icon_name().as_deref(),
+        Some("image-missing"),
+        "a path resolving outside every allowed icon root must not be opened — issue #93"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "an allow-list refusal must not change the row's reserved layout"
+    );
+
+    // A symlink that sits *under* an allowed root (`icon_root` itself) but
+    // whose target is the same outside-root file used above. Textually the
+    // path passed on the wire (`icon_root.join("escapes.png")`) looks
+    // exactly as trustworthy as `real_icon_path` above; only resolving it
+    // — which is the entire difficulty this issue's brief calls out — shows
+    // the difference. Must be refused, exactly as `outside_item` was,
+    // pinning that a symlink cannot be used to launder an outside-root
+    // path through an allowed directory.
+    let escaping_link = icon_root.join("escapes.png");
+    std::os::unix::fs::symlink(&outside_icon_path, &escaping_link)
+        .expect("failed to create the root-escaping symlink fixture");
+    let escaping_item = item_with_icon(
+        12,
+        "symlink under an allowed root leads outside every one",
+        IconSpec::Path(icon_path(&escaping_link)),
+    );
+    view::bind(&stack, &Node::for_item(escaping_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
+    assert_eq!(
+        icon.icon_name().as_deref(),
+        Some("image-missing"),
+        "a symlink under an allowed root that resolves outside every one must not be opened — \
+         issue #93, and the case a bare textual prefix check on the path string would have \
+         missed"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "an allow-list refusal via a symlink must not change the row's reserved layout"
+    );
+
+    // An ordinary symlink that both lives under an allowed root *and*
+    // resolves to a target still under that same root — the shape a real
+    // icon theme's own symlinks take (`/usr/share/icons/hicolor` is largely
+    // links between sizes and themes). This is the acceptance criterion
+    // that rules out `O_NOFOLLOW`: refusing to follow a symlink at all
+    // would refuse this one too, even though nothing about it reaches
+    // outside the allow-list. Must still open and decode, exactly like
+    // `path_item` above.
+    let themed_target = icon_root.join("themed-real.png");
+    std::fs::write(&themed_target, LARGE_ICON_PNG)
+        .expect("failed to write the themed-icon symlink target fixture");
+    let themed_link = icon_root.join("themed-link.png");
+    std::os::unix::fs::symlink(&themed_target, &themed_link)
+        .expect("failed to create the in-root themed-icon symlink fixture");
+    let themed_item = item_with_icon(
+        13,
+        "ordinary themed icon reached through a symlink",
+        IconSpec::Path(icon_path(&themed_link)),
+    );
+    view::bind(&stack, &Node::for_item(themed_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::Paintable);
+    assert!(
+        icon.paintable().is_some(),
+        "an ordinary symlink within an allowed root must still open and decode — the case that \
+         makes O_NOFOLLOW the wrong tool here, issue #93"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "a resolved icon reached through an in-root symlink must not change the row's reserved \
+         layout"
+    );
+
+    // `/proc/self/mem`, named literally per issue #93's acceptance
+    // criteria: the regular file the issue exists to close a path to. It
+    // passes every rule `IconPath::new` applies (absolute, no `..`
+    // component, no NUL, no control character) and `open_regular_file`
+    // opens it successfully (it really is a regular file by its mode), so
+    // only the allow-list check added by this issue stands between it and
+    // the decoder.
+    let procfs_item = item_with_icon(
+        14,
+        "proc self mem",
+        IconSpec::Path(icon_path(std::path::Path::new("/proc/self/mem"))),
+    );
+    view::bind(&stack, &Node::for_item(procfs_item));
+    assert_eq!(icon.storage_type(), gtk::ImageType::IconName);
+    assert_eq!(
+        icon.icon_name().as_deref(),
+        Some("image-missing"),
+        "/proc/self/mem must never be opened — issue #93"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "refusing /proc/self/mem must not change the row's reserved layout"
+    );
+
+    println!("row icon allow-list assertions passed");
 
     // Rebinding the same slot to `icon: None`, right after it held a
     // resolved icon (the garbage-path bind just above still shows

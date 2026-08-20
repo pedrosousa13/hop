@@ -15,6 +15,7 @@
 
 pub mod app;
 pub mod cli;
+mod icon_roots;
 pub mod ipc;
 pub mod keymap;
 pub mod layer_shell;
