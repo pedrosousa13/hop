@@ -184,6 +184,28 @@ const TITLE_CHILD_NAME: &str = "hop-row-title";
 /// string that could quietly drift apart from each other later. The icon
 /// and title widgets have no stylesheet rule of their own yet, so they have
 /// no equivalent CSS class to keep in sync — only this one needs both.
+///
+/// `ui/mode_label.rs`'s label carries only a CSS class (`"hop-mode-label"`)
+/// and no widget name at all — a single identity, not this constant's
+/// doubled one — and that precedent is worth naming here precisely because
+/// this module doesn't follow it. The difference is not an oversight: the
+/// mode label's own module never has to look that widget up out of a
+/// parent container by name, since `ui::window::HopWindow` keeps the
+/// `gtk::Label` handle `mode_label::build` returns for as long as the
+/// window lives and never has to rediscover it later. The subtitle has no
+/// such standing handle — [`bind`] and [`unbind`] are handed only the
+/// `Row` page's outer `gtk::Widget` each time GTK's list-view recycling
+/// calls them, and [`find_named_child`] is how they, and
+/// `tests/view_tree_renderer.rs`'s assertions, get back to the specific
+/// label a previous `build` call created — so a widget name is required
+/// here regardless of what CSS does. And CSS cannot substitute for one: a
+/// style class is not visible to `first_child`/`next_sibling`-based
+/// traversal the way `widget_name()` is, so `.hop-row-subtitle` can select
+/// this label for styling but could never answer [`find_named_child`]'s
+/// "which child is this" question in its place. Single identity is right
+/// for a widget nothing looks up by name; doubled identity is right for
+/// one that both needs styling and must be found again — the mode label
+/// and the subtitle simply are not the same shape of problem.
 const SUBTITLE_CHILD_NAME: &str = "hop-row-subtitle";
 
 /// The `Row` page's leading icon, reached out of `container` (the `gtk::Box`
@@ -288,9 +310,20 @@ pub fn build() -> gtk::Box {
 /// calls, or a widget nested one level deeper than another, cannot make
 /// this function return the wrong widget — it would either still find the
 /// right one by name or find `None`, never silently return one named
-/// widget where a different one was expected. `build` gives each named
-/// widget a name once and never again, so there is exactly one candidate
-/// this can find for any name.
+/// widget where a different one was expected. `build` is the only thing
+/// that calls `set_widget_name` on any widget under `container`, and it
+/// gives each of the three names above to exactly one widget, once — so
+/// today, there really is exactly one candidate this can find for any
+/// name. That is an invariant this function *relies on*, though, not one
+/// it enforces: nothing here counts candidates or checks for a duplicate,
+/// so if a future widget were ever added anywhere under `container` that
+/// reused one of these names, this depth-first walk would not detect the
+/// collision — it would simply return whichever candidate it reached
+/// first and stay silent about the other. Keeping the names unique is an
+/// obligation on whoever next adds a named widget to this tree, the same
+/// way it already was when `build` named only direct children; widening
+/// the search from direct children to the full subtree in issue #196
+/// changed how far that obligation now has to reach, not who holds it.
 ///
 /// # Why this walks the full subtree, not only `container`'s direct
 /// children, since issue #196
@@ -308,6 +341,31 @@ pub fn build() -> gtk::Box {
 /// search over every descendant. The "name, not position" guarantee above
 /// is unaffected by that: nesting depth is just one more kind of position
 /// this function already refused to rely on.
+///
+/// # A name match with a failed downcast no longer stops the search
+///
+/// Before issue #196's widening, a child whose `widget_name()` matched
+/// `name` but whose `downcast::<W>()` failed ended the search immediately,
+/// returning `None` even if the intended widget sat among the remaining
+/// children. [`find_named_descendant`]'s recursive shape does not preserve
+/// that short-circuit: when a name matches but the downcast fails, the
+/// walk falls through to search that same child's own descendants and
+/// then its later siblings, exactly as it would for a child whose name
+/// never matched at all. Given the one-name-one-widget invariant above,
+/// this path is not expected to be exercised in practice — no name this
+/// module hands out is ever attached to a widget of the wrong type — but
+/// it is a genuine, previously-undocumented broadening of what counts as
+/// "found," not only of *where* the search looks: a matched-but-wrong-
+/// typed name used to end the search outright with `None`, and now it
+/// does not. The behavior below treats "found" as "first name-and-type
+/// match anywhere in the subtree," which is at least consistent with how
+/// the function already treats a plain name mismatch, rather than
+/// special-casing an early exit for the name-matched-wrong-type case
+/// alone — but the honest cost is that it would also mask a violation of
+/// the one-name-one-widget invariant instead of surfacing one: if that
+/// invariant were ever broken by a later change, this function would
+/// quietly return whichever correctly-typed candidate it reaches first
+/// instead of failing loudly with `None`.
 fn find_named_child<W: IsA<gtk::Widget>>(container: &gtk::Box, name: &str) -> Option<W> {
     find_named_descendant(container.upcast_ref::<gtk::Widget>(), name)
 }
