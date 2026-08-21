@@ -45,6 +45,17 @@ carefully for the mode-label/marker-highlight case, and this document holds
 every item marked "capture-verifiable" to that same standard: named
 specifically, not claimed as a general proof of correctness.
 
+Since issue #228, the smoke test also *defends* the two capture-readable
+claims that nothing else can pin: every capture's dimensions are asserted
+against the token-declared window size from the PNG header, and the results
+capture's selected-row composited fill is decoded and sampled against
+`--hop-accent-subdued`'s documented composite — so those specific claims are
+regression-defended on every test run, not point-in-time prose. The
+limitation above is unchanged: a capture still cannot show timing,
+accessibility, live settings, or input handling, and flat token colours
+(the row ground, the hint-chip background) remain pinned at the declaration
+level by the token-resolution tests rather than by pixel assertions.
+
 **Status legend**, applied honestly rather than aspirationally — this
 document's value depends on a reviewer being able to trust a "satisfied"
 claim:
@@ -199,6 +210,17 @@ selected row's composited fill sampled exactly `#2f2719`, matching
 `--hop-accent-subdued`'s own comment ("composites to #2f2719") to the byte;
 a hint chip's background sampled exactly `#202024`, matching `--hop-bg-hover`.
 That is real, not plausible, confirmation for the tokens it covers.
+
+Of these three samples, the composited selection fill is no longer a
+one-off: issue #228 committed a regression for it — `headless_smoke.rs`
+decodes its own results capture and asserts the fill equals the composite
+`--hop-accent-subdued` documents, computed live from the committed token
+values — so that claim is re-proven on every test run. The row ground and
+hint-chip samples deliberately did not get pixel regressions: those flat
+token colours are already pinned at the declaration level by the
+token-resolution tests, which is the cheaper and earlier place to catch a
+drift. The light palette remains unverified by any capture (see item 7
+below), manually or otherwise.
 
 A genuine, previously-unrecorded contrast failure turned up while checking
 the rest; it has since been closed by issue #214 — the finding is kept as
@@ -557,6 +579,14 @@ chip's background sampled exactly `#202024` (`--hop-bg-hover`) — three
 surfaces genuinely tracing to their tokens, not stock Adwaita, confirmed
 against a live capture rather than assumed from the stylesheet's text alone.
 
+Since issue #228, the selected-row sample among these is regression-defended:
+`headless_smoke.rs` decodes its own results capture on every test run and
+asserts the composited fill equals `--hop-accent-subdued`'s documented
+composite, computed from the committed token values — no longer dependent on
+this pass's one-off manual sampling. The row-ground and hint-chip samples
+stay declaration-level (token-resolution tests), by design; the remaining
+stock surfaces named below are unchanged.
+
 But "a provider now exists" is not "every themeable surface passes", and
 this pass's own captures surfaced several concrete surfaces that fell back to
 an un-tokenized Adwaita default, each checked against this item's own pass
@@ -693,6 +723,12 @@ pass produced, and per that rule's own comment this is a deliberate use of
 the accent's reservation ("action hints"), not an exception to
 "never for body text" — a key glyph is a short badge naming a physical key,
 not prose.
+
+Since issue #228 that sample is no longer the only evidence: the committed
+regression in `headless_smoke.rs` re-reads the composited fill from a fresh
+capture on every test run and asserts it against `--hop-accent-subdued`'s
+documented composite, so "the selection indicator renders the committed
+accent" is defended by a test, not by this pass's prose.
 
 The focus ring clause is not partially built, it is entirely absent: grep
 for "focus" across `apps/hop-gtk/src` finds no CSS class, no widget, and no
