@@ -12,8 +12,9 @@
 //! module doc records and this one inherits:
 //!
 //! - **Xvfb, skipped with a printed reason when absent.** The local machine
-//!   cannot provision it mid-run (sudo needs a password); CI installs it
-//!   and makes these arms hard requirements. Same for `dbus-daemon`.
+//!   cannot provision it mid-run (sudo needs a password); `ci` installs it
+//!   (and `dbus`, for the session bus) and runs this suite as a hard
+//!   requirement inside its own `cargo test --workspace`.
 //! - **Subprocesses, not in-process GTK or in-process daemons.** Every
 //!   participant here is driven exactly as a user drives it — `hopd`,
 //!   `hop-gtk`, `hop`, `hop-hotkeyd` as real binaries from the workspace
@@ -21,7 +22,8 @@
 //!   established trick; see `headless_smoke.rs`'s `hopd_path`). Because
 //!   `cargo test -p hop-hotkeyd` builds only *this* crate's binaries, the
 //!   sibling check below is also what turns a partial build into a printed
-//!   skip rather than a spawn panic — CI's gate job builds all four first.
+//!   skip rather than a spawn panic — `ci`'s workspace-wide test run builds
+//!   all four binaries before any test executes.
 //! - **Helpers duplicated, not shared.** Integration-test helpers are
 //!   private to their own test crate; the duplication across
 //!   `socket.rs`/`headless_smoke.rs`/`x11_smoke.rs`/this file is the
@@ -265,7 +267,7 @@ impl Environment {
             if sibling(name).is_none() {
                 eprintln!(
                     "skipping: the `{name}` binary has not been built — run \
-                     `cargo build --workspace` (CI's hotkey gate does)"
+                     `cargo build --workspace` (CI's `ci` job does)"
                 );
                 return None;
             }
