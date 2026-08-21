@@ -147,6 +147,19 @@ glib-build-tools = "0.22"
 # only guarantees a `CARGO_BIN_EXE_<name>` variable for a package's *own*
 # binaries, not a dependency's, so the sibling-path trick is what stands in
 # for it here).
+# Issue #228's pixel regression assertions in `tests/headless_smoke.rs` decode
+# this crate's own `--screenshot` PNG captures to sample the selected row's
+# composited fill — the one colour claim nothing short of decoded pixels can
+# defend (flat token colours stay pinned at the declaration level by the
+# token-resolution tests, and capture geometry needs only the PNG header, no
+# decode). Dev-only, so it ships in no binary — and it is not a new
+# supply-chain surface either: Cargo.lock already resolves `gdk-pixbuf`
+# 0.22.0 in every build of this crate, down the `gtk4`/`libadwaita` → `gdk4`
+# → `gdk-pixbuf` path, so `"0.22"` pins the binding crate to the version the
+# graph already carries rather than adding one. Its MIT license is already
+# on `deny.toml`'s workspace-wide allow list, which is exactly why that file
+# gains no entry for it.
+gdk-pixbuf = "0.22"
 hopd = { path = "../../crates/hopd", version = "0.1.0" }
 
 [features]
