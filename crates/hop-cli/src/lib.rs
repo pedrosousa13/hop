@@ -1,12 +1,15 @@
 //! `hop` — the command-line client for the hop launcher daemon.
 //!
-//! Three subcommands exist today: `hop version`, which needs no daemon,
-//! `hop query <text>...`, and `hop exec <query> <item-id> <action-id>`, which
-//! runs an action on one of the query's results. All three (except `version`)
-//! speak the same length-prefixed JSON framing [`hopd`](../hopd/index.html)
-//! does over the same Unix socket, using `hop_protocol`'s IO-free codec on
-//! both ends of the pipe (see that crate's `framing` module docs for why the
-//! codec itself has no socket code in it).
+//! Four subcommands exist today: `hop version`, which needs no daemon;
+//! `hop query <text>...` and `hop exec <query> <item-id> <action-id>`, which
+//! runs an action on one of the query's results; and `hop toggle`, which
+//! activates the resident hop-gtk over the session bus rather than talking
+//! to hopd at all. The first three (except `version`) speak the same
+//! length-prefixed JSON framing [`hopd`](../hopd/index.html) does over the
+//! same Unix socket, using `hop_protocol`'s IO-free codec on both ends of
+//! the pipe (see that crate's `framing` module docs for why the codec
+//! itself has no socket code in it); the fourth speaks a few dozen bytes of
+//! D-Bus — see [`dbus`] for why that, too, is hand-rolled.
 //!
 //! # Why no tokio
 //!
@@ -35,10 +38,12 @@
 //! generated `--help` text this binary wants to own. `hopd::parse` (issue
 //! #122, then #180) already carries the identical `--socket` shape by hand
 //! for the same reason, so this module matches its sibling rather than
-//! reaching for a dependency neither yet needs. That trade tips the other
-//! way once `toggle` and `doctor` land with their own flags — this doc
-//! comment is the point to revisit it, not a standing argument that today's
-//! three-flag-or-fewer world will hold forever.
+//! reaching for a dependency neither yet needs. Issue #234's `toggle` was
+//! the named trigger for revisiting this — but it landed taking no
+//! arguments at all (its one question is answered on the session bus, not
+//! through flags), so the trade holds: the revisit fires when `toggle` or
+//! `doctor` lands *with its own flags*, not merely with another subcommand
+//! name.
 //!
 //! # Why `--socket` only before the subcommand
 //!
@@ -58,12 +63,14 @@
 //! alternative (parsing `--socket` anywhere) would have had to special-case
 //! away.
 
+pub mod dbus;
 use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-
+use std::process::{ExitCode, Stdio};
+// `run_toggle`'s detached re-invocation of hop-gtk puts the child in its
+// own process group; `process_group` lives on this Unix-only extension
+// trait.
 use hop_protocol::framing::{
     FRAME_PREFIX_LEN, FrameError, decode_payload, encode_frame, payload_len,
 };
@@ -71,6 +78,8 @@ use hop_protocol::{
     API_VERSION, ActionId, BoundError, ClientMsg, DaemonMsg, ErrorCode, ExecOutcome, Item, ItemId,
     ProtoError, QueryText,
 };
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 
 /// The `id` this CLI sends on its one `Query` frame per process. There is
 /// only ever one query in flight on this connection, so a fixed id (rather
@@ -125,13 +134,21 @@ pub enum Command {
         item_id: ItemId,
         action_id: ActionId,
     },
+    /// `hop toggle`: activate the resident hop-gtk (its GApplication
+    /// re-invocation mechanism presents the pre-built window) and exit 0;
+    /// with no resident instance, say so plainly and exit non-zero. Takes
+    /// no arguments — and no `--socket`, either: residency is a session-bus
+    /// question, not a daemon-socket one, so this arm never resolves the
+    /// socket path at all (`main.rs`'s "Resolved only for the commands that
+    /// connect" documents the same rule for `version`).
+    Toggle,
     /// Anything else: no arguments, an unrecognized subcommand, `query` or
     /// `exec` with too few arguments, or an out-of-bounds id.
     Usage,
 }
 
 /// The line `main` prints to stderr for [`Command::Usage`].
-pub const USAGE: &str = "usage: hop [--socket <path>] version | hop [--socket <path>] query <text>... | hop [--socket <path>] exec <query> <item-id> <action-id>";
+pub const USAGE: &str = "usage: hop [--socket <path>] version | hop [--socket <path>] query <text>... | hop [--socket <path>] exec <query> <item-id> <action-id> | hop toggle";
 
 /// Parses `args` — the process's arguments with `argv[0]` already stripped —
 /// into an [`Invocation`].
@@ -188,6 +205,16 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Invocation {
             }
         }
         Some("exec") => parse_exec(args.collect()),
+        Some("toggle") => {
+            if args.next().is_some() {
+                // `toggle` takes nothing: not flags, not free text. A
+                // stray argument is far more likely a typo or a misplaced
+                // flag than an instruction this subcommand could honor.
+                Command::Usage
+            } else {
+                Command::Toggle
+            }
+        }
         _ => Command::Usage,
     };
 
@@ -546,6 +573,52 @@ pub fn run_exec(socket: &Path, query: &str, item_id: ItemId, action_id: ActionId
     }
 }
 
+/// Runs `hop toggle`: asks the session bus (via [`dbus`]) whether
+/// hop-gtk's well-known name is owned, and if so re-invokes `hop-gtk` —
+/// whose unique-GApplication machinery forwards the activation to the
+/// resident instance and presents its pre-built window (`apps/hop-gtk`'s
+/// `app.rs` module doc is the receiving half of exactly this handshake) —
+/// then exits 0.
+///
+/// With no resident instance it says so plainly on stderr and exits
+/// non-zero (criterion 3): launching a fresh hop-gtk here would silently
+/// convert "toggle" into "start", which is a decision the user's autostart
+/// owns, not the hotkey's. The re-invocation is spawned detached — own
+/// process group, all three standard streams to null — because this
+/// process's only remaining act is to exit, and the forwarded activation
+/// must not die with it.
+///
+/// Returns the process's exit code rather than a `Result`, like every flow
+/// in this module: the failure modes are reported to stderr right here and
+/// mapped to exit 1.
+pub fn run_toggle() -> ExitCode {
+    match dbus::launcher_is_resident() {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("hop: no resident launcher instance (is hop-gtk running?)");
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("hop: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let spawned = std::process::Command::new("hop-gtk")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    match spawned {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("hop: found no runnable hop-gtk to activate: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -761,5 +834,40 @@ mod tests {
             parse(["query".to_string(), "--socket".to_string(), "x".to_string()].into_iter());
         assert_eq!(invocation.socket, None);
         assert_eq!(invocation.command, Command::Query("--socket x".to_string()));
+    }
+
+    #[test]
+    fn toggle_parses() {
+        assert_eq!(
+            parse(["toggle".to_string()].into_iter()).command,
+            Command::Toggle
+        );
+    }
+
+    #[test]
+    fn toggle_takes_no_arguments() {
+        // Not flags, not free text: `toggle`'s one input is the session
+        // bus, so anything after the name is a refusal, not an argument.
+        assert_eq!(
+            parse(["toggle".to_string(), "now".to_string()].into_iter()).command,
+            Command::Usage
+        );
+    }
+
+    #[test]
+    fn toggle_ignores_a_socket_override_like_version_does() {
+        // Residency is a session-bus question, never a daemon-socket one;
+        // a leading `--socket` parses (the flag's shape is recognized
+        // before any subcommand) but the toggle arm never resolves it —
+        // the same inertness `main.rs` documents for `version`.
+        let invocation = parse(
+            [
+                "--socket".to_string(),
+                "/nonsense".to_string(),
+                "toggle".to_string(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(invocation.command, Command::Toggle);
     }
 }

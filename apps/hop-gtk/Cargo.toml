@@ -163,6 +163,11 @@ gdkwayland = { package = "gdk4-wayland", version = "0.11" }
 # move runs on a short-lived thread instead of the GTK main thread. MIT OR
 # Apache-2.0: the MIT arm satisfies `deny.toml`'s allow list, per that
 # file's note on deliberately not allowing the second arm of an OR.
+#
+# Declared here rather than taken from the workspace entry (which issue
+# #234 added for `hop-hotkeyd`): that one enables the `xtest` feature its
+# grab-loop harness needs, and this crate wants only core protocol —
+# keeping its own plain `"0.13"` says so.
 x11rb = "0.13"
 
 [build-dependencies]

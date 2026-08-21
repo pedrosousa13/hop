@@ -669,6 +669,7 @@ name = "hop-cli"
 version = "0.1.0"
 dependencies = [
  "hop-protocol",
+ "libc",
  "serde_json",
  "tempfile",
 ]
@@ -712,6 +713,18 @@ dependencies = [
  "toml",
  "x11rb",
  "yeslogic-fontconfig-sys",
+]
+
+[[package]]
+name = "hop-hotkeyd"
+version = "0.1.0"
+dependencies = [
+ "hop-protocol",
+ "libc",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "x11rb",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@ members = [
     "crates/hopd",
     "crates/hop-cli",
     "apps/hop-gtk",
+    "crates/hop-hotkeyd",
 ]
 
 [workspace.package]
@@ -39,6 +40,17 @@ fasteval = { version = "0.2", default-features = false }
 # read out of toml's own `Value` rather than derived. MIT/Apache-2.0, on
 # `deny.toml`'s allow list.
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+# Issue #234's `hop-hotkeyd` speaks X11 directly: `XGrabKey` on the user's
+# configured binding (design spec §2's X11 row) and `XTestFakeInput` in the
+# crate's own end-to-end harness, which fakes the keypress a real keyboard
+# would. The same pure-Rust-over-a-socket reasoning `apps/hop-gtk`'s
+# identical dependency records applies verbatim — FFI into `libX11` would
+# add the workspace's next `unsafe` block for calls a safe crate already
+# wraps — so this is that entry promoted to the workspace level for a second
+# consumer, not a new dependency. `xtest` is the one extension feature the
+# crate enables (the grab itself is core protocol); MIT OR Apache-2.0, MIT
+# arm on `deny.toml`'s allow list.
+x11rb = { version = "0.13", features = ["xtest"] }
 
 # Every member crate opts in with `[lints] workspace = true`. A workspace lint no
 # crate inherits is a gate that does nothing, so any new member must do the same.
@@ -49,7 +61,7 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # block declared rather than smuggled in: the lint covers normal compilation
 # of both members — `src/` and `#[cfg(test)]` code alike — so each one needs
 # its own narrow `#[expect(unsafe_code)]` at the statement to build at all.
-# As of issue #198 there are eight: that one production block, plus five
+# As of issue #198 there were eight: that one production block, plus five
 # test-only `libc::mkfifo`/`pre_exec` calls in `hop-protocol::content`,
 # `hop-protocol`'s own `config_file` (the config-file read promoted out of
 # `hopd::config` by issue #182), `hopd::config`, `hopd`'s
@@ -64,9 +76,14 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # specific exception to "no new `unsafe`", since no safe binding reaches
 # this call on the pango/fontconfig versions this workspace targets — see
 # `apps/hop-gtk/src/fonts.rs`'s doc comment, "Registering with
-# fontconfig"). Each `expect` is itself the proof the lint reaches where
-# it's written: were it not firing there, the unfulfilled expectation would
-# warn, and CI's `-D warnings` would fail.
+# fontconfig"). Issue #234 adds five, all production code: `hop-cli`'s
+# `dbus` (one `libc::getuid`, the SASL EXTERNAL identity) and four in
+# `hop-hotkeyd`'s `run` (the signalfd setup, the `poll` wrapper, the
+# child-side signal-mask reset, and the `pre_exec` registration that
+# installs it into the spawned toggle). That makes thirteen. Each `expect`
+# is itself the proof the lint reaches where it's written: were it not
+# firing there, the unfulfilled expectation would warn, and CI's
+# `-D warnings` would fail.
 #
 # What it does not cover is doc tests. Cargo hands `--deny=unsafe_code` to
 # rustdoc — visible in `cargo test -p hop-protocol --doc -v` — but rustdoc

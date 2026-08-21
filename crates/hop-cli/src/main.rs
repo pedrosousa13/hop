@@ -49,6 +49,7 @@ fn main() -> ExitCode {
             hop_cli::print_version();
             ExitCode::SUCCESS
         }
+        Command::Toggle => hop_cli::run_toggle(),
         Command::Query(text) => match resolve(invocation.socket.as_deref()) {
             Ok(socket) => hop_cli::run_query(&socket, &text),
             Err(code) => code,
