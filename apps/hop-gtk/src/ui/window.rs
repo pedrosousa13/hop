@@ -130,7 +130,22 @@ impl HopWindow {
     /// name ([`crate::keymap::Action`]) that [`HopWindow::dispatch_action`]
     /// switches on without ever asking the keymap "which key was that"
     /// again.
-    pub fn build(app: &adw::Application, cmd_tx: CommandSender, keymap: Keymap) -> Self {
+    ///
+    /// `strategy` is the overlay decision `app` resolved and logged at
+    /// startup (issue #232) — see `session`'s module doc for why the
+    /// decision is made once there rather than re-derived here. Two of its
+    /// arms wire behavior onto the window below: X11's self-positioning
+    /// (delegated entirely to `x11::apply_self_positioning`) and
+    /// close-on-focus-loss, wired here because it is window behavior in
+    /// both sessions that ask for it (GNOME Wayland's documented shape,
+    /// and X11's parity with it). The layer-shell arm needs nothing: the
+    /// compositor owns placement and focus for a layer surface.
+    pub fn build(
+        app: &adw::Application,
+        cmd_tx: CommandSender,
+        keymap: Keymap,
+        strategy: crate::session::OverlayStrategy,
+    ) -> Self {
         let (window_w, window_h) = *tokens::WINDOW_SIZE_PX;
         let row_h = *tokens::ROW_HEIGHT_PX;
 
@@ -234,6 +249,15 @@ impl HopWindow {
 
         crate::layer_shell::apply_or_fallback(&window);
 
+        // Issue #232: the two strategy arms that add behavior to the plain
+        // window. Order matters only for readability — layer-shell (when a
+        // feature-on build meets a supporting compositor) owns placement
+        // and focus itself, and `session` never pairs it with either arm
+        // below.
+        if strategy.self_positions() {
+            crate::x11::apply_self_positioning(&window);
+        }
+
         let hop_window = HopWindow {
             window,
             entry,
@@ -251,8 +275,33 @@ impl HopWindow {
         hop_window.wire_entry();
         hop_window.wire_selection_indicator();
         hop_window.wire_keyboard(keymap);
+        if strategy.dismisses_on_focus_loss() {
+            hop_window.wire_dismiss_on_focus_loss();
+        }
 
         hop_window
+    }
+
+    /// Closes the window when it loses keyboard input focus — the
+    /// close-on-focus-loss behavior design spec §2 documents for the GNOME
+    /// Wayland row and issue #232 extends to X11 as parity. `close()` on a
+    /// `hide_on_close` window hides rather than destroys it (see
+    /// [`Self::dispatch_action`]'s `Action::Dismiss` arm), so dismissing
+    /// keeps the pre-built window's "never rebuilt" property intact: the
+    /// next toggle re-presents this same instance.
+    ///
+    /// The `is_visible` guard covers the one ordering where the notify
+    /// fires without a user-visible focus loss: hiding the window itself
+    /// ends any focus it had, which flips `is-active` to false on its way
+    /// down. Closing an already-hidden window would be harmless, but the
+    /// guard makes that path a no-op instead of relying on GTK treating it
+    /// as one.
+    fn wire_dismiss_on_focus_loss(&self) {
+        self.window.connect_is_active_notify(|window| {
+            if !window.is_active() && window.is_visible() {
+                window.close();
+            }
+        });
     }
 
     /// Types `text` into the query entry, exactly as a keystroke would.
@@ -965,7 +1014,16 @@ mod tests {
         app.register(gio::Cancellable::NONE)
             .expect("registering a NON_UNIQUE test application must not fail");
         let (cmd_tx, cmd_rx) = crate::ipc::test_channel();
-        let window = HopWindow::build(&app, cmd_tx, Keymap::defaults());
+        // These widget tests run under broadway — `SessionKind::Other`, the
+        // one strategy that deliberately wires nothing session-specific
+        // onto the window (no self-positioning, no focus-loss dismissal),
+        // which is exactly what a capture harness wants.
+        let window = HopWindow::build(
+            &app,
+            cmd_tx,
+            Keymap::defaults(),
+            crate::session::SessionKind::Other.overlay_strategy(crate::layer_shell::probe()),
+        );
         (window, cmd_rx)
     }
 

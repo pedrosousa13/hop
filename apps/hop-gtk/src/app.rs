@@ -66,7 +66,7 @@ use gtk::prelude::*;
 
 use crate::icon_roots;
 use crate::ipc::{self, IpcEvent};
-use crate::{cli, fonts, screenshot, style, ui};
+use crate::{cli, fonts, screenshot, session, style, ui};
 
 /// GNOME reverse-DNS convention; unregistered (no publisher claims this
 /// prefix on Flathub or similar) since v1 has not shipped anywhere that
@@ -278,6 +278,38 @@ fn install_stylesheet(_app: &adw::Application) {
     style::install_locked(&display);
 }
 
+/// Resolves the overlay strategy for this run — which display session was
+/// detected, what the layer-shell probe answered, and the §2 platform-table
+/// behavior that follows from the two (issue #232) — logging the one-line
+/// capability report [`session::startup_report`] produces and returning the
+/// strategy for [`ui::window::HopWindow::build`] to wire in.
+///
+/// Called from each mode's `activate` handler rather than once at startup
+/// because it needs the display, and a `GdkDisplay` only exists once
+/// GApplication's default startup handler has opened one (the same ordering
+/// `install_stylesheet`'s doc comment accounts for). A re-invocation
+/// forwarded to an already-running primary instance re-runs this on every
+/// toggle; that repetition is deliberate — the report is exactly what M6's
+/// `hop doctor` will want to scrape from a running session's logs, and a
+/// line per presentation is the cheapest honest record of what the session
+/// looked like at each one.
+///
+/// The `None`-display panic matches `install_stylesheet`'s posture: there
+/// is no window to show, strategy or no strategy, without a display.
+fn resolve_overlay_strategy() -> session::OverlayStrategy {
+    let Some(display) = gtk::gdk::Display::default() else {
+        panic!("hop-gtk: no gdk::Display available at GApplication startup");
+    };
+    let kind = session::SessionKind::detect(&display);
+    let layer_shell_support = crate::layer_shell::probe();
+    let strategy = kind.overlay_strategy(layer_shell_support);
+    eprintln!(
+        "hop-gtk: {}",
+        session::startup_report(kind, layer_shell_support, strategy)
+    );
+    strategy
+}
+
 /// The ordinary, unique-instance run: builds the window once on first
 /// `activate`, presents it on every `activate` after that (this run's own
 /// first activation, or a later one forwarded from a re-invocation) — see
@@ -295,7 +327,8 @@ fn run_interactive(socket_path: PathBuf, keymap: crate::keymap::Keymap) -> ExitC
         }
 
         let (cmd_tx, evt_rx) = ipc::spawn(socket_path.clone());
-        let window = ui::window::HopWindow::build(app, cmd_tx, keymap.clone());
+        let window =
+            ui::window::HopWindow::build(app, cmd_tx, keymap.clone(), resolve_overlay_strategy());
         window.present_with_token(activation_token.as_deref());
 
         glib::spawn_future_local({
@@ -388,7 +421,12 @@ fn run_screenshot(
         let exit_code = exit_code.clone();
         move |app| {
             let (cmd_tx, evt_rx) = ipc::spawn(socket_path.clone());
-            let window = ui::window::HopWindow::build(app, cmd_tx.clone(), keymap.clone());
+            let window = ui::window::HopWindow::build(
+                app,
+                cmd_tx.clone(),
+                keymap.clone(),
+                resolve_overlay_strategy(),
+            );
             window.present_with_token(None);
 
             let done = Rc::new(std::cell::Cell::new(false));

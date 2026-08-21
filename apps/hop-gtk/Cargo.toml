@@ -126,6 +126,45 @@ tempfile.workspace = true
 # `yeslogic-fontconfig-sys`, and re-check this claim.
 yeslogic-fontconfig-sys = "6.0.1"
 
+# Issue #232's X11 overlay path. GTK4 removed every window-positioning API
+# (`gtk_window_move` and friends are gone, and GDK4 exposes no position on
+# `gdk::Surface` at all), so "override-positioned window" — design spec §2's
+# X11 row — can only be implemented by speaking to the X server directly:
+# take the toplevel's XID from its surface and send a `ConfigureWindow` that
+# centers it. Two dependencies make that possible, both justified here:
+#
+# `gdkx11` (the `gdk4-x11` crate) is the official gtk-rs binding for GDK's
+# X11-specific API; this crate needs exactly two things from it —
+# `X11Display`, so session detection (`session::SessionKind::detect`)
+# downcasts the live `GdkDisplay` instead of guessing from environment
+# variables, and `X11Surface::xid()`, the only public route to the XID the
+# `ConfigureWindow` below targets. Its sibling `gdkwayland` (`gdk4-wayland`)
+# is added for the symmetric reason: `WaylandDisplay` is how detection names
+# the Wayland half of the Wayland-vs-X11 report M6's `hop doctor` consumes,
+# compile-checked rather than string-matched. Both link system libraries
+# (`libgtk-4-x11` / `libgtk-4-wayland`) that ship inside `libgtk-4-dev`,
+# which this crate already required before this issue — so no new system
+# prerequisite is introduced. Version "0.11" pins them alongside the
+# `gdk4` 0.11.x already in the dependency graph under `gtk`; their MIT
+# license is already on `deny.toml`'s workspace-wide allow list.
+gdkx11 = { package = "gdk4-x11", version = "0.11" }
+gdkwayland = { package = "gdk4-wayland", version = "0.11" }
+#
+# `x11rb` is the pure-Rust X11 client that actually sends the
+# `ConfigureWindow`. The alternative was FFI into `libX11` (`x11-dl`),
+# which would have added this workspace's next `unsafe` block for a call
+# (`XMoveWindow`) a safe crate already wraps — x11rb speaks the X protocol
+# over the display's own Unix socket with no unsafe code anywhere, which is
+# why it is the one taken. It opens its *own* X connection (a second client
+# connection alongside GDK's) because X requests between different clients
+# carry no ordering guarantee against each other; that is harmless here —
+# whether the move lands before or after the server processes GDK's map
+# request, the window ends up at the configured position — and it means the
+# move runs on a short-lived thread instead of the GTK main thread. MIT OR
+# Apache-2.0: the MIT arm satisfies `deny.toml`'s allow list, per that
+# file's note on deliberately not allowing the second arm of an OR.
+x11rb = "0.13"
+
 [build-dependencies]
 # Issue #198's `build.rs` — this crate's first — compiles
 # `assets/hop-gtk.gresource.xml` into the `.gresource` blob `src/fonts.rs`
