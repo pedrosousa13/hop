@@ -62,6 +62,7 @@
 //! crate, and the duplication is the established, documented pattern here.
 #![allow(clippy::unwrap_used)]
 
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -89,14 +90,14 @@ impl WaylandServer {
     /// Spawns headless **sway** in `runtime_dir`, or `None` when the `sway`
     /// binary is not installed — the documented skip condition.
     ///
-    /// The Wayland socket name derives from this process's pid (the same
-    /// trick `x11_smoke.rs`'s display-number derivation uses) so parallel
-    /// test invocations do not collide; each test also gets its own
-    /// `runtime_dir`, so identical names in different directories stay
-    /// independent.
+    /// sway names its own listening socket (`wayland-N`, chosen by
+    /// wl_display_add_socket_auto — there is no flag to pin it), so the
+    /// name is *discovered* by scanning this test's private `runtime_dir`
+    /// once sway is up; parallel test invocations stay independent because
+    /// each test gets its own runtime dir. Weston, which does take a
+    /// socket name, keeps the pid-derived pin instead.
     fn start_sway(runtime_dir: &Path) -> Option<Self> {
         let sway = find_in_path("sway")?;
-        let socket_name = format!("hop-wl-{}", std::process::id());
 
         // sway insists on a config file; this one is minimal on purpose —
         // a single headless output at a size comfortably larger than the
@@ -106,6 +107,12 @@ impl WaylandServer {
         let config = runtime_dir.join("sway-config");
         std::fs::write(&config, "output * resolution 1280x800 position 0,0\n")
             .expect("writing the minimal sway config");
+
+        // sway's stderr is captured to a file, not discarded: when sway
+        // dies on a runner, the panic that reports it is the only place
+        // its error text can surface.
+        let stderr = std::fs::File::create(runtime_dir.join("sway-stderr.log"))
+            .expect("creating sway's stderr capture");
 
         let mut child = Command::new(&sway)
             .arg("-c")
@@ -118,19 +125,23 @@ impl WaylandServer {
             // same way the client side forces GSK_RENDERER=cairo below.
             .env("WLR_RENDERER", "pixman")
             .env("XDG_RUNTIME_DIR", runtime_dir)
-            // wlroots names its listening socket after this variable when
-            // set — which is what makes `socket_name` deterministic.
-            .env("WAYLAND_DISPLAY", &socket_name)
+            // No `WAYLAND_DISPLAY` pin on purpose: that variable names the
+            // socket a Wayland *client* connects through; a compositor's
+            // own listening socket comes from wl_display_add_socket_auto,
+            // which picks `wayland-N` and never reads it. sway's socket is
+            // discovered by scanning, in `await_discovered_socket` — the
+            // first CI run of this file died on exactly this assumption,
+            // while Weston (which does take `--socket`) kept its pin.
             .env("HOME", runtime_dir.join("isolated-home"))
             .env(
                 "XDG_CONFIG_HOME",
                 runtime_dir.join("isolated-xdg-config-home"),
             )
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("sway was found on $PATH but could not be spawned");
-        Self::await_socket(runtime_dir, &socket_name, &mut child, "sway");
+        let socket_name = Self::await_discovered_socket(runtime_dir, &mut child, "sway");
         Some(WaylandServer { child, socket_name })
     }
 
@@ -187,12 +198,74 @@ impl WaylandServer {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+
+    /// Polls for the compositor's socket, failing with context — including
+    /// the captured stderr tail — if the compositor exits first (a config
+    /// error, a missing renderer — anything that would otherwise surface
+    /// as an opaque timeout). Returns the socket name it found: sway names
+    /// its own listening socket (`wayland-N`) and offers no flag to
+    /// choose it, so discovery, not pinning, is the contract here.
+    fn await_discovered_socket(runtime_dir: &Path, child: &mut Child, compositor: &str) -> String {
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        loop {
+            if let Some(name) = discover_wayland_socket(runtime_dir) {
+                return name;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!(
+                    "{compositor} exited before creating its socket (status {status}); {}",
+                    stderr_tail(runtime_dir, compositor)
+                );
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "{compositor} started but never created a wayland-* socket \
+                     in {runtime_dir:?}; {}",
+                    stderr_tail(runtime_dir, compositor)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 impl Drop for WaylandServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// The first `wayland-*` socket file in `dir`, sorted for determinism —
+/// what sway's `wl_display_add_socket_auto` created, whatever number it
+/// landed on inside this test's private runtime dir.
+fn discover_wayland_socket(dir: &Path) -> Option<String> {
+    let mut candidates: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("wayland-"))
+        .filter(|entry| entry.file_type().map(|t| t.is_socket()).unwrap_or(false))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// The tail of a compositor's captured stderr, for panic messages — its
+/// stderr goes to a file rather than the test run, so this is the only
+/// place its error text can surface.
+fn stderr_tail(runtime_dir: &Path, compositor: &str) -> String {
+    match std::fs::read_to_string(runtime_dir.join(format!("{compositor}-stderr.log"))) {
+        Ok(text) => {
+            let count = text.chars().count();
+            let tail: String = if count > 2000 {
+                text.chars().skip(count - 2000).collect()
+            } else {
+                text
+            };
+            format!("{compositor}'s stderr tail:\n{tail}")
+        }
+        Err(e) => format!("(no {compositor} stderr captured: {e})"),
     }
 }
 
