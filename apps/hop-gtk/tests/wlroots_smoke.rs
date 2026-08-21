@@ -16,11 +16,12 @@
 //! one layer down, where there is no room for a no-op to hide: hop-gtk runs
 //! with `WAYLAND_DEBUG=1`, libwayland's wire logger, and the test asserts on
 //! the raw protocol traffic. A real layer-surface run must contain the
-//! `zwlr_layer_shell_v1` requests `layer_shell::apply_or_fallback` issues —
-//! `set_layer(3)` (overlay), `set_keyboard_interactivity(1)` (exclusive) — and must
+//! `zwlr_layer_shell_v1` traffic `layer_shell::apply_or_fallback` produces —
+//! a `get_layer_surface` request carrying the overlay layer (3) as its
+//! layer argument, a `set_keyboard_interactivity(1)` (exclusive) — and must
 //! not contain any nonzero `set_anchor` (unanchored is how the surface ends
 //! up centered). The feature-off and Weston runs must contain *no*
-//! `zwlr_layer_shell_v1` traffic at all. This is stronger than a screenshot:
+//! layer-surface requests at all. This is stronger than a screenshot:
 //! the `--screenshot` capture is hop-gtk's own rendering, which would look
 //! identical either way, so the wire log is what distinguishes the layer-
 //! surface path from the ordinary-window path.
@@ -415,12 +416,16 @@ fn png_header_dimensions(png: &[u8]) -> (u32, u32) {
     (be_u32(16), be_u32(20))
 }
 
-/// The layer-surface half of the wire-log proof: the exact requests
-/// `layer_shell::apply_or_fallback` must have issued, asserted against
+/// The layer-surface half of the wire-log proof: the protocol traffic
+/// `layer_shell::apply_or_fallback` must have produced, asserted against
 /// libwayland's log lines (each request prints as its interface and object
-/// id, then the method name and bare integer arguments — the wlroots
-/// `layer` enum's overlay is 3, the `keyboard_interactivity` enum's
-/// exclusive is 1). The unanchored half is negative: no nonzero
+/// id, then the method name and bare integer arguments). The layer itself
+/// rides as the third argument of `get_layer_surface` — gtk4-layer-shell
+/// passes it at creation, and its `set_layer` request exists only for
+/// post-map changes, which never happen here, so `.set_layer(` must NOT
+/// be expected (the first real CI run died on exactly that expectation).
+/// The wlroots `layer` enum's overlay is 3; the `keyboard_interactivity`
+/// enum's exclusive is 1. The unanchored half is negative: no nonzero
 /// `set_anchor` (the four anchor bits are 1/2/4/8) may appear, because an
 /// unanchored layer surface is what the compositor centers. Compiled only
 /// with the feature, for the same reason `start_weston` is.
@@ -430,9 +435,14 @@ fn assert_wire_shows_layer_surface(stderr: &str) {
         stderr.contains("zwlr_layer_shell_v1"),
         "the compositor's layer-shell protocol must have been bound and used"
     );
+    let layer_line = stderr
+        .lines()
+        .find(|line| line.contains(".get_layer_surface("))
+        .expect("a layer surface must have been requested on the wire");
     assert!(
-        stderr.contains(".set_layer(3)"),
-        "the surface must be requested on the overlay layer (3)"
+        layer_line.contains(", 3,"),
+        "the surface must be created on the overlay layer (3), but the \
+         get_layer_surface line was:\n{layer_line}"
     );
     assert!(
         stderr.contains(".set_keyboard_interactivity(1)"),
