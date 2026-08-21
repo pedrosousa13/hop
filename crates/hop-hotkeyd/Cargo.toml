@@ -30,9 +30,10 @@ thiserror.workspace = true
 # The signal half of the event loop: SIGINT/SIGTERM are blocked with
 # `sigprocmask` and read back through a `signalfd`, so the grab loop's one
 # `poll` wakes on both key events and signals with no async-signal handler
-# anywhere (see `run.rs`'s module doc). Already a workspace dependency
-# (`hopd` uses it for the systemd socket descriptors); this is a second
-# consumer, not a new one.
+# anywhere (see `run.rs`'s module doc). Already a workspace dependency —
+# `hop-protocol` (its config-file/content hazard tests) brought it in before
+# `hopd` (the systemd socket descriptors) did — so this is a third consumer,
+# not a new one.
 libc.workspace = true
 
 # The X11 client: `XGrabKey` on the root window, core protocol only in the

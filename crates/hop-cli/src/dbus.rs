@@ -138,7 +138,12 @@ fn unix_socket_path(entry: &str) -> Option<std::path::PathBuf> {
 /// Performs the SASL handshake: null-byte greeting, `AUTH EXTERNAL` with the
 /// hex-encoded decimal uid (the mechanism every stock session bus accepts
 /// from a same-user client), then `BEGIN` to switch to the message stream.
-#[expect(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "the SASL EXTERNAL identity is the process's real uid, and \
+              libc::getuid is the only way to read it; a plain syscall \
+              wrapper with no preconditions on process state"
+)]
 fn authenticate(stream: &mut UnixStream) -> Result<(), DbusError> {
     // SAFETY: `libc::getuid` reads the calling process's real uid — a plain
     // syscall wrapper with no preconditions on process state.

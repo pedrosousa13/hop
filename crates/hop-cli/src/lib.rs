@@ -563,7 +563,7 @@ pub fn run_exec(socket: &Path, query: &str, item_id: ItemId, action_id: ActionId
             ExitCode::from(11)
         }
         Err(ClientError::ProviderFailed(what)) => {
-            eprintln!("hop: the item's provider failed: {what}");
+            eprintln!("hop: provider failed to execute: {what}");
             ExitCode::from(12)
         }
         Err(err) => {

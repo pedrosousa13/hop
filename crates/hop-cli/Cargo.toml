@@ -18,8 +18,10 @@ hop-protocol = { path = "../hop-protocol", version = "0.1.0" }
 serde_json.workspace = true
 # `dbus.rs`'s SASL `EXTERNAL` auth needs the process's real uid — one
 # `libc::getuid` call, declared under the workspace's `unsafe_code = deny`
-# lint like every other FFI touchpoint. Already a workspace dependency
-# (`hopd`, then `hop-hotkeyd`); this is a third consumer, not a new one.
+# lint like every other FFI touchpoint. Already a workspace dependency —
+# `hop-protocol` (its config-file/content hazard tests) brought it in before
+# `hopd` (the systemd socket descriptors) and `hop-hotkeyd` (the signalfd
+# event loop) did — so this is a fourth consumer, not a new one.
 libc.workspace = true
 
 [dev-dependencies]
