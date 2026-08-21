@@ -17,7 +17,7 @@
 //! with `WAYLAND_DEBUG=1`, libwayland's wire logger, and the test asserts on
 //! the raw protocol traffic. A real layer-surface run must contain the
 //! `zwlr_layer_shell_v1` requests `layer_shell::apply_or_fallback` issues —
-//! `set_layer(3)` (overlay), `set_keyboard_mode(1)` (exclusive) — and must
+//! `set_layer(3)` (overlay), `set_keyboard_interactivity(1)` (exclusive) — and must
 //! not contain any nonzero `set_anchor` (unanchored is how the surface ends
 //! up centered). The feature-off and Weston runs must contain *no*
 //! `zwlr_layer_shell_v1` traffic at all. This is stronger than a screenshot:
@@ -362,7 +362,7 @@ fn assert_wire_shows_layer_surface(stderr: &str) {
         "the surface must be requested on the overlay layer (3)"
     );
     assert!(
-        stderr.contains(".set_keyboard_mode(1)"),
+        stderr.contains(".set_keyboard_interactivity(1)"),
         "the surface must request exclusive keyboard interactivity (1)"
     );
     for anchor in 1..=15u32 {
@@ -374,13 +374,18 @@ fn assert_wire_shows_layer_surface(stderr: &str) {
     }
 }
 
-/// The negative half: not one byte of layer-shell traffic, for whichever
-/// unsupported arm `context` names.
+/// The negative half: no layer-surface request, for whichever unsupported
+/// arm `context` names. The assertion targets *use*, not the interface
+/// name: every wlroots compositor advertises `zwlr_layer_shell_v1` in its
+/// registry globals and libwayland's WAYLAND_DEBUG=1 logs received events
+/// too, so the name alone appears on the wire even for a client that never
+/// touches the protocol. What only a real user emits is the
+/// `get_layer_surface` request that turns a window into a layer surface.
 fn assert_wire_shows_no_layer_shell(stderr: &str, context: &str) {
     assert!(
-        !stderr.contains("zwlr_layer_shell_v1"),
+        !stderr.contains(".get_layer_surface("),
         "{context}: no layer-shell protocol traffic may appear, \
-         but the wire log mentions zwlr_layer_shell_v1"
+         but the wire log shows a get_layer_surface request"
     );
 }
 

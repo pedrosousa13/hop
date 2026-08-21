@@ -133,13 +133,15 @@ impl HopWindow {
     ///
     /// `strategy` is the overlay decision `app` resolved and logged at
     /// startup (issue #232) — see `session`'s module doc for why the
-    /// decision is made once there rather than re-derived here. Two of its
+    /// decision is made once there rather than re-derived here. All three
     /// arms wire behavior onto the window below: X11's self-positioning
-    /// (delegated entirely to `x11::apply_self_positioning`) and
-    /// close-on-focus-loss, wired here because it is window behavior in
-    /// both sessions that ask for it (GNOME Wayland's documented shape,
-    /// and X11's parity with it). The layer-shell arm needs nothing: the
-    /// compositor owns placement and focus for a layer surface.
+    /// (delegated entirely to `x11::apply_self_positioning`),
+    /// close-on-focus-loss in the two sessions that ask for it (GNOME
+    /// Wayland's documented shape, and X11's parity with it), and — since
+    /// issue #233 — the layer-shell arm, which applies
+    /// `layer_shell::apply_or_fallback` when the strategy is LayerShell:
+    /// the compositor owns placement and focus for a layer surface, and
+    /// the probe inside decides supported-versus-fallback.
     pub fn build(
         app: &adw::Application,
         cmd_tx: CommandSender,

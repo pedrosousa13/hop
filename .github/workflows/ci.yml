@@ -178,9 +178,10 @@ jobs:
   # `latency-gate` are: issue #233's wlroots arm has its own failure shape —
   # "the layer-shell path regressed" or "the compositor/library provisioning
   # broke" is a different problem for a reviewer than a plain test failure —
-  # and one job would collapse that status into `ci`'s. It compiles the
-  # workspace (unlike `supply-chain`), so it wants the pinned toolchain and
-  # the build cache, and it runs `wlroots_smoke.rs` in *both* of that file's
+  # and one job would collapse that status into `ci`'s. It compiles hop-gtk
+  # in both feature modes plus the `hopd` binary the smoke tests spawn, so
+  # it wants the pinned toolchain and the build cache, and it runs
+  # `wlroots_smoke.rs` in *both* of that file's
   # compilation modes, because the file's tests are gated on the feature they
   # exercise: with `--features layer-shell` the sway arm (window really
   # becomes a layer surface — asserted on the Wayland wire via
@@ -197,11 +198,13 @@ jobs:
   # has `libgtk-layer-shell-dev`, the GTK3 library of the same idea, which
   # the `gtk4-layer-shell` Rust crate's `-sys` build probe (pkg-config name
   # `gtk4-layer-shell-0`, required version >= 1) cannot use. The boring
-  # workaround is building the real thing from a pinned release: v1.0.4, the
-  # library's latest stable tag (satisfies the >= 1 probe; the same version
-  # Ubuntu >= 24.10 ships as `libgtk4-layer-shell-dev`, so if the runner
-  # image ever moves past noble this whole step can collapse back into one
-  # apt package name). The meson flags each cut something CI does not need:
+  # workaround is building the real thing from a pinned commit — v1.0.4's
+  # own SHA, not the tag, because a mutable ref is exactly what a
+  # provisioning step must not float on (the same philosophy as
+  # `supply-chain`'s SHA-pinned action). v1.0.4 satisfies the >= 1 probe;
+  # the same version Ubuntu >= 24.10 ships as `libgtk4-layer-shell-dev`, so
+  # if the runner image ever moves past noble this whole step can collapse
+  # back into one apt package name).
   # docs/tests are the library's own documentation and test suites,
   # introspection/vapi are the Python/Vala bindings whose generators
   # (g-ir-scanner, vapigen) are not installed and would fail the build for
@@ -235,14 +238,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev libgtk-4-bin libadwaita-1-dev \
+            libgtk-4-dev libadwaita-1-dev \
             sway weston \
             meson ninja-build libwayland-dev wayland-protocols
 
-      - name: Build and install gtk4-layer-shell v1.0.4
+      - name: Build and install gtk4-layer-shell v1.0.4 (pinned commit)
         run: |
-          git clone --depth 1 --branch v1.0.4 \
-            https://github.com/wmww/gtk4-layer-shell.git /tmp/gtk4-layer-shell
+          git clone https://github.com/wmww/gtk4-layer-shell.git /tmp/gtk4-layer-shell
+          git -C /tmp/gtk4-layer-shell checkout 536ff516ed68b9bb34afc4c07f942a54b2b4b03f
           meson setup /tmp/gtk4-layer-shell/build /tmp/gtk4-layer-shell \
             --prefix=/usr/local \
             -Ddocs=false -Dtests=false -Dintrospection=false -Dvapi=false
@@ -261,6 +264,13 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      # wlroots_smoke.rs spawns `hopd` beside hop-gtk — the query
+      # round-trip needs a daemon — and a `-p hop-gtk` test build compiles
+      # hopd's library but never its binary, so the gate builds the binary
+      # explicitly or every fresh-runner run dies in spawn_daemon.
+      - name: Build hopd (the smoke tests' daemon)
+        run: cargo build -p hopd
 
       # The feature-on code (`layer_shell.rs`'s apply branch, `session.rs`'s
       # LayerShell wiring, `window.rs`'s gate) is compiled by no other gate —
