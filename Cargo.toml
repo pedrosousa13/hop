@@ -61,7 +61,7 @@ x11rb = { version = "0.13", features = ["xtest"] }
 # block declared rather than smuggled in: the lint covers normal compilation
 # of both members — `src/` and `#[cfg(test)]` code alike — so each one needs
 # its own narrow `#[expect(unsafe_code)]` at the statement to build at all.
-# As of issue #198 there are eight: that one production block, plus five
+# As of issue #198 there were eight: that one production block, plus five
 # test-only `libc::mkfifo`/`pre_exec` calls in `hop-protocol::content`,
 # `hop-protocol`'s own `config_file` (the config-file read promoted out of
 # `hopd::config` by issue #182), `hopd::config`, `hopd`'s
@@ -76,9 +76,14 @@ x11rb = { version = "0.13", features = ["xtest"] }
 # specific exception to "no new `unsafe`", since no safe binding reaches
 # this call on the pango/fontconfig versions this workspace targets — see
 # `apps/hop-gtk/src/fonts.rs`'s doc comment, "Registering with
-# fontconfig"). Each `expect` is itself the proof the lint reaches where
-# it's written: were it not firing there, the unfulfilled expectation would
-# warn, and CI's `-D warnings` would fail.
+# fontconfig"). Issue #234 adds five, all production code: `hop-cli`'s
+# `dbus` (one `libc::getuid`, the SASL EXTERNAL identity) and four in
+# `hop-hotkeyd`'s `run` (the signalfd setup, the `poll` wrapper, the
+# child-side signal-mask reset, and the `pre_exec` registration that
+# installs it into the spawned toggle). That makes thirteen. Each `expect`
+# is itself the proof the lint reaches where it's written: were it not
+# firing there, the unfulfilled expectation would warn, and CI's
+# `-D warnings` would fail.
 #
 # What it does not cover is doc tests. Cargo hands `--deny=unsafe_code` to
 # rustdoc — visible in `cargo test -p hop-protocol --doc -v` — but rustdoc

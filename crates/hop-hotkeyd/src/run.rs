@@ -29,9 +29,12 @@
 //! through a descriptor closes it structurally: the signal becomes *data*
 //! the same `poll` that watches the X socket wakes on, so there is no
 //! window in which a SIGTERM can be delivered but not observed, and no
-//! async-signal handler anywhere in the process. The cost is three narrow
-//! `unsafe` blocks around `libc` calls this workspace's `unsafe_code = deny`
-//! lint requires declaring — each carries its own SAFETY comment below.
+//! async-signal handler anywhere in the process. The cost is four narrow
+//! `unsafe` touchpoints around `libc` calls this workspace's
+//! `unsafe_code = deny` lint requires declaring — the signalfd setup, the
+//! `poll` wrapper, the child-side mask reset, and the `pre_exec`
+//! registration that calls it — each carrying its own SAFETY comment or
+//! `reason` below.
 //!
 //! # Single-instance by X-level evidence, not lockfiles (AC 5)
 //!
@@ -95,7 +98,12 @@ enum Outcome {
 /// disposition (kill the process — acceptable but ungraceful) or, worse,
 /// arrive after the mask is set but be queued invisibly. With the mask set
 /// first, delivery is deferred until the `read` below asks for it.
-#[expect(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "signalfd(2) is the only way to read blocked signals as data; \
+              sigprocmask and signalfd report failure by return value, and \
+              the produced fd is transferred whole into an OwnedFd/File"
+)]
 fn install_signal_fd() -> io::Result<File> {
     // SAFETY: `sigset_t` is a plain C value that `sigemptyset`/`sigaddset`
     // initialize; `sigprocmask` and `signalfd` report failure by return
@@ -129,7 +137,12 @@ fn install_signal_fd() -> io::Result<File> {
 /// whether anything woke early. `POLLERR`/`POLLHUP` count as wakeups: a
 /// hung-up X socket must end the wait so the loop can reconnect, not sit
 /// in another full timeout.
-#[expect(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "poll(2) has no safe wrapper in this workspace's dependency \
+              set, and it is what lets one blocking call watch both the X \
+              socket and the signalfd; failure is reported by return value"
+)]
 fn wait_readable(fds: &mut [libc::pollfd], timeout: Duration) -> io::Result<bool> {
     // SAFETY: `fds` is a valid slice of initialized `pollfd` values for the
     // duration of the call; `poll` reports failure by return value.
@@ -378,7 +391,40 @@ fn handle_event(event: &x11rb::protocol::Event, resolved: &[ResolvedBinding<'_>]
 /// and `Mod2Mask` (Num Lock, same story one row over). Without this, a
 /// user with Num Lock on would find their hotkey dead for no reason either
 /// they or the config can see.
+///
+/// Also the anchor for the child-side mask reset below: everything between
+/// this constant and [`spawn_toggle`] is the signal story of this module.
 const FORGIVEN_STATE: u16 = 0x0002 | 0x0010;
+
+/// Resets this process's signal mask to empty.
+///
+/// Never called by hop-hotkeyd itself — this process *wants* its signals
+/// blocked. It is installed into the spawned toggle's `pre_exec`, because a
+/// fork inherits the parent's signal mask: without this, `hop toggle` (and,
+/// through it, every hop-gtk it launches) would inherit the blocked
+/// SIGINT/SIGTERM and ignore Ctrl+C and SIGTERM for as long as it ran.
+#[expect(
+    unsafe_code,
+    reason = "sigset_t is a plain C value only sigemptyset can portably \
+              initialize, and sigprocmask is the only way to change the \
+              mask; both calls report failure by return value"
+)]
+fn reset_signal_mask() -> io::Result<()> {
+    // SAFETY: both calls are async-signal-safe (POSIX.1-2008's required
+    // list), which is the contract `pre_exec` imposes on everything the
+    // closure touches between fork and exec; neither has preconditions on
+    // process state beyond the initialized `sigset_t`.
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut empty) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 /// Spawns `hop toggle` — the universal toggle, design spec §3 — detached
 /// from this process so hop-gtk's re-invocation (which forwards to the
@@ -390,8 +436,22 @@ const FORGIVEN_STATE: u16 = 0x0002 | 0x0010;
 /// fatal — the grab loop's job is to keep holding the key even when the
 /// toggle side is briefly broken.
 fn spawn_toggle() {
-    let spawned = Command::new("hop")
-        .arg("toggle")
+    let mut command = Command::new("hop");
+    command.arg("toggle");
+
+    #[expect(
+        unsafe_code,
+        reason = "CommandExt::pre_exec is the only hook that runs between \
+                  fork and exec; registering the mask reset there is the \
+                  only way to keep the blocked SIGINT/SIGTERM out of the \
+                  child"
+    )]
+    // SAFETY: the closure runs once per spawn, between fork and exec, and
+    // calls only `reset_signal_mask` — async-signal-safe libc calls, which
+    // is exactly what `pre_exec`'s own documentation requires of the
+    // closure. Registration itself cannot fail; a failing closure surfaces
+    // through `spawn` below.
+    let spawned = unsafe { command.pre_exec(reset_signal_mask) }
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
