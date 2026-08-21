@@ -177,7 +177,7 @@ exceptions = [
     # license nothing else in the tree needs, accepted narrowly rather than
     # widening the allow list for a license hop takes on nowhere else.
     { allow = ["Apache-2.0"], name = "gethostname" },
-     { allow = ["Apache-2.0 WITH LLVM-exception"], name = "target-lexicon" },
+    { allow = ["Apache-2.0 WITH LLVM-exception"], name = "target-lexicon" },
 ]
 
 [licenses.private]

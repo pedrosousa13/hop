@@ -1,6 +1,6 @@
 //! Detects which kind of display session `hop-gtk` is running in, and
 //! decides — once, at startup — which of the design spec §2 platform
-//! table's overlay strategies this run gets.
+//! table's overlay strategies this run gets (issue #232).
 //!
 //! # Why a decision made here rather than ad hoc where it is needed
 //!
@@ -196,8 +196,6 @@ mod tests {
         // edit that lets the probe answer leak into the X11 decision fails
         // here.
 
-        // And when a build with the feature meets a supporting compositor,
-        // layer-shell wins — the KDE/wlroots rows.
         for support in [
             layer_shell::Support::NotCompiledIn,
             layer_shell::Support::UnsupportedByCompositor,
@@ -227,7 +225,7 @@ mod tests {
         assert!(strategy.dismisses_on_focus_loss());
 
         // And when a build with the feature meets a supporting compositor,
-        // layer-shell wins — the KDE/wlrows rows.
+        // layer-shell wins — the KDE/wlroots rows.
         let strategy = SessionKind::Wayland.overlay_strategy(layer_shell::Support::Supported);
         assert_eq!(strategy, OverlayStrategy::LayerShell);
         assert!(!strategy.dismisses_on_focus_loss());

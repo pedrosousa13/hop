@@ -1,6 +1,6 @@
 //! X11's overlay positioning: centers the window on the screen at map time,
 //! implementing design spec §2's X11 row — a "normal override-positioned
-//! window" — for every WM/DE and, critically, with **no** window manager at
+//! window" (issue #232) — for every WM/DE and, critically, with **no** window manager at
 //! all (the under-Xvfb shape `tests/x11_smoke.rs` verifies).
 //!
 //! # Why this goes through the X server directly — there is no GTK4 API left
