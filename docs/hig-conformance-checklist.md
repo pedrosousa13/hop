@@ -201,13 +201,17 @@ a hint chip's background sampled exactly `#202024`, matching `--hop-bg-hover`.
 That is real, not plausible, confirmation for the tokens it covers.
 
 A genuine, previously-unrecorded contrast failure turned up while checking
-the rest: `assets/stylesheet.css`'s `.hop-row-hint-key` rule sets
+the rest; it has since been closed by issue #214 — the finding is kept as
+recorded, with its closure at the end of this paragraph:
+`assets/stylesheet.css`'s `.hop-row-hint-key` rule set
 `color: {{hop-accent}}` — the bare, palette-invariant ramp literal
 (`#e3a83b`), not `{{hop-sel-bar}}` or any other name `.hop-theme-light`
 redeclares. Reading `apps/hop-gtk/src/tokens.rs`'s `raw_from`: a
 `Palette::Light` lookup checks `.hop-theme-light`'s overlay first, but that
-overlay only redeclares the eleven SEMANTIC LAYER names (`--hop-bg`,
-`--hop-sel-bar`, and the rest) — `--hop-accent` itself is not among them, so
+overlay only redeclares the SEMANTIC LAYER names (`--hop-bg`,
+`--hop-sel-bar`, and the rest — twelve today, issue #214's palette-aware
+`--hop-hint-accent` alias being the twelfth; eleven at this pass's own
+snapshot) — `--hop-accent` itself is not among them, so
 a light-palette resolution of `--hop-accent` falls through to the same dark
 literal a dark-palette resolution gets. The result: under the light palette,
 the hint-key glyph ("Enter") would render in the *dark* accent, `#e3a83b`,
@@ -228,8 +232,17 @@ plumbing this crate does not itself provide), so a live light-mode render
 was not achievable here; see item 7's own note on the same limitation. The
 arithmetic itself does not depend on that capture, though — it follows
 directly from the hex values `tokens.css` and `resolve`'s own logic commit
-to. Worth a follow-up issue; not filed here per this pass's own scope (see
-"What to do" in #202).
+to. That follow-up was filed and closed as issue #214:
+`.hop-row-hint-key` now asks for `{{hop-hint-accent}}` — a semantic-layer
+alias declared `var(--hop-accent)` under the dark palette and redeclared in
+`.hop-theme-light` as `var(--hop-accent-light)`, with regression tests
+pinning the glyph's resolved colour to different values per palette — so the
+glyph resolves to the committed light accent under the light palette and the
+≈2.0:1 failure computed above cannot occur. What the closure does not change:
+the environment limitation above still stands — no portal/GSettings plumbing
+exists to force a live light-palette capture, so the light palette's
+on-screen rendering remains confirmed by arithmetic and by the regression
+tests, not by a capture of the running app.
 
 #### 2b. Screen-reader labels on rows and actions
 
@@ -549,7 +562,8 @@ this pass's own captures surfaced several concrete surfaces that fell back to
 an un-tokenized Adwaita default, each checked against this item's own pass
 condition rather than waved through on the provider's existence. One of them
 — the window/listview base background, immediately below — has since been
-closed by issue #215; the rest remain stock:
+closed by issue #215, and the declared brand fonts' bundling half by issue
+#198; the rest remain stock:
 
 - **Most of the window, in the state a user sees most often — closed by
   issue #215.** An empty-query capture (`--screenshot out.png`, no
@@ -592,17 +606,31 @@ closed by issue #215; the rest remain stock:
   `tokens.css` but referenced by no selector in `assets/stylesheet.css` —
   the rounded corner visible in every capture this pass produced is
   Adwaita's own default client-side-decoration shape, not a hop value.
-- **The declared brand fonts, on this machine.** `fc-list` on the machine
-  this pass ran on shows neither "Inter" nor "Iosevka"/"Iosevka Term"
-  installed, and `apps/hop-gtk` bundles no GResource of its own (no
+- **The declared brand fonts, on this machine — the bundling half closed by
+  issue #198.** At this pass's snapshot, `fc-list` on the machine this pass
+  ran on showed neither "Inter" nor "Iosevka"/"Iosevka Term" installed, and
+  `apps/hop-gtk` bundled no GResource of its own (no
   `gresource`/`register_resource`/font-map call anywhere in the crate) — this
   item's own Verifiability note already flagged font family as needing
   exactly that check. So every capture this pass produced, including the
   ones confirming correct *colour* above, rendered every label in a
   fallback system font, not hop's declared identity type; the CSS
-  `font-family` chain is correctly wired (confirmed by reading it) but its
+  `font-family` chain was correctly wired (confirmed by reading it) but its
   actual on-screen effect for typeface, specifically, was not something this
-  pass could observe.
+  pass could observe. Issue #198 closed the bundling half: the five faces now
+  compile into a GResource (`assets/hop-gtk.gresource.xml`, registered by
+  `fonts::bundle` before Pango constructs its first font map, with fontconfig
+  told about the materialized directory). Better, the check this item's
+  Verifiability note called for is no longer hypothetical:
+  `apps/hop-gtk/tests/font_resolution.rs` asks Pango for `"Inter"` and
+  `"Iosevka Term"` through a real `pango::Context` and asserts each loaded
+  font's own family echoes the request back — the bundled-font GResource path
+  is confirmed actually reached, cited here as the evidence rather than
+  re-derived. What remains open from this bullet is unchanged: whether a
+  *captured* frame on a given machine renders the bundled faces is still the
+  separate, manual-capture proof the Verifiability note describes, and the
+  query entry, the row title's typography, and the window's own shape remain
+  stock Adwaita.
 
 Row background and row-hover, the selection indicator's fill, the hint
 chips' colours and backgrounds, the subtitle's colour, and the mode label's
@@ -613,9 +641,11 @@ existed to capture, by pixel sampling. The gaps above are named as what they
 are: real and specific, not a residue of "no provider yet." The window/listview
 background gap dominated the most commonly seen state and was, as this pass
 suggested, worth a follow-up issue; that follow-up was filed and closed as
-issue #215 (see above). The query entry, the row title's typography, the
-window's own shape, and font family remain open, not filed here per this
-pass's own scope.
+issue #215 (see above). The query entry, the row title's typography, and the
+window's own shape remain open, not filed here per this pass's own scope;
+the font-family gap's bundling half has since been closed by issue #198
+(above), leaving only the capture-side confirmation that the bundled
+typefaces are what actually renders on screen.
 
 ---
 
@@ -655,8 +685,10 @@ fill; issue #193 closed that. This pass's own pixel sample of a selected row
 (item 6 above) reads exactly `#2f2719` — `--hop-accent-subdued`'s own
 documented composite, to the byte — so the selection indicator now genuinely
 renders the committed accent, confirmed live rather than assumed. The hint
-chip's key glyph (`.hop-row-hint-key`, issue #197) also renders in
-`--hop-accent`, visible as amber "Enter"/"Open" text in every capture this
+chip's key glyph (`.hop-row-hint-key`, issue #197) also renders in the
+accent — `--hop-hint-accent`, issue #214's palette-aware alias that resolves
+to `--hop-accent` under the dark palette — visible as amber "Enter"/"Open"
+text in every capture this
 pass produced, and per that rule's own comment this is a deliberate use of
 the accent's reservation ("action hints"), not an exception to
 "never for body text" — a key glyph is a short badge naming a physical key,
@@ -675,13 +707,17 @@ grep result.
 
 One more thing surfaced while checking this item, cross-referenced rather
 than repeated in full: item 2a above found that `.hop-row-hint-key`'s
-`color: {{hop-accent}}` resolves to the *dark* accent literal even under the
-light palette (`.hop-theme-light` never redeclares `--hop-accent`), so a
-light-mode hint glyph would render `#e3a83b`, not the committed light accent
-`#875c0f` this item's own "the break" section names. That is a contrast
-failure first and an accent-fidelity slip second — see item 2a for the
-arithmetic and why a live light-palette capture could not be forced in this
-environment.
+`color: {{hop-accent}}` resolved to the *dark* accent literal even under the
+light palette (`.hop-theme-light` did not then redeclare `--hop-accent`), so
+a light-mode hint glyph would have rendered `#e3a83b`, not the committed
+light accent `#875c0f` this item's own "the break" section names. Issue #214
+has since closed it: the rule now asks for the palette-aware
+`--hop-hint-accent` alias instead, which `.hop-theme-light` redeclares as
+`var(--hop-accent-light)`, so the glyph resolves to the committed light
+accent under the light palette and this slip no longer exists — see item 2a's
+annotation for the detail. It was a contrast failure first and an
+accent-fidelity slip second — item 2a carries the arithmetic and why a live
+light-palette capture could not be forced in this environment.
 
 ---
 
@@ -690,14 +726,14 @@ environment.
 | # | Item | Kind | Status |
 | --- | --- | --- | --- |
 | 1 | Icon language | Binding | Satisfied, verified — for content icons, the only kind this UI has; no chrome icon exists yet to test the rule's other half |
-| 2a | Contrast-checked palette | Binding | Partially satisfied — several tokens confirmed reaching the screen at their exact documented values; one real contrast failure found (hint-key glyph under the light palette, ≈2.0:1) |
+| 2a | Contrast-checked palette | Binding | Partially satisfied (updated by #214, after this table's own `0fc1c92` snapshot) — several tokens confirmed reaching the screen at their exact documented values; the hint-key glyph's light-palette contrast failure (≈2.0:1) is closed, the glyph now resolving through the palette-aware `--hop-hint-accent` alias; the remaining gap (recorded ratios plausible rather than independently re-derived; no reachable portal/GSettings plumbing for a live light-palette capture) is unchanged — see item 2a's own section above for the full account |
 | 2b | Screen-reader labels | Binding | Not yet satisfied — real subtitle and hint content now exists (#196, #197) and none of it is exposed |
 | 2c | System font scaling | Binding | Not yet satisfied — the row's fixed-height reservation still conflicts with it; the previous mode-label evidence is retracted (that code was removed by #193) |
 | 3 | Reduced motion | Binding | Partially satisfied (updated by #207, after this table's own `0fc1c92` snapshot) — a real, live-verified subject exists for the action hint's entrance fade; the other five motion-table rows (window open/close, selection move, skeleton→resolved, state change) remain exactly as unbuilt as at `0fc1c92` — see item 3's own section above for the full account |
 | 4 | Full keyboard operability | Binding | Unknown — not independently verified end-to-end |
 | 5 | Window model | Deliberately broken | Satisfied, verified |
-| 6 | Stock widget styling | Deliberately broken | Partially satisfied (updated by #215, after this table's own `0fc1c92` snapshot) — the provider (#193) exists and several surfaces confirmed tokenized; the window/listview base background (most of the default empty state) is now tokenized too, closing that surface; the query entry, the row title's typography, and the window's own shape remain stock Adwaita — see item 6's own section above for the full account |
-| 7 | Accent colour | Deliberately broken | Partially satisfied — never follows the desktop; the selection indicator and hint-key glyph now genuinely render the accent (pixel-confirmed); the focus ring is entirely unbuilt, confirmed stock Adwaita blue on screen |
+| 6 | Stock widget styling | Deliberately broken | Partially satisfied (updated by #215 and #198, after this table's own `0fc1c92` snapshot) — the provider (#193) exists and several surfaces confirmed tokenized; the window/listview base background (most of the default empty state) is now tokenized too (#215), closing that surface, and the declared brand fonts are bundled in a GResource whose path Pango is test-confirmed to reach (#198); the query entry, the row title's typography, and the window's own shape remain stock Adwaita — see item 6's own section above for the full account |
+| 7 | Accent colour | Deliberately broken | Partially satisfied (updated by #214, after this table's own `0fc1c92` snapshot) — never follows the desktop; the selection indicator and hint-key glyph now genuinely render the accent (pixel-confirmed), and the glyph's light-palette slip is closed by #214's palette-aware alias; the focus ring remains entirely unbuilt, confirmed stock Adwaita blue on screen — see item 7's own section above for the full account |
 
 None of the above is this issue's to fix — see #183's own scope, and #202's
 (the issue that requested this refresh pass). Recorded so the reviewer of
