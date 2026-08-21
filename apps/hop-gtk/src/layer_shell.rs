@@ -1,9 +1,19 @@
 //! Probes for `gtk4-layer-shell` support at startup, and the fallback that
-//! runs whenever it is absent — which, in this issue's verified environment,
-//! is every run: issue #179's environment note records `gtk4-layer-shell` as
-//! **not installed** on the machine this was built and verified on, so the
-//! layer-shell branch below is written to the crate's documented public API
-//! but has not been exercised here. The fallback path is what has.
+//! runs whenever it is absent.
+//!
+//! # Provenance (issue #233)
+//!
+//! The apply branch below was first written to this crate's documented
+//! public API without ever running against a real compositor: issue #179's
+//! environment note records `gtk4-layer-shell` as **not installed** on the
+//! machine the GNOME path (#232) was verified on, so every local run took
+//! the fallback. Issue #233 closed that gap in CI: `tests/wlroots_smoke.rs`
+//! drives a feature-on build under a headless wlroots compositor (sway) and
+//! asserts, on the live Wayland wire (`WAYLAND_DEBUG=1`), that the window
+//! actually becomes a layer surface — overlay layer, exclusive keyboard,
+//! unanchored — while the two unsupported arms below stay observable under
+//! the same harness. The fallback path is what every machine without the
+//! library still runs.
 //!
 //! # Two independent reasons this can report "unsupported"
 //!
@@ -79,13 +89,12 @@ pub fn probe() -> Support {
 /// Applies layer-shell to `window` if [`probe`] reports [`Support::Supported`];
 /// otherwise a documented no-op, leaving `window` exactly as `ui::window`
 /// built it — the fallback path this module's doc comment describes.
-///
 /// The layer-shell configuration below (overlay layer, exclusive keyboard,
 /// no anchors — a centered popup rather than an edge-anchored panel) mirrors
 /// the design spec's platform table entries for KDE and wlroots
-/// compositors. It is compiled only under the `layer-shell` feature and has
-/// not run against a real compositor in this issue's verified environment —
-/// see this module's top doc comment.
+/// compositors. It is compiled only under the `layer-shell` feature and is
+/// exercised end to end by `tests/wlroots_smoke.rs` under a headless sway
+/// in CI (issue #233) — see this module's top doc comment.
 pub fn apply_or_fallback(window: &impl IsA<gtk::Window>) -> Support {
     let support = probe();
 
