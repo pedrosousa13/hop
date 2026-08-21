@@ -636,6 +636,7 @@ name = "hop-gtk"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "gdk-pixbuf",
  "gio",
  "glib",
  "glib-build-tools",

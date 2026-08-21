@@ -16,6 +16,19 @@
 //! comment, further down in this file, for exactly what it does and does
 //! not establish, and for where the stronger, widget-level proof lives.
 //!
+//! Issue #228 points a real pixel decoder at the claims only decoded pixels
+//! can defend: every capture's dimensions are checked against the window
+//! size the token system declares, from the PNG's IHDR header bytes alone,
+//! and the results-state capture is decoded (via a dev-only `gdk-pixbuf`
+//! dependency — see `Cargo.toml`'s own comment on it for why it adds no new
+//! compiled code) so the selected row's composited fill can be sampled and
+//! asserted against the composite `--hop-accent-subdued` documents.
+//! Deliberately *not* added: pixel assertions for flat token colours such as
+//! the row ground or the hint-chip background — those are already pinned at
+//! the declaration level by the token-resolution tests — or for the
+//! mode-label/marker-highlight visibility gap described above, which stays
+//! owned by the widget-level tests.
+//!
 //! # Why a subprocess per screenshot rather than driving `hop_gtk::app` in-process
 //!
 //! GTK is not safely re-initializable within one process — `gtk::init()` (and
@@ -46,6 +59,13 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+// The new assertions below read every expected value live out of the token
+// system — the window size, the row height, and the two colours whose
+// composite the selected row's fill documents — never as literals duplicated
+// beside them, for the same drift reason `src/tokens.rs`'s own tests state:
+// a future edit to `assets/tokens.css` should fail here loudly, not pass
+// against a stale copy of its old values.
+use hop_gtk::tokens::{self, Palette};
 
 /// A spawned `gtk4-broadwayd`, killed on drop. Display number is derived
 /// from this process's own pid so parallel `cargo test` invocations (a
@@ -230,6 +250,222 @@ fn assert_is_a_png(path: &Path) {
     );
 }
 
+/// Reads a PNG's width and height straight out of its IHDR header bytes —
+/// no decode. Every PNG opens with the 8-byte signature `assert_is_a_png`
+/// already checks, then chunks laid out as a 4-byte big-endian length, a
+/// 4-byte type, and the data; the IHDR is required to be the first chunk,
+/// so its data — big-endian width, then height, 4 bytes each — sits at
+/// bytes 16..24 of the file, per the PNG specification's layout. Issue
+/// #228's geometry assertion answers "does this capture measure the window
+/// the token system declares" from these eight bytes alone, which is why it
+/// needs no image-decoding dependency at all.
+fn png_header_dimensions(png: &[u8]) -> (u32, u32) {
+    const IHDR_DIMENSIONS: std::ops::Range<usize> = 16..24;
+    assert!(
+        png.len() > IHDR_DIMENSIONS.end,
+        "file is too small to carry a PNG IHDR ({} bytes)",
+        png.len()
+    );
+    let be_u32 =
+        |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().expect("4 bytes per u32"));
+    (be_u32(IHDR_DIMENSIONS.start), be_u32(IHDR_DIMENSIONS.start + 4))
+}
+
+/// Asserts the PNG at `path` measures exactly the window size the token
+/// system declares — `WINDOW_SIZE_PX`, read live out of `assets/tokens.css`
+/// the same way `src/tokens.rs`'s own `window_size_matches_tokens_css` reads
+/// it, never a `400`/`500` literal duplicated here that an edit to the
+/// tokens could silently drift away from. Dimensions come from the PNG
+/// header alone (see [`png_header_dimensions`]), so this half of issue
+/// #228's pixel coverage needs no decode.
+fn assert_capture_is_window_sized(path: &Path) {
+    let png = std::fs::read(path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+    let (width, height) = png_header_dimensions(&png);
+    let (expected_w, expected_h) = *tokens::WINDOW_SIZE_PX;
+    assert_eq!(
+        (width, height),
+        (expected_w as u32, expected_h as u32),
+        "{path:?} measures {width}x{height}, but the token system declares a \
+         {expected_w}x{expected_h} window"
+    );
+}
+
+/// Parses `#rrggbb` — the shape every opaque colour token in
+/// `assets/tokens.css` is authored in — into float channels, panicking on
+/// anything else (a reshaped token is a programming error to fail on
+/// immediately, the same stance `src/tokens.rs`'s own parsers take).
+fn hex_channels(value: &str) -> (f64, f64, f64) {
+    let hex = value
+        .strip_prefix('#')
+        .unwrap_or_else(|| panic!("expected a `#rrggbb` colour, got {value:?}"));
+    assert!(hex.len() == 6, "expected a `#rrggbb` colour, got {value:?}");
+    let channel = |at: usize| {
+        u8::from_str_radix(&hex[at..at + 2], 16).expect("hex channel") as f64
+    };
+    (channel(0), channel(2), channel(4))
+}
+
+/// Parses `rgba(r, g, b, a)` — the shape `--hop-accent-subdued` is authored
+/// in — into float channels plus the alpha, panicking on anything else for
+/// the same reason [`hex_channels`] does.
+fn rgba_channels(value: &str) -> ((f64, f64, f64), f64) {
+    let body = value
+        .strip_prefix("rgba(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("expected an `rgba(r, g, b, a)` colour, got {value:?}"));
+    let mut parts = body.split(',');
+    let mut next = || {
+        parts
+            .next()
+            .unwrap_or_else(|| panic!("too few channels in {value:?}"))
+            .trim()
+            .parse::<f64>()
+            .unwrap_or_else(|err| panic!("channel in {value:?} is not a number: {err}"))
+    };
+    let colour = (next(), next(), next());
+    let alpha = next();
+    assert!(
+        parts.next().is_none() && (0.0..=1.0).contains(&alpha),
+        "malformed or out-of-range alpha in {value:?}"
+    );
+    (colour, alpha)
+}
+
+/// The colour `--hop-accent-subdued`'s own comment in `assets/tokens.css`
+/// documents its selected-row fill compositing to, computed from the
+/// committed token values rather than restated here as a second hardcoded
+/// literal: both inputs — the translucent accent wash and the window ground
+/// it composites over (`--hop-bg`) — are resolved live through
+/// `tokens::resolve`, the same resolver the stylesheet build uses, then
+/// combined with the standard source-over alpha formula and rounded to the
+/// u8 channels a PNG stores. If either token moves, this moves with it and
+/// the assertion below keeps telling the truth; if the *rendering* stops
+/// matching the tokens, the assertion fails.
+fn documented_selection_fill() -> [u8; 3] {
+    let (fg, alpha) = rgba_channels(&tokens::resolve("hop-accent-subdued", Palette::Dark));
+    let bg = hex_channels(&tokens::resolve("hop-bg", Palette::Dark));
+    let over = |f: f64, b: f64| (f * alpha + b * (1.0 - alpha)).round() as u8;
+    [over(fg.0, bg.0), over(fg.1, bg.1), over(fg.2, bg.2)]
+}
+
+/// Decodes the PNG at `path` with `gdk-pixbuf` and asserts the selected
+/// row's composited fill really renders the documented composite — issue
+/// #228's whole point: the one colour claim in the HIG conformance
+/// checklist that only decoded pixels can defend, promoted from a one-off
+/// manual sample recorded in prose to a committed regression.
+/// The vertical position of the results list depends on the query entry's
+/// allocated height, which GTK derives from theme metrics no token commits —
+/// so the row cannot be found from geometry alone. What *is* committed is
+/// the fill's colour and its size: `.hop-selection-indicator` is the only
+/// surface in the capture painted `--hop-sel-fill` (the composite this
+/// function expects), it spans essentially the full window width, and its
+/// height is `ROW_HEIGHT_PX` by `ui::window.rs`'s own `set_height_request`.
+/// So the scan finds every scanline where the expected colour matches
+/// across a substantial run of pixels (a threshold low enough that the row's
+/// own title text and action-hint chips drawn over the fill cannot break a
+/// scanline's count, high enough that no other surface could plausibly
+/// reach it), groups those scanlines into contiguous vertical bands, and
+/// demands exactly one band of the committed row height. Text glyphs are
+/// avoided by sampling the middle of the longest *uninterrupted* horizontal
+/// run of the expected colour inside the band — a run by definition contains
+/// nothing drawn over the fill. If the fill's colour, place, or size breaks,
+/// the band disappears or the sample mismatches and this fails.
+fn assert_selected_row_fill_is_the_documented_composite(path: &Path, expected: [u8; 3]) {
+    let pixbuf = gdk_pixbuf::Pixbuf::from_file(path)
+        .unwrap_or_else(|err| panic!("decoding {path:?}: {err}"));
+    assert_eq!(
+        pixbuf.colorspace(),
+        gdk_pixbuf::Colorspace::Rgb,
+        "{path:?} decoded to an unexpected colourspace"
+    );
+    let width = pixbuf.width() as usize;
+    let height = pixbuf.height() as usize;
+    let channels = pixbuf.n_channels() as usize;
+    let rowstride = pixbuf.rowstride() as usize;
+    let pixels = pixbuf.pixel_bytes().expect("pixbuf exposes its pixel bytes");
+    // Rowstride, not width * channels: gdk-pixbuf pads each row, so the
+    // pixel at (x, y) lives at y * rowstride + x * channels, never at
+    // y * width * channels + ....
+    let pixel = |x: usize, y: usize| -> [u8; 3] {
+        let at = y * rowstride + x * channels;
+        pixels[at..at + 3].try_into().expect("3 bytes per RGB pixel")
+    };
+
+    let row_h = *tokens::ROW_HEIGHT_PX as usize;
+    // A scanline belongs to the fill band when at least this many of its
+    // pixels are exactly the expected composite — see this function's doc
+    // comment for why the threshold sits where it does.
+    let scanline_threshold = width / 8;
+
+    let matching_scanlines: Vec<usize> = (0..height)
+        .filter(|&y| (0..width).filter(|&x| pixel(x, y) == expected).count() >= scanline_threshold)
+        .collect();
+
+    // Group the matching scanlines into contiguous vertical bands.
+    let mut bands: Vec<(usize, usize)> = Vec::new();
+    for &y in &matching_scanlines {
+        match bands.last_mut() {
+            Some((_, end)) if *end + 1 == y => *end = y,
+            _ => bands.push((y, y)),
+        }
+    }
+    assert_eq!(
+        bands.len(),
+        1,
+        "{path:?} should show exactly one composited-selection-fill band \
+         (one deterministically-selected row), found {}: {:?}",
+        bands.len(),
+        bands
+    );
+    let (band_top, band_bottom) = bands[0];
+    let band_height = band_bottom - band_top + 1;
+    // The indicator's height is `ROW_HEIGHT_PX` by construction; up to a
+    // scanline at each edge may blend the fill into the ground behind it
+    // and so miss the exact-match count, hence the small slack — but only
+    // downward: a band *taller* than a row would mean some other surface
+    // joined in.
+    assert!(
+        band_height + 2 >= row_h && band_height <= row_h,
+        "the composited-fill band in {path:?} spans {band_height} scanlines, \
+         but a selected row is {row_h}px tall"
+    );
+
+    // Sample the middle scanline of the band, along its longest
+    // uninterrupted run of the expected colour — inside the fill, clear of
+    // every glyph and chip drawn over it (see the doc comment).
+    let sample_y = (band_top + band_bottom) / 2;
+    let mut best: (usize, usize) = (0, 0);
+    let mut run_start: Option<usize> = None;
+    for x in 0..=width {
+        let matching = x < width && pixel(x, sample_y) == expected;
+        match (run_start, matching) {
+            (None, true) => run_start = Some(x),
+            (Some(start), false) => {
+                if x - start > best.1 - best.0 {
+                    best = (start, x);
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    let (run_start, run_end) = best;
+    assert!(
+        run_end - run_start >= width / 2,
+        "the fill band's longest unobstructed run in {path:?} is only \
+         {}px wide at y={sample_y}",
+        run_end - run_start
+    );
+    let sample_x = (run_start + run_end) / 2;
+    assert_eq!(
+        pixel(sample_x, sample_y),
+        expected,
+        "the selected row's composited fill at ({sample_x}, {sample_y}) in \
+         {path:?} does not match the composite `--hop-accent-subdued` \
+         documents"
+    );
+}
+
 #[test]
 fn captures_the_empty_state_and_a_results_state_headless() {
     let runtime_dir = tempfile::tempdir().unwrap();
@@ -245,6 +481,9 @@ fn captures_the_empty_state_and_a_results_state_headless() {
     // window shows.
     run_screenshot(&daemon, &broadway, &empty_state_png, None);
     assert_is_a_png(&empty_state_png);
+    // Issue #228: every capture must measure the window the token system
+    // declares — checked from the PNG's IHDR header bytes alone, no decode.
+    assert_capture_is_window_sized(&empty_state_png);
 
     // Results state: "2+2" is the same deterministic calculator query
     // `crates/hopd/tests/calculator.rs` drives against this same real
@@ -258,6 +497,18 @@ fn captures_the_empty_state_and_a_results_state_headless() {
     // same test for the exclusive-route case that shows it.
     run_screenshot(&daemon, &broadway, &results_state_png, Some("2+2"));
     assert_is_a_png(&results_state_png);
+    assert_capture_is_window_sized(&results_state_png);
+    // Issue #228: the selected row's composited fill — the one colour claim
+    // only decoded pixels can defend (flat token colours stay pinned at the
+    // declaration level by the token-resolution tests, so they get no pixel
+    // assertion here) — is sampled from the decoded capture and asserted
+    // against the composite `--hop-accent-subdued`'s own comment documents,
+    // computed live from the committed token values by
+    // `documented_selection_fill`, never restated as a literal here.
+    assert_selected_row_fill_is_the_documented_composite(
+        &results_state_png,
+        documented_selection_fill(),
+    );
 
     // The two states are visually different renders, not the same frame
     // written twice — a coarse but meaningful check that content actually
@@ -280,6 +531,7 @@ fn captures_the_empty_state_and_a_results_state_headless() {
     // real `marker_span` over the leading `=`.
     run_screenshot(&daemon, &broadway, &exclusive_route_png, Some("=1+1"));
     assert_is_a_png(&exclusive_route_png);
+    assert_capture_is_window_sized(&exclusive_route_png);
 
     // What the assertion below does and does not establish, stated
     // precisely rather than left to be over-read: `"=1+1"` and `"2+2"`
@@ -294,11 +546,19 @@ fn captures_the_empty_state_and_a_results_state_headless() {
     // Pango attribute range over the reported span — lives in the
     // widget-level, broadway-gated tests in `ui::window`'s own test module:
     // `assert_mode_label_mirrors_exclusive_and_nothing_else` and
-    // `assert_marker_highlight_covers_exactly_the_reported_span`. A
-    // pixel-region check here would close that gap for the screenshot path
-    // specifically, but decoding a PNG needs an image-decoding dependency
-    // this task does not take on; unclosed, and named as such rather than
-    // implied closed.
+    // `assert_marker_highlight_covers_exactly_the_reported_span`. The
+    // pixel-decoding dependency whose absence the previous wording of this
+    // paragraph named as the reason the gap stayed open now exists — issue
+    // #228 added it, dev-only, and pointed it at the claims only decoded
+    // pixels can defend: the composited selection fill (asserted above) and
+    // every capture's geometry (asserted from the PNG header). This gap is a
+    // different claim — whether two *widget-level* effects are visible in
+    // captures whose query text differs — and it stays unclosed here,
+    // deliberately: a pixel scan cannot separate "mode label absent" from
+    // "mode label drawn where the differing text already changed the bytes"
+    // any better than the byte-diff can, so the stronger, widget-level proof
+    // remains the right owner, and this test still names the gap rather than
+    // implying it closed.
     let exclusive_bytes = std::fs::read(&exclusive_route_png).unwrap();
     assert_ne!(
         exclusive_bytes, results_bytes,
