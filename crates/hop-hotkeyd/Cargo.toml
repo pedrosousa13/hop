@@ -1,0 +1,49 @@
+[package]
+name = "hop-hotkeyd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hop-hotkeyd"
+path = "src/main.rs"
+
+[dependencies]
+# `version` alongside `path` for the reason given in `hop-core/Cargo.toml`: a
+# bare path dependency is a wildcard requirement, which `cargo deny check
+# bans` flags.
+hop-protocol = { path = "../hop-protocol", version = "0.1.0" }
+
+# `config.rs` parses `[hotkey]` out of `config.toml` — `toml` is already a
+# workspace dependency (`hopd::config`, then `hop-gtk::keymap`, carry the
+# same justification): no hand-rolled TOML parser worth writing, and this
+# module reads out of `toml::Value` directly, so it needs no `serde`
+# dependency of its own either.
+toml.workspace = true
+
+# One typed refusal per way loading `[hotkey]` can go wrong, the same shape
+# `hopd::config::ConfigError`, `hop-gtk::keymap::KeymapError` and
+# `hop_protocol::config_file::ConfigFileError` already use `thiserror` for.
+thiserror.workspace = true
+
+# The signal half of the event loop: SIGINT/SIGTERM are blocked with
+# `sigprocmask` and read back through a `signalfd`, so the grab loop's one
+# `poll` wakes on both key events and signals with no async-signal handler
+# anywhere (see `run.rs`'s module doc). Already a workspace dependency
+# (`hopd` uses it for the systemd socket descriptors); this is a second
+# consumer, not a new one.
+libc.workspace = true
+
+# The X11 client: `XGrabKey` on the root window, core protocol only in the
+# production binary. Promoted to a workspace dependency by this issue — see
+# the root `Cargo.toml`'s comment on the entry for why x11rb rather than
+# `libX11` FFI, and `apps/hop-gtk/Cargo.toml`'s identical entry for the
+# original argument.
+x11rb.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
