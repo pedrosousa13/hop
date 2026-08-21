@@ -285,3 +285,49 @@ jobs:
 
       - name: "Fallback arm (feature off: sway)"
         run: cargo test -p hop-gtk --test wlroots_smoke
+
+  # A separate job, not a step in `ci`, for the same reason `layer-shell-gate`
+  # is: issue #234's Xvfb arm has its own failure shape — "the hotkey path
+  # regressed" or "the X/dbus provisioning broke" is a different problem for
+  # a reviewer than a plain test failure — and one job would collapse that
+  # status into `ci`'s. The arm it runs is `crates/hop-hotkeyd/tests/e2e.rs`,
+  # which skips with a printed reason when its prerequisites are absent —
+  # exactly what keeps `ci`'s default `cargo test --workspace` green without
+  # this provisioning — so installing them here is what turns the skip into
+  # a hard, passing requirement, the same move `ci`'s own Xvfb install made
+  # for `x11_smoke.rs`.
+  #
+  # The build step is load-bearing, not hygiene: `cargo test -p hop-hotkeyd`
+  # compiles only that package, while the harness drives four binaries from
+  # the shared target directory (`hopd`, `hop`, `hop-gtk`, `hop-hotkeyd`)
+  # and skips, rather than fails, when a sibling is missing — the same
+  # reason `layer-shell-gate` builds `hopd` explicitly. `hop-gtk` is in the
+  # list because the toggle chain's last hop is a real re-invocation of it;
+  # its GTK system packages are installed above for exactly that link.
+  hotkey-gate:
+    name: Hotkey gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK4 + libadwaita + Xvfb + dbus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libgtk-4-bin libadwaita-1-dev xvfb dbus
+
+      # Same version pin as `ci`'s toolchain step, for the same reason: see
+      # the comment there and in `rust-toolchain.toml` (issue #223).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the binaries the harness drives
+        run: cargo build -p hopd -p hop-cli -p hop-gtk -p hop-hotkeyd
+
+      - name: Hotkey end-to-end arm
+        run: cargo test -p hop-hotkeyd --test e2e
