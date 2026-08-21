@@ -268,7 +268,10 @@ fn png_header_dimensions(png: &[u8]) -> (u32, u32) {
     );
     let be_u32 =
         |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().expect("4 bytes per u32"));
-    (be_u32(IHDR_DIMENSIONS.start), be_u32(IHDR_DIMENSIONS.start + 4))
+    (
+        be_u32(IHDR_DIMENSIONS.start),
+        be_u32(IHDR_DIMENSIONS.start + 4),
+    )
 }
 
 /// Asserts the PNG at `path` measures exactly the window size the token
@@ -299,9 +302,7 @@ fn hex_channels(value: &str) -> (f64, f64, f64) {
         .strip_prefix('#')
         .unwrap_or_else(|| panic!("expected a `#rrggbb` colour, got {value:?}"));
     assert!(hex.len() == 6, "expected a `#rrggbb` colour, got {value:?}");
-    let channel = |at: usize| {
-        u8::from_str_radix(&hex[at..at + 2], 16).expect("hex channel") as f64
-    };
+    let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex channel") as f64;
     (channel(0), channel(2), channel(4))
 }
 
@@ -382,13 +383,17 @@ fn assert_selected_row_fill_is_the_documented_composite(path: &Path, expected: [
     let height = pixbuf.height() as usize;
     let channels = pixbuf.n_channels() as usize;
     let rowstride = pixbuf.rowstride() as usize;
-    let pixels = pixbuf.pixel_bytes().expect("pixbuf exposes its pixel bytes");
+    let pixels = pixbuf
+        .pixel_bytes()
+        .expect("pixbuf exposes its pixel bytes");
     // Rowstride, not width * channels: gdk-pixbuf pads each row, so the
     // pixel at (x, y) lives at y * rowstride + x * channels, never at
     // y * width * channels + ....
     let pixel = |x: usize, y: usize| -> [u8; 3] {
         let at = y * rowstride + x * channels;
-        pixels[at..at + 3].try_into().expect("3 bytes per RGB pixel")
+        pixels[at..at + 3]
+            .try_into()
+            .expect("3 bytes per RGB pixel")
     };
 
     let row_h = *tokens::ROW_HEIGHT_PX as usize;
