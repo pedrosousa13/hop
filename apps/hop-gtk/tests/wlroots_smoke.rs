@@ -572,15 +572,11 @@ fn feature_off_build_maps_the_ordinary_window_under_headless_sway() {
     let output = run_screenshot(&server, &daemon, &capture);
 
     assert_is_a_png(&capture);
-    let bytes = std::fs::read(&capture).unwrap();
-    assert_eq!(
-        png_header_dimensions(&bytes),
-        (
-            tokens::WINDOW_SIZE_PX.0 as u32,
-            tokens::WINDOW_SIZE_PX.1 as u32
-        ),
-        "the ordinary window must still capture at the overlay size"
-    );
+    // No size assertion on purpose: this build maps an *ordinary* toplevel,
+    // and sway is a tiling compositor — it sizes tiled windows itself (the
+    // first real CI run measured 1276x773 inside a 1280x800 output, which
+    // is correct placement behavior, not a defect). What makes this the
+    // ordinary-window path is the report and the wire below, not pixels.
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     // Wayland session, probe says not-compiled-in, so the strategy is the
