@@ -33,11 +33,29 @@ jobs:
       # comment documents having hit once already while this was built.
       # `libadwaita-1-dev` is the same story one layer up, for
       # `apps/hop-gtk`'s libadwaita dependency.
-      - name: Install GTK4 + libadwaita
+      #
+      # Issue #232 adds two packages for its Xvfb arm, each load-bearing:
+      #
+      # `xvfb` provides `Xvfb`, the X server `tests/x11_smoke.rs` spawns to
+      # prove hop-gtk's X11 overlay end to end (centered map, focus-loss
+      # dismissal, --screenshot capture, socket round trip). Broadway
+      # cannot stand in for this: it is a different display protocol, and
+      # only a real X server exercises GDK's X11 backend. The test skips
+      # with a printed reason when `Xvfb` is absent — which is what makes
+      # the same `cargo test --workspace` pass on machines without it — so
+      # installing the package here is what turns the skip into a hard,
+      # passing requirement.
+      #
+      # `dbus` provides `dbus-run-session`, which the same test's
+      # interactive arm wraps hop-gtk in: a unique GApplication registers
+      # on the session bus, and GitHub runners have no user session bus
+      # running, so without a private bus that arm would die in
+      # GApplication registration before a window ever mapped.
+      - name: Install GTK4 + libadwaita + Xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev libgtk-4-bin libadwaita-1-dev
+            libgtk-4-dev libgtk-4-bin libadwaita-1-dev xvfb dbus
 
       # Pinned to the exact version `rust-toolchain.toml` pins, not left on
       # `@stable`: an unpinned action would install whatever is newest that

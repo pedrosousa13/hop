@@ -166,7 +166,18 @@ exceptions = [
     # is "WITH" an added patent-clarifying exception to) is itself
     # GPL-3.0-compatible, per the general note above on why Apache-2.0 is
     # deliberately absent from — but not disallowed by — the allow list.
-    { allow = ["Apache-2.0 WITH LLVM-exception"], name = "target-lexicon" },
+    # `gethostname` (single license, Apache-2.0-only) arrives with issue
+    # #232's `x11rb` — the pure-Rust X11 client `apps/hop-gtk/src/x11.rs`
+    # sends its overlay-positioning `ConfigureWindow` through — and is
+    # non-optional there: x11rb's own connection setup and resource manager
+    # call it to read the local hostname, with no feature that turns that
+    # off. Apache-2.0 is itself GPL-3.0-compatible (per the general note
+    # above on why it stays off the workspace-wide allow list), so this is
+    # the same shape as the `target-lexicon` entry below it: one crate, one
+    # license nothing else in the tree needs, accepted narrowly rather than
+    # widening the allow list for a license hop takes on nowhere else.
+    { allow = ["Apache-2.0"], name = "gethostname" },
+     { allow = ["Apache-2.0 WITH LLVM-exception"], name = "target-lexicon" },
 ]
 
 [licenses.private]
