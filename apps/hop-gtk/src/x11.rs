@@ -174,10 +174,14 @@ fn center_on_screen(xid: u32) -> Result<(), PositionError> {
 /// than the screen, because a negative origin would hang the window off the
 /// top-left edge rather than centering the part that fits.
 ///
-/// Pure and unit-tested: this is the whole of §2's "override-positioned"
-/// arithmetic, kept out of the I/O around it so a regression here fails in
-/// `cargo test --workspace` on every machine, not just where Xvfb exists.
-fn centered_origin(screen_w: i32, screen_h: i32, win_w: i32, win_h: i32) -> (i32, i32) {
+/// Pure and unit-tested, and `pub` so `tests/x11_smoke.rs` computes the
+/// expected geometry from this very function rather than restating the
+/// arithmetic a second time: if the app's centering rule ever changes, the
+/// test's expectation changes in the same commit or not at all. This is the
+/// whole of §2's "override-positioned" arithmetic, kept out of the I/O
+/// around it so a regression here fails in `cargo test --workspace` on every
+/// machine, not just where Xvfb exists.
+pub fn centered_origin(screen_w: i32, screen_h: i32, win_w: i32, win_h: i32) -> (i32, i32) {
     ((screen_w - win_w).max(0) / 2, (screen_h - win_h).max(0) / 2)
 }
 
