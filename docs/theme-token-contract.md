@@ -66,16 +66,33 @@ GTK supports neither:
 - opacity — `.hop-honesty { opacity: 1 }`
 - dimensions — the locked `min-width`/`min-height` on
   `.hop-honesty .hop-skeleton`
-- contrast — `--hop-fg` and `--hop-text-subtitle` on
-  `.hop-honesty .hop-honesty-text`; `--hop-fg-2` and `--hop-text-timestamp`
+- contrast — for text, its colour, weight, and size, locked as separate
+  longhand declarations: `color: var(--hop-fg)` plus the weight and size of
+  `--hop-text-subtitle` on `.hop-honesty .hop-honesty-text`;
+  `color: var(--hop-fg-2)` plus the weight and size of `--hop-text-timestamp`
   on `.hop-honesty .hop-honesty-stamp`
+
+This is the per-property split issue #200 established, and it is the
+convention for every `.hop-honesty` member, present and future: colour,
+weight, and size are locked; font family stays theme-owned. The type tokens
+carry all of those components together, so the locked block declares their
+colour, weight, and size as longhands and deliberately never the family —
+those `font-family` declarations live outside the locked block, in the
+ordinary application-priority sheet, where a user theme's family choice
+still wins, provided the element remains present and legible. The error row
+and the skeleton bars will inherit this split when they are built, not
+re-litigate it. The carve-out likewise reserves the accent to themes;
+nothing in the honesty-critical rules references an accent token today, so
+that half of the carve-out currently binds nothing — there is no accent lock
+for a theme to collide with.
 
 Opacity and dimensions are fixed declarations rather than overridable custom
 properties — that absence of a token is deliberate, since neither may ever
 become theme-swappable. Presence is not a declaration to begin with, fixed or
 otherwise, for the reason given above. Contrast is the one guarantee carried
 by named tokens, because legibility rides on the same color and type-scale
-tokens the rest of the surface uses.
+tokens the rest of the surface uses — with the family component of those
+type tokens deliberately left outside the lock, per the carve-out above.
 
 When a requested theme style would hide a member, make it imperceptible,
 collapse it below perceivable dimensions, or make it illegible through
