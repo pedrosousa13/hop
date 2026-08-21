@@ -246,14 +246,22 @@ impl HopWindow {
             .content(&content)
             .hide_on_close(true)
             .build();
+        // Issue #233: the strategy — not a second probe — decides whether
+        // this window becomes a layer surface. `apply_or_fallback` still
+        // re-checks the probe internally (a documented no-op unless the
+        // compositor answered "supported"), but gating on
+        // `uses_layer_shell()` keeps exactly one decision authoritative:
+        // the one `resolve_overlay_strategy` logged to stderr above.
+        // X11's and every fallback row never reach it, so the ordinary
+        // window those rows describe is what actually maps.
+        if strategy.uses_layer_shell() {
+            crate::layer_shell::apply_or_fallback(&window);
+        }
 
-        crate::layer_shell::apply_or_fallback(&window);
-
-        // Issue #232: the two strategy arms that add behavior to the plain
-        // window. Order matters only for readability — layer-shell (when a
-        // feature-on build meets a supporting compositor) owns placement
-        // and focus itself, and `session` never pairs it with either arm
-        // below.
+        // Issue #232: the one remaining strategy arm that adds behavior to
+        // the plain window. Layer-shell (when a feature-on build meets a
+        // supporting compositor) owns placement and focus itself, and
+        // `session` never pairs it with this arm.
         if strategy.self_positions() {
             crate::x11::apply_self_positioning(&window);
         }

@@ -166,6 +166,19 @@ impl OverlayStrategy {
             }
         }
     }
+
+    /// Whether this strategy's window is presented as a layer surface —
+    /// the gate `ui::window`'s build runs [`crate::layer_shell::
+    /// apply_or_fallback`] behind (issue #233). Exactly one variant says
+    /// yes, by construction of [`SessionKind::overlay_strategy`]: the
+    /// protocol is Wayland-only, so X11's row never qualifies, and every
+    /// fallback row *is* the ordinary window the layer-shell call would
+    /// otherwise be a no-op on. Gating on the strategy rather than letting
+    /// `apply_or_fallback` re-probe keeps one decision — recorded in the
+    /// startup report — authoritative for both the wiring and the log.
+    pub fn uses_layer_shell(self) -> bool {
+        matches!(self, OverlayStrategy::LayerShell)
+    }
 }
 
 /// The one-line capability report printed to stderr at startup — which
@@ -246,6 +259,68 @@ mod tests {
         );
         assert!(!strategy.dismisses_on_focus_loss());
         assert!(!strategy.self_positions());
+    }
+
+    #[test]
+    fn only_the_layer_shell_strategy_applies_layer_shell() {
+        // Issue #233: the strategy is what `ui::window`'s build gates the
+        // `layer_shell::apply_or_fallback` call on, so the predicate must be
+        // true for exactly one variant — the one `overlay_strategy` produces
+        // for a Wayland session the compositor answered "supported" in — and
+        // false for X11 and `Other`, which must never touch the layer-shell
+        // API no matter what any probe said (the protocol is Wayland-only).
+        assert!(OverlayStrategy::LayerShell.uses_layer_shell());
+        assert!(!OverlayStrategy::SelfPositioned.uses_layer_shell());
+        assert!(
+            !OverlayStrategy::CompositorPlaced {
+                dismiss_on_focus_loss: true
+            }
+            .uses_layer_shell()
+        );
+        assert!(
+            !OverlayStrategy::CompositorPlaced {
+                dismiss_on_focus_loss: false
+            }
+            .uses_layer_shell()
+        );
+    }
+
+    #[test]
+    fn startup_report_names_the_layer_shell_path_and_why() {
+        // Criterion 5 of issue #233: the report must say not only which
+        // overlay path a supporting-compositor run took but what the probe
+        // answered, so `hop doctor` (M6) can tell "layer-shell because the
+        // compositor implements it" from "ordinary window because the
+        // feature was not compiled in". Both halves of every Wayland
+        // outcome are pinned here, next to the exact substrings
+        // tests/wlroots_smoke.rs asserts against.
+        let report = startup_report(
+            SessionKind::Wayland,
+            layer_shell::Support::Supported,
+            SessionKind::Wayland.overlay_strategy(layer_shell::Support::Supported),
+        );
+        assert!(
+            report.contains("layer-shell support: Supported"),
+            "a layer-shell run must record the probe's yes: {report}"
+        );
+        assert!(
+            report.contains("overlay strategy: layer-shell overlay"),
+            "a layer-shell run must name the layer-shell strategy: {report}"
+        );
+
+        let report = startup_report(
+            SessionKind::Wayland,
+            layer_shell::Support::UnsupportedByCompositor,
+            SessionKind::Wayland.overlay_strategy(layer_shell::Support::UnsupportedByCompositor),
+        );
+        assert!(
+            report.contains("layer-shell support: UnsupportedByCompositor"),
+            "the compositor's no must be visible, not collapsed into the strategy: {report}"
+        );
+        assert!(
+            report.contains("overlay strategy: compositor-placed"),
+            "the fallback must be named as the ordinary window it is: {report}"
+        );
     }
 
     #[test]

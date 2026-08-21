@@ -173,3 +173,105 @@ jobs:
 
       - name: Latency gate
         run: cargo test --release -p hop-core --test latency -- --ignored --test-threads=1
+
+  # A separate job, not a step in `ci`, for the same reason `supply-chain` and
+  # `latency-gate` are: issue #233's wlroots arm has its own failure shape —
+  # "the layer-shell path regressed" or "the compositor/library provisioning
+  # broke" is a different problem for a reviewer than a plain test failure —
+  # and one job would collapse that status into `ci`'s. It compiles the
+  # workspace (unlike `supply-chain`), so it wants the pinned toolchain and
+  # the build cache, and it runs `wlroots_smoke.rs` in *both* of that file's
+  # compilation modes, because the file's tests are gated on the feature they
+  # exercise: with `--features layer-shell` the sway arm (window really
+  # becomes a layer surface — asserted on the Wayland wire via
+  # WAYLAND_DEBUG=1, since the --screenshot capture is hop-gtk's own
+  # rendering and would look identical either way) and the Weston arm
+  # (compositor without zwlr_layer_shell_v1 falls back cleanly) run; with
+  # default features the feature-off arm runs under the same sway. All three
+  # skip with a printed reason on a machine without their prerequisites,
+  # which is exactly what makes the default `cargo test --workspace` in `ci`
+  # stay green without any of this provisioning.
+  #
+  # The provisioning is the interesting part: `ubuntu-latest` is Ubuntu 24.04
+  # (noble), which ships **no** gtk4-layer-shell package at all — apt only
+  # has `libgtk-layer-shell-dev`, the GTK3 library of the same idea, which
+  # the `gtk4-layer-shell` Rust crate's `-sys` build probe (pkg-config name
+  # `gtk4-layer-shell-0`, required version >= 1) cannot use. The boring
+  # workaround is building the real thing from a pinned release: v1.0.4, the
+  # library's latest stable tag (satisfies the >= 1 probe; the same version
+  # Ubuntu >= 24.10 ships as `libgtk4-layer-shell-dev`, so if the runner
+  # image ever moves past noble this whole step can collapse back into one
+  # apt package name). The meson flags each cut something CI does not need:
+  # docs/tests are the library's own documentation and test suites,
+  # introspection/vapi are the Python/Vala bindings whose generators
+  # (g-ir-scanner, vapigen) are not installed and would fail the build for
+  # nothing. `ldconfig` afterwards is load-bearing, not hygiene: hop-gtk
+  # links `libgtk4-layer-shell.so.0` at build time and *loads* it at run
+  # time, and without the linker cache refresh the cargo steps below would
+  # compile cleanly and then fail to start. `PKG_CONFIG_PATH` (job env) is
+  # the same story for compile time — the `/usr/local` pkgconfig directories
+  # are on pkg-config's default search path, but the sys-crate probe's
+  # failure mode when they are missed is an unreadable "library not found",
+  # so the path is spelled out instead of assumed.
+  #
+  # `sway` provides the wlroots compositor the layer-shell arm runs under
+  # (headless backend: `WLR_BACKENDS=headless`, no GPU or input devices —
+  # see `tests/wlroots_smoke.rs`'s module doc for the full invocation).
+  # `weston` provides the layer-shell-*less* compositor the fallback arm
+  # runs under: its headless backend ships in the `libweston-13-0` package
+  # `weston` depends on, and Weston implements no `zwlr_layer_shell_v1`,
+  # which is precisely the unsupported-compositor answer the probe must stay
+  # observable for. `meson`/`ninja-build`/`libwayland-dev`/
+  # `wayland-protocols` are the pinned-source build's own prerequisites.
+  layer-shell-gate:
+    name: Layer shell gate
+    runs-on: ubuntu-latest
+    env:
+      PKG_CONFIG_PATH: /usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK4 + libadwaita + compositors + gtk4-layer-shell build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libgtk-4-bin libadwaita-1-dev \
+            sway weston \
+            meson ninja-build libwayland-dev wayland-protocols
+
+      - name: Build and install gtk4-layer-shell v1.0.4
+        run: |
+          git clone --depth 1 --branch v1.0.4 \
+            https://github.com/wmww/gtk4-layer-shell.git /tmp/gtk4-layer-shell
+          meson setup /tmp/gtk4-layer-shell/build /tmp/gtk4-layer-shell \
+            --prefix=/usr/local \
+            -Ddocs=false -Dtests=false -Dintrospection=false -Dvapi=false
+          ninja -C /tmp/gtk4-layer-shell/build
+          sudo ninja -C /tmp/gtk4-layer-shell/build install
+          sudo ldconfig
+          pkg-config --modversion gtk4-layer-shell-0
+
+      # Same version pin as `ci`'s toolchain step, for the same reason: see
+      # the comment there and in `rust-toolchain.toml` (issue #223). Only
+      # clippy is needed — this job does not run `cargo fmt`.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The feature-on code (`layer_shell.rs`'s apply branch, `session.rs`'s
+      # LayerShell wiring, `window.rs`'s gate) is compiled by no other gate —
+      # `ci`'s clippy runs default features — so it is linted here, where the
+      # library it needs is installed, rather than left to rot unlinted
+      # between CI runs.
+      - name: Clippy (layer-shell feature on)
+        run: cargo clippy -p hop-gtk --features layer-shell --all-targets -- -D warnings
+
+      - name: "Layer-shell arm (feature on: sway + Weston)"
+        run: cargo test -p hop-gtk --features layer-shell --test wlroots_smoke
+
+      - name: "Fallback arm (feature off: sway)"
+        run: cargo test -p hop-gtk --test wlroots_smoke
