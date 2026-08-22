@@ -51,7 +51,7 @@ use hop_protocol::ExecOutcome;
 use hop_gtk::ipc::{self, IpcCommand, IpcEvent};
 use hop_gtk::tokens;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt, InputFocus};
+use x11rb::protocol::xproto::{ConnectionExt, InputFocus, MapState};
 use x11rb::rust_connection::RustConnection;
 
 /// How long any single "wait for the X server to reflect reality" poll may
@@ -274,10 +274,31 @@ impl XConnection {
         None
     }
 
-    /// Whether the overlay window is currently in the tree — the dismissal
-    /// check reads this, since a hidden window disappears from `query_tree`.
+    /// Whether the overlay window is currently gone from the screen —
+    /// either absent from the tree entirely or mapped no more.
+    ///
+    /// # Why "absent from the tree" is not enough on X11
+    ///
+    /// Dismissal is `close()` on a `hide_on_close` window: GTK *hides* the
+    /// surface rather than destroying it (the pre-built window must survive
+    /// for the next toggle). Under broadway a hidden surface disappears
+    /// from the window tree, which is what this file's original wording
+    /// assumed; a real X server keeps an unmapped window in `query_tree`
+    /// forever as an `IsUnMapped` child — measured against Xvfb, where the
+    /// dismissed overlay stays listed at its last geometry. So "gone"
+    /// here means the X server reports the window unmapped (or unreachable,
+    /// which for a live server means the same user-visible thing).
     fn hop_window_gone(&self) -> bool {
-        self.find_hop_window().is_none()
+        let Some((xid, _)) = self.find_hop_window() else {
+            return true;
+        };
+        match self.conn.get_window_attributes(xid) {
+            Ok(cookie) => cookie
+                .reply()
+                .map(|attr| attr.map_state == MapState::UNMAPPED)
+                .unwrap_or(true),
+            Err(_) => true,
+        }
     }
 }
 
@@ -459,6 +480,15 @@ fn png_header_dimensions(png: &[u8]) -> (u32, u32) {
     (be_u32(16), be_u32(20))
 }
 
+/// How many pixels of CSD drop-shadow margin the default Adwaita theme
+/// draws inside each side of a GTK4 toplevel's X surface under X11 — the
+/// inset between the window's X geometry (which does measure
+/// `tokens::WINDOW_SIZE_PX`; see `find_hop_window`) and the widget area
+/// `--screenshot` actually captures. See the size assertion in
+/// [`screenshot_captures_the_x11_session_and_the_socket_round_trips`] for
+/// why this is measured GTK4/X11 fact rather than a tolerance fudge.
+const CSD_SHADOW_INSET_PX: i32 = 5;
+
 /// Acceptance criteria 3, 4, and 5: `--screenshot` captures the positioned
 /// window under Xvfb; a query drives results over the socket in that same
 /// session (the capture only happens after `QueryDone` — a zero-exit run
@@ -493,20 +523,38 @@ fn screenshot_captures_the_x11_session_and_the_socket_round_trips() {
     let results_run = run_screenshot(&xvfb, &daemon, &results, Some("2+2"));
     assert_is_a_png(&results);
 
-    // Both captures must measure the overlay the token system declares
-    // (read live, never a stale literal), and the results capture must
-    // differ from the empty one — identical bytes would mean the query
-    // never changed what was on screen.
+    // Both captures must measure what an X11 window of the declared token
+    // size actually renders, and the results capture must differ from the
+    // empty one — identical bytes would mean the query never changed what
+    // was on screen.
+    //
+    // What an X11 window of the declared size renders is *not* the declared
+    // size itself, and that is GTK4 client-side-decoration truth, not a hop
+    // bug: under X11, GDK draws every CSD toplevel's drop shadow INSIDE the
+    // window's own X surface (there is no compositor-side frame to hang it
+    // on, and GTK4 sets no `_GTK_FRAME_EXTENTS` for anyone to read back).
+    // The widget the screenshot harness captures — the very thing a user
+    // sees as "the window" — sits inset within that surface by the default
+    // Adwaita theme's shadow margin, 5px per side, so a 400×500 surface
+    // paints a 390×490 content area. Measured against Ubuntu noble's
+    // libadwaita (what CI runs), not assumed: mapping this exact binary
+    // under Xvfb shows a GetGeometry of exactly WINDOW_SIZE_PX at the X
+    // level (the interactive arm below asserts precisely that through
+    // `find_hop_window`) while the PNG comes out (W−10, H−10). If a future
+    // theme widens the shadow, both numbers move together and this
+    // assertion fails loudly rather than drifting silently.
     let empty_bytes = std::fs::read(&empty).unwrap();
     let results_bytes = std::fs::read(&results).unwrap();
     let expected = (
-        tokens::WINDOW_SIZE_PX.0 as u32,
-        tokens::WINDOW_SIZE_PX.1 as u32,
+        (tokens::WINDOW_SIZE_PX.0 - 2 * CSD_SHADOW_INSET_PX) as u32,
+        (tokens::WINDOW_SIZE_PX.1 - 2 * CSD_SHADOW_INSET_PX) as u32,
     );
     assert_eq!(
         png_header_dimensions(&results_bytes),
         expected,
-        "the capture must measure the overlay size the token system declares"
+        "the capture must measure the rendered content area of the \
+         declared overlay size (declared surface minus the CSD shadow \
+         inset GTK4 carves out on X11)"
     );
     assert_ne!(
         empty_bytes, results_bytes,
