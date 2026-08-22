@@ -68,6 +68,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// Only the layer-shell test fns read committed token values
+// (`tokens::WINDOW_SIZE_PX` for the window-size assertions), so this import
+// is compiled only with the feature, for the same reason `start_weston` is
+// — a feature-off build must stay clippy-clean under `-D warnings`.
+#[cfg(feature = "layer-shell")]
 use hop_gtk::tokens;
 
 /// How long any single "wait for the compositor to come up" poll may run
@@ -182,7 +187,11 @@ impl WaylandServer {
 
     /// Polls for the compositor's socket, failing with context if the
     /// compositor exits first (a config error, a missing renderer — anything
-    /// that would otherwise surface as an opaque timeout).
+    /// that would otherwise surface as an opaque timeout). Compiled only
+    /// with the `layer-shell` feature: its only caller is the gated
+    /// `start_weston`, and an uncalled private method would fail clippy
+    /// under `-D warnings` in a feature-off build.
+    #[cfg(feature = "layer-shell")]
     fn await_socket(runtime_dir: &Path, socket_name: &str, child: &mut Child, compositor: &str) {
         let socket = runtime_dir.join(socket_name);
         let deadline = Instant::now() + POLL_TIMEOUT;
@@ -411,6 +420,10 @@ fn assert_is_a_png(path: &Path) {
 
 /// Reads a PNG's width and height straight out of its IHDR header bytes —
 /// duplicated from `x11_smoke.rs`; see this file's top doc comment.
+/// Compiled only with the `layer-shell` feature: its only callers are the
+/// two gated window-size test fns, and an uncalled private fn would fail
+/// clippy under `-D warnings` in a feature-off build.
+#[cfg(feature = "layer-shell")]
 fn png_header_dimensions(png: &[u8]) -> (u32, u32) {
     let be_u32 = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
     (be_u32(16), be_u32(20))
