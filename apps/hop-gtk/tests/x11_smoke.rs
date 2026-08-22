@@ -185,13 +185,20 @@ fn spawn_daemon(runtime_dir: &Path) -> DaemonProcess {
         runtime_dir: runtime_dir.to_path_buf(),
     };
 
+    // A created socket file does not mean a listening one: bind(2) trails
+    // create(2) by an unbounded moment on a loaded runner, and hop-gtk's
+    // IPC client *drops* a query sent during its not-yet-connected window
+    // rather than queueing it — the exact shape of the CI flake this
+    // closed (screenshot child connected to nothing and timed out). Poll
+    // for a successful connection, which is what every later step
+    // already assumes.
     for _ in 0..50 {
-        if process.socket_path.exists() {
+        if std::os::unix::net::UnixStream::connect(&process.socket_path).is_ok() {
             return process;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("hopd did not create its socket in time");
+    panic!("hopd never accepted a connection on its socket");
 }
 
 /// The environment every `hop-gtk` subprocess of these tests runs under:
