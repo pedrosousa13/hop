@@ -15,9 +15,15 @@
 //!   [`hop_protocol::config_file::read`] like every other reader of that
 //!   file, with the absent-or-malformed ⇒ logged-no-op posture issue #234's
 //!   criterion 2 fixes.
-//! - [`run`] — the grab loop itself: one X connection, one signalfd, one
-//!   blocking `poll`; single-instance by `BadAccess` evidence; backoff on
-//!   connection loss.
+//! - [`run`] — backend selection in issue #235's documented order
+//!   (**GlobalShortcuts portal → X11 grab → DE-shortcut guidance**, chosen
+//!   backend and reason logged at startup), the X11 grab loop itself (one
+//!   X connection, one signalfd, one blocking `poll`; single-instance by
+//!   `BadAccess` evidence; backoff on connection loss) and the guidance
+//!   arm for sessions where neither automatic backend applies.
+//! - [`portal`] — the GlobalShortcuts portal client: probe, `CreateSession`
+//!   /`BindShortcuts`, and blocking on `Activated`, over zbus's blocking
+//!   API so no async runtime enters this crate.
 //!
 //! # Why no tokio
 //!
@@ -38,4 +44,5 @@
 //! shortcut would — and knows nothing else about either process.
 pub mod binding;
 pub mod config;
+pub mod portal;
 pub mod run;

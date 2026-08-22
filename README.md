@@ -75,3 +75,32 @@ instead of the derived one — useful for running a development `hopd`
 alongside a real session's own, at `$XDG_RUNTIME_DIR/hop-dev/hopd.sock` or
 similar. `<path>` must still resolve inside `$XDG_RUNTIME_DIR`; anything else
 is refused rather than silently falling back to the derived path.
+
+## Global hotkeys
+
+A global hotkey runs the universal toggle: `hop-hotkeyd` grabs the key(s)
+configured under `[hotkey]` in `~/.config/hop/config.toml` (`toggle =
+"ctrl+alt+space"` — same spelling as `[keymap]`) and runs `hop toggle` when
+it fires.
+
+At startup `hop-hotkeyd` probes backends in a fixed order and logs what it
+chose and why on stderr (`hop-hotkeyd: backend ... chosen/unavailable ...`),
+so `hop doctor` can report it later:
+
+1. **GlobalShortcuts portal** — used wherever the desktop offers it (KDE,
+   GNOME 48+).
+2. **X11 grab** — a real `XGrabKey`, anywhere an X display is reachable.
+3. **DE-shortcut guidance** — when neither applies, hop-hotkeyd prints
+   per-desktop one-liners and exits cleanly rather than failing silently:
+
+```sh
+# GNOME: Settings → Keyboard → View and Customize Shortcuts → Custom
+# Shortcuts → add one with the command:
+hop toggle
+
+# KDE Plasma: System Settings → Shortcuts → Add New → Command or Script:
+hop toggle
+
+# sway / wlroots compositors, in your sway config:
+bind = SUPER, Space, exec, hop toggle
+```

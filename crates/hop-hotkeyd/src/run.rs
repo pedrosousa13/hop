@@ -174,7 +174,16 @@ fn backoff(attempt: u32) -> Duration {
         .min(Duration::from_secs(30))
 }
 
-/// Runs the resident grab loop over `bindings` until a signal ends it.
+/// Runs the resident hotkey agent over `bindings` until a signal ends it.
+///
+/// Backend selection comes first, in issue #235's documented order —
+/// **GlobalShortcuts portal → X11 grab → DE-shortcut guidance** (the spec
+/// assigns these per-platform at §3; the *order* is the issue's own,
+/// grounded in §2's graceful-degradation rule) — and the chosen backend
+/// plus the reason is logged before anything grabs anything. Every probe
+/// failure degrades to the next backend with the reason logged; the
+/// guidance arm prints the per-desktop one-liners and exits 0, the same
+/// logged-no-op posture missing or malformed config gets.
 ///
 /// Returns the process's exit code rather than a `Result`: every terminal
 /// outcome here is either "clean shutdown" (exit 0) or "refused with a
@@ -188,35 +197,234 @@ pub fn run(bindings: &[ToggleEntry]) -> ExitCode {
         }
     };
 
-    let mut attempt = 0u32;
-    loop {
-        match session(&mut signal_fd, bindings) {
-            Outcome::Signalled => {
-                eprintln!("hop-hotkeyd: exiting on signal");
-                return ExitCode::SUCCESS;
-            }
-            Outcome::AlreadyHeld(spelling) => {
-                eprintln!(
-                    "hop-hotkeyd: `{spelling}` is already grabbed by another client \
-                     — is another hop-hotkeyd running?"
-                );
-                return ExitCode::FAILURE;
-            }
-            Outcome::Fatal(reason) => {
-                eprintln!("hop-hotkeyd: {reason}");
-                return ExitCode::FAILURE;
-            }
-            Outcome::ConnectionLost(reason) => {
-                attempt += 1;
-                let delay = backoff(attempt);
-                eprintln!(
-                    "hop-hotkeyd: {reason}; retrying in {:.1}s",
-                    delay.as_secs_f64()
-                );
-                std::thread::sleep(delay);
+    match select_backend(bindings) {
+        Backend::Portal(session) => portal_arm(signal_fd, session),
+        Backend::X11Grab => {
+            let mut attempt = 0u32;
+            loop {
+                match session(&mut signal_fd, bindings) {
+                    Outcome::Signalled => {
+                        eprintln!("hop-hotkeyd: exiting on signal");
+                        return ExitCode::SUCCESS;
+                    }
+                    Outcome::AlreadyHeld(spelling) => {
+                        eprintln!(
+                            "hop-hotkeyd: `{spelling}` is already grabbed by another client \
+                             — is another hop-hotkeyd running?"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    Outcome::Fatal(reason) => {
+                        eprintln!("hop-hotkeyd: {reason}");
+                        return ExitCode::FAILURE;
+                    }
+                    Outcome::ConnectionLost(reason) => {
+                        attempt += 1;
+                        let delay = backoff(attempt);
+                        eprintln!(
+                            "hop-hotkeyd: {reason}; retrying in {:.1}s",
+                            delay.as_secs_f64()
+                        );
+                        std::thread::sleep(delay);
+                    }
+                }
             }
         }
+        Backend::Guidance => {
+            print_guidance();
+            ExitCode::SUCCESS
+        }
     }
+}
+/// The portal arm once selected: block on the session's `Activated`
+/// signal forever, running the universal toggle per activation.
+///
+/// Shutdown rides the signalfd on a watcher thread rather than the main
+/// thread's `poll`: the main thread is blocked inside zbus's message
+/// iterator, which offers no descriptor to multiplex, and a second
+/// runtime to poll both is precisely the dependency this crate refuses.
+/// With SIGINT/SIGTERM blocked process-wide ([`install_signal_fd`]), the
+/// signal sits pending until the watcher reads it — no lost-wakeup window —
+/// and `process::exit` ends the daemon cleanly; the spawned toggles are
+/// in their own process groups and outlive us by design.
+fn portal_arm(signal_fd: File, session: crate::portal::PortalSession) -> ExitCode {
+    std::thread::spawn(move || {
+        let mut signal_fd = signal_fd;
+        // The descriptor [`install_signal_fd`] hands out is non-blocking
+        // (the X11 arm multiplexes it through `poll`), so this arm polls
+        // too: a bare `read` would return `EAGAIN` when *no* signal is
+        // pending and be indistinguishable from one. A 1 s tick costs
+        // nothing and keeps the exit path identical to the X11 arm's.
+        let mut fds = [libc::pollfd {
+            fd: signal_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        loop {
+            fds[0].revents = 0;
+            match wait_readable(&mut fds, Duration::from_secs(1)) {
+                Ok(true) => {
+                    let mut info = [0u8; 128];
+                    match signal_fd.read(&mut info) {
+                        Ok(n) if n > 0 => {
+                            eprintln!("hop-hotkeyd: exiting on signal");
+                            std::process::exit(0);
+                        }
+                        _ => continue, // spurious wakeup; keep waiting
+                    }
+                }
+                _ => continue,
+            }
+        }
+    });
+    if let Err(reason) = crate::portal::serve(session, spawn_toggle) {
+        // The portal or the bus went away mid-session. Exiting non-zero
+        // hands the decision to the supervisor: systemd restarts us and
+        // startup selection runs again against whatever is actually there,
+        // which is the same degradation path a fresh login takes.
+        eprintln!("hop-hotkeyd: {reason}; exiting for the supervisor to re-select a backend");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// The per-session DE-shortcut guidance (issue #235's criterion 4): the
+/// one-liners that make a desktop's own custom shortcut run the universal
+/// toggle, for the sessions where neither automatic backend applies.
+fn print_guidance() {
+    eprintln!(
+        "hop-hotkeyd: no automatic backend applies — configure your desktop's \
+         own shortcut to run `hop toggle`:"
+    );
+    eprintln!(
+        "hop-hotkeyd:   GNOME: Settings → Keyboard → View and Customize Shortcuts \
+         → Custom Shortcuts → add one with the command `hop toggle`"
+    );
+    eprintln!(
+        "hop-hotkeyd:   KDE Plasma: System Settings → Shortcuts → Add New → \
+         Command or Script, `hop toggle`"
+    );
+    eprintln!(
+        "hop-hotkeyd:   sway/wlroots: add `bind = SUPER, Space, exec, hop toggle` \
+         to your sway config"
+    );
+}
+/// Which backend won selection — the session-less shape the pure decision
+/// core ([`decide`]) returns. [`select_backend`] pairs [`Choice::Portal`]
+/// with the live session its probe produced.
+enum Choice {
+    Portal,
+    X11Grab,
+    Guidance,
+}
+
+/// The backends issue #235's order walks, in the state the selected arm
+/// needs them: the portal arm carries its live session, the X11 arm
+/// re-enters the existing grab loop, and the guidance arm only prints.
+enum Backend {
+    Portal(crate::portal::PortalSession),
+    X11Grab,
+    Guidance,
+}
+
+/// How the portal probe went. Kept separate from the live session object
+/// so the ordering decision itself is unit-testable with neither a bus nor
+/// an X server ([`decide`]); `select_backend` keeps the session alongside.
+enum PortalVerdict {
+    Bound,
+    /// Nothing to talk to: no session bus, or no service owning the
+    /// portal's well-known name.
+    Unavailable(String),
+    /// The portal answered but said no — a refused bind, a malformed
+    /// reply, a timeout waiting for its verdict.
+    Refused(String),
+}
+
+/// Walks issue #235's documented order — **portal → X11 grab → guidance** —
+/// over probe outcomes and produces both the choice and the exact log lines
+/// that explain it (the caller prints each with the crate's `hop-hotkeyd:`
+/// prefix; the stable phrasing is what `hop doctor`'s M6 report will grep).
+///
+/// Pure and unit-tested below. `x11` is a closure rather than a result so
+/// the X server is probed only after the portal has fallen through — on a
+/// working portal no X connection is ever attempted (spec §2's rule that
+/// every capability probe has a defined fallback is *why* each arm names
+/// its reason rather than failing quietly).
+fn decide(
+    portal: PortalVerdict,
+    x11: impl FnOnce() -> Result<(), String>,
+) -> (Choice, Vec<String>) {
+    let mut lines = Vec::new();
+    match portal {
+        PortalVerdict::Bound => {
+            lines.push(
+                "backend portal chosen: org.freedesktop.portal.Desktop accepted \
+                 CreateSession/BindShortcuts"
+                    .to_string(),
+            );
+            return (Choice::Portal, lines);
+        }
+        PortalVerdict::Unavailable(reason) => {
+            lines.push(format!(
+                "backend portal unavailable: {reason}; falling back to the X11 grab"
+            ));
+        }
+        PortalVerdict::Refused(reason) => {
+            lines.push(format!(
+                "backend portal bind refused: {reason}; falling back to the X11 grab"
+            ));
+        }
+    }
+    match x11() {
+        Ok(()) => {
+            lines.push("backend X11 grab chosen: an X display is reachable".to_string());
+            (Choice::X11Grab, lines)
+        }
+        Err(reason) => {
+            lines.push(format!("backend X11 grab unavailable: {reason}"));
+            lines.push(
+                "no automatic backend applies; printing per-desktop shortcut \
+                 guidance instead"
+                    .to_string(),
+            );
+            (Choice::Guidance, lines)
+        }
+    }
+}
+
+/// Runs the real probes in the documented order and returns the selected
+/// backend. The portal verdict and its session travel together: `session`
+/// is `Some` exactly when the verdict is [`PortalVerdict::Bound`].
+fn select_backend(bindings: &[ToggleEntry]) -> Backend {
+    let (verdict, session) = match crate::portal::probe() {
+        Err(reason) => (PortalVerdict::Unavailable(reason), None),
+        Ok(conn) => match crate::portal::bind(&conn, bindings) {
+            Ok(session) => (PortalVerdict::Bound, Some(session)),
+            Err(reason) => (PortalVerdict::Refused(reason), None),
+        },
+    };
+    let (choice, lines) = decide(verdict, probe_x11);
+    for line in &lines {
+        eprintln!("hop-hotkeyd: {line}");
+    }
+    match choice {
+        Choice::Portal => Backend::Portal(
+            // By construction: `Bound` is only ever produced with a live
+            // session riding next to it in `select_backend`.
+            session.expect("a Bound portal verdict always carries its session"),
+        ),
+        Choice::X11Grab => Backend::X11Grab,
+        Choice::Guidance => Backend::Guidance,
+    }
+}
+
+/// The X11 reachability probe: one throwaway connection attempt. The
+/// winning X11 arm re-connects inside [`session`], which keeps that
+/// function's reconnect-and-re-grab loop untouched by selection.
+fn probe_x11() -> Result<(), String> {
+    x11rb::connect(None)
+        .map(|_| ())
+        .map_err(|err| format!("cannot connect to the X server ({err}); is DISPLAY set?"))
 }
 
 /// One connect → grab → serve cycle. Ends when a signal arrives, a grab
@@ -459,5 +667,99 @@ fn spawn_toggle() {
         .spawn();
     if let Err(err) = spawned {
         eprintln!("hop-hotkeyd: could not run `hop toggle`: {err}");
+    }
+}
+/// The selection-order units: [`decide`] is pure, so the documented
+/// fallback order and its log phrasing are pinned here without a bus, a
+/// portal, or an X server. The round trips themselves are `tests/portal.rs`'s
+/// business.
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// The X11 probe closure tests use when X *is* reachable — records that
+    /// it ran at all, since on a working portal it must never be called.
+    fn x11_ok(flag: &mut bool) -> impl FnOnce() -> Result<(), String> + '_ {
+        move || {
+            *flag = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_working_portal_wins_and_never_probes_x11() {
+        let mut x11_probed = false;
+        let (choice, lines) = decide(PortalVerdict::Bound, x11_ok(&mut x11_probed));
+        assert!(matches!(choice, Choice::Portal));
+        assert!(!x11_probed, "a working portal must short-circuit selection");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("backend portal chosen"),
+            "the chosen-backend line is what startup logs: {joined}"
+        );
+    }
+
+    #[test]
+    fn no_portal_falls_through_to_x11_with_the_reason_logged() {
+        let (choice, lines) = decide(
+            PortalVerdict::Unavailable("no session bus (test)".to_string()),
+            || Ok(()),
+        );
+        assert!(matches!(choice, Choice::X11Grab));
+        let joined = lines.join("\n");
+        for expected in [
+            "backend portal unavailable",
+            "no session bus (test)",
+            "falling back to the X11 grab",
+            "backend X11 grab chosen",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing `{expected}` in: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bind_refusal_degrades_exactly_like_an_absent_portal() {
+        let (choice, lines) = decide(
+            PortalVerdict::Refused("BindShortcuts refused (response code 1)".to_string()),
+            || Err("cannot connect to the X server (test); is DISPLAY set?".to_string()),
+        );
+        assert!(matches!(choice, Choice::Guidance));
+        let joined = lines.join("\n");
+        // Criterion 3's wording split: a refusal is reported as a refused
+        // bind, not as an unavailable portal — the reasons are different
+        // even though both degrade.
+        for expected in [
+            "backend portal bind refused",
+            "BindShortcuts refused (response code 1)",
+            "falling back to the X11 grab",
+            "backend X11 grab unavailable",
+            "cannot connect to the X server (test)",
+            "no automatic backend applies",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing `{expected}` in: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn guidance_is_reached_only_after_both_backends_decline() {
+        let x11_probed = std::cell::Cell::new(false);
+        let (choice, lines) = decide(
+            PortalVerdict::Unavailable("test".to_string()),
+            || -> Result<(), String> {
+                x11_probed.set(true);
+                Err("no X".to_string())
+            },
+        );
+        assert!(matches!(choice, Choice::Guidance));
+        assert!(x11_probed.get());
+        assert_eq!(lines.len(), 3, "one reason per probe plus the outcome");
     }
 }

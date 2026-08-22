@@ -51,6 +51,16 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # crate enables (the grab itself is core protocol); MIT OR Apache-2.0, MIT
 # arm on `deny.toml`'s allow list.
 x11rb = { version = "0.13", features = ["xtest"] }
+# Issue #235 adds the GlobalShortcuts portal backend to `hop-hotkeyd`: the
+# portal speaks real D-Bus marshalling breadth — `a{sv}` option dicts,
+# variants, `Request.Response` callbacks, the `Activated` trigger signal —
+# which is precisely the line `hop-cli/src/dbus.rs`'s module doc draws for
+# where hand-rolled wire-speak ends. `zbus`'s *blocking* API carries it with
+# no async runtime in our code (this crate's no-tokio stance, `run.rs`'s
+# module doc), because zbus runs its own executor internally and exposes the
+# synchronous facade over it. MIT OR Apache-2.0 — the MIT arm is already on
+# `deny.toml`'s allow list.
+zbus = "5"
 
 # Every member crate opts in with `[lints] workspace = true`. A workspace lint no
 # crate inherits is a gate that does nothing, so any new member must do the same.

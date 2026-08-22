@@ -42,6 +42,11 @@ libc.workspace = true
 # `libX11` FFI, and `apps/hop-gtk/Cargo.toml`'s identical entry for the
 # original argument.
 x11rb.workspace = true
+# The GlobalShortcuts portal backend (issue #235): `CreateSession`/
+# `BindShortcuts` round trips and the `Activated` signal, over the blocking
+# API so the daemon stays synchronous — see the root `Cargo.toml`'s entry
+# for why zbus and not more hand-rolled D-Bus.
+zbus.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
