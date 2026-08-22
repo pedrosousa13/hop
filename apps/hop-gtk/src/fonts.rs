@@ -2,7 +2,7 @@
 //! `apps/hop-gtk/build.rs` starts at compile time by compiling
 //! `assets/hop-gtk.gresource.xml` into a `.gresource` blob under `OUT_DIR`.
 //! `assets/fonts/README.md` has the full provenance, licensing, and "why
-//! exactly these five files" account; `assets/tokens.css`'s own header
+//! exactly these four files" account; `assets/tokens.css`'s own header
 //! states the requirement this module exists to satisfy: "Both are bundled
 //! via GResource rather than trusted to be installed. A launcher cannot let
 //! its identity element fall back silently to generic `monospace` on a
@@ -26,10 +26,10 @@
 //!    resolve through Pango's font map — a registered GResource and a
 //!    materialized file on disk are both necessary but neither is
 //!    sufficient; fontconfig has to be told the directory exists before
-//!    anything asks Pango to lay out `"Inter"` or `"Iosevka Term"`. See
+//!    anything asks Pango to lay out `"Geist"` or `"Geist Mono"`. See
 //!    "Registering with fontconfig" below for the mechanism, the one
 //!    `unsafe` block this needs, and why a directory-wide call rather than
-//!    five per-file ones.
+//!    four per-file ones.
 //!
 //! An earlier revision of this doc comment described step 3 as "the
 //! issue's other, still-open half" and named this module as deliberately
@@ -169,7 +169,7 @@
 //! `deny.toml`'s allow list, links the system fontconfig via `pkg-config`
 //! and vendors no C source of its own) that call needs.
 //!
-//! ## One `AddDir` call, not five `AddFile` calls
+//! ## One `AddDir` call, not four `AddFile` calls
 //!
 //! `FcConfigAppFontAddDir` scans every font file in a directory and adds
 //! each one it recognizes to the current config's application-font set;
@@ -177,17 +177,17 @@
 //! The two are genuinely equivalent here, not merely similar enough: the
 //! directory [`init`] passes to [`register_with_fontconfig`] is the same
 //! [`tempfile::TempDir`] this module's own materialization step just
-//! finished writing exactly [`FACES`]'s five files into, and nothing
+//! finished writing exactly [`FACES`]'s four files into, and nothing
 //! else — see "The directory: `$XDG_RUNTIME_DIR`, not `/tmp`" above for why
 //! it is always freshly created and never shared or reused across
 //! processes. A directory scan over a directory whose contents this module
-//! itself just wrote finds exactly the same five files five `AddFile` calls
+//! itself just wrote finds exactly the same four files four `AddFile` calls
 //! would have named individually, at the cost of one FFI call (and one
 //! `unsafe` block, one `SAFETY` comment, one failure mode to handle) instead
-//! of five. Were this directory ever shared with unrelated files — a real
+//! of four. Were this directory ever shared with unrelated files — a real
 //! risk for, say, `$XDG_RUNTIME_DIR` itself, or a directory another process
 //! also writes into — `AddDir`'s "scan everything" behavior would stop
-//! being equivalent to naming five specific files, and this choice would
+//! being equivalent to naming four specific files, and this choice would
 //! need revisiting.
 //!
 //! ## What `NULL` as the `FcConfig*` argument means
@@ -226,25 +226,32 @@ use thiserror::Error;
 /// One bundled font face: which family it belongs to, which weight it is,
 /// and where its bytes live in the compiled GResource — the "one place"
 /// issue #198 asks this data to live, cross-referenced against
-/// `assets/tokens.css` lines 40–49 by [`crate::tokens::text_token_names`]
+/// `assets/tokens.css`'s TYPE SCALE block by [`crate::tokens::text_token_names`]
 /// and [`crate::tokens::font_token`] in this module's own tests (see
 /// `bundled_faces_cover_every_weight_tokens_css_declares`, below) rather
 /// than merely by a comment asserting the two agree.
 ///
-/// Mirrors `assets/fonts/README.md`'s own table exactly — five rows, same
+/// Mirrors `assets/fonts/README.md`'s own table exactly — four rows, same
 /// files, same families, same weights — because that table *is* the
 /// authoring record this struct restates as data a test can check instead
 /// of only a human reading prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Face {
     /// The font family name as embedded in the file itself and as
-    /// `--hop-font-sans`/`--hop-font-mono` name it — `"Inter"` or
-    /// `"Iosevka Term"`, confirmed against each file with `fc-query
+    /// `--hop-font-sans`/`--hop-font-mono` name it — `"Geist"` or
+    /// `"Geist Mono"`, confirmed against each file with `fc-query
     /// -f '%{family}|%{style}|%{weight}\n'` (`assets/fonts/README.md`'s own
-    /// "Which faces, and why exactly these" section).
+    /// "Which faces, and why exactly these" section). Each value here is
+    /// the *typographic* family — `fc-query` reports Geist Mono Medium as
+    /// the two-name list `Geist Mono,Geist Mono Medium`, of which the first
+    /// entry is what CSS/Pango matching resolves under.
     pub family: &'static str,
     /// The OpenType/CSS numeric weight this file provides — `400`, `500`,
-    /// or `600`. No two [`FACES`] entries share both this and [`family`].
+    /// or `650`. No two [`FACES`] entries share both this and [`family`].
+    /// 650 (`Geist-SemiBoldPlus.ttf`) is not an upstream static: it is
+    /// instanced from Geist's variable font at build-authoring time and
+    /// named "Semibold Plus" so it never collides with upstream's own
+    /// SemiBold static — see `assets/fonts/README.md`.
     pub weight: u16,
     /// This face's path inside the compiled GResource, under the
     /// `/dev/hop/Launcher/fonts/` prefix `assets/hop-gtk.gresource.xml`
@@ -280,17 +287,17 @@ impl Face {
     }
 }
 
-/// The five bundled faces — `assets/fonts/README.md`'s own table, restated
+/// The four bundled faces — `assets/fonts/README.md`'s own table, restated
 /// as data. See [`Face`]'s own doc comment for what each field means and
 /// how it is cross-checked against `assets/tokens.css`.
 ///
 /// Every `resource_path` below repeats the same `/dev/hop/Launcher/fonts/`
 /// prefix `assets/hop-gtk.gresource.xml` declares on its `<gresource>`
 /// element (matching `app.rs`'s own `APP_ID`, `"dev.hop.Launcher"`) —
-/// spelled out in full five times rather than built from one shared `const`
+/// spelled out in full four times rather than built from one shared `const`
 /// prefix, because `concat!` needs its arguments to be literals and a
 /// `const` cannot be spliced into one at compile time. The XML's own
-/// declaration and these five literals are therefore two independent
+/// declaration and these four literals are therefore two independent
 /// places that must agree, not one enforced by the compiler —
 /// `resource_paths_resolve_to_nonempty_bytes`, this module's own test
 /// below, is the runtime check that catches a drift between them: a
@@ -299,29 +306,24 @@ impl Face {
 /// immediately.
 pub static FACES: &[Face] = &[
     Face {
-        family: "Inter",
+        family: "Geist",
         weight: 400,
-        resource_path: "/dev/hop/Launcher/fonts/Inter-Regular.ttf",
+        resource_path: "/dev/hop/Launcher/fonts/Geist-Regular.ttf",
     },
     Face {
-        family: "Inter",
+        family: "Geist",
         weight: 500,
-        resource_path: "/dev/hop/Launcher/fonts/Inter-Medium.ttf",
+        resource_path: "/dev/hop/Launcher/fonts/Geist-Medium.ttf",
     },
     Face {
-        family: "Inter",
-        weight: 600,
-        resource_path: "/dev/hop/Launcher/fonts/Inter-SemiBold.ttf",
+        family: "Geist",
+        weight: 650,
+        resource_path: "/dev/hop/Launcher/fonts/Geist-SemiBoldPlus.ttf",
     },
     Face {
-        family: "Iosevka Term",
-        weight: 400,
-        resource_path: "/dev/hop/Launcher/fonts/IosevkaTerm-Regular.ttf",
-    },
-    Face {
-        family: "Iosevka Term",
+        family: "Geist Mono",
         weight: 500,
-        resource_path: "/dev/hop/Launcher/fonts/IosevkaTerm-Medium.ttf",
+        resource_path: "/dev/hop/Launcher/fonts/GeistMono-Medium.ttf",
     },
 ];
 
@@ -534,11 +536,11 @@ fn init() -> Result<FontBundle, FontsError> {
 }
 
 /// Registers `dir` — [`init`]'s own materialized directory, containing
-/// exactly [`FACES`]'s five files and nothing else by the time this is
+/// exactly [`FACES`]'s four files and nothing else by the time this is
 /// called — with fontconfig's current config, via one
 /// `FcConfigAppFontAddDir` call. See this module's doc comment,
 /// "Registering with fontconfig", for the maintainer waiver this call site
-/// exists under, why one directory-wide call was chosen over five per-file
+/// exists under, why one directory-wide call was chosen over four per-file
 /// `FcConfigAppFontAddFile` calls, what passing `NULL` as the config
 /// argument means, and the ordering hazard that governs where this
 /// function's *caller's caller* is allowed to run — this function itself
@@ -712,7 +714,7 @@ mod tests {
     /// already performs for every other structural value this crate reads
     /// out of `assets/tokens.css` — rather than re-scanning the file's text
     /// a second time here. [`crate::tokens::FontToken::family`] is the
-    /// fully `var()`-resolved family *list* (e.g. `"Inter", -apple-system,
+    /// fully `var()`-resolved family *list* (e.g. `"Geist", -apple-system,
     /// "Cantarell", sans-serif`, `--hop-font-sans`'s own value) — this test
     /// takes only its first, quoted entry, the same "first entry of the
     /// fallback chain" name [`Face::family`]'s own doc comment already
@@ -746,8 +748,8 @@ mod tests {
     }
 
     /// Pulls the first, quoted family name out of a resolved `--hop-font-*`
-    /// value — e.g. `"Inter", -apple-system, "Cantarell", sans-serif` →
-    /// `Inter` — the same "first entry names the bundled face; the rest are
+    /// value — e.g. `"Geist", -apple-system, "Cantarell", sans-serif` →
+    /// `Geist` — the same "first entry names the bundled face; the rest are
     /// this crate's own system-font fallback chain, never reached because
     /// this issue's whole point is that the first entry always resolves"
     /// reading `assets/tokens.css`'s own `TYPEFACES` section comment gives

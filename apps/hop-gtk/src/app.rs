@@ -146,8 +146,8 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     // below (`socket_path`, `keymap::Keymap::load`): `eprintln!` and refuse
     // to start, rather than letting `hop-gtk` run with the bundled faces
     // silently unregistered. A silent fallback to whatever system font
-    // fontconfig's ordinary search happens to resolve `"Inter"` or
-    // `"Iosevka Term"` to instead is the exact defect issue #198 exists to
+    // fontconfig's ordinary search happens to resolve `"Geist"` or
+    // `"Geist Mono"` to instead is the exact defect issue #198 exists to
     // close — see `fonts.rs`'s own module doc, "Computed once, not per
     // lookup", for the identical argument made about `FontsError` as a
     // type rather than a comment.

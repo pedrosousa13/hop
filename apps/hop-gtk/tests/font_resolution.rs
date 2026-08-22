@@ -23,7 +23,7 @@
 //!
 //! `pango::Context::list_families` (or the identically-shaped
 //! `pango::FontMap::list_families`) would prove only that a family *named*
-//! `"Inter"` or `"Iosevka Term"` exists somewhere fontconfig's font map
+//! `"Geist"` or `"Geist Mono"` exists somewhere fontconfig's font map
 //! knows about — a containing-check over a list. That is a materially
 //! weaker claim than this issue needs, for a specific reason: Pango's own
 //! matching never fails outright. Ask it for a family it has never heard
@@ -45,20 +45,20 @@
 //! # What is, and is not, proved here
 //!
 //! **Proved:**
-//! - [`strong_resolution_check`] — requesting `"Inter"` and requesting
-//!   `"Iosevka Term"`, at a real weight either family bundles, each
+//! - [`strong_resolution_check`] — requesting `"Geist"` and requesting
+//!   `"Geist Mono"`, at a real weight either family bundles, each
 //!   resolves to a loaded font whose own `family()` matches the request
 //!   exactly. This is the test the issue's acceptance criterion names by
 //!   name.
-//! - [`iosevka_term_resolves_to_a_family_fontconfig_itself_reports_as_monospace`]
+//! - [`geist_mono_resolves_to_a_family_fontconfig_itself_reports_as_monospace`]
 //!   — corroboration alongside the strong check above: the resolved
-//!   `"Iosevka Term"` family is one `pango::FontFamily::is_monospace`
+//!   `"Geist Mono"` family is one `pango::FontFamily::is_monospace`
 //!   itself reports `true` for, not merely a family that happens to share
 //!   the name.
-//! - [`every_bundled_face_resolves_to_its_own_family`] — all five
+//! - [`every_bundled_face_resolves_to_its_own_family`] — all four
 //!   `(family, weight)` pairs [`FACES`] declares resolve to their own
 //!   requested family, not just the two distinct family *names* the checks
-//!   above already cover — the five-file bundle could still ship a face at
+//!   above already cover — the four-file bundle could still ship a face at
 //!   the wrong weight, or fail to register one weight specifically, in a
 //!   way neither of the two name-only checks above would ever see.
 //! - [`mono_face_gives_equal_advance_widths_where_the_proportional_face_does_not`]
@@ -73,7 +73,7 @@
 //! a claim about `assets/stylesheet.css`'s own rules and `ui::window`'s
 //! widget tree, already out of this issue's scope (see `fonts.rs`'s module
 //! doc). What this file proves is the layer immediately below that: ask
-//! for `"Inter"` or `"Iosevka Term"` through the same `pango::Context`
+//! for `"Geist"` or `"Geist Mono"` through the same `pango::Context`
 //! mechanism any GTK widget uses, and Pango genuinely hands back the
 //! bundled face rather than a fallback. A real capture, taken manually
 //! (`gtk4-broadwayd` plus `hop-gtk --screenshot`, the same shape #215
@@ -220,19 +220,19 @@ fn run_assertions() {
     let widget = gtk::Label::new(None);
     let context = widget.pango_context();
 
-    strong_resolution_check(&context, "Inter");
-    strong_resolution_check(&context, "Iosevka Term");
+    strong_resolution_check(&context, "Geist");
+    strong_resolution_check(&context, "Geist Mono");
 
-    iosevka_term_resolves_to_a_family_fontconfig_itself_reports_as_monospace(&context);
+    geist_mono_resolves_to_a_family_fontconfig_itself_reports_as_monospace(&context);
 
     every_bundled_face_resolves_to_its_own_family(&context);
 
     mono_face_gives_equal_advance_widths_where_the_proportional_face_does_not(&context);
 
     println!(
-        "all five bundled (family, weight) pairs resolve through a real pango::Context, \
-         Iosevka Term resolves to a family fontconfig itself reports as monospace, and its \
-         rendered advance width is uniform where Inter's is not"
+        "all four bundled (family, weight) pairs resolve through a real pango::Context, \
+         Geist Mono resolves to a family fontconfig itself reports as monospace, and its \
+         rendered advance width is uniform where Geist's is not"
     );
 }
 
@@ -276,38 +276,38 @@ fn strong_resolution_check(context: &pango::Context, family: &str) {
     );
 }
 
-/// Corroborates [`strong_resolution_check`]'s `"Iosevka Term"` case: not
+/// Corroborates [`strong_resolution_check`]'s `"Geist Mono"` case: not
 /// only does the family name match, the resolved family is one fontconfig
 /// itself classifies as monospace. This is a second, independent signal —
-/// a family could in principle be named `"Iosevka Term"` by mistake without
+/// a family could in principle be named `"Geist Mono"` by mistake without
 /// actually being a monospace face — and it is the one Pango-level property
 /// [`pango::FontFamily::is_monospace`] exposes directly, ahead of this
 /// file's own stronger, rendered-width proof further down
 /// ([`mono_face_gives_equal_advance_widths_where_the_proportional_face_does_not`]).
-fn iosevka_term_resolves_to_a_family_fontconfig_itself_reports_as_monospace(
+fn geist_mono_resolves_to_a_family_fontconfig_itself_reports_as_monospace(
     context: &pango::Context,
 ) {
     let font_map = context
         .font_map()
         .expect("a pango::Context built from a real, realized-display widget must have a font map");
 
-    let family = font_map.family("Iosevka Term").expect(
-        "fontconfig's font map has no family named \"Iosevka Term\" — bundle() should \
+    let family = font_map.family("Geist Mono").expect(
+        "fontconfig's font map has no family named \"Geist Mono\" — bundle() should \
                  have already made strong_resolution_check fail before this ever ran",
     );
 
     assert!(
         family.is_monospace(),
-        "\"Iosevka Term\" resolved to a family, but pango::FontFamily::is_monospace() reports \
+        "\"Geist Mono\" resolved to a family, but pango::FontFamily::is_monospace() reports \
          false for it — that is not the monospace face this issue bundles",
     );
 }
 
-/// All five [`hop_gtk::fonts::FACES`] entries, not just the two distinct
+/// All four [`hop_gtk::fonts::FACES`] entries, not just the two distinct
 /// family *names* [`strong_resolution_check`] already covers: this is what
-/// would catch a bundle that resolves `"Inter"` correctly at its default
+/// would catch a bundle that resolves `"Geist"` correctly at its default
 /// weight but is missing, or has swapped, one of its other two weights (or
-/// either of `"Iosevka Term"`'s two), a defect neither of the two name-only
+/// `"Geist Mono"`'s single one), a defect neither of the two name-only
 /// checks above could see.
 fn every_bundled_face_resolves_to_its_own_family(context: &pango::Context) {
     for face in hop_gtk::fonts::FACES {
@@ -332,21 +332,26 @@ fn every_bundled_face_resolves_to_its_own_family(context: &pango::Context) {
 }
 
 /// Maps a [`hop_gtk::fonts::Face::weight`] value to the [`pango::Weight`]
-/// variant with the identical numeric meaning — `PANGO_WEIGHT_NORMAL`,
-/// `_MEDIUM` and `_SEMIBOLD` are defined as 400, 500 and 600 respectively,
-/// the same CSS numeric weight scale `assets/tokens.css` and [`FACES`] both
-/// already use, so this is a renaming, not a unit conversion. The
-/// fallback panics rather than guessing, because a weight [`FACES`] names
-/// that is not one of the three real weights this bundle ships would mean
-/// this test itself has drifted from `fonts.rs`'s own data — worth failing
-/// loudly over, not silently rounding to the nearest known weight.
+/// with the identical numeric meaning — `PANGO_WEIGHT_NORMAL` and
+/// `_MEDIUM` are defined as 400 and 500 respectively, the same CSS numeric
+/// weight scale `assets/tokens.css` and [`FACES`] both already use, so this
+/// is a renaming, not a unit conversion. 650 has no named variant
+/// (`PANGO_WEIGHT_SEMIBOLD` is 600, `PANGO_WEIGHT_BOLD` 700), so it goes
+/// through the enum's `__Unknown(i32)` escape hatch with the raw CSS value:
+/// `PangoWeight` is a plain integer to the C API, and Pango hands the value
+/// to fontconfig numerically, which is exactly how the instanced 650 face
+/// (`fc-scan` weight 190) is meant to be matched. The fallback panics
+/// rather than guessing, because a weight [`FACES`] names that this test
+/// does not know how to spell would mean this test itself has drifted from
+/// `fonts.rs`'s own data — worth failing loudly over, not silently rounding
+/// to the nearest known weight.
 ///
 /// [`FACES`]: hop_gtk::fonts::FACES
 fn pango_weight(weight: u16) -> pango::Weight {
     match weight {
         400 => pango::Weight::Normal,
         500 => pango::Weight::Medium,
-        600 => pango::Weight::Semibold,
+        650 => pango::Weight::__Unknown(650),
         other => panic!(
             "hop_gtk::fonts::FACES named weight {other}, which this test does not know how to \
              map to a pango::Weight — FACES has drifted from what this test expects"
@@ -361,10 +366,10 @@ fn pango_weight(weight: u16) -> pango::Weight {
 ///
 /// **What is measured:** for each of two strings, `"iiiii"` (five narrow
 /// glyphs) and `"WWWWW"` (five wide ones), a [`pango::Layout`] is built
-/// with `"Iosevka Term"` at weight 500 (one of [`FACES`]'s own two Iosevka
-/// Term weights) and its total logical width read back via
+/// with `"Geist Mono"` at weight 500 (the one [`FACES`] entry that family
+/// has) and its total logical width read back via
 /// [`pango::Layout::size`]. The same two strings are then laid out again
-/// with `"Inter"`, also at weight 500 — one of [`FACES`]'s own three Inter
+/// with `"Geist"`, also at weight 500 — one of [`FACES`]'s own three Geist
 /// weights, and the one weight both bundled families actually share, so
 /// this needs no second [`pango_weight`] case.
 ///
@@ -390,21 +395,21 @@ fn pango_weight(weight: u16) -> pango::Weight {
 fn mono_face_gives_equal_advance_widths_where_the_proportional_face_does_not(
     context: &pango::Context,
 ) {
-    let iosevka_i = layout_width(context, "Iosevka Term", "iiiii");
-    let iosevka_w = layout_width(context, "Iosevka Term", "WWWWW");
+    let mono_i = layout_width(context, "Geist Mono", "iiiii");
+    let mono_w = layout_width(context, "Geist Mono", "WWWWW");
     assert_eq!(
-        iosevka_i, iosevka_w,
-        "Iosevka Term (mono) must give \"iiiii\" and \"WWWWW\" the same total advance width; \
-         got {iosevka_i} and {iosevka_w} Pango units — a mismatch here means this is not \
+        mono_i, mono_w,
+        "Geist Mono (mono) must give \"iiiii\" and \"WWWWW\" the same total advance width; \
+         got {mono_i} and {mono_w} Pango units — a mismatch here means this is not \
          actually rendering as a monospace face",
     );
 
-    let inter_i = layout_width(context, "Inter", "iiiii");
-    let inter_w = layout_width(context, "Inter", "WWWWW");
+    let sans_i = layout_width(context, "Geist", "iiiii");
+    let sans_w = layout_width(context, "Geist", "WWWWW");
     assert_ne!(
-        inter_i, inter_w,
-        "Inter (proportional) gave \"iiiii\" and \"WWWWW\" the same total advance width \
-         ({inter_i} Pango units each) — either Inter itself failed to resolve and both strings \
+        sans_i, sans_w,
+        "Geist (proportional) gave \"iiiii\" and \"WWWWW\" the same total advance width \
+         ({sans_i} Pango units each) — either Geist itself failed to resolve and both strings \
          fell back to the same substituted face, or something is wrong with this measurement",
     );
 }

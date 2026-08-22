@@ -115,6 +115,28 @@ window.background {
 }
 
 /* ============================================================
+   QUERY ENTRY — issue #253
+   The launcher's single `gtk::Entry` (`ui::window::build`, widget name and
+   CSS class `hop-query-entry`, the doubled-identity precedent `ui::row`'s
+   child constants document). One declaration today: the text caret's
+   colour. Before this rule the caret fell through to GTK's default, which
+   tracks the entry's text colour — an ordinary fg, never the accent — so
+   the one blinking pixel of machine-input chrome was the only accented
+   surface the SPEC names ("selection tint, focus ring, caret, calc icon,
+   lit keycap") that did not route through the accent family.
+
+   `--hop-hint-accent` is the spelling, not the bare ramp name: it is the
+   semantic-layer alias that resolves per palette (`.hop-theme-light`
+   redeclares it; `.hop-theme-light` never overlays a bare ramp name), the
+   same trap-and-fix `.hop-row-hint-key`'s own comment below documents in
+   full for issue #214. The caret is a state indicator like the key glyph,
+   not body text, so accenting it stays inside tokens.css's reservation.
+   ============================================================ */
+.hop-query-entry {
+  caret-color: {{hop-hint-accent}};
+}
+
+/* ============================================================
    LIST VIEW GROUND — issue #215
    `listview` is `GtkListView`'s own single CSS node, confirmed against the
    Gtk-4.0 gir's "CSS nodes" section for GtkListView, the same source the

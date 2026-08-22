@@ -83,6 +83,12 @@ use crate::ui::{marker_highlight, mode_label, model, view};
 /// build.
 const PAGE_STEP: i64 = 5;
 
+/// The query `gtk::Entry`'s widget name and CSS class — one string serving
+/// both, the doubled-identity precedent `ui::row`'s `SUBTITLE_CHILD_NAME`
+/// doc comment documents. `assets/stylesheet.css`'s `.hop-query-entry`
+/// rule (issue #253's accent caret) selects on it.
+const QUERY_ENTRY_NAME: &str = "hop-query-entry";
+
 /// The pre-built window and everything it owns. `Clone` and cheap to clone —
 /// every field is a GTK/glib reference-counted handle — so `app`'s
 /// `glib::spawn_future_local` event loop can hold one across `.await`
@@ -154,6 +160,14 @@ impl HopWindow {
         let entry = gtk::Entry::builder()
             .placeholder_text("Type to search")
             .build();
+        // Doubled identity (widget name + CSS class, one string serving
+        // both — the same precedent `ui::row`'s `SUBTITLE_CHILD_NAME` doc
+        // comment documents): `assets/stylesheet.css`'s `.hop-query-entry`
+        // rule needs a selector to hang the accent caret colour on (issue
+        // #253), and the name keeps a future `find_named_child` caller from
+        // having to invent a second string for the same widget.
+        entry.set_widget_name(QUERY_ENTRY_NAME);
+        entry.add_css_class(QUERY_ENTRY_NAME);
 
         // The mode label (issue #184) sits as an overlay child over `entry`
         // rather than a sibling beside it — see `ui::mode_label::build`'s own
