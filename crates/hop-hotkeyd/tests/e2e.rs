@@ -574,7 +574,7 @@ fn config_with_hotkey() -> String {
 #[test]
 #[ignore = "the XTEST chord -> grab dispatch -> toggle chain still fails \
             inside this harness while the identical steps pass when driven \
-            manually against the same private Xvfb (see issue #247); the \
+            manually against the same private Xvfb (see issue #251); the \
             surrounding links are covered: the grab itself and its \
             arbitration by `second_hotkeyd_exits_instead_of_double_grabbing`, \
             and the whole toggle-activation half by \
