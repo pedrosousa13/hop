@@ -53,6 +53,21 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt};
 use x11rb::rust_connection::RustConnection;
 
+/// How many times [`center_on_screen`] applies — and then verifiably
+/// re-checks — the centered position before giving up and reporting
+/// [`PositionError::NeverSettled`]. Each round costs one configure plus one
+/// read-back round trip and one [`CENTER_SETTLE_POLL`] sleep; eight rounds
+/// span ~400ms of wall clock, far more than GDK's own post-map configure has
+/// ever taken to land, while staying an order of magnitude inside any
+/// user-noticeable delay.
+const CENTER_SETTLE_ATTEMPTS: u32 = 8;
+
+/// How long each [`CENTER_SETTLE_ATTEMPTS`] round waits between applying the
+/// centered position and reading the geometry back — chosen so a concurrent
+/// GDK configure (the racer; see [`center_on_screen`]'s doc comment) lands
+/// *before* the check rather than between the check and our next apply.
+const CENTER_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Everything that can go wrong centering the window. Reported to stderr,
 /// never fatal: a window that fails to center is a degraded overlay, not a
 /// reason to take the whole launcher down (matching how `layer_shell`'s
@@ -70,6 +85,11 @@ pub enum PositionError {
     /// The connection carried no screens at all; cannot happen against any
     /// conforming server, but the setup structure allows it.
     NoScreen,
+    /// Every bounded re-apply of the centered position was clobbered by a
+    /// later configure from GDK itself (see [`center_on_screen`]'s doc
+    /// comment for why one shot is not enough). Reported like every other
+    /// variant — to stderr, never fatal.
+    NeverSettled,
 }
 
 impl fmt::Display for PositionError {
@@ -79,6 +99,10 @@ impl fmt::Display for PositionError {
             PositionError::Request(err) => write!(f, "X11 request failed: {err}"),
             PositionError::Reply(err) => write!(f, "X11 reply failed: {err}"),
             PositionError::NoScreen => write!(f, "X11 server reported no screens"),
+            PositionError::NeverSettled => write!(
+                f,
+                "the centered position never stuck; something kept re-configuring the window"
+            ),
         }
     }
 }
@@ -140,7 +164,29 @@ pub fn apply_self_positioning(window: &adw::ApplicationWindow) {
 }
 
 /// Moves the window `xid` to the center of its screen, sized as it already
-/// is. Runs on its own thread — see this module's doc comment.
+/// is, and re-applies the move until it has verifiably stuck. Runs on its
+/// own thread — see this module's doc comment.
+///
+/// # Why one `ConfigureWindow` is not enough — the clobbering race
+///
+/// The move races GDK itself. At map time GDK has never been told the
+/// window's position (GTK4 exposes no way to set one), so its cached origin
+/// for the surface is (0, 0); moments after the map, GDK's own first size
+/// allocation issues a MoveResize from that cached origin, which lands at
+/// (0, 0) and silently erases any external move that preceded it. Under a
+/// no-WM server (`Xvfb`, issue #232's shape) nothing else ever re-places the
+/// window, so whoever configures last wins — measured locally the race is
+/// close to a coin flip, and on a slow machine GDK's allocation reliably
+/// lands after our first configure, leaving an un-centered overlay.
+///
+/// The fix is to make our write win *verifiably* rather than quickly: each
+/// round applies the centered position, waits long enough for a concurrent
+/// GDK configure to land or not, then reads the geometry back through the X
+/// server and only accepts success once the window is still where we put
+/// it. A WM environment needs no special handling here: the read-back is of
+/// the same geometry [`centered_origin`] was computed from, so the loop
+/// converges exactly when the window really is centered, whatever stood in
+/// between.
 fn center_on_screen(xid: u32) -> Result<(), PositionError> {
     // `None` means "read `$DISPLAY`", the same server GDK's X11 backend is
     // already connected to.
@@ -164,9 +210,19 @@ fn center_on_screen(xid: u32) -> Result<(), PositionError> {
         i32::from(geo.height),
     );
 
-    conn.configure_window(xid, &ConfigureWindowAux::new().x(x).y(y))?;
-    conn.flush()?;
-    Ok(())
+    for _ in 0..CENTER_SETTLE_ATTEMPTS {
+        conn.configure_window(xid, &ConfigureWindowAux::new().x(x).y(y))?;
+        conn.flush()?;
+        // Long enough that GDK's own post-map configure — the racer this
+        // loop exists to outlast — has landed before we look; short enough
+        // that giving up entirely stays well under a user-noticeable delay.
+        std::thread::sleep(CENTER_SETTLE_POLL);
+        let after = conn.get_geometry(xid)?.reply()?;
+        if (i32::from(after.x), i32::from(after.y)) == (x, y) {
+            return Ok(());
+        }
+    }
+    Err(PositionError::NeverSettled)
 }
 
 /// Where a `win_w` × `win_h` window's top-left corner goes to sit centered
