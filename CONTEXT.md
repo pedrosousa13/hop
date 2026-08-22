@@ -4,8 +4,9 @@ The vocabulary this codebase uses. When naming something — a type, a test, an
 issue title, a comment — use the term as defined here rather than a synonym.
 
 Seeded at the end of M1, from the terms the core crates actually settled on,
-and extended through M2 with the framing and query-lifecycle terms the daemon
-and its clients settled on. It describes what exists; extend it as later
+extended through M2 with the framing and query-lifecycle terms the daemon
+and its clients settled on, and through M3 with the frontend surface's own
+vocabulary. It describes what exists; extend it as later
 milestones resolve new terms.
 
 ## Items and actions
@@ -582,6 +583,33 @@ query-cost bound; direct embedders own that upstream. `hopd` gets the wire
 bound from `hop_protocol::limits::MAX_QUERY_TEXT` before routing. Separately,
 `Learning::record_launch` refuses a normalized `selections` key over that
 constant for storage.
+
+## The frontend surface
+
+**Token** — one named design value in `assets/tokens.css`: a colour, a type
+treatment, a spacing step, a radius, a duration. Tokens are the only source of
+design values; a literal written anywhere else is a second copy of one, and the
+rule §8a states is "every component consumes tokens; no ad-hoc values". Never
+"variable" or "design constant".
+
+**Palette** — the set of token values for one colour scheme. hop has two, dark
+and light, and a scheme change swaps values rather than rewriting components:
+the semantic tokens components consume keep their names and point at different
+ramp steps. Never "theme" for this, which is the *user's* stylesheet.
+
+**Honesty-critical** — the reserved class of interface members whose
+truthfulness a user theme may not undo: the error row, the offline stamp, the
+pending skeleton. A user theme stays authoritative everywhere else, and may
+still restyle even these members' font family and accent, provided they remain
+present and legible. `docs/theme-token-contract.md` is the normative statement
+of the boundary; the design rule it forces is that a member's meaning must live
+in its words and its shape, never in a colour, because colour is the one thing a
+theme may still change.
+
+**Row anatomy** — the fixed order of a result row's elements: icon, title,
+subtitle, action hint. It is an order and a set of reserved sizes, not a
+description of what is built — an element's slot is reserved whether or not it
+has anything to show, so that nothing reflows when an async result lands.
 
 ## Conventions
 
