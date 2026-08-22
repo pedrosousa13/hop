@@ -1,0 +1,207 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+@font-face { font-family:'Geist'; src:url('fonts/geist-400.woff2') format('woff2'); font-weight:400; }
+@font-face { font-family:'Geist'; src:url('fonts/geist-500.woff2') format('woff2'); font-weight:500; }
+@font-face { font-family:'Geist Mono'; src:url('fonts/geistmono-500.woff2') format('woff2'); font-weight:500; }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#08090b; color:#e8e7ea;
+         font-family:'Geist',system-ui,sans-serif; padding:26px 28px 18px;
+    background-image:radial-gradient(70% 50% at 20% 0%, rgba(40,50,70,.45) 0%, transparent 60%); }
+  h1 { font-size:15px; font-weight:600; margin-bottom:4px; }
+  .sub { font-size:11.5px; color:#8a8992; margin-bottom:20px; line-height:1.6; }
+  .grid { display:flex; flex-wrap:wrap; gap:20px; }
+  .frame { width:340px; height:450px; border-radius:13px; position:relative;
+    background:rgba(23,24,29,.8); backdrop-filter:blur(24px) saturate(1.4);
+    border:1px solid rgba(255,255,255,.09);
+    box-shadow:0 26px 70px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.05);
+    display:flex; flex-direction:column; overflow:hidden; }
+  svg.qico { width:16px; height:16px; flex:none; }
+  svg.qico path { stroke:#5aa9e6; }
+  .query { display:flex; align-items:center; gap:10px; height:52px; padding:0 14px;
+           border-bottom:1px solid rgba(255,255,255,.06); flex:none; }
+  .qtext { font-family:'Geist Mono',ui-monospace,monospace; font-size:16px;
+           font-weight:500; color:#f2f1f4; }
+  .qph { font-family:'Geist Mono',ui-monospace,monospace; font-size:14px;
+         color:#55555e; }
+  .caret { display:inline-block; width:1.5px; height:17px; margin-left:1px;
+           vertical-align:-3px; background:#5aa9e6;
+           animation:blink 1.1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity:0 } }
+  .list { flex:1; padding:5px 7px; overflow:hidden; position:relative; }
+  .section { font-size:9.5px; font-weight:650; letter-spacing:.1em;
+             text-transform:uppercase; color:#6d6c77; padding:7px 9px 4px; }
+  .item { height:42px; border-radius:8px; display:flex; align-items:center;
+          gap:10px; padding:0 9px; transition:background .14s ease; }
+  .item.hov { background:rgba(255,255,255,.05); }
+  .item.sel { background:rgba(90,169,230,.10);
+              box-shadow:inset 0 0 0 1px rgba(90,169,230,.30); }
+  .rico { width:24px; height:24px; border-radius:7px; flex:none;
+          display:flex; align-items:center; justify-content:center; }
+  .rico svg { width:14px; height:14px; }
+  .rico.calc { background:#5aa9e6; box-shadow:0 1px 10px rgba(90,169,230,.4); }
+  .rico.calc svg { stroke:#0d1117; }
+  .rico.app { background:rgba(255,255,255,.06); }
+  .rico.app svg { stroke:#c6c5cf; }
+  .rico.dim { background:rgba(255,255,255,.03); }
+  .rico.dim::after { content:''; width:12px; height:12px; border-radius:5px;
+                     background:rgba(255,255,255,.07); }
+  .txt { flex:1; min-width:0; }
+  .t { font-size:13px; font-weight:500; color:#f0eff3; white-space:nowrap;
+       overflow:hidden; text-overflow:ellipsis; }
+  .s { font-size:11px; color:#8d8c97; white-space:nowrap; overflow:hidden;
+       text-overflow:ellipsis; margin-top:1px; }
+  .kbd { font-family:'Geist Mono',ui-monospace,monospace; font-size:9px; color:#8b8a95;
+         border:1px solid rgba(255,255,255,.1); border-radius:4px; padding:2px 5px; }
+  .item.sel .kbd { color:#0d1117; background:#5aa9e6; border-color:#5aa9e6;
+                   font-weight:700; }
+  .stamp { font-family:'Geist Mono',ui-monospace,monospace; font-size:10px;
+           color:#8f8e95; flex:none; }
+  .fname { position:absolute; top:8px; right:10px; font-size:9px; color:#5b5e68;
+           font-family:ui-monospace,monospace; z-index:3; }
+  /* pending shimmer */
+  .pending .t, .pending .s { color:transparent !important; position:relative; }
+  .pending .t::after, .pending .s::after { content:''; position:absolute; left:0;
+    top:50%; height:10px; width:70%; transform:translateY(-50%); border-radius:5px;
+    background:linear-gradient(90deg, rgba(255,255,255,.06), rgba(255,255,255,.12),
+    rgba(255,255,255,.06)); background-size:200% 100%;
+    animation:shimmer 1.4s linear infinite; }
+  .pending .s::after { width:45%; }
+  @keyframes shimmer { from { background-position:200% 0 } to { background-position:-200% 0 } }
+  .attrib { font-family:'Geist Mono',ui-monospace,monospace; font-size:9.5px;
+            color:#6d6c77; }
+  /* error pin */
+  .errpin { position:absolute; left:7px; right:7px; bottom:7px;
+    border-radius:8px; border:1px solid rgba(230,104,92,.35);
+    background:rgba(230,104,92,.08); padding:8px 10px; display:flex;
+    gap:9px; align-items:center; }
+  .errpin .rico { width:22px; height:22px; border-radius:6px;
+    background:rgba(230,104,92,.15); font-size:11px; color:#e6685c;
+    font-weight:800; }
+  .errpin .t { color:#f2b8b0; font-size:12px; }
+  .errpin .s { color:#c98d85; font-size:10.5px; }
+  /* no-results fallback */
+  .fallback .ico { width:24px; height:24px; border-radius:7px; background:rgba(255,255,255,.06);
+    display:flex; align-items:center; justify-content:center; flex:none; }
+  .fallback .ico svg { width:13px; height:13px; stroke:#c6c5cf; }
+  .cap { margin-top:11px; font-size:11.5px; color:#9b9aa3; line-height:1.55; max-width:352px; }
+  .cap b { color:#e8e7ea; font-size:12.5px; }
+</style>
+</head>
+<body>
+<h1>hop &mdash; the six states, final identity (Geist &middot; ice &middot; macOS-modern material)</h1>
+<div class="sub">Each frame is an acceptance gate for implementation: what the state must communicate, borrowed from, and designed against &mdash; carried over from the approved M3 pass, now in the new skin.</div>
+<div class="grid">
+
+  <!-- 1 empty -->
+  <div>
+    <div class="frame"><span class="fname">1 · empty query</span>
+      <div class="query"><svg class="qico" viewBox="0 0 20 20" fill="none" stroke-width="1.6"><path d="M4 5h12M4 10h8M4 15h5"/></svg><span class="qph">type, or <b style="color:#7a7984">?</b> for prefixes<span class="caret"></span></span></div>
+      <div class="list">
+        <div class="section">Recent</div>
+        <div class="item sel"><div class="rico calc"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><rect x="3" y="2" width="10" height="12" rx="1.5"/><path d="M5.5 5h5M6 8.5h.01M8 8.5h.01M10 8.5h.01"/></svg></div>
+          <div class="txt"><div class="t">128 × 42</div><div class="s">calculator · just now</div></div><span class="kbd">&crarr;</span></div>
+        <div class="item"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.4 1.6h5A1.5 1.5 0 0 1 14 6.1v5.4a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5v-7Z"/></svg></div>
+          <div class="txt"><div class="t">Files</div><div class="s">launched 2h ago</div></div></div>
+        <div class="item"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2"/></svg></div>
+          <div class="txt"><div class="t">Settings</div><div class="s">launched yesterday</div></div></div>
+        <div class="section">Prefixes</div>
+        <div class="item"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><path d="M4 5h12M4 10h8"/></svg></div>
+          <div class="txt"><div class="t">w&nbsp; windows · a&nbsp; apps · f&nbsp; files · = math · : emoji</div><div class="s">&nbsp;</div></div></div>
+      </div>
+    </div>
+    <div class="cap"><b>Empty query</b> — hop already knows you: real recents immediately, never a fresh-install void.</div>
+  </div>
+
+  <!-- 2 results -->
+  <div>
+    <div class="frame"><span class="fname">2 · results</span>
+      <div class="query"><svg class="qico" viewBox="0 0 20 20" fill="none" stroke-width="1.6"><path d="M4 5h12M4 10h8M4 15h5"/></svg><span class="qtext">2+2<span class="caret"></span></span></div>
+      <div class="list">
+        <div class="section">Calculator</div>
+        <div class="item sel"><div class="rico calc"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><rect x="3" y="2" width="10" height="12" rx="1.5"/><path d="M5.5 5h5M6 8.5h.01M8 8.5h.01M10 8.5h.01"/></svg></div>
+          <div class="txt"><div class="t">2+2 = 4</div><div class="s">Enter to copy · ctrl K actions</div></div><span class="kbd">&crarr;</span></div>
+        <div class="section">Applications</div>
+        <div class="item hov"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.4 1.6h5A1.5 1.5 0 0 1 14 6.1v5.4a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5v-7Z"/></svg></div>
+          <div class="txt"><div class="t">Files</div><div class="s">GNOME Files</div></div></div>
+        <div class="item"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2"/></svg></div>
+          <div class="txt"><div class="t">Settings</div><div class="s">GNOME Settings</div></div></div>
+      </div>
+    </div>
+    <div class="cap"><b>Results</b> — zero jank as providers resolve; fixed frame, rows stream in.</div>
+  </div>
+
+  <!-- 3 no results -->
+  <div>
+    <div class="frame"><span class="fname">3 · no results</span>
+      <div class="query"><svg class="qico" viewBox="0 0 20 20" fill="none" stroke-width="1.6"><path d="M4 5h12M4 10h8M4 15h5"/></svg><span class="qtext">zzqq<span class="caret"></span></span></div>
+      <div class="list">
+        <div class="section">No local matches</div>
+        <div class="item sel fallback">
+          <div class="ico"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg></div>
+          <div class="txt"><div class="t">Search the web for “zzqq”</div><div class="s">fallback · GNOME Web</div></div><span class="kbd">&crarr;</span></div>
+        <div class="item"><div class="ico" style="background:rgba(255,255,255,.04)"><svg viewBox="0 0 16 16" fill="none" stroke="#8d8c97" stroke-width="1.5"><rect x="5" y="5" width="8" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-5A1.5 1.5 0 0 0 3 3.5v7A1.5 1.5 0 0 0 4.5 12H5"/></svg></div>
+          <div class="txt"><div class="t">Copy “zzqq” to clipboard</div><div class="s">fallback · clipboard</div></div></div>
+      </div>
+    </div>
+    <div class="cap"><b>No results</b> — never a void: fallback handlers become actionable rows (Albert's move).</div>
+  </div>
+
+  <!-- 4 pending -->
+  <div>
+    <div class="frame"><span class="fname">4 · pending</span>
+      <div class="query"><svg class="qico" viewBox="0 0 20 20" fill="none" stroke-width="1.6"><path d="M4 5h12M4 10h8M4 15h5"/></svg><span class="qtext">par<span class="caret"></span></span></div>
+      <div class="list">
+        <div class="section">Apps</div>
+        <div class="item"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.4 1.6h5A1.5 1.5 0 0 1 14 6.1v5.4a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5v-7Z"/></svg></div>
+          <div class="txt"><div class="t">Parity</div><div class="s">GNOME Parity</div></div></div>
+        <div class="section">Working…</div>
+        <div class="item pending"><div class="rico dim"></div>
+          <div class="txt"><div class="t">x</div><div class="s">y</div></div><span class="attrib">calculator</span></div>
+        <div class="item pending"><div class="rico dim"></div>
+          <div class="txt"><div class="t">xx</div><div class="s">yy</div></div><span class="attrib">files</span></div>
+      </div>
+    </div>
+    <div class="cap"><b>Pending</b> — not-yet-real data reads as loading: shimmer bars, provider-attributed (Ulauncher's honesty).</div>
+  </div>
+
+  <!-- 5 error -->
+  <div>
+    <div class="frame"><span class="fname">5 · error</span>
+      <div class="query"><svg class="qico" viewBox="0 0 20 20" fill="none" stroke-width="1.6"><path d="M4 5h12M4 10h8M4 15h5"/></svg><span class="qtext">2+2 weather lisbon<span class="caret"></span></span></div>
+      <div class="list">
+        <div class="section">Calculator</div>
+        <div class="item sel"><div class="rico calc"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><rect x="3" y="2" width="10" height="12" rx="1.5"/><path d="M5.5 5h5M6 8.5h.01M8 8.5h.01M10 8.5h.01"/></svg></div>
+          <div class="txt"><div class="t">2+2 = 4</div><div class="s">Enter to copy · ctrl K actions</div></div><span class="kbd">&crarr;</span></div>
+      </div>
+      <div class="errpin">
+        <div class="rico">!</div>
+        <div class="txt"><div class="t">weather failed — budget exceeded</div><div class="s">provider isolated; other results unaffected</div></div>
+      </div>
+    </div>
+    <div class="cap"><b>Error</b> — names the failed provider, pins below all real results so the top-down scan survives.</div>
+  </div>
+
+  <!-- 6 offline -->
+  <div>
+    <div class="frame"><span class="fname">6 · offline</span>
+      <div style="height:26px; flex:none;"></div>
+      <div class="list">
+        <div class="section">Cached · daemon unreachable</div>
+        <div class="item sel"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.4 1.6h5A1.5 1.5 0 0 1 14 6.1v5.4a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5v-7Z"/></svg></div>
+          <div class="txt"><div class="t">Files</div><div class="s">last launch</div></div><span class="stamp">as of 09:14</span></div>
+        <div class="item"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2"/></svg></div>
+          <div class="txt"><div class="t">Settings</div><div class="s">last launch</div></div><span class="stamp">as of 09:14</span></div>
+        <div class="item"><div class="rico app"><svg viewBox="0 0 16 16" fill="none" stroke-width="1.5"><path d="M11.3 2.6l2.1 2.1L5.1 13l-[IP_ADDRESS]-2.9 8.3-8.3Z"/></svg></div>
+          <div class="txt"><div class="t">Text Editor</div><div class="s">last launch</div></div><span class="stamp">as of 09:14</span></div>
+      </div>
+    </div>
+    <div class="cap"><b>Offline</b> — cached data never reads as live: every row stamps its age in mono.</div>
+  </div>
+
+</div>
+</body>
+</html>
