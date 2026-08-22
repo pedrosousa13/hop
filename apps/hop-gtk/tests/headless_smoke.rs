@@ -22,7 +22,7 @@
 //! and the results-state capture is decoded (via a dev-only `gdk-pixbuf`
 //! dependency — see `Cargo.toml`'s own comment on it for why it adds no new
 //! compiled code) so the selected row's composited fill can be sampled and
-//! asserted against the composite `--hop-accent-subdued` documents.
+//! asserted against the composite `--hop-sel-fill` documents.
 //! Deliberately *not* added: pixel assertions for flat token colours such as
 //! the row ground or the hint-chip background — those are already pinned at
 //! the declaration level by the token-resolution tests — or for the
@@ -332,19 +332,27 @@ fn rgba_channels(value: &str) -> ((f64, f64, f64), f64) {
     (colour, alpha)
 }
 
-/// The colour `--hop-accent-subdued`'s own comment in `assets/tokens.css`
-/// documents its selected-row fill compositing to, computed from the
-/// committed token values rather than restated here as a second hardcoded
-/// literal: both inputs — the translucent accent wash and the window ground
-/// it composites over (`--hop-bg`) — are resolved live through
-/// `tokens::resolve`, the same resolver the stylesheet build uses, then
+/// The colour `.hop-selection-indicator`'s fill — `--hop-sel-fill` —
+/// composites to over the window ground, computed from the committed token
+/// values rather than restated here as a second hardcoded literal: both
+/// inputs — the translucent accent wash and the background it composites
+/// over (`--hop-bg`) — are resolved live through `tokens::resolve` under
+/// the given `Palette`, the same resolver the stylesheet build uses, then
 /// combined with the standard source-over alpha formula and rounded to the
-/// u8 channels a PNG stores. If either token moves, this moves with it and
-/// the assertion below keeps telling the truth; if the *rendering* stops
-/// matching the tokens, the assertion fails.
-fn documented_selection_fill() -> [u8; 3] {
-    let (fg, alpha) = rgba_channels(&tokens::resolve("hop-accent-subdued", Palette::Dark));
-    let bg = hex_channels(&tokens::resolve("hop-bg", Palette::Dark));
+/// u8 channels a PNG stores. The lookup goes through the *semantic* alias
+/// `--hop-sel-fill`, not the dark arm's `--hop-accent-subdued` directly:
+/// the light theme re-points the alias at `--hop-accent-light-subdued`
+/// (issue #214's palette-aware accent shape), so resolving
+/// `--hop-accent-subdued` under `Palette::Light` would return the dark
+/// wash over a light ground and compute a colour nothing renders. If any
+/// token moves, this moves with it and the assertion below keeps telling
+/// the truth; if the *rendering* stops matching the tokens, the assertion
+/// fails. It is computed per palette because which palette applies is the
+/// renderer's decision, not the test's — see the pixel assertion's doc
+/// comment below.
+fn documented_selection_fill(palette: Palette) -> [u8; 3] {
+    let (fg, alpha) = rgba_channels(&tokens::resolve("hop-sel-fill", palette));
+    let bg = hex_channels(&tokens::resolve("hop-bg", palette));
     let over = |f: f64, b: f64| (f * alpha + b * (1.0 - alpha)).round() as u8;
     [over(fg.0, bg.0), over(fg.1, bg.1), over(fg.2, bg.2)]
 }
@@ -354,6 +362,31 @@ fn documented_selection_fill() -> [u8; 3] {
 /// #228's whole point: the one colour claim in the HIG conformance
 /// checklist that only decoded pixels can defend, promoted from a one-off
 /// manual sample recorded in prose to a committed regression.
+///
+/// # Which palette, and why both are accepted
+///
+/// `hop-gtk` follows libadwaita's resolved colour scheme and never forces
+/// one (see `src/style.rs`'s doc comment) — so which palette renders is the
+/// environment's decision, not this test's. On a desktop with a session
+/// bus, libadwaita reads the settings portal and resolves dark; on a CI
+/// runner there is no session bus and therefore no portal, and it falls
+/// back to **light**. The expected composite is therefore computed from
+/// *both* palettes' committed tokens (via [`documented_selection_fill`])
+/// and a pixel matches when it lands within ±1 of either — the assertion's
+/// contract ("the fill renders the documented composite of the committed
+/// tokens, at row height, spanning the row") holds under either resolution.
+///
+/// # Why ±1 per channel, and no more
+///
+/// `documented_selection_fill` rounds the composite formula with Rust's
+/// `f64::round`, which rounds half-way values up; cairo's blend floors.
+/// Under light the two disagree by exactly one bit on one channel: the
+/// rendered fill measures (238, 234, 223) where the u8-cast formula yields
+/// (239, 234, 223). A ±1 window absorbs that rounding seam; it must not
+/// grow past it.
+///
+/// # Why this does not decay into accepting anything
+///
 /// The vertical position of the results list depends on the query entry's
 /// allocated height, which GTK derives from theme metrics no token commits —
 /// so the row cannot be found from geometry alone. What *is* committed is
@@ -361,17 +394,18 @@ fn documented_selection_fill() -> [u8; 3] {
 /// surface in the capture painted `--hop-sel-fill` (the composite this
 /// function expects), it spans essentially the full window width, and its
 /// height is `ROW_HEIGHT_PX` by `ui::window.rs`'s own `set_height_request`.
-/// So the scan finds every scanline where the expected colour matches
-/// across a substantial run of pixels (a threshold low enough that the row's
-/// own title text and action-hint chips drawn over the fill cannot break a
-/// scanline's count, high enough that no other surface could plausibly
-/// reach it), groups those scanlines into contiguous vertical bands, and
-/// demands exactly one band of the committed row height. Text glyphs are
-/// avoided by sampling the middle of the longest *uninterrupted* horizontal
-/// run of the expected colour inside the band — a run by definition contains
-/// nothing drawn over the fill. If the fill's colour, place, or size breaks,
-/// the band disappears or the sample mismatches and this fails.
-fn assert_selected_row_fill_is_the_documented_composite(path: &Path, expected: [u8; 3]) {
+/// So the scan finds every scanline where enough pixels match one of the
+/// two expected composites (a threshold low enough that the row's own title
+/// text and action-hint chips drawn over the fill cannot break a scanline's
+/// count, high enough that no other surface could plausibly reach it),
+/// groups those scanlines into contiguous vertical bands, and demands
+/// exactly one band of the committed row height. Text glyphs are avoided by
+/// sampling the middle of the longest *uninterrupted* horizontal run inside
+/// the band — a run by definition contains nothing drawn over the fill. A
+/// fill that breaks colour (beyond ±1 of both composites), place (no band,
+/// or several), or size (a band outside the row-height window) still fails:
+/// the tolerance buys rounding slack, not permission.
+fn assert_selected_row_fill_is_the_documented_composite(path: &Path) {
     let pixbuf = gdk_pixbuf::Pixbuf::from_file(path)
         .unwrap_or_else(|err| panic!("decoding {path:?}: {err}"));
     assert_eq!(
@@ -396,14 +430,30 @@ fn assert_selected_row_fill_is_the_documented_composite(path: &Path, expected: [
             .expect("3 bytes per RGB pixel")
     };
 
+    // Both palettes' documented composites, and the ±1/either matcher they
+    // feed — see the doc comment above for why the window exists and why it
+    // stays at one bit.
+    let expected_dark = documented_selection_fill(Palette::Dark);
+    let expected_light = documented_selection_fill(Palette::Light);
+    let matches_either = |actual: [u8; 3]| {
+        [expected_dark, expected_light].iter().any(|expected| {
+            actual
+                .iter()
+                .zip(expected.iter())
+                .all(|(a, e)| (i32::from(*a) - i32::from(*e)).abs() <= 1)
+        })
+    };
+
     let row_h = *tokens::ROW_HEIGHT_PX as usize;
     // A scanline belongs to the fill band when at least this many of its
-    // pixels are exactly the expected composite — see this function's doc
-    // comment for why the threshold sits where it does.
+    // pixels match one of the two expected composites — see this function's
+    // doc comment for why the threshold sits where it does.
     let scanline_threshold = width / 8;
 
     let matching_scanlines: Vec<usize> = (0..height)
-        .filter(|&y| (0..width).filter(|&x| pixel(x, y) == expected).count() >= scanline_threshold)
+        .filter(|&y| {
+            (0..width).filter(|&x| matches_either(pixel(x, y))).count() >= scanline_threshold
+        })
         .collect();
 
     // Group the matching scanlines into contiguous vertical bands.
@@ -426,7 +476,7 @@ fn assert_selected_row_fill_is_the_documented_composite(path: &Path, expected: [
     let band_height = band_bottom - band_top + 1;
     // The indicator's height is `ROW_HEIGHT_PX` by construction; up to a
     // scanline at each edge may blend the fill into the ground behind it
-    // and so miss the exact-match count, hence the small slack — but only
+    // and so miss the match count, hence the small slack — but only
     // downward: a band *taller* than a row would mean some other surface
     // joined in.
     assert!(
@@ -436,13 +486,13 @@ fn assert_selected_row_fill_is_the_documented_composite(path: &Path, expected: [
     );
 
     // Sample the middle scanline of the band, along its longest
-    // uninterrupted run of the expected colour — inside the fill, clear of
+    // uninterrupted run of matching pixels — inside the fill, clear of
     // every glyph and chip drawn over it (see the doc comment).
     let sample_y = (band_top + band_bottom) / 2;
     let mut best: (usize, usize) = (0, 0);
     let mut run_start: Option<usize> = None;
     for x in 0..=width {
-        let matching = x < width && pixel(x, sample_y) == expected;
+        let matching = x < width && matches_either(pixel(x, sample_y));
         match (run_start, matching) {
             (None, true) => run_start = Some(x),
             (Some(start), false) => {
@@ -462,12 +512,12 @@ fn assert_selected_row_fill_is_the_documented_composite(path: &Path, expected: [
         run_end - run_start
     );
     let sample_x = (run_start + run_end) / 2;
-    assert_eq!(
-        pixel(sample_x, sample_y),
-        expected,
+    assert!(
+        matches_either(pixel(sample_x, sample_y)),
         "the selected row's composited fill at ({sample_x}, {sample_y}) in \
-         {path:?} does not match the composite `--hop-accent-subdued` \
-         documents"
+         {path:?} is {:?}, which matches neither palette's composite \
+         `--hop-sel-fill` documents",
+        pixel(sample_x, sample_y)
     );
 }
 
@@ -507,13 +557,12 @@ fn captures_the_empty_state_and_a_results_state_headless() {
     // only decoded pixels can defend (flat token colours stay pinned at the
     // declaration level by the token-resolution tests, so they get no pixel
     // assertion here) — is sampled from the decoded capture and asserted
-    // against the composite `--hop-accent-subdued`'s own comment documents,
+    // against the composite `--hop-sel-fill`'s own comment documents,
     // computed live from the committed token values by
-    // `documented_selection_fill`, never restated as a literal here.
-    assert_selected_row_fill_is_the_documented_composite(
-        &results_state_png,
-        documented_selection_fill(),
-    );
+    // `documented_selection_fill` under both palettes (which one libadwaita
+    // resolves depends on the environment — see the assertion's doc
+    // comment), never restated as a literal here.
+    assert_selected_row_fill_is_the_documented_composite(&results_state_png);
 
     // The two states are visually different renders, not the same frame
     // written twice — a coarse but meaningful check that content actually
