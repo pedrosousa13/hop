@@ -408,7 +408,7 @@ type Overlay<'a> = Option<&'a HashMap<String, String>>;
 /// needs this unresolved form, because it must split a
 /// `<weight> <size>/<line> var(--family)` shorthand into pieces *before* the
 /// trailing piece is resolved — resolving the whole shorthand first would
-/// inline the family stack's own internal whitespace (`"Inter",
+/// inline the family stack's own internal whitespace (`"Geist",
 /// -apple-system, ...`) into the string being split, breaking the assumption
 /// that the shorthand has exactly one whitespace-delimited trailing token.
 ///
@@ -862,7 +862,8 @@ pub static OFFLINE_ROW_GAP_PX: LazyLock<i32> = LazyLock::new(|| px_token("hop-sp
 /// mentions the marker or this highlight at all — the issue is the only
 /// source for this exception, not a second one alongside it.) Every other
 /// reservation (selection indicator, focus ring, action hints) stays off
-/// limits. 8.85:1 against the dark window ground, clearing the
+/// limits. 7.35:1 against the dark window ground (ice #5AA9E6, issue
+/// #253's active accent preset), clearing the
 /// accessibility floor's "Accent as small text or glyph" row at 4.5:1 —
 /// chosen over the softer `--hop-accent-subdued` wash the selected-row fill
 /// uses, because D7 makes legibility, not subtlety, the point: `w ` vs
@@ -912,11 +913,11 @@ mod tests {
     #[test]
     fn mode_label_font_matches_tokens_css() {
         let font = &*MODE_LABEL_FONT;
-        assert_eq!(font.weight, 600);
+        assert_eq!(font.weight, 650);
         assert_eq!(font.size_px, 11.0);
         assert_eq!(font.line_height_px, 14.0);
         assert!(
-            font.family.contains("Inter"),
+            font.family.contains("Geist"),
             "expected the sans stack, got: {}",
             font.family
         );
@@ -949,14 +950,14 @@ mod tests {
 
     #[test]
     fn accent_rgb_matches_tokens_css() {
-        assert_eq!(*ACCENT_RGB, (0xe3, 0xa8, 0x3b));
+        assert_eq!(*ACCENT_RGB, (0x5a, 0xa9, 0xe6));
     }
 
     #[test]
     fn widen_channel_replicates_the_byte_rather_than_shifting() {
         assert_eq!(widen_channel(0x00), 0x0000);
         assert_eq!(widen_channel(0xff), 0xffff);
-        assert_eq!(widen_channel(0xe3), 0xe3e3);
+        assert_eq!(widen_channel(0x5a), 0x5a5a);
     }
 
     #[test]

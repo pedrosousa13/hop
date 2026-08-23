@@ -83,6 +83,12 @@ use crate::ui::{marker_highlight, mode_label, model, view};
 /// build.
 const PAGE_STEP: i64 = 5;
 
+/// The query `gtk::Entry`'s widget name and CSS class — one string serving
+/// both, the doubled-identity precedent `ui::row`'s `SUBTITLE_CHILD_NAME`
+/// doc comment documents. `assets/stylesheet.css`'s `.hop-query-entry`
+/// rule (issue #253's accent caret) selects on it.
+const QUERY_ENTRY_NAME: &str = "hop-query-entry";
+
 /// The pre-built window and everything it owns. `Clone` and cheap to clone —
 /// every field is a GTK/glib reference-counted handle — so `app`'s
 /// `glib::spawn_future_local` event loop can hold one across `.await`
@@ -154,6 +160,14 @@ impl HopWindow {
         let entry = gtk::Entry::builder()
             .placeholder_text("Type to search")
             .build();
+        // Doubled identity (widget name + CSS class, one string serving
+        // both — the same precedent `ui::row`'s `SUBTITLE_CHILD_NAME` doc
+        // comment documents): `assets/stylesheet.css`'s `.hop-query-entry`
+        // rule needs a selector to hang the accent caret colour on (issue
+        // #253), and the name keeps a future `find_named_child` caller from
+        // having to invent a second string for the same widget.
+        entry.set_widget_name(QUERY_ENTRY_NAME);
+        entry.add_css_class(QUERY_ENTRY_NAME);
 
         // The mode label (issue #184) sits as an overlay child over `entry`
         // rather than a sibling beside it — see `ui::mode_label::build`'s own
@@ -248,6 +262,19 @@ impl HopWindow {
             .content(&content)
             .hide_on_close(true)
             .build();
+        // Issue #253: the material mode (translucent vs. opaque window
+        // ground) is decided and applied here — before layer-shell/X11
+        // wiring below, and well before `app`'s `present_with_token` ever
+        // shows this window — satisfying `assets/stylesheet.css`'s own
+        // MATERIAL MODES comment that the decision is made and the class
+        // applied once, before presentation. `material::resolve`
+        // re-detects the session from the live display rather than taking
+        // `strategy` as an input: the two decisions are independent (a
+        // Wayland session's overlay *strategy* depends on layer-shell
+        // support; its material *mode* never does — see `material`'s own
+        // module doc for why Wayland is always opaque here), so nothing is
+        // gained by threading one through the other.
+        crate::material::apply(&window, crate::material::resolve());
         // Issue #233: the strategy — not a second probe — decides whether
         // this window becomes a layer surface. `apply_or_fallback` still
         // re-checks the probe internally (a documented no-op unless the

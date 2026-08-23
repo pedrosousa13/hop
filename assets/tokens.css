@@ -26,8 +26,8 @@
      installed. A launcher cannot let its identity element fall
      back silently to generic `monospace` on a fresh install.
      ========================================================== */
-  --hop-font-mono: "Iosevka Term", "Iosevka", ui-monospace, monospace;
-  --hop-font-sans: "Inter", -apple-system, "Cantarell", sans-serif;
+  --hop-font-mono: "Geist Mono", ui-monospace, monospace;
+  --hop-font-sans: "Geist", -apple-system, "Cantarell", sans-serif;
 
   /* ==========================================================
      TYPE SCALE
@@ -35,16 +35,25 @@
      what you typed, what was computed, what key runs the
      selected action, and when data was fetched. A path-shaped
      subtitle was considered for v1 and dropped (#206).
-     Everything else is proportional.
-     ========================================================== */
+     Issue #253 retargets two weights. `--hop-text-timestamp` moves 400 →
+     500 because the Geist Mono bundle ships exactly one cut (Medium); the
+     drift guard (`fonts.rs`'s
+     `bundled_faces_cover_every_weight_tokens_css_declares`) requires every
+     declared `(family, weight)` to exist in the bundle, so no face is
+     declared that is not shipped. `--hop-text-section` moves 600 → 650 —
+     SPEC decision 7's section-header weight, and the reason a 650 face
+     (`Geist-SemiBoldPlus.ttf`, instanced from Geist's variable font) is
+     bundled at all. GTK's CSS parser accepts the numeric weight directly
+     (verified against GTK 4.14's parser before this landed).
+    ========================================================== */
   --hop-text-input:        500 20px/26px   var(--hop-font-mono);
   --hop-text-calc-result:  500 22px/28px   var(--hop-font-mono);
   --hop-text-title:        500 14px/20px   var(--hop-font-sans);
   --hop-text-subtitle:     400 12.5px/18px var(--hop-font-sans);
-  --hop-text-timestamp:    400 11px/14px   var(--hop-font-mono);
+  --hop-text-timestamp:    500 11px/14px   var(--hop-font-mono);
   --hop-text-hint-label:   500 11px/14px   var(--hop-font-sans);
   --hop-text-hint-key:     500 11px/14px   var(--hop-font-mono);
-  --hop-text-section:      600 11px/14px   var(--hop-font-sans);
+  --hop-text-section:      650 11px/14px   var(--hop-font-sans);
   --hop-text-empty:        400 13.5px/20px var(--hop-font-sans);
   --hop-text-error:        500 13.5px/20px var(--hop-font-sans);
 
@@ -83,24 +92,99 @@
   --hop-neutral-900-light: #211f1a; /* title / query    15.64:1                                */
 
   /* ==========================================================
-     THE ONE ACCENT — amber-gold, hue ~40deg
-     Used ONLY for the selection indicator, the focus ring, and
-     action hints. Never for body text. That restraint is what
-     keeps the UI legible when a careless theme desaturates
-     everything around it.
-     Chosen against: every major desktop's default blue; Ubuntu's
-     orange-red (hue ~15deg); the violet that has become AI
-     tooling's own default.
-     ========================================================== */
-  --hop-accent:              #e3a83b;              /* 8.85:1 on the window ground */
-  --hop-accent-hover:        #f2bb57;
-  --hop-accent-subdued:      rgba(227, 168, 59, 0.14); /* selected-row fill; composites to #2f2719 */
-  --hop-accent-ring:         rgba(227, 168, 59, 0.40);
+     ACCENT FAMILY — one active preset, four ready to swap.
+     Issue #253 (SPEC decision 7): the accent is a *family*, not
+     one fixed colour. Exactly one block below is live; swapping
+     accents is commenting the live block out and uncommenting
+     another. Every accented surface routes through these eight
+     names via the SEMANTIC LAYER (--hop-sel-fill/-ring/-bar,
+     --hop-hint-accent) and the runtime parse (tokens::ACCENT_RGB
+     reads hop-accent), so one swap moves all of them at once.
 
-  --hop-accent-light:         #875c0f;             /* 5.13:1 on paper; 4.51:1 on its selected row */
-  --hop-accent-light-hover:   #a9740f;
-  --hop-accent-light-subdued: rgba(135, 97, 16, 0.10); /* composites to #efeadf */
-  --hop-accent-light-ring:    rgba(135, 97, 16, 0.35);
+     The reservation is unchanged from v1: used ONLY for the
+     selection indicator, the focus ring, and action hints (plus
+     the query caret, added by #253). Never for body text. That
+     restraint is what keeps the UI legible when a careless theme
+     desaturates everything around it.
+
+     Every ratio in a comment was computed from WCAG relative
+     luminance against the surface the token actually renders on:
+     dark members against --hop-neutral-950, light members against
+     --hop-neutral-0-light, each base additionally against its own
+     selected row — the subdued tint composited over that ground —
+     because the selection fill sits under accent-coloured glyphs.
+     Text-bearing members (the bases: sel-bar, key glyph, caret,
+     marker highlight) must clear 4.5:1 on both grounds; hovers,
+     tints, and rings are state/edge colour, not text, so their
+     ratios are recorded but held only to "clearly visible".
+
+     The five presets (SPEC decision 7): ice #5AA9E6 [active],
+     amber #E3A83B, mint #2EC27E, coral #E6685C, iris #8F7FF0.
+     Dark bases ship as specified — every one clears 4.5:1 on
+     --hop-neutral-950 as-is. Light bases are the specified hue
+     darkened until they clear 4.5:1 on paper AND on their own
+     composited selected row (the same discipline the v1 amber
+     pass applied); every as-specified hex fails 4.5:1 on paper
+     (worst: ice at 2.42:1), so each light base is a correction
+     marked WAS below.
+     ========================================================== */
+
+  /* ---- ICE [active] ---------------------------------------- */
+  --hop-accent:              #5AA9E6;              /* 7.35:1 on the window ground; 5.96:1 on its selected row (#1c2731) */
+  --hop-accent-hover:        #7FBCEE;              /* 9.20:1 on the window ground */
+  --hop-accent-subdued:      rgba(90, 169, 230, 0.14); /* selected-row fill; composites to #1c2731 */
+  --hop-accent-ring:         rgba(90, 169, 230, 0.40);
+
+  --hop-accent-light:         #3A6E96;             /* 5.18:1 on paper; 4.54:1 on its selected row (#e7ebec);
+                                                    WAS the as-specified #5AA9E6 — 2.42:1 on paper, failed 4.5:1 */
+  --hop-accent-light-hover:   #4F83AC;             /* 3.85:1 on paper — hover is a state colour, never text */
+  --hop-accent-light-subdued: rgba(58, 110, 150, 0.10); /* composites to #e7ebec */
+  --hop-accent-light-ring:    rgba(58, 110, 150, 0.35);
+
+  /* ---- AMBER ----------------------------------------------- */
+  /* --hop-accent:              #E3A83B;            */ /* 8.85:1 on the window ground; 6.97:1 on its selected row (#2f2719) */
+  /* --hop-accent-hover:        #F2BB57;            */ /* 10.71:1 on the window ground */
+  /* --hop-accent-subdued:      rgba(227, 168, 59, 0.14); */ /* composites to #2f2719 */
+  /* --hop-accent-ring:         rgba(227, 168, 59, 0.40); */
+  /* --hop-accent-light:         #875C0F;           */ /* 5.59:1 on paper; 4.86:1 on its selected row (#eee9df).
+                                                        The v1 block annotated this face 5.13:1 / 4.51:1 — recomputed
+                                                        for this table against the current ground tokens; value unchanged. */
+  /* --hop-accent-light-hover:   #A9740F;           */ /* 3.84:1 on paper — hover is a state colour, never text */
+  /* --hop-accent-light-subdued: rgba(135, 97, 16, 0.10); */ /* composites to #eee9df */
+  /* --hop-accent-light-ring:    rgba(135, 97, 16, 0.35); */
+
+  /* ---- MINT ------------------------------------------------- */
+  /* --hop-accent:              #2EC27E;            */ /* 8.14:1 on the window ground; 6.51:1 on its selected row (#162b23) */
+  /* --hop-accent-hover:        #5BD89B;            */ /* 10.46:1 on the window ground */
+  /* --hop-accent-subdued:      rgba(46, 194, 126, 0.14); */ /* composites to #162b23 */
+  /* --hop-accent-ring:         rgba(46, 194, 126, 0.40); */
+  /* --hop-accent-light:         #1D784E;           */ /* 5.18:1 on paper; 4.53:1 on its selected row (#e4ece5);
+                                                        WAS the as-specified #2EC27E — 2.18:1 on paper, failed 4.5:1 */
+  /* --hop-accent-light-hover:   #2B8A5E;           */ /* 4.07:1 on paper — hover is a state colour, never text */
+  /* --hop-accent-light-subdued: rgba(29, 120, 78, 0.10); */ /* composites to #e4ece5 */
+  /* --hop-accent-light-ring:    rgba(29, 120, 78, 0.35); */
+
+  /* ---- CORAL ------------------------------------------------ */
+  /* --hop-accent:              #E6685C;            */ /* 5.79:1 on the window ground; 4.89:1 on its selected row (#301e1e) */
+  /* --hop-accent-hover:        #F08378;            */ /* 7.33:1 on the window ground */
+  /* --hop-accent-subdued:      rgba(230, 104, 92, 0.14); */ /* composites to #301e1e */
+  /* --hop-accent-ring:         rgba(230, 104, 92, 0.40); */
+  /* --hop-accent-light:         #AA4D44;           */ /* 5.18:1 on paper; 4.52:1 on its selected row (#f2e8e4);
+                                                        WAS the as-specified #E6685C — 3.07:1 on paper, failed 4.5:1 */
+  /* --hop-accent-light-hover:   #B96259;           */ /* 4.03:1 on paper — hover is a state colour, never text */
+  /* --hop-accent-light-subdued: rgba(170, 77, 68, 0.10); */ /* composites to #f2e8e4 */
+  /* --hop-accent-light-ring:    rgba(170, 77, 68, 0.35); */
+
+  /* ---- IRIS -------------------------------------------------- */
+  /* --hop-accent:              #8F7FF0;            */ /* 5.76:1 on the window ground; 4.82:1 on its selected row (#242133) */
+  /* --hop-accent-hover:        #A99CF4;            */ /* 7.80:1 on the window ground */
+  /* --hop-accent-subdued:      rgba(143, 127, 240, 0.14); */ /* composites to #242133 */
+  /* --hop-accent-ring:         rgba(143, 127, 240, 0.40); */
+  /* --hop-accent-light:         #6A5EB2;           */ /* 5.17:1 on paper; 4.56:1 on its selected row (#eceaef);
+                                                        WAS the as-specified #8F7FF0 — 3.09:1 on paper, failed 4.5:1 */
+  /* --hop-accent-light-hover:   #7B70C0;           */ /* 4.05:1 on paper — hover is a state colour, never text */
+  /* --hop-accent-light-subdued: rgba(106, 94, 178, 0.10); */ /* composites to #eceaef */
+  /* --hop-accent-light-ring:    rgba(106, 94, 178, 0.35); */
 
   /* ==========================================================
      SPACING / RADIUS / ELEVATION
@@ -117,6 +201,62 @@
                              0 0 0 1px rgba(255, 255, 255, 0.06);
   --hop-shadow-window-light: 0 20px 60px -15px rgba(33, 31, 26, 0.25),
                              0 0 0 1px rgba(0, 0, 0, 0.06);
+
+  /* ==========================================================
+     MATERIAL LAYERS — issue #253 (SPEC decisions 1 and 8)
+     The macOS-modern surface, expressed as tokens rather than
+     stylesheet literals so a theme can retint it under
+     docs/theme-token-contract.md's ordinary-surface rules.
+     Three families:
+
+     - Ground sheen (--hop-bg-window-image): the layered window
+       ground's top-down depth gradient, drawn over the flat
+       --hop-bg by assets/stylesheet.css's WINDOW GROUND rule.
+       Purely decorative — a white-alpha wash on both palettes,
+       carrying no text — so no contrast ratio is claimed for it.
+
+     - Elevation (--hop-elev-1): one soft shadow step for lifted
+       surfaces (the hovered row today). GTK draws its own CSD
+       shadow OUTSIDE the window surface; these elevate only INNER
+       surfaces — never the toplevel itself.
+
+     - Translucent ground (--hop-bg-translucent[-light]): the
+       ONLY alpha-bearing window-ground value in this file. It is
+       consumed exclusively by stylesheet.css's
+       `window.background.hop-material-blur` rule, reachable only
+       when src/material.rs proved at startup that the compositor
+       really applies blur behind this window (X11 + picom-class
+       compositors, best-effort; KDE Wayland is degraded to opaque
+       for lack of a safe adoption path — see that module's doc
+       comment for the researched blockers). Never render
+       translucent without blur actually applied: SPEC decision 8's
+       honesty invariant outranks prettiness. Contrast under blur:
+       composited over a near-white backdrop (the worst case a
+       real blurred backdrop can present), dark 0.78 alpha lands
+       near #464646 — roughly 8:1 against --hop-fg; over anything
+       darker it only approaches the opaque ground the ramp ratios
+       above were computed against. The light value holds the same
+       shape.
+
+     - Lift (--hop-lift-transform): SPEC decision 6's hover lift.
+       One token rather than a stylesheet literal so the REDUCED
+       MOTION block below can strip exactly this transform — a
+       vestibular trigger — without touching the shadow or
+       background halves of the same hover state.
+     ========================================================== */
+  --hop-bg-window-image: linear-gradient(180deg,
+                         rgba(255, 255, 255, 0.028) 0%,
+                         rgba(255, 255, 255, 0) 140px);
+
+  --hop-elev-1:       0 1px 2px rgba(0, 0, 0, 0.35),
+                      0 10px 24px -14px rgba(0, 0, 0, 0.6);
+  --hop-elev-1-light: 0 1px 2px rgba(33, 31, 26, 0.08),
+                      0 10px 24px -16px rgba(33, 31, 26, 0.2);
+
+  --hop-bg-translucent:       rgba(18, 18, 20, 0.78);
+  --hop-bg-translucent-light: rgba(250, 249, 246, 0.82);
+
+  --hop-lift-transform: translateY(-1px);
 
   /* ==========================================================
      GEOMETRY
@@ -186,6 +326,8 @@
      (selection indicator, focus ring, action hints — never body text). */
   --hop-hint-accent: var(--hop-accent);
   --hop-shadow:    var(--hop-shadow-window);
+  --hop-elev:      var(--hop-elev-1);
+  --hop-bg-blur:   var(--hop-bg-translucent);
 }
 
 .hop-theme-light {
@@ -201,6 +343,8 @@
   --hop-sel-bar:   var(--hop-accent-light);
   --hop-hint-accent: var(--hop-accent-light);
   --hop-shadow:    var(--hop-shadow-window-light);
+  --hop-elev:      var(--hop-elev-1-light);
+  --hop-bg-blur:   var(--hop-bg-translucent-light);
 }
 
 /* ============================================================
@@ -269,5 +413,12 @@
     --hop-duration-state:  1ms;
     --hop-duration-resolve: 1ms;
     --hop-delay-hint:      0ms;
+    /* Issue #253: the row-lift hover transform (SPEC decision 6) is a
+       translation — the vestibular trigger this block exists to strip.
+       `assets/stylesheet.css`'s hovered-row rule consumes it through a
+       {{motion:...}} placeholder, so reduced motion resolves the lift to
+       `none` while the shadow and background halves of the same hover
+       state stay, at --hop-duration-state's 1ms reduced value. */
+    --hop-lift-transform: none;
   }
 }

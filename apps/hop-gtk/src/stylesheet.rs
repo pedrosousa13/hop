@@ -307,14 +307,14 @@ fn resolve_placeholder(inner: &str, palette: Palette, motion: Motion) -> String 
 }
 
 /// Reshapes a resolved `--hop-text-*` value — `<weight> <size>px/<line>px
-/// <family-list>`, e.g. `500 13.5px/20px "Inter", -apple-system, sans-serif`
+/// <family-list>`, e.g. `500 13.5px/20px "Geist", -apple-system, sans-serif`
 /// — into the 3-field `<weight> <size> <family-list>` form GTK's `font:`
 /// shorthand actually parses.
 ///
 /// This exists because of one concrete, empirically-confirmed fact: GTK
 /// 4.14's CSS parser rejects the 4-field CSS-Fonts form `assets/tokens.css`'s
 /// own `--hop-text-*` tokens are authored in. Loading
-/// `.x { font: 500 13.5px/20px "Inter", sans-serif; }` through a real
+/// `.x { font: 500 13.5px/20px "Geist", sans-serif; }` through a real
 /// `gtk::CssProvider` (checked directly, under `gtk4-broadwayd`, with the
 /// provider's `parsing-error` signal connected, before this function was
 /// written) produces a parse error — "Expected a string" — rather than the
@@ -653,11 +653,11 @@ mod tests {
              same rule under both: {dark_rule}"
         );
         assert!(
-            dark_rule.contains("color: #e3a83b;"),
+            dark_rule.contains("color: #5AA9E6;"),
             "dark key glyph should resolve to the dark accent, got: {dark_rule}"
         );
         assert!(
-            light_rule.contains("color: #875c0f;"),
+            light_rule.contains("color: #3A6E96;"),
             "light key glyph should resolve to the light accent, got: {light_rule}"
         );
     }
@@ -759,9 +759,9 @@ mod tests {
     fn font_shorthand_strips_the_line_height_segment() {
         assert_eq!(
             font_shorthand_no_line_height(
-                "500 13.5px/20px \"Inter\", -apple-system, \"Cantarell\", sans-serif"
+                "500 13.5px/20px \"Geist\", -apple-system, \"Cantarell\", sans-serif"
             ),
-            "500 13.5px \"Inter\", -apple-system, \"Cantarell\", sans-serif"
+            "500 13.5px \"Geist\", -apple-system, \"Cantarell\", sans-serif"
         );
     }
 
@@ -778,7 +778,7 @@ mod tests {
             Motion::Full,
         );
         assert!(
-            resolved.contains("font: 500 13.5px \"Inter\""),
+            resolved.contains("font: 500 13.5px \"Geist\""),
             "expected the 3-field shorthand with no `/<line-height>` segment, got: {resolved}"
         );
     }
@@ -791,12 +791,12 @@ mod tests {
     /// case already covers.
     #[test]
     fn font_longhand_helpers_each_extract_their_own_field() {
-        let raw = "500 13.5px/20px \"Inter\", -apple-system, \"Cantarell\", sans-serif";
+        let raw = "500 13.5px/20px \"Geist\", -apple-system, \"Cantarell\", sans-serif";
         assert_eq!(font_weight_only(raw), "500");
         assert_eq!(font_size_only(raw), "13.5px");
         assert_eq!(
             font_family_only(raw),
-            "\"Inter\", -apple-system, \"Cantarell\", sans-serif"
+            "\"Geist\", -apple-system, \"Cantarell\", sans-serif"
         );
     }
 
@@ -825,7 +825,7 @@ mod tests {
             "expected the bare size with the `/<line-height>` segment dropped, got: {resolved}"
         );
         assert!(
-            !resolved.contains("Inter"),
+            !resolved.contains("Geist"),
             "a `{{{{font-weight:...}}}}`/`{{{{font-size:...}}}}` placeholder must never leak \
              the family list into the resolved sheet, got: {resolved}"
         );

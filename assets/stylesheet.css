@@ -112,6 +112,78 @@ window.background {
   background-color: {{hop-bg}};
   color: {{hop-fg}};
   font-family: {{hop-font-sans}};
+
+  /* MATERIAL LAYERS — issue #253. The layered depth sheen over the flat
+     ground, the panel hairline (--hop-line, drawn as a 1px inset ring just
+     inside the window edge so it follows --hop-radius-lg's rounding), and
+     that radius token itself. All inner-surface work: GTK draws its own CSD
+     window shadow OUTSIDE this surface, and nothing here tries to replace
+     it.
+
+     ALPHA GUARD (grep target: hop-material-blur): this rule and the
+     .hop-material-opaque restatement below are the only places the window
+     ground is painted in the opaque modes, and both resolve to solid
+     colours — background-image carries no alpha-bearing paint over the
+     ground (it fades to transparent over {{hop-bg}}, which stays fully
+     opaque underneath). The single exception in the entire system is
+     window.background.hop-material-blur further down, reachable only when
+     src/material.rs proved at startup that the compositor really applies
+     blur behind this window. No other rule may introduce alpha on the
+     window ground. */
+  background-image: {{hop-bg-window-image}};
+  border-radius: {{hop-radius-lg}};
+  box-shadow: inset 0 0 0 1px {{hop-line}};
+}
+
+/* ============================================================
+   MATERIAL MODES — issue #253
+   `src/material.rs` decides ONCE per presentation, before this window is
+   built, whether the compositor applies blur behind it, logs the outcome,
+   and `apply`s exactly one of these two classes onto the ApplicationWindow.
+   CSS consumes them ONLY here: under .hop-material-blur the window ground
+   becomes the translucent layered variant; .hop-material-opaque keeps the
+   solid layered ground. A window wearing neither class (every test harness
+   that builds one directly) renders the base rule above — also solid — so
+   an unclassed window can never be translucent either.
+   ============================================================ */
+
+/* Opaque degrade — the honest default. Restates the base rule's ground
+   deliberately: redundant today BY DESIGN, so a future edit that made the
+   base rule translucent could never silently become the opaque mode's look
+   too — each mode class pins what its mode means. */
+window.background.hop-material-opaque {
+  background-color: {{hop-bg}};
+}
+
+/* Blurred mode — the ONLY translucent window ground in the system, fed by
+   the ONLY alpha-bearing ground token in tokens.css. Reachable only when
+   detection proved the compositor applies blur behind this window (X11 +
+   picom-class compositors, best-effort). SPEC decision 8's invariant: never
+   a half-transparent panel over hard pixels. */
+window.background.hop-material-blur {
+  background-color: {{hop-bg-blur}};
+}
+
+/* ============================================================
+   QUERY ENTRY — issue #253
+   The launcher's single `gtk::Entry` (`ui::window::build`, widget name and
+   CSS class `hop-query-entry`, the doubled-identity precedent `ui::row`'s
+   child constants document). One declaration today: the text caret's
+   colour. Before this rule the caret fell through to GTK's default, which
+   tracks the entry's text colour — an ordinary fg, never the accent — so
+   the one blinking pixel of machine-input chrome was the only accented
+   surface the SPEC names ("selection tint, focus ring, caret, calc icon,
+   lit keycap") that did not route through the accent family.
+
+   `--hop-hint-accent` is the spelling, not the bare ramp name: it is the
+   semantic-layer alias that resolves per palette (`.hop-theme-light`
+   redeclares it; `.hop-theme-light` never overlays a bare ramp name), the
+   same trap-and-fix `.hop-row-hint-key`'s own comment below documents in
+   full for issue #214. The caret is a state indicator like the key glyph,
+   not body text, so accenting it stays inside tokens.css's reservation.
+   ============================================================ */
+.hop-query-entry {
+  caret-color: {{hop-hint-accent}};
 }
 
 /* ============================================================
@@ -200,12 +272,132 @@ listview {
    spelling here even setting the v1 ruling aside; it is no longer the
    *reason* the rule reads this way.
    ============================================================ */
+
+/* ============================================================
+   ROW HOVER LIFT — issue #253, SPEC decisions 2 and 6
+   Decision 6's mouse contract: "Hover = row lift + action icons fade in."
+   Decision 2 bounds it: "hover/selection transitions (≤140ms) ... no row
+   cascades, no panel springs, nothing decorative" and "`Motion::Reduced`
+   collapses what remains to opacity-only." This rule pair is the row-lift
+   half of that contract (the actions-fade-in half is `.hop-row-hint`/
+   `.hop-row-hint-shown` above, a different, class-driven mechanism this
+   rule does not touch).
+
+   Three tokens, none of them literals, all already declared in
+   `tokens.css` by an earlier session (this issue's own Task 1, MATERIAL
+   LAYERS and REDUCED MOTION blocks) — this rule is the first and only
+   *consumer* of all three, not their origin:
+
+   - `{{hop-elev}}` — the palette axis. `tokens.css`'s SEMANTIC LAYER alias
+     for one soft elevation shadow step (`--hop-elev-1` under dark,
+     `--hop-elev-1-light` under `.hop-theme-light`), the same
+     alias-not-bare-ramp-name shape `{{hop-bg}}` above is on this file's
+     own record for — see the ROW SURFACE comment just above for the trap
+     a bare `--hop-elev-1` would fall into under the light palette.
+   - `{{motion:hop-lift-transform}}` — the motion axis, not the palette
+     one: `translateY(-1px)` under `Motion::Full`, `none` under
+     `Motion::Reduced` (`tokens.css`'s REDUCED MOTION `@media` block
+     overrides `--hop-lift-transform` specifically, and only that token,
+     for exactly this reason — a translation is the vestibular trigger
+     decision 2's "opacity-only" collapse exists to strip). Getting this
+     wrong by spelling it `{{hop-lift-transform}}` (the palette form)
+     would still resolve — `tokens::resolve` follows `var()` chains same
+     as `resolve_motion` does — but to the *unconditional* `:root` value
+     always, never the reduced-motion override, silently defeating
+     decision 2's own accessibility requirement while looking correct in
+     a diff. `{{motion:...}}` is the only spelling that actually reaches
+     `resolve_motion`.
+   - `{{motion:hop-duration-state}}` / `{{motion:hop-ease-std}}` — the
+     transition's own timing. `--hop-duration-state` is 120ms full, 1ms
+     reduced (`tokens.css`'s REDUCED MOTION block), comfortably inside
+     decision 2's ≤140ms ceiling either way. `--hop-ease-std` carries no
+     reduced-motion override — `tokens.css`'s own comment marks it
+     "state crossfade" — but is still spelled with the `motion:` prefix,
+     matching `.hop-row-hint-shown`'s own precedent below for a token in
+     the same position (`{{motion:hop-ease-out}}`) that also has none:
+     this file's own PLACEHOLDER SYNTAX section names that "not an error,"
+     and a reader should not have to look up which of a rule's several
+     `{{motion:...}}` values happens to carry an override and which does
+     not to know the placeholder form is correct throughout.
+
+   GTK 4.14 support for `transform` and `box-shadow` as animatable CSS
+   properties on a plain `row` node — not assumed, checked against a real,
+   installed GTK 4.14.5 the same way this file's own header describes
+   checking `font:`'s shorthand form: a throwaway `gtk::CssProvider`,
+   `parsing-error` signal connected, loaded under `gtk4-broadwayd`, fed
+   `listview > row:hover { transform: translateY(-1px); box-shadow: 0 1px
+   2px rgba(0,0,0,.35); }` — zero parse errors, and `CssProvider::to_str()`
+   echoed back a normalized `transform: translate3d(0, -1px, 0);`, proving
+   GTK's parser understood it as a real transform, not an inert unknown
+   property it silently ignores. The GTK 4.14.5 source itself (pinned by
+   this workspace's own `Cargo.toml` comment on the `gtk4`/`v4_14` feature
+   tier) confirms both properties are registered `GTK_STYLE_PROPERTY_
+   ANIMATED` (`gtk/gtkcssstylepropertyimpl.c`, the `"transform"` and
+   `"box-shadow"` `gtk_css_style_property_register` calls) with real
+   interpolation, not a snap disguised as one:
+   `gtk_css_transform_transition` (`gtk/gtkcsstransformvalue.c`) lerps
+   `translate`/`rotate`/`scale` components directly, and
+   `gtk_css_value_shadow_transition` (`gtk/gtkcssshadowvalue.c`) even
+   synthesizes a zero-alpha filler shadow via `shadow_value_for_transition`
+   so `box-shadow: none` (this rule's own resting value — no `box-shadow`
+   declared below is itself GTK's registered initial value for the
+   property) interpolates smoothly into `{{hop-elev}}` rather than
+   snapping in from nothing. Neither property clips inside the
+   `GtkScrolledWindow` this list sits in: LIST VIEW GROUND's own comment
+   above already established there is no intervening `GtkViewport` node,
+   and a −1px translate plus a soft shadow both stay well inside a 56px
+   `--hop-row-h` row's own paint area, never reaching a sibling row's
+   bounds by more than the deliberate 1px overlap the lift itself is.
+
+   `transition:` is declared on this rule — the RESTING `listview > row`,
+   not `listview > row:hover` below — and that is a deliberate departure
+   from `.hop-row-hint-shown`'s own precedent further down this file, not
+   an inconsistency with it. That rule's own comment explains GTK resolves
+   a transition from "whichever rule matches at the moment the animated
+   property's computed value changes" — true, but incomplete on its own:
+   checked directly against GTK 4.14.5's source this time (not merely
+   asserted), `gtk_css_node_real_update_style`
+   (`gtk/gtkcssnode.c`) always passes the *newly computed* style as
+   `gtk_css_animated_style_new`'s `base_style` argument, and
+   `gtk_css_animated_style_create_css_transitions`
+   (`gtk/gtkcssanimatedstyle.c`) reads `transition-duration`/`-property`/
+   `-timing-function` exclusively off that `base_style` — the style being
+   transitioned *into*, never the one being left. For `.hop-row-hint-shown`
+   that is exactly the wanted behaviour: issue #207's own scope is the
+   *entrance* fade only, so declaring `transition:` on the entered class
+   alone means leaving it resolves against `.hop-row-hint` alone (which
+   declares no `transition:` of its own), falling back to CSS's own
+   un-animated initial value and snapping — deliberately one-directional.
+   A hover lift has no such one-directional mandate — decision 6 names a
+   mouse *contract*, an ordinary reversible affordance, and decision 1's
+   own "macOS-modern ... layered soft shadows" framing is not served by a
+   lift that eases in but slams back flat the instant the pointer leaves.
+   Declaring `transition:` here, on the always-matching base rule, instead
+   makes it the one that governs *both* directions: entering `:hover`, the
+   newly-computed style is the cascade of this rule and `:hover`'s own
+   overrides — `:hover` never redeclares `transition:` itself, so cascade
+   resolves that one property from this lower-specificity rule regardless
+   — and leaving `:hover`, the newly-computed style is this rule alone,
+   which carries the declaration directly. Either direction, `base_style`
+   in the source's own sense above is a style that has this `transition:`
+   in its cascade, so both eases at `--hop-duration-state`, not one eased
+   and one snapped. A future edit must not move this declaration onto
+   `listview > row:hover` to "match the hint's pattern" — that would
+   silently re-introduce the one-directional snap this comment exists to
+   rule out, for a state this file's own contract, unlike the hint's,
+   never scoped to one direction.
+   ============================================================ */
 listview > row {
   background-color: {{hop-bg}};
+  transition: background-color {{motion:hop-duration-state}} {{motion:hop-ease-std}},
+              box-shadow {{motion:hop-duration-state}} {{motion:hop-ease-std}},
+              transform {{motion:hop-duration-state}} {{motion:hop-ease-std}};
 }
 
 listview > row:hover {
   background-color: {{hop-bg-hover}};
+  box-shadow: {{hop-elev}};
+  transform: {{motion:hop-lift-transform}};
 }
 
 /* ============================================================

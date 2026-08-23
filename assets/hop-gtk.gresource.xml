@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  hop's GResource manifest — issue #198. Declares the five vendored font
-  files under `assets/fonts/` (see that directory's own README.md for their
-  provenance, licences, and why exactly these five) so `apps/hop-gtk/build.rs`
-  can compile them into one binary blob `apps/hop-gtk/src/fonts.rs` embeds
-  and registers with gio at startup.
+  hop's GResource manifest — issue #198, re-pointed by issue #253 (design
+  refresh, phase 1: identity). Declares the four vendored Geist font files
+  under `assets/fonts/` (see that directory's own README.md for their
+  provenance, licences, and why exactly these four) so
+  `apps/hop-gtk/build.rs` can compile them into one binary blob
+  `apps/hop-gtk/src/fonts.rs` embeds and registers with gio at startup.
 
   Prefix chosen to match `apps/hop-gtk/src/app.rs`'s own `APP_ID`
   ("dev.hop.Launcher"), reverse-DNS-to-path exactly the way GNOME's own
@@ -17,16 +18,15 @@
   resource path is recognizably "this app's", not an arbitrary string).
 
   `compressed="true"` is not the GResource default (`false`) and is not
-  cosmetic: the five files are ~22 MB raw and compress to ~6.6 MB with zlib,
-  and that compression is the entire reason this issue chose GResource
-  (`glib-compile-resources` + `gio::Resource`) over the far simpler
-  `include_bytes!` an earlier draft considered — `include_bytes!` has no
-  compression step at all, so it would have shipped the full, uncompressed
-  22 MB in the binary. GResource's `compressed` flag makes
-  `glib-compile-resources` zlib-deflate each `<file>` at build time and gio
-  inflate it back to the original bytes on the first `resources_lookup_data`
-  call — transparent to every caller in `fonts.rs`, which only ever sees the
-  original, uncompressed font bytes.
+  cosmetic: TTF faces compress well under zlib, and that compression is the
+  entire reason this issue chose GResource (`glib-compile-resources` +
+  `gio::Resource`) over the far simpler `include_bytes!` an earlier draft
+  considered — `include_bytes!` has no compression step at all, so it would
+  have shipped every face fully uncompressed in the binary. GResource's
+  `compressed` flag makes `glib-compile-resources` zlib-deflate each `<file>`
+  at build time and gio inflate it back to the original bytes on the first
+  `resources_lookup_data` call — transparent to every caller in `fonts.rs`,
+  which only ever sees the original, uncompressed font bytes.
 
   Each `<file>` names a bare filename, not a `fonts/`-prefixed one, and
   `apps/hop-gtk/build.rs` passes `assets/fonts` itself (not `assets`) as
@@ -34,9 +34,9 @@
   settling on this shape: `glib-compile-resources` uses a `<file>` element's
   own text as the resource's sub-path under `prefix` *verbatim*, unless an
   `alias` attribute overrides it, so an earlier draft that named
-  `assets` as the sourcedir and wrote `fonts/Inter-Regular.ttf` here (to
+  `assets` as the sourcedir and wrote `fonts/Geist-Regular.ttf` here (to
   find the file on disk) produced resources at
-  `/dev/hop/Launcher/fonts/fonts/Inter-Regular.ttf` — the `fonts/` segment
+  `/dev/hop/Launcher/fonts/fonts/Geist-Regular.ttf` — the `fonts/` segment
   doubled, once from `prefix` and once from the `<file>` text — which
   `src/fonts.rs`'s `FACES` table (correctly) does not look up, so every
   lookup failed. Sourcing from `assets/fonts` directly and writing bare
@@ -46,10 +46,9 @@
 -->
 <gresources>
   <gresource prefix="/dev/hop/Launcher/fonts">
-    <file compressed="true">Inter-Regular.ttf</file>
-    <file compressed="true">Inter-Medium.ttf</file>
-    <file compressed="true">Inter-SemiBold.ttf</file>
-    <file compressed="true">IosevkaTerm-Regular.ttf</file>
-    <file compressed="true">IosevkaTerm-Medium.ttf</file>
+    <file compressed="true">Geist-Regular.ttf</file>
+    <file compressed="true">Geist-Medium.ttf</file>
+    <file compressed="true">Geist-SemiBoldPlus.ttf</file>
+    <file compressed="true">GeistMono-Medium.ttf</file>
   </gresource>
 </gresources>
