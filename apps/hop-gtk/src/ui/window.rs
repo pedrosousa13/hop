@@ -94,6 +94,35 @@ const PAGE_STEP: i64 = 5;
 /// rule (issue #253's accent caret) selects on it.
 const QUERY_ENTRY_NAME: &str = "hop-query-entry";
 
+/// Which of two run purposes a built window serves: the ordinary interactive
+/// launcher, or a one-shot `--screenshot` capture. "Run purpose", not "mode"
+/// — mode is reserved vocabulary (it names how a query is interpreted); the
+/// disambiguation follows the same pattern as [`crate::keymap::Action`].
+///
+/// The distinction gates exactly one wiring decision — close-on-focus-loss
+/// ([`Self::wire_dismiss_on_focus_loss`], issue #232's X11 and GNOME
+/// Wayland rows). That behavior presumes a user who can click away and
+/// expects the overlay to follow. A `--screenshot` run has no user, so the
+/// acceptance criterion is flat: a capture harness's window must not be
+/// dismissible at all, whatever strategy the session resolves. `Screenshot`
+/// therefore skips that wiring regardless of what
+/// [`crate::session::OverlayStrategy`] asks for.
+///
+/// This is not what caused the flake issue #261 reports — that signature
+/// (silent exit 1, no error print) traces to an Xvfb display-number race in
+/// `tests/x11_smoke.rs`'s harness, fixed alongside this. But reproducing
+/// that flake locally surfaced this as a separate latent failure mode of
+/// its own: a background focus loss really did hide a wired capture window
+/// and hung the run to its own printed timeout. Unwiring dismissal fixes
+/// that on its own merits rather than as a workaround for the reported one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunPurpose {
+    /// The interactive launcher (`hop-gtk` with no mode flags).
+    Interactive,
+    /// A one-shot `hop-gtk --screenshot <path>` capture run.
+    Screenshot,
+}
+
 /// The pre-built window and everything it owns. `Clone` and cheap to clone —
 /// every field is a GTK/glib reference-counted handle — so `app`'s
 /// `glib::spawn_future_local` event loop can hold one across `.await`
@@ -181,8 +210,10 @@ impl HopWindow {
     /// arms wire behavior onto the window below: X11's self-positioning
     /// (delegated entirely to `x11::apply_self_positioning`),
     /// close-on-focus-loss in the two sessions that ask for it (GNOME
-    /// Wayland's documented shape, and X11's parity with it), and — since
-    /// issue #233 — the layer-shell arm, which applies
+    /// Wayland's documented shape, and X11's parity with it) — gated on
+    /// `purpose`, so a `--screenshot` run never wires it (see
+    /// [`RunPurpose`] for why) — and — since issue #233 — the layer-shell
+    /// arm, which applies
     /// `layer_shell::apply_or_fallback` when the strategy is LayerShell:
     /// the compositor owns placement and focus for a layer surface, and
     /// the probe inside decides supported-versus-fallback.
@@ -191,6 +222,7 @@ impl HopWindow {
         cmd_tx: CommandSender,
         keymap: Keymap,
         strategy: crate::session::OverlayStrategy,
+        purpose: RunPurpose,
     ) -> Self {
         let (window_w, window_h) = *tokens::WINDOW_SIZE_PX;
         let row_h = *tokens::ROW_HEIGHT_PX;
@@ -484,12 +516,11 @@ impl HopWindow {
             });
         }
         row_action_group.add_action(&row_open_actions);
-
         hop_window.wire_entry();
         hop_window.wire_selection_indicator();
         hop_window.wire_row_right_click();
         hop_window.wire_keyboard(keymap);
-        if strategy.dismisses_on_focus_loss() {
+        if strategy.dismisses_on_focus_loss() && purpose == RunPurpose::Interactive {
             hop_window.wire_dismiss_on_focus_loss();
         }
 
@@ -1918,6 +1949,27 @@ mod tests {
     /// flag only disables cross-process single-instance forwarding, not
     /// this process-local export).
     fn build_test_window(app_id: &str) -> (HopWindow, async_channel::Receiver<IpcCommand>) {
+        // These widget tests run under broadway — `SessionKind::Other`, the
+        // one strategy that deliberately wires nothing session-specific
+        // onto the window (no self-positioning, no focus-loss dismissal),
+        // which is exactly what a capture harness wants.
+        build_configured_window(
+            app_id,
+            crate::session::SessionKind::Other.overlay_strategy(crate::layer_shell::probe()),
+            RunPurpose::Interactive,
+        )
+    }
+
+    /// [`build_test_window`] with the overlay strategy and run purpose
+    /// spelled out — the shape
+    /// [`screenshot_window_never_wires_close_on_focus_loss`] needs, pinning
+    /// issue #261's wiring decision across both purposes under a strategy
+    /// that *does* ask for dismissal.
+    fn build_configured_window(
+        app_id: &str,
+        strategy: crate::session::OverlayStrategy,
+        purpose: RunPurpose,
+    ) -> (HopWindow, async_channel::Receiver<IpcCommand>) {
         let app = adw::Application::new(Some(app_id), gio::ApplicationFlags::NON_UNIQUE);
         // GTK asserts "New application windows must be added after the
         // GApplication::startup signal has been emitted" the moment
@@ -1932,16 +1984,7 @@ mod tests {
         app.register(gio::Cancellable::NONE)
             .expect("registering a NON_UNIQUE test application must not fail");
         let (cmd_tx, cmd_rx) = crate::ipc::test_channel();
-        // These widget tests run under broadway — `SessionKind::Other`, the
-        // one strategy that deliberately wires nothing session-specific
-        // onto the window (no self-positioning, no focus-loss dismissal),
-        // which is exactly what a capture harness wants.
-        let window = HopWindow::build(
-            &app,
-            cmd_tx,
-            Keymap::defaults(),
-            crate::session::SessionKind::Other.overlay_strategy(crate::layer_shell::probe()),
-        );
+        let window = HopWindow::build(&app, cmd_tx, Keymap::defaults(), strategy, purpose);
         (window, cmd_rx)
     }
 
@@ -2969,5 +3012,73 @@ mod tests {
         );
 
         println!("assert_overflow_chevron_does_nothing_for_an_unknown_item_id passed");
+    }
+
+    /// Issue #261's wiring decision, pinned across both run purposes under
+    /// [`OverlayStrategy::SelfPositioned`] — the X11 strategy, the one whose
+    /// row asks for close-on-focus-loss and the one the flaking CI arm
+    /// actually ran under. `1150` is the next base this file has not
+    /// already claimed (`400`, `550`, `700`, `850`, `1000`).
+    ///
+    /// The focus loss itself is simulated with `ObjectExt::notify("is-active")`,
+    /// which fires `connect_is_active_notify`'s handler without needing a real
+    /// X focus change broadway cannot produce: what this pins is what the
+    /// handler does, not how GTK decides the property. Under a real server the
+    /// same notify arrives whenever input focus leaves the window — exactly
+    /// what Xvfb's WM-less map/unmap races can produce mid-capture.
+    #[test]
+    fn screenshot_window_never_wires_close_on_focus_loss() {
+        run_under_broadway(
+            "ui::window::tests::screenshot_window_never_wires_close_on_focus_loss",
+            1150,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let x11_strategy = crate::session::OverlayStrategy::SelfPositioned;
+        assert!(x11_strategy.dismisses_on_focus_loss());
+
+        // The `--screenshot` purpose: a background focus loss must leave the
+        // window mapped for the capture.
+        let (window, _cmd_rx) = build_configured_window(
+            "dev.hop.WindowTest.ScreenshotFocusLoss",
+            x11_strategy,
+            RunPurpose::Screenshot,
+        );
+        window.present_with_token(None);
+        assert!(
+            window.window.is_visible(),
+            "setup: the window must be visible once presented"
+        );
+        window.window.notify("is-active");
+        assert!(
+            window.window.is_visible(),
+            "a --screenshot window must stay mapped through a focus loss — dismissing a \
+             capture harness's only window hides it mid-capture (issue #261)"
+        );
+
+        // The interactive purpose: the same focus loss must still dismiss,
+        // guarding this pin against drifting into "never wire dismissal at
+        // all" — that would regress issue #232's documented behavior.
+        let (window, _cmd_rx) = build_configured_window(
+            "dev.hop.WindowTest.InteractiveFocusLoss",
+            x11_strategy,
+            RunPurpose::Interactive,
+        );
+        window.present_with_token(None);
+        assert!(
+            window.window.is_visible(),
+            "setup: the window must be visible once presented"
+        );
+        window.window.notify("is-active");
+        assert!(
+            !window.window.is_visible(),
+            "an interactive window must dismiss on focus loss (issue #232)"
+        );
+
+        println!("screenshot_window_never_wires_close_on_focus_loss passed");
     }
 }

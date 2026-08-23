@@ -31,6 +31,12 @@ frontend-local vocabulary — what a key press or click means at the UI level
 (move the selection, dismiss the window, …) — not this term; the two meet
 only where `keymap::Action::Activate` runs an item's default action.
 
+**Run purpose** — which of hop-gtk's two kinds of invocation a window is
+built for: the interactive launcher, or a one-shot `--screenshot` capture
+(`hop-gtk`'s `ui::window::RunPurpose`, issue #261). Frontend-local like
+`keymap::Action` above; distinct from **Mode**, which interprets a query —
+a run purpose classifies an invocation of the launcher itself.
+
 **Provider** — a source of items. Describes itself with a **manifest** (its id,
 the kinds it produces, the modes it serves, a minimum term length, a per-query
 budget, and whether its ids are safe to persist in the clear) and answers
