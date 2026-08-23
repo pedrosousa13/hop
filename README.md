@@ -90,6 +90,8 @@ so `hop doctor` can report it later:
 1. **GlobalShortcuts portal** — used wherever the desktop offers it (KDE,
    GNOME 48+).
 2. **X11 grab** — a real `XGrabKey`, anywhere an X display is reachable.
+   On a Wayland session this grab lives on XWayland — see the GNOME ≤ 47
+   note below.
 3. **DE-shortcut guidance** — when neither applies, hop-hotkeyd prints
    per-desktop one-liners and exits cleanly rather than failing silently:
 
@@ -104,3 +106,11 @@ hop toggle
 # sway / wlroots compositors, in your sway config:
 bind = SUPER, Space, exec, hop toggle
 ```
+
+**GNOME 47 and older:** there is no GlobalShortcuts portal on those releases,
+so hop-hotkeyd falls back to the X11 grab — or, when no X display is
+reachable, to printed per-DE guidance — and under Wayland that grab lives
+on XWayland, meaning the hotkey fires only while an X11/XWayland window has
+input focus; native Wayland windows never trigger it. Set up a DE custom
+shortcut running `hop toggle` instead (first block above); the
+GlobalShortcuts portal becomes available as a GNOME 48+ enhancement.

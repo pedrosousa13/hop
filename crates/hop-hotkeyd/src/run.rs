@@ -345,6 +345,16 @@ enum PortalVerdict {
 /// that explain it (the caller prints each with the crate's `hop-hotkeyd:`
 /// prefix; the stable phrasing is what `hop doctor`'s M6 report will grep).
 ///
+/// `wayland` says whether the process runs under a Wayland session
+/// ([`wayland_session`]). It only shapes wording: under Wayland an X11 grab
+/// lives on XWayland, so the chosen-backend log must say the hotkey fires
+/// only while an X11/XWayland window has input focus instead of silently
+/// implying global coverage (issue #248 AC2).
+///
+/// The Wayland caveat is deliberately a separate, unprefixed line: it is not
+/// a backend-choice report, so it stays outside the stable `backend ...`
+/// line shape `hop doctor` greps rather than perturbing it (issue #248).
+///
 /// Pure and unit-tested below. `x11` is a closure rather than a result so
 /// the X server is probed only after the portal has fallen through — on a
 /// working portal no X connection is ever attempted (spec §2's rule that
@@ -353,6 +363,7 @@ enum PortalVerdict {
 fn decide(
     portal: PortalVerdict,
     x11: impl FnOnce() -> Result<(), String>,
+    wayland: bool,
 ) -> (Choice, Vec<String>) {
     let mut lines = Vec::new();
     match portal {
@@ -378,6 +389,15 @@ fn decide(
     match x11() {
         Ok(()) => {
             lines.push("backend X11 grab chosen: an X display is reachable".to_string());
+            if wayland {
+                lines.push(
+                    "this is a Wayland session: the grab lives on XWayland and fires \
+                     only while an X11/XWayland window has input focus; native \
+                     Wayland windows never trigger it — a DE custom shortcut running \
+                     `hop toggle` covers every window"
+                        .to_string(),
+                );
+            }
             (Choice::X11Grab, lines)
         }
         Err(reason) => {
@@ -392,6 +412,16 @@ fn decide(
     }
 }
 
+/// Whether this process runs under a Wayland session: either a Wayland
+/// compositor socket is in the environment (`WAYLAND_DISPLAY`) or the
+/// session manager said so (`XDG_SESSION_TYPE`). Only the X11-grab log
+/// wording depends on it ([`decide`]); backend *selection* never does.
+fn wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE")
+            .is_ok_and(|session_type| session_type.eq_ignore_ascii_case("wayland"))
+}
+
 /// Runs the real probes in the documented order and returns the selected
 /// backend. The portal verdict and its session travel together: `session`
 /// is `Some` exactly when the verdict is [`PortalVerdict::Bound`].
@@ -403,7 +433,7 @@ fn select_backend(bindings: &[ToggleEntry]) -> Backend {
             Err(reason) => (PortalVerdict::Refused(reason), None),
         },
     };
-    let (choice, lines) = decide(verdict, probe_x11);
+    let (choice, lines) = decide(verdict, probe_x11, wayland_session());
     for line in &lines {
         eprintln!("hop-hotkeyd: {line}");
     }
@@ -691,7 +721,7 @@ mod tests {
     #[test]
     fn a_working_portal_wins_and_never_probes_x11() {
         let mut x11_probed = false;
-        let (choice, lines) = decide(PortalVerdict::Bound, x11_ok(&mut x11_probed));
+        let (choice, lines) = decide(PortalVerdict::Bound, x11_ok(&mut x11_probed), false);
         assert!(matches!(choice, Choice::Portal));
         assert!(!x11_probed, "a working portal must short-circuit selection");
         let joined = lines.join("\n");
@@ -706,6 +736,7 @@ mod tests {
         let (choice, lines) = decide(
             PortalVerdict::Unavailable("no session bus (test)".to_string()),
             || Ok(()),
+            false,
         );
         assert!(matches!(choice, Choice::X11Grab));
         let joined = lines.join("\n");
@@ -727,6 +758,7 @@ mod tests {
         let (choice, lines) = decide(
             PortalVerdict::Refused("BindShortcuts refused (response code 1)".to_string()),
             || Err("cannot connect to the X server (test); is DISPLAY set?".to_string()),
+            false,
         );
         assert!(matches!(choice, Choice::Guidance));
         let joined = lines.join("\n");
@@ -748,6 +780,53 @@ mod tests {
         }
     }
 
+    /// Issue #248 AC2: when the X11 grab wins *under a Wayland session*,
+    /// the startup log must say what that means — the grab lives on
+    /// XWayland and fires only while an X11/XWayland window has focus.
+    #[test]
+    fn x11_grab_under_wayland_logs_the_xwayland_scope() {
+        let (choice, lines) = decide(
+            PortalVerdict::Unavailable("no session bus (test)".to_string()),
+            || Ok(()),
+            true,
+        );
+        assert!(matches!(choice, Choice::X11Grab));
+        let joined = lines.join("\n");
+        for expected in [
+            "backend X11 grab chosen",
+            "XWayland",
+            "only while an X11/XWayland window has input focus",
+            "native Wayland windows never trigger it",
+            "`hop toggle`",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing `{expected}` in: {joined}"
+            );
+        }
+    }
+
+    /// The honest caveat is Wayland-conditional: a plain X11 session's
+    /// grab really is global, so no scope warning may appear there.
+    #[test]
+    fn x11_grab_on_a_real_x11_session_stays_unqualified() {
+        let (choice, lines) = decide(
+            PortalVerdict::Unavailable("no session bus (test)".to_string()),
+            || Ok(()),
+            false,
+        );
+        assert!(matches!(choice, Choice::X11Grab));
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("backend X11 grab chosen"),
+            "the chosen-backend line is what startup logs: {joined}"
+        );
+        assert!(
+            !joined.contains("XWayland"),
+            "an X11-session grab must not carry the Wayland caveat: {joined}"
+        );
+    }
+
     #[test]
     fn guidance_is_reached_only_after_both_backends_decline() {
         let x11_probed = std::cell::Cell::new(false);
@@ -757,6 +836,7 @@ mod tests {
                 x11_probed.set(true);
                 Err("no X".to_string())
             },
+            false,
         );
         assert!(matches!(choice, Choice::Guidance));
         assert!(x11_probed.get());
