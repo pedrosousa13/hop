@@ -62,15 +62,26 @@
 //! by design, this crate's controller sees the key first, indifferent to
 //! what has focus.
 //!
-//! No §8 default triggers this: every default spelling
-//! ([`Action::default_spelling`]) is a non-printable key (an arrow, Page
-//! Up/Down, Home, End, Return, Tab, Escape, Menu) that a query never needs
-//! to type, so the hazard is inert until a user's own `[keymap]` table
-//! introduces a printable one. This module's own test suite demonstrates it
-//! directly, rather than only describing it: `keymap::tests::a_rebound_action_answers_to_its_new_key_and_no_longer_its_old_one`
+//! Every §8 default but one avoids this outright: every default spelling
+//! ([`Action::default_spelling`]) except [`Action::SecondaryAction`]'s is a
+//! non-printable key (an arrow, Page Up/Down, Home, End, Return, Tab,
+//! Escape) that a query never needs to type, so the hazard is inert for
+//! those until a user's own `[keymap]` table introduces a printable one.
+//! This module's own test suite demonstrates it directly, rather than only
+//! describing it: `keymap::tests::a_rebound_action_answers_to_its_new_key_and_no_longer_its_old_one`
 //! rebinds `navigate_down` to `"j"`, and the same lookup that proves `j` now
 //! resolves to `NavigateDown` is exactly what would stop that letter
 //! reaching a query's text.
+//!
+//! [`Action::SecondaryAction`]'s own default, `ctrl+k` (issue #254 — see
+//! [`Action::default_spelling`]'s own doc comment for why it replaced
+//! `Menu`), *is* a printable key, but not the shape this hazard describes:
+//! the hazard is a *bare* printable key claiming a character outright, and
+//! `ctrl+k` is never bare — [`Keymap::lookup`] matches on the exact `(key,
+//! modifiers)` pair a press carries, so a plain `k` press with no Ctrl held
+//! does not match this binding at all and reaches the query exactly as it
+//! did before this default existed. Only the one chord, Ctrl+K, is claimed;
+//! the letter itself stays typable.
 //!
 //! This is deliberately **not** guarded against here — no refusal, no
 //! automatic focus-scoping. A binding that fights the query entry is a
@@ -293,11 +304,12 @@ pub enum Action {
     /// resolve to this one keymap `Action` rather than to two independent
     /// code paths that happen to agree today.
     Activate,
-    /// Open the secondary-action menu for the selected item. Bound and
-    /// dispatched by this module and `ui::window`; the menu itself does not
-    /// exist yet in `hop-gtk` — see
-    /// [`ui::window::HopWindow::open_secondary_action_menu`] for the honest
-    /// account of what is and is not built.
+    /// Open the ctrl-K action panel for the selected item — issue #254's
+    /// `ui::action_panel::ActionPanel`. Bound (`ctrl+k` by default; see
+    /// [`Action::default_spelling`]'s own doc comment for why that replaced
+    /// `Menu`) and dispatched by this module and `ui::window`; see
+    /// [`ui::window::HopWindow::open_secondary_action_menu`] for what
+    /// actually happens on dispatch.
     SecondaryAction,
     /// Complete the query against the longest shared prefix among the
     /// current results. Bound and dispatched; the completer itself does not
@@ -358,12 +370,43 @@ impl Action {
             Action::Home => "Home",
             Action::End => "End",
             Action::Activate => "Return",
-            // The X11/GDK keysym most keyboards with a dedicated
-            // context-menu key report — the same key most desktop
-            // environments already bind to "open the context menu for
-            // whatever has focus", so this default asks nothing new of a
-            // keyboard that has the key at all.
-            Action::SecondaryAction => "Menu",
+            // Was `"Menu"` (the X11/GDK keysym most keyboards with a
+            // dedicated context-menu key report) through issue #182 and
+            // #197. Design refresh SPEC decision 5
+            // (`docs/design/2026-08-22-design-refresh/SPEC.md`) and issue
+            // #254 both name `ctrl+k` as *the* opener for the action panel
+            // that binding now actually opens (see
+            // `ui::window::HopWindow::open_secondary_action_menu`) —
+            // "Action panel — ctrl K, full, this pass," not "in addition to
+            // Menu."
+            //
+            // This *replaces* the default rather than adding a second one,
+            // and that is a structural fact about this module, not a
+            // stylistic choice: `Keymap` holds exactly one `Binding` per
+            // `Action` (`by_action: HashMap<Action, Binding>`, keyed by
+            // `Action` alone), which is what lets `Keymap::binding_for`
+            // answer deterministically with no `HashMap`-iteration-order
+            // hazard — see that method's own doc comment, and
+            // `binding_for_is_stable_even_when_two_different_actions_share_one_key`,
+            // for why that single-slot-per-action shape is load-bearing
+            // elsewhere in this module, not incidental. Giving one action
+            // two simultaneous defaults would need a real data-model change
+            // (`by_action: HashMap<Action, Vec<Binding>>` at least, plus a
+            // `lookup` that no longer silently drops whichever binding a
+            // later `HashMap::collect` overwrites), which is exactly the
+            // schema work M6's own conflict-detection slice, not this
+            // wiring issue, would have to own. A user who preferred `Menu`
+            // can still bind it back via `[keymap]`
+            // (`secondary_action = "Menu"`) — nothing about this default
+            // change removes that key from `Binding::parse`'s vocabulary,
+            // only from what a fresh `config.toml` gets for free.
+            //
+            // `ctrl+k` also does not ask a keyboard for a key it might not
+            // have: unlike a dedicated `Menu` key (absent on plenty of
+            // compact and laptop keyboards), every keyboard this crate
+            // targets has both Ctrl and K, and the chord matches the
+            // command-palette convention this exact feature is modeled on.
+            Action::SecondaryAction => "ctrl+k",
             Action::CompletePrefix => "Tab",
             Action::Dismiss => "Escape",
         }
@@ -1027,18 +1070,61 @@ mod tests {
     /// with no GDK runtime or display connection behind them — confirmed by
     /// this whole file running under a plain `cargo test`, with no
     /// `gtk::init()` and no `GDK_BACKEND` anywhere in it.
+    ///
+    /// Goes through [`Binding::parse`] rather than a bare
+    /// `gdk::Key::from_name(action.default_spelling())`, because that is no
+    /// longer a correct reading of every default spelling once issue #254
+    /// gave [`Action::SecondaryAction`] a modifier-qualified one
+    /// (`"ctrl+k"`): `gdk::Key::from_name` expects a single GDK keysym name,
+    /// not this module's own `mod+key` grammar, and would either fail to
+    /// resolve `"ctrl+k"` at all or (worse) silently resolve a substring of
+    /// it. `Binding::parse` is this module's own, single source of truth
+    /// for that grammar — the same function [`default_bindings`] itself
+    /// calls — so driving the test through it keeps this assertion honest
+    /// about every default, modifier-qualified or not, rather than only the
+    /// ones that happen to have none.
     #[test]
     fn defaults_cover_every_action_with_its_documented_key() {
         let keymap = Keymap::defaults();
         for action in Action::ALL {
-            let key = gdk::Key::from_name(action.default_spelling()).unwrap();
+            let binding = Binding::parse(action.default_spelling()).unwrap();
             assert_eq!(
-                keymap.lookup(key, gdk::ModifierType::empty()),
+                keymap.lookup(binding.key, binding.modifiers),
                 Some(action),
                 "default spelling {:?} for {action:?} did not resolve back to it",
                 action.default_spelling()
             );
         }
+    }
+
+    /// The safety claim this module's top doc comment makes for issue
+    /// #254's `ctrl+k` default, checked directly: the "rebound printable
+    /// key" hazard is about a *bare* printable key claiming a character
+    /// outright, and this default is never bare. A plain `k` press, with no
+    /// Ctrl held, must resolve to nothing — leaving it exactly as free for
+    /// the query entry as it was before this default existed — while the
+    /// same key held with Ctrl must resolve to
+    /// [`Action::SecondaryAction`].
+    #[test]
+    fn the_secondary_action_default_does_not_claim_a_bare_k() {
+        let keymap = Keymap::defaults();
+        assert_eq!(
+            keymap.lookup(
+                gdk::Key::from_name("k").unwrap(),
+                gdk::ModifierType::empty()
+            ),
+            None,
+            "a bare k, with no modifier held, must not resolve to anything — the query must \
+             still be able to receive that letter as ordinary typed text"
+        );
+        assert_eq!(
+            keymap.lookup(
+                gdk::Key::from_name("k").unwrap(),
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            Some(Action::SecondaryAction),
+            "ctrl+k specifically must resolve to SecondaryAction"
+        );
     }
 
     #[test]

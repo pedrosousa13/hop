@@ -1096,6 +1096,197 @@ fn run_assertions() {
 
     println!("row hint entrance-fade recycling assertions passed (issue #207)");
 
+    // --- issue #254: per-row action icons. Continues on the exact same
+    // recycled `stack`/`container` every section above already proved
+    // recycling for — no real window is needed here (unlike the
+    // responsive-collapse section below): `ui::row::resolve_action_icons`
+    // makes no width-driven decision, only a fixed-count one, so a bare
+    // `gtk::Box` never added to a window answers exactly like a realized
+    // one would.
+
+    // A resting bind — `item_a` carries exactly one action (`test_item`'s
+    // own "open") — must show slot 0 and hide slot 1: one real action
+    // never means two visible icons.
+    view::bind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
+    let action_icon_1 = row::action_icon_widget(&container, 0)
+        .expect("build must give the row a named first action-icon button");
+    let action_icon_2 = row::action_icon_widget(&container, 1)
+        .expect("build must give the row a named second action-icon button");
+    assert!(
+        row::action_icon_widget(&container, 2).is_none(),
+        "there must be no third action-icon button — ROW_ACTION_ICON_CAP is 2, not \
+         item.actions.len()"
+    );
+    assert!(
+        action_icon_1.is_visible(),
+        "a real first action must show the row's first action-icon button"
+    );
+    assert!(
+        !action_icon_2.is_visible(),
+        "an item with only one action must not show a second action icon"
+    );
+    assert_eq!(
+        row_layout(&container, &icon),
+        baseline_layout,
+        "action icons appearing or hiding must not change the row's reserved row height or \
+         icon slot"
+    );
+
+    // Zero actions — a legitimate wire shape — must hide *both* icons, not
+    // merely fail to show a first one.
+    let no_actions_item = item_with_no_actions(60, "no actions at all");
+    view::bind(
+        &stack,
+        &Node::for_item(no_actions_item, activate_key_display.clone()),
+    );
+    assert!(
+        !action_icon_1.is_visible(),
+        "an item with zero actions must hide the first action icon too"
+    );
+    assert!(!action_icon_2.is_visible());
+
+    // Two actions of two different kinds — both slots must show, each
+    // carrying that exact action's own icon, tooltip, and GAction target,
+    // not the other's and not the row's default action.
+    let two_actions_item = item_with_two_actions(61, "two different actions");
+    view::bind(
+        &stack,
+        &Node::for_item(two_actions_item.clone(), activate_key_display.clone()),
+    );
+    assert!(action_icon_1.is_visible());
+    assert!(action_icon_2.is_visible());
+    assert_eq!(
+        action_icon_1.tooltip_text().as_deref(),
+        Some("Open"),
+        "the first slot's tooltip must name that exact action's own label"
+    );
+    assert_eq!(
+        action_icon_2.tooltip_text().as_deref(),
+        Some("Copy path"),
+        "the second slot's tooltip must name the *second* action's label, not the first's"
+    );
+    assert_eq!(
+        action_icon_1.action_name().as_deref(),
+        Some("row.run-action"),
+        "every action-icon button must invoke the same shared GAction — ui::window::HopWindow \
+         is what tells the two apart, by target, not by a different action name per button"
+    );
+    let target_1 = action_icon_1
+        .action_target_value()
+        .expect("a visible action-icon button must carry a real action target")
+        .get::<(String, String)>()
+        .expect("the action target must unpack as an (item_id, action_id) pair of strings");
+    assert_eq!(
+        target_1,
+        (two_actions_item.id.as_str().to_string(), "open".to_string()),
+        "the first slot's target must name this item's id and its first action's id"
+    );
+    let target_2 = action_icon_2
+        .action_target_value()
+        .expect("a visible action-icon button must carry a real action target")
+        .get::<(String, String)>()
+        .expect("the action target must unpack as an (item_id, action_id) pair of strings");
+    assert_eq!(
+        target_2,
+        (
+            two_actions_item.id.as_str().to_string(),
+            "copy-path".to_string()
+        ),
+        "the second slot's target must name the *second* action's id, not the first's default"
+    );
+
+    // Three actions — one more than `ROW_ACTION_ICON_CAP` — must still
+    // show only the first two, in wire order; the third is only ever
+    // reachable through the ctrl-K/right-click action panel, never a
+    // dedicated row icon.
+    let three_actions_item = item_with_three_actions(62, "three actions, one over the cap");
+    view::bind(
+        &stack,
+        &Node::for_item(three_actions_item.clone(), activate_key_display.clone()),
+    );
+    assert_eq!(action_icon_1.tooltip_text().as_deref(), Some("Open"));
+    assert_eq!(action_icon_2.tooltip_text().as_deref(), Some("Copy path"));
+    let target_2_of_three = action_icon_2
+        .action_target_value()
+        .expect("a visible action-icon button must carry a real action target")
+        .get::<(String, String)>()
+        .expect("the action target must unpack as an (item_id, action_id) pair of strings");
+    assert_eq!(
+        target_2_of_three,
+        (
+            three_actions_item.id.as_str().to_string(),
+            "copy-path".to_string()
+        ),
+        "the third action (\"reveal\") must never reach a row icon at all — the cap truncates, \
+         it does not shift which two actions are shown"
+    );
+
+    // Recycling: a row shown wide open with two visible icons, rebound to
+    // an item with only one action, must not carry the second icon's
+    // stale visibility (or its stale target) forward — the exact hazard
+    // this module's own doc comment ("the recycling constraint") warns a
+    // fixed, unconditional-every-bind rule (rather than a before/after
+    // comparison) is what rules out here.
+    view::bind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
+    assert!(
+        action_icon_1.is_visible(),
+        "recycling back onto a one-action item must still show the first icon"
+    );
+    assert!(
+        !action_icon_2.is_visible(),
+        "recycling from a two-action item onto a one-action item must not leave the second \
+         action icon visible — a recycled row must not carry a stale icon forward"
+    );
+    let target_after_recycle = action_icon_1
+        .action_target_value()
+        .expect("a visible action-icon button must carry a real action target")
+        .get::<(String, String)>()
+        .expect("the action target must unpack as an (item_id, action_id) pair of strings");
+    assert_eq!(
+        target_after_recycle,
+        (item_a.id.as_str().to_string(), "open".to_string()),
+        "the first slot's target must be rewritten to the newly-bound item's own action, not \
+         left pointing at whichever item most recently used that slot"
+    );
+
+    // `unbind`'s own symmetry with the title, subtitle, icon, and hint:
+    // every action-icon button must be hidden, its tooltip and target
+    // cleared — a recycled row about to be rebound to a different item
+    // must not carry stale action data across the gap.
+    view::unbind(
+        &stack,
+        &Node::for_item(item_a.clone(), activate_key_display.clone()),
+    );
+    assert!(!action_icon_1.is_visible());
+    assert!(!action_icon_2.is_visible());
+    assert!(
+        action_icon_1.action_target_value().is_none(),
+        "unbind must clear the action target, not merely hide the button"
+    );
+
+    // Neither the title nor the subtitle label can be text-selected — SPEC
+    // decision 6: "no text selection inside rows (the copy action owns
+    // that)."
+    let title = row::title_widget(&container).expect("build must give the row a named title");
+    let subtitle =
+        row::subtitle_widget(&container).expect("build must give the row a named subtitle");
+    assert!(
+        !title.is_selectable(),
+        "the row's title label must not be text-selectable"
+    );
+    assert!(
+        !subtitle.is_selectable(),
+        "the row's subtitle label must not be text-selectable"
+    );
+
+    println!("row action-icon assertions passed (issue #254)");
+
     // --- issue #197: the responsive collapse. `assets/tokens.css`'s own
     // GEOMETRY note: "the action hint collapses to icon-only before it
     // would be pushed off-window." GTK has no CSS media query (confirmed
@@ -1652,6 +1843,51 @@ fn item_with_icon_none(n: usize, title: &str) -> Item {
 fn item_with_actions(n: usize, title: &str) -> Item {
     let mut item = test_item(n, title);
     item.default_action = ActionId::new("archive").unwrap();
+    item
+}
+
+/// A tiny [`Item`] with zero actions — a legitimate wire shape
+/// (`Item.actions` is not required to be non-empty) issue #254's own
+/// section uses to prove every action-icon button hides, not just fails to
+/// show a first one.
+fn item_with_no_actions(n: usize, title: &str) -> Item {
+    let mut item = test_item(n, title);
+    item.actions = vec![];
+    item
+}
+
+/// A tiny [`Item`] carrying exactly `ui::row::ROW_ACTION_ICON_CAP` (2)
+/// actions of two different [`ActionKind`]s, so issue #254's own section
+/// can tell the row's two action-icon buttons apart by more than position.
+fn item_with_two_actions(n: usize, title: &str) -> Item {
+    let mut item = test_item(n, title);
+    item.actions = vec![
+        Action {
+            id: ActionId::new("open").unwrap(),
+            kind: ActionKind::Open,
+            label: "Open".to_string(),
+        },
+        Action {
+            id: ActionId::new("copy-path").unwrap(),
+            kind: ActionKind::Copy,
+            label: "Copy path".to_string(),
+        },
+    ];
+    item.default_action = ActionId::new("open").unwrap();
+    item
+}
+
+/// [`item_with_two_actions`] plus one more action — one over
+/// `ui::row::ROW_ACTION_ICON_CAP` — issue #254's own proof that the row's
+/// fixed two icon buttons show exactly the first two actions in wire
+/// order, truncating rather than shifting which two are shown.
+fn item_with_three_actions(n: usize, title: &str) -> Item {
+    let mut item = item_with_two_actions(n, title);
+    item.actions.push(Action {
+        id: ActionId::new("reveal").unwrap(),
+        kind: ActionKind::Focus,
+        label: "Reveal".to_string(),
+    });
     item
 }
 

@@ -63,16 +63,21 @@
 //! or it is not, and both signal handlers below only ever do that one
 //! computation.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gio::prelude::*;
 use gtk::prelude::*;
+use gtk::{gdk, glib};
 
-use hop_protocol::{ExecOutcome, Item};
+use hop_protocol::{ActionId, ExecOutcome, Item, ItemId};
 
 use crate::ipc::{CommandSender, IpcCommand, IpcEvent};
 use crate::keymap::{Action, Keymap};
 use crate::tokens;
+use crate::ui::action_panel::ActionPanel;
 use crate::ui::offline_indicator::OfflineIndicator;
-use crate::ui::{marker_highlight, mode_label, model, view};
+use crate::ui::{marker_highlight, mode_label, model, row, view};
 
 /// Rows moved per [`Action::PageUp`]/[`Action::PageDown`]. A fixed step
 /// rather than one derived from the scrolled window's currently allocated
@@ -121,6 +126,39 @@ pub struct HopWindow {
     /// [`HopWindow::apply_event`] for the one place it is ever shown or
     /// hidden.
     offline_indicator: OfflineIndicator,
+    /// Issue #254's ctrl-K action panel — built once here, alongside every
+    /// other widget `build` constructs, per this module's "never rebuilt"
+    /// convention (this struct's own top doc comment) and
+    /// `ui::action_panel`'s own doc comment on why the panel is built once
+    /// and presented on demand rather than reconstructed per open. See
+    /// [`HopWindow::open_secondary_action_menu`] for the one place this is
+    /// ever presented, and [`HopWindow::dispatch_action`]'s `Action::Dismiss`
+    /// arm for the one place it is ever dismissed by a key press.
+    action_panel: ActionPanel,
+    /// The item [`HopWindow::open_secondary_action_menu`] most recently
+    /// opened [`Self::action_panel`] for — pinned at *open* time, read at
+    /// *choose* time, by the `on_choose` closure [`HopWindow::build`] wires
+    /// into `action_panel` itself. See
+    /// [`HopWindow::open_secondary_action_menu`]'s own doc comment,
+    /// "Pinning the item at open time, not choose time," for why this
+    /// indirection exists rather than that closure re-reading
+    /// `self.selection.selected()` when a choice is reported.
+    ///
+    /// `Rc<RefCell<..>>`, not a plain field: the closure captured into
+    /// `action_panel` at construction and the `&self` methods on this
+    /// struct both need to reach the *same* cell, and the closure outlives
+    /// any one `&self` borrow — the identical shape
+    /// `ui::offline_indicator::OfflineIndicator`'s own `stamp` field would
+    /// need if two independent closures ever had to share one mutable slot
+    /// (today they do not; this is the first field in this window that
+    /// does). This workspace denies `unsafe_code`, so `RefCell`'s runtime
+    /// borrow check is the only interior-mutability tool available — safe
+    /// here because every borrow is short-lived and non-overlapping: one
+    /// `borrow_mut` to set it in [`HopWindow::open_secondary_action_menu`],
+    /// one `borrow_mut().take()` to read-and-clear it in the `on_choose`
+    /// closure, each call synchronous and single-threaded on the GTK main
+    /// loop, never nested.
+    pinned_action_item: Rc<RefCell<Option<Item>>>,
     cmd_tx: CommandSender,
 }
 
@@ -249,6 +287,52 @@ impl HopWindow {
         // arm for the one place this ever becomes visible.
         let offline_indicator = OfflineIndicator::build();
 
+        // Issue #254's ctrl-K action panel — built once, like every other
+        // widget above, never rebuilt per open (see
+        // `HopWindow::action_panel`'s own field doc comment). Not appended
+        // to `content`: it presents itself as a `gtk::Popover` anchored to
+        // `indicator` from `open_secondary_action_menu`, not as a
+        // permanent member of this window's own layout.
+        //
+        // `pinned_action_item` is created before `action_panel` because the
+        // `on_choose` closure below needs its own clone of the `Rc` before
+        // the panel that closure belongs to exists — the same
+        // build-the-shared-cell-first ordering `wire_keyboard`'s own
+        // `keymap` capture uses for an unrelated reason (there, avoiding a
+        // second `Keymap` load; here, giving two independent closures/
+        // methods a handle to the one cell they must agree on).
+        let pinned_action_item: Rc<RefCell<Option<Item>>> = Rc::new(RefCell::new(None));
+        let action_panel = {
+            let cmd_tx = cmd_tx.clone();
+            let pinned_action_item = Rc::clone(&pinned_action_item);
+            ActionPanel::new(move |action_id| {
+                // `take()`, not a borrow-and-clone: once a choice is
+                // reported the pin has done its job for this `present`
+                // call, and clearing it here is what keeps
+                // `pinned_action_item` truthful as "the item the
+                // *currently open* panel was opened for" rather than a
+                // stale answer surviving after the panel it named has
+                // already closed. `ActionPanel::activate_at` calls
+                // `on_choose` at most once per `present` (it dismisses
+                // immediately after), so there is no second call this
+                // `take` could wrongly starve.
+                let Some(item) = pinned_action_item.borrow_mut().take() else {
+                    // Structurally unreachable in production —
+                    // `present_action_panel_for_selected` below (the shared
+                    // core of both `open_secondary_action_menu`, ctrl-K's
+                    // handler, and `open_secondary_action_menu_at`, issue
+                    // #254 AC2's right-click handler) always pins an item
+                    // before the panel can be opened at all, so `on_choose`
+                    // cannot fire with nothing pinned — but not `unwrap`,
+                    // matching this crate's `clippy::unwrap_used` lint on a
+                    // value this function cannot itself prove is `Some`
+                    // from its own signature alone.
+                    return;
+                };
+                send_execute(&cmd_tx, item.id, action_id);
+            })
+        };
+
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&entry_overlay);
         content.append(&status);
@@ -295,6 +379,56 @@ impl HopWindow {
             crate::x11::apply_self_positioning(&window);
         }
 
+        // Issue #254 AC2: per-row action-icon buttons (`ui::row::build`)
+        // invoke a GAction named `ROW_ACTION_GROUP_PREFIX.ROW_ACTION_NAME`
+        // ("row.run-action") rather than a plain `connect_clicked` closure
+        // holding its own, separately-tracked mutable state — see
+        // `ui::row`'s own top doc comment, "How a click runs the right
+        // action", for why. This is where that name resolves to something
+        // real: one parameterized `gio::SimpleAction`, installed on the
+        // window itself (via `insert_action_group`) so every row
+        // descendant can reach it by name regardless of which recycled
+        // slot it currently lives in — action names resolve by walking up
+        // the widget tree looking for a matching group, and the window is
+        // the ancestor every row shares.
+        // `.ok()`, not an `.expect()`: `ROW_ACTION_TARGET_TYPE` is the fixed
+        // literal `"(ss)"`, a valid GVariant type string by construction, so
+        // `Err` here is structurally unreachable — but a corrupted constant
+        // should fail by silently registering a parameter-less action
+        // (whose `connect_activate` below would then simply never receive a
+        // parameter) rather than by an `.expect()`, which this crate's
+        // `unwrap_used` lint (promoted to a hard error by `-D warnings` in
+        // CI) refuses to spend on a one-time, build-time value like this
+        // one.
+        let row_action_target_type = glib::VariantTy::new(row::ROW_ACTION_TARGET_TYPE).ok();
+        let row_run_action = gio::SimpleAction::new(row::ROW_ACTION_NAME, row_action_target_type);
+        {
+            let cmd_tx = cmd_tx.clone();
+            row_run_action.connect_activate(move |_action, parameter| {
+                let Some(parameter) = parameter else {
+                    return;
+                };
+                let Some((item_id, action_id)) = parameter.get::<(String, String)>() else {
+                    return;
+                };
+                // Round-tripping strings that already satisfied
+                // `ItemId`/`ActionId`'s own length bounds when
+                // `ui::row::resolve_action_icons` packed them into this
+                // exact target — re-validated here anyway rather than
+                // trusted, the same "do not assume a value already passed
+                // one check elsewhere" posture this crate takes with wire
+                // data generally.
+                let (Ok(item_id), Ok(action_id)) = (ItemId::new(item_id), ActionId::new(action_id))
+                else {
+                    return;
+                };
+                send_execute(&cmd_tx, item_id, action_id);
+            });
+        }
+        let row_action_group = gio::SimpleActionGroup::new();
+        row_action_group.add_action(&row_run_action);
+        window.insert_action_group(row::ROW_ACTION_GROUP_PREFIX, Some(&row_action_group));
+
         let hop_window = HopWindow {
             window,
             entry,
@@ -306,11 +440,14 @@ impl HopWindow {
             scrolled,
             status,
             offline_indicator,
+            action_panel,
+            pinned_action_item,
             cmd_tx,
         };
 
         hop_window.wire_entry();
         hop_window.wire_selection_indicator();
+        hop_window.wire_row_right_click();
         hop_window.wire_keyboard(keymap);
         if strategy.dismisses_on_focus_loss() {
             hop_window.wire_dismiss_on_focus_loss();
@@ -405,12 +542,19 @@ impl HopWindow {
     /// both routes resolve to this one function rather than to two
     /// independently-written effects that happen to agree today.
     ///
-    /// [`Action::SecondaryAction`] and [`Action::CompletePrefix`] are
-    /// dispatched here too, to [`HopWindow::open_secondary_action_menu`] and
-    /// [`HopWindow::complete_prefix`] — both real, reachable handlers that do
-    /// nothing visible yet. See each one's own doc comment for why (D4):
-    /// the binding must exist now so a later issue only has to write the
-    /// feature, not also retrofit the keymap plumbing around it.
+    /// [`Action::SecondaryAction`] is dispatched here to
+    /// [`HopWindow::open_secondary_action_menu`] — issue #254's real
+    /// handler, replacing the do-nothing stub issue #182 left in its place
+    /// (see that method's own doc comment for what it does now).
+    /// [`Action::CompletePrefix`] still dispatches to
+    /// [`HopWindow::complete_prefix`], still empty on purpose — its own
+    /// unbuilt slice, untouched by this issue; see that method's own doc
+    /// comment.
+    ///
+    /// [`Action::Dismiss`]'s own arm below is no longer a bare
+    /// `self.window.close()` either: an open [`Self::action_panel`] claims
+    /// Escape (Dismiss's default binding) for itself first — see that arm's
+    /// own comment for why.
     fn dispatch_action(&self, action: Action) {
         match action {
             Action::NavigateUp => self.move_selection(-1),
@@ -422,11 +566,46 @@ impl HopWindow {
             Action::Activate => activate_selected(&self.selection, &self.cmd_tx),
             Action::SecondaryAction => self.open_secondary_action_menu(),
             Action::CompletePrefix => self.complete_prefix(),
-            // `hide_on_close(true)` (set in `build`) is what makes `close()`
-            // hide the pre-built window rather than destroy it — the same
-            // "never rebuilt" property `present_with_token` relies on to
-            // `present()` this exact window again later.
-            Action::Dismiss => self.window.close(),
+            Action::Dismiss => {
+                if self.action_panel.popover().is_visible() {
+                    // Issue #254: Escape closes the panel and returns focus
+                    // to the list — it must not *also* dismiss the window
+                    // underneath it. `ActionPanel::dismiss` is documented
+                    // safe to call on an already-closed panel, so the
+                    // `is_visible` guard here is only about *which* thing
+                    // Escape closes, never about whether `dismiss` itself
+                    // is safe to call unconditionally.
+                    //
+                    // This guard lives here, in `dispatch_action`, rather
+                    // than relying on `gtk::Popover`'s own surface (a
+                    // `gtk::Native` distinct from this window's — confirmed
+                    // against this workspace's installed gtk4-rs: `Popover`
+                    // implements `Native`) to keep this window's own
+                    // `EventControllerKey` from ever seeing an Escape aimed
+                    // at the panel's focused entry in the first place. That
+                    // surface separation is real and is why a live keypress
+                    // is expected to route to the panel's own
+                    // `ActionPanel::handle_key` without this arm's help at
+                    // all — but this test suite proves its behavior by
+                    // calling `dispatch_action` directly (this file's own
+                    // top doc comment gives the reason: no GTK4 backend in
+                    // this environment can synthesize a real key event), so
+                    // the *only* thing that suite can exercise, and the
+                    // only thing this arm can be held to regardless of
+                    // whatever the real surface routing does, is what
+                    // `dispatch_action(Action::Dismiss)` itself does when
+                    // called. Guarding here makes the invariant hold
+                    // unconditionally rather than incidentally.
+                    self.action_panel.dismiss();
+                } else {
+                    // `hide_on_close(true)` (set in `build`) is what makes
+                    // `close()` hide the pre-built window rather than
+                    // destroy it — the same "never rebuilt" property
+                    // `present_with_token` relies on to `present()` this
+                    // exact window again later.
+                    self.window.close();
+                }
+            }
         }
     }
 
@@ -470,20 +649,184 @@ impl HopWindow {
         self.selection.set_selected(len - 1);
     }
 
-    /// [`Action::SecondaryAction`]'s handler — bound in the keymap and
-    /// reached from [`HopWindow::dispatch_action`], and empty on purpose.
-    /// §8 names a secondary-action menu key as one of the launcher's default
-    /// bindings, but `hop-gtk` has no secondary-action menu to open: no
-    /// widget, no per-item action list surfaced anywhere in this crate
-    /// today. D4 of the plan this issue implements requires the *binding*
-    /// to exist regardless — leaving it out of the keymap now would be
-    /// exactly the hardcoded-handler retrofit this issue exists to prevent
-    /// — while ruling out building the menu itself here: that is its own
-    /// slice, scoped separately so it can pick its own widget and
-    /// interaction model without this issue's binding-only brief
-    /// constraining it. A future issue building that menu starts by giving
-    /// this function a body.
-    fn open_secondary_action_menu(&self) {}
+    /// [`Action::SecondaryAction`]'s handler — bound in the keymap (`ctrl+k`
+    /// by default) and reached from [`HopWindow::dispatch_action`]. Issue
+    /// #182/#197 left this as a deliberate no-op, on the grounds that
+    /// `hop-gtk` had no secondary-action menu to open yet; issue #254 built
+    /// that menu (`ui::action_panel::ActionPanel`) and this is the "later
+    /// issue" that do-nothing stub's own doc comment named — giving this
+    /// function a real body.
+    ///
+    /// Resolves the selected item exactly the way [`activate_selected`]
+    /// does — `self.selection.selected()`, guarded against
+    /// [`gtk::INVALID_LIST_POSITION`], then [`gtk::SingleSelection::item`]
+    /// decoded through [`model::item_of`] — rather than growing a second,
+    /// independent "what item is selected" lookup for this one caller.
+    /// Does nothing, gracefully, in exactly the same "nothing to act on"
+    /// case `activate_selected` already treats as a no-op (an empty or
+    /// no-results list), and again if the resolved item has no actions at
+    /// all: [`ActionPanel::present`] itself refuses to open for that case
+    /// (its own doc comment, "Zero actions: no mystery box") and reports
+    /// `false`, which this method reads back to keep
+    /// [`Self::pinned_action_item`] truthful rather than pinning an item no
+    /// panel is actually showing.
+    ///
+    /// Anchored to [`Self::indicator`] — the one widget in this window that
+    /// already tracks the selected row's on-screen position
+    /// ([`position_indicator`], driven by [`wire_selection_indicator`]) —
+    /// rather than a `GtkListView` row widget reached by walking the list's
+    /// own recycled children. `ui::view` and `ui::row` own that recycling
+    /// machinery, and pulling a live row widget back out of it here would
+    /// mean either growing a new, public seam on those modules for one
+    /// caller or duplicating their own position bookkeeping — `indicator`
+    /// already sits at exactly the selected row's `y`, updated on every
+    /// selection change and every scroll, for free. Design spec decision 6
+    /// backs this choice independently: ctrl-K is named there as opening
+    /// the panel "as a general overlay," in contrast with a right-click,
+    /// which opens it pinned to the literal cursor point — see
+    /// [`Self::open_secondary_action_menu_at`], issue #254 AC2's own
+    /// handler for that path, for why *it* anchors to `self.list_view` and
+    /// a real `gtk::Popover::set_pointing_to` rectangle instead. A popover
+    /// parented to `indicator` reads as "near the selected row," which is
+    /// what "general overlay" asks for, without this method claiming the
+    /// pixel-exact row anchoring decision 6 reserves for the cursor path.
+    ///
+    /// The actual "resolve the selected item, pin it, present the panel"
+    /// work lives in [`Self::present_action_panel_for_selected`] — shared
+    /// with [`Self::open_secondary_action_menu_at`], since both paths do
+    /// exactly that, differing only in *what* they anchor to and whether
+    /// they select a row first. See that method's own doc comment,
+    /// "Pinning the item at open time, not choose time," for the reasoning
+    /// this split carries forward unchanged from before it existed.
+    fn open_secondary_action_menu(&self) {
+        self.present_action_panel_for_selected(&self.indicator, None);
+    }
+
+    /// Issue #254 AC2's own handler: a right-click on a row selects that
+    /// row and opens [`Self::action_panel`] anchored at the exact cursor
+    /// position, `(x, y)` — SPEC decision 6's "right-click row = action
+    /// panel at cursor," in contrast with ctrl-K's "general overlay" anchor
+    /// [`Self::open_secondary_action_menu`]'s own doc comment describes.
+    /// `x`/`y` arrive from [`Self::wire_row_right_click`]'s own
+    /// `gtk::GestureClick`, already in `self.list_view`'s own coordinate
+    /// space — see that method's own doc comment for why that is exactly
+    /// the space this function needs both halves of its own job to agree
+    /// on.
+    ///
+    /// # Select, then open — atomically, in one synchronous call
+    ///
+    /// This issue's own brief names this as the sharpest edge in the
+    /// slice: a right-click must select the row under the cursor *before*
+    /// the panel opens, or the panel would act on whatever the results
+    /// selection already happened to be — a different item than the one
+    /// actually under the pointer. [`row_index_at_y`] turns `y` alone into
+    /// "which row" (rows are fixed-height — `tokens::ROW_HEIGHT_PX` — so no
+    /// widget lookup is needed, only arithmetic, the same trick
+    /// [`position_indicator`] already relies on in the opposite direction),
+    /// `self.selection.set_selected` moves the selection to it, and only
+    /// *then* does this function call
+    /// [`Self::present_action_panel_for_selected`], which reads
+    /// `self.selection.selected()` straight back out — the identical read
+    /// [`Self::open_secondary_action_menu`]'s own path already trusts.
+    /// Nothing here is two steps a second event could interleave with:
+    /// GTK is single-threaded, and both the select and the resolve-and-
+    /// present run inside this one synchronous function call, driven
+    /// directly by [`tests::assert_right_click_selects_the_row_under_the_
+    /// cursor_before_opening_the_panel_at_that_point`] rather than assumed.
+    ///
+    /// A click landing outside every real row — an empty list, or a click
+    /// in the blank space below the last row — resolves to `None` and this
+    /// function does nothing: there is no row to select and nothing honest
+    /// to open a panel for, the same judgment [`ActionPanel::present`]'s
+    /// own "Zero actions: no mystery box" section makes for a different
+    /// empty case.
+    fn open_secondary_action_menu_at(&self, x: f64, y: f64) {
+        let row_h = *tokens::ROW_HEIGHT_PX;
+        let scroll_offset = self.scrolled.vadjustment().value();
+        let Some(index) = row_index_at_y(y, scroll_offset, row_h, self.store.n_items()) else {
+            return;
+        };
+        self.selection.set_selected(index);
+
+        let rect = gdk::Rectangle::new(x.round() as i32, y.round() as i32, 1, 1);
+        self.present_action_panel_for_selected(&self.list_view, Some(&rect));
+    }
+
+    /// The shared core [`Self::open_secondary_action_menu`] and
+    /// [`Self::open_secondary_action_menu_at`] both delegate to: resolves
+    /// the currently selected item exactly the way [`activate_selected`]
+    /// does — `self.selection.selected()`, guarded against
+    /// [`gtk::INVALID_LIST_POSITION`], then [`gtk::SingleSelection::item`]
+    /// decoded through [`model::item_of`] — rather than growing a second,
+    /// independent "what item is selected" lookup for either caller. Does
+    /// nothing, gracefully, in exactly the same "nothing to act on" case
+    /// `activate_selected` already treats as a no-op (an empty or no-
+    /// results list), and again if the resolved item has no actions at
+    /// all: [`ActionPanel::present`] itself refuses to open for that case
+    /// (its own doc comment, "Zero actions: no mystery box") and reports
+    /// `false`, which this method reads back to keep
+    /// [`Self::pinned_action_item`] truthful rather than pinning an item no
+    /// panel is actually showing.
+    ///
+    /// `pointing_to` is forwarded to [`gtk::Popover::set_pointing_to`]
+    /// unconditionally, on every call — including `None` for
+    /// [`Self::open_secondary_action_menu`]'s own ctrl-K path. That `None`
+    /// is load-bearing, not a default left implicit: [`Self::action_panel`]
+    /// wraps one popover, built once and reused (`ActionPanel`'s own doc
+    /// comment, "Why a `gtk::Popover`"), so a *previous* right-click's
+    /// rectangle would otherwise still be set the next time ctrl-K opens
+    /// it, silently anchoring a "general overlay" open to a stale cursor
+    /// point instead of centering on `parent` the way an unset
+    /// `pointing_to` does.
+    ///
+    /// # Pinning the item at open time, not choose time
+    ///
+    /// [`Self::pinned_action_item`] is set here, once, before
+    /// [`ActionPanel::present`] is ever called — not read fresh from
+    /// `self.selection` inside the `on_choose` closure [`HopWindow::build`]
+    /// wires into `action_panel`. The results selection is free to move
+    /// while the panel stays open (a mouse click elsewhere in the results
+    /// list, or any future feature that touches `self.selection`, is not
+    /// blocked by an open panel today), so reading
+    /// `self.selection.selected()` again at choose time would run the
+    /// chosen action against whichever item happens to be selected *at that
+    /// later moment* — silently wrong the instant the two diverge, and
+    /// invisible to every test that never moves the selection after
+    /// opening. Pinning once, here, before `present` runs, is what makes
+    /// "which item does a choice run against" a question with exactly one
+    /// answer for the whole time one `present` call's panel stays open —
+    /// proven directly by
+    /// `tests::assert_choosing_pins_the_item_opened_for_not_whatever_is_selected_later`,
+    /// which moves the selection mid-flight specifically to catch a
+    /// choose-time implementation that a same-item test could not tell
+    /// apart from this one.
+    fn present_action_panel_for_selected(
+        &self,
+        parent: &impl IsA<gtk::Widget>,
+        pointing_to: Option<&gdk::Rectangle>,
+    ) {
+        let selected = self.selection.selected();
+        if selected == gtk::INVALID_LIST_POSITION {
+            return;
+        }
+        let Some(object) = self.selection.item(selected) else {
+            return;
+        };
+        let item: Item = model::item_of(&object);
+
+        *self.pinned_action_item.borrow_mut() = Some(item.clone());
+        self.action_panel.popover().set_pointing_to(pointing_to);
+        if !self.action_panel.present(&item, parent) {
+            // `present` refused to open (the item has no actions) — the pin
+            // just set can never be read by anything real, since
+            // `on_choose` only ever runs as a result of a choice made
+            // inside a panel that actually opened. Clearing it anyway keeps
+            // the field's own documented meaning ("the item the *currently
+            // open* panel was opened for") true rather than leaving a stale
+            // answer behind for a panel nothing is showing.
+            *self.pinned_action_item.borrow_mut() = None;
+        }
+    }
 
     /// [`Action::CompletePrefix`]'s handler — the same honesty as
     /// [`HopWindow::open_secondary_action_menu`] above: bound, reachable,
@@ -507,6 +850,65 @@ impl HopWindow {
         self.scrolled.vadjustment().connect_value_changed(move |_| {
             position_indicator(&indicator, &selection, &scrolled, row_h);
         });
+    }
+
+    /// Attaches the one right-click `gtk::GestureClick` this window has, to
+    /// `self.list_view` itself — never to any individual row widget.
+    /// `ui::row`'s own row content is recycled (`GtkListView`'s whole
+    /// reason to exist), so a gesture attached to one recycled row widget
+    /// would face the identical "which item does this widget currently
+    /// show" problem `ui::row`'s own action-icon buttons solve with a
+    /// GAction target — except a row's *position* has no equivalent
+    /// widget-stored answer to reach for the same way. Attaching once, to
+    /// `list_view`, and deriving the clicked row from the click's own `y`
+    /// via [`row_index_at_y`] sidesteps that entirely: one gesture answers
+    /// for every row, current and future, with no per-row wiring added to
+    /// `ui::row` at all.
+    ///
+    /// A plain, default-phase (Bubble) `GtkGestureClick` restricted to
+    /// [`gdk::BUTTON_SECONDARY`] needs no propagation-phase tuning to see
+    /// every secondary click — checked directly against GTK 4.14.5's own
+    /// source (`gtk/gtklistfactorywidget.c`,
+    /// `gtk_list_factory_widget_init`) while building this: the row's own
+    /// internal click gesture (the one `set_single_click_activate` in
+    /// [`build`] governs) is restricted to `GDK_BUTTON_PRIMARY` only
+    /// (`gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (gesture),
+    /// GDK_BUTTON_PRIMARY)`), so a secondary-button press is never claimed
+    /// there and bubbles up to this controller on `list_view` untouched.
+    ///
+    /// `n_press == 1` only: a right *double*-click must not open the panel
+    /// twice, or once per press — the same "double-click = single click"
+    /// mouse-contract line SPEC decision 6 states for the left-click
+    /// activation path, applied here to the one other click-driven affordance
+    /// this window wires by hand.
+    ///
+    /// `x`/`y`, as GTK reports them to a controller added directly to
+    /// `list_view`, are in `list_view`'s own coordinate space — the
+    /// viewport's, not the full virtual scrolled content's, since
+    /// `GtkListView` implements `GtkScrollable` directly
+    /// (`assets/stylesheet.css`'s own LIST VIEW GROUND comment already
+    /// established there is no intervening `GtkViewport` node). That is
+    /// exactly the space [`HopWindow::open_secondary_action_menu_at`]
+    /// needs both halves of its own job to agree on: [`row_index_at_y`]'s
+    /// arithmetic already assumes a viewport-relative `y` (matching
+    /// [`position_indicator`]'s own inverse), and `list_view` is also the
+    /// `parent` that call anchors [`gtk::Popover::set_pointing_to`]'s
+    /// rectangle to — a rectangle and a parent drawn from two different
+    /// coordinate spaces would place the popover somewhere other than the
+    /// literal cursor point decision 6 asks for.
+    fn wire_row_right_click(&self) {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gdk::BUTTON_SECONDARY);
+
+        let hop_window = self.clone();
+        gesture.connect_pressed(move |_gesture, n_press, x, y| {
+            if n_press != 1 {
+                return;
+            }
+            hop_window.open_secondary_action_menu_at(x, y);
+        });
+
+        self.list_view.add_controller(gesture);
     }
 
     /// Presents the window, optionally with an activation token — the
@@ -730,6 +1132,59 @@ fn position_indicator(
     indicator.set_visible(true);
 }
 
+/// The index of the row whose fixed-height (`row_h`) band contains
+/// viewport-relative `y` — the arithmetic inverse of [`position_indicator`]'s
+/// own `offset = selected*row_h - scroll_offset`, used by
+/// [`HopWindow::open_secondary_action_menu_at`] to turn a right-click's
+/// pixel position into "which row is under the cursor".
+///
+/// `None` if `y` names no real row: above the very first one (a negative
+/// index — a click landing above the viewport, which should not happen for
+/// a gesture attached directly to `list_view`, but this function makes no
+/// assumption about that), or at or past `item_count` (a click in the
+/// blank space below the last row, or into an empty list altogether) —
+/// both cases are treated identically as "nothing under the cursor",
+/// leaving the caller to decide that means "do nothing" rather than this
+/// function clamping to a row that is not actually there. `row_h <= 0`
+/// (never true for a real [`tokens::ROW_HEIGHT_PX`], but this function
+/// takes a bare `i32` rather than that type directly) answers `None` for
+/// the same reason: dividing by a non-positive height cannot honestly name
+/// a row either.
+///
+/// GTK-free and independently unit-tested
+/// (`tests::assert_row_index_at_y_resolves_the_row_under_a_viewport_relative_y`)
+/// for the identical reason `ui::row::hint_entered_shown` is: a pure
+/// arithmetic decision, isolated from the real `gtk::ScrolledWindow`/
+/// `gtk::ListView` [`HopWindow::open_secondary_action_menu_at`] drives it
+/// against.
+fn row_index_at_y(y: f64, scroll_offset: f64, row_h: i32, item_count: u32) -> Option<u32> {
+    if row_h <= 0 {
+        return None;
+    }
+    let absolute_y = scroll_offset + y;
+    if absolute_y < 0.0 {
+        return None;
+    }
+    let index = (absolute_y / f64::from(row_h)).floor();
+    if index >= f64::from(item_count) {
+        return None;
+    }
+    Some(index as u32)
+}
+
+/// Sends `cmd_tx.send(IpcCommand::Execute { item_id, action_id })` — the
+/// one call every route that turns a chosen item and action into a real
+/// command shares: [`activate_at`] (default-action activation, keyboard or
+/// mouse), the `row.run-action` GAction [`HopWindow::build`] installs (a
+/// per-row action-icon click, issue #254 AC2), and [`ActionPanel`]'s own
+/// `on_choose` closure, also wired in [`HopWindow::build`] (a ctrl-K/
+/// right-click panel choice). Named and pulled out on its own specifically
+/// so a fourth route never has a reason to write this three-field struct
+/// literal a fourth time.
+fn send_execute(cmd_tx: &CommandSender, item_id: ItemId, action_id: ActionId) {
+    cmd_tx.send(IpcCommand::Execute { item_id, action_id });
+}
+
 /// Sends an [`IpcCommand::Execute`] for the currently selected item's
 /// default action, or does nothing if no item is selected — an empty or
 /// no-results list, where Enter has nothing to run. [`Action::Activate`]'s
@@ -757,10 +1212,7 @@ fn activate_at(selection: &gtk::SingleSelection, cmd_tx: &CommandSender, positio
         return;
     };
     let item: Item = model::item_of(&object);
-    cmd_tx.send(IpcCommand::Execute {
-        item_id: item.id,
-        action_id: item.default_action,
-    });
+    send_execute(cmd_tx, item.id, item.default_action);
 }
 
 /// Wires `list_view`'s own `activate` signal — GTK's name for "the user
@@ -909,12 +1361,53 @@ mod tests {
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
+    use gtk::gdk;
     use hop_protocol::{
         Action as WireAction, ActionId, ActionKind, ItemId, ItemTitle, Kind, MarkerSpan, Mode,
     };
 
     use super::*;
     use crate::keymap::{Action, Keymap};
+
+    /// [`row_index_at_y`]'s own truth table — GTK-free, no display needed,
+    /// matching `ui::row::tests`'s own precedent of pinning a pure
+    /// arithmetic/logic decision as plain assertions before ever touching
+    /// the real widget this file's broadway-gated tests drive it against.
+    #[test]
+    fn row_index_at_y_resolves_the_row_under_a_viewport_relative_y() {
+        // No scroll offset: row 0 spans [0, 56), row 1 spans [56, 112), ...
+        assert_eq!(row_index_at_y(0.0, 0.0, 56, 3), Some(0));
+        assert_eq!(row_index_at_y(55.9, 0.0, 56, 3), Some(0));
+        assert_eq!(
+            row_index_at_y(56.0, 0.0, 56, 3),
+            Some(1),
+            "a y exactly on a row boundary must belong to the row below it"
+        );
+        assert_eq!(row_index_at_y(140.0, 0.0, 56, 3), Some(2));
+
+        // Scrolled down by exactly one row's height: the same on-screen
+        // y=0 now names row 1, not row 0 — the whole reason this function
+        // takes a scroll offset at all rather than just a raw pixel `y`.
+        assert_eq!(row_index_at_y(0.0, 56.0, 56, 3), Some(1));
+
+        // Above the viewport (should not occur for a gesture attached
+        // directly to list_view, but this function makes no assumption
+        // about that) and at-or-past the last real row both name no row.
+        assert_eq!(row_index_at_y(-1.0, 0.0, 56, 3), None);
+        assert_eq!(
+            row_index_at_y(168.0, 0.0, 56, 3),
+            None,
+            "row index 3 does not exist for a 3-item list"
+        );
+        assert_eq!(
+            row_index_at_y(0.0, 0.0, 56, 0),
+            None,
+            "an empty list has no row for any y to resolve to"
+        );
+
+        // A non-positive row height cannot honestly name a row either.
+        assert_eq!(row_index_at_y(0.0, 0.0, 0, 3), None);
+    }
 
     /// Set on the re-exec'd child so it knows to run the real assertions
     /// in-process instead of spawning a second child.
@@ -985,6 +1478,65 @@ mod tests {
                 kind: ActionKind::Open,
                 label: "Open".to_string(),
             }],
+            default_action: ActionId::new("open").unwrap(),
+            copy_text: None,
+            append_to_end: false,
+            provider: "test".to_string(),
+        }
+    }
+
+    /// A variant of [`test_item`] carrying more than one action, in
+    /// `action_ids` order — [`test_item`] alone (exactly one action,
+    /// doubling as its own `default_action`) cannot exercise "the chosen
+    /// action's own id, not `default_action`", which is exactly the
+    /// distinction issue #254's action-panel tests below need. The first id
+    /// in `action_ids` is always `default_action`, matching [`test_item`]'s
+    /// own convention of using its one (and here, first) action as the
+    /// default.
+    fn test_item_with_actions(n: usize, title: &str, action_ids: &[&str]) -> Item {
+        let actions: Vec<WireAction> = action_ids
+            .iter()
+            .map(|id| WireAction {
+                id: ActionId::new(*id).unwrap(),
+                kind: ActionKind::Open,
+                label: (*id).to_string(),
+            })
+            .collect();
+        let default_action = actions
+            .first()
+            .expect("test fixture must name at least one action id")
+            .id
+            .clone();
+        Item {
+            id: ItemId::new(format!("test:{n}")).unwrap(),
+            kind: Kind::Action,
+            title: ItemTitle::new(title).unwrap(),
+            subtitle: None,
+            icon: None,
+            actions,
+            default_action,
+            copy_text: None,
+            append_to_end: false,
+            provider: "test".to_string(),
+        }
+    }
+
+    /// An item with zero actions — [`ActionPanel::present`]'s own "no
+    /// mystery box" rule (see that method's doc comment) means this must
+    /// never open the panel. Matches `tests/action_panel.rs`'s own
+    /// `zero_action_item` fixture: `default_action` still names an id
+    /// (`hop_protocol::Item`'s own field is not `Option`), even though no
+    /// action with that id exists in `actions` — a wire shape this crate's
+    /// own daemon is trusted never to send, exercised here only because a
+    /// test fixture has to fill every field regardless.
+    fn test_item_without_actions(n: usize, title: &str) -> Item {
+        Item {
+            id: ItemId::new(format!("test:{n}")).unwrap(),
+            kind: Kind::Action,
+            title: ItemTitle::new(title).unwrap(),
+            subtitle: None,
+            icon: None,
+            actions: vec![],
             default_action: ActionId::new("open").unwrap(),
             copy_text: None,
             append_to_end: false,
@@ -1101,6 +1653,7 @@ mod tests {
 
         assert_dispatch_action_moves_selection_and_activates();
         assert_mouse_click_activates_the_clicked_row();
+        assert_activate_signal_produces_exactly_one_execute_per_emission();
         assert_mode_label_mirrors_exclusive_and_nothing_else();
         assert_marker_highlight_covers_exactly_the_reported_span();
         assert_stale_marker_span_is_never_applied_to_newer_text();
@@ -1158,16 +1711,33 @@ mod tests {
             other => panic!("expected Execute, got {other:?}"),
         }
 
-        // The two behaviorless actions (D4) must be callable without
-        // panicking and must produce no `IpcCommand` — they do nothing
-        // visible yet, on purpose; see `HopWindow::open_secondary_action_menu`
-        // and `HopWindow::complete_prefix`.
+        // `CompletePrefix` is still the D4 behaviorless stub: callable
+        // without panicking, no `IpcCommand`. `SecondaryAction` is not
+        // behaviorless any more (issue #254) — it opens the action panel
+        // for `item_b`, still selected from the Activate check above — but
+        // opening the panel alone must still send no `IpcCommand` either;
+        // only choosing an action inside it does that (see
+        // `ctrl_k_action_panel_opens_pins_and_dispatches_through_the_keymap`'s
+        // own assertions for that real behavior, exercised properly against
+        // a *presented* window rather than this one, which is not yet
+        // presented at this point in the test).
         window.dispatch_action(Action::SecondaryAction);
         window.dispatch_action(Action::CompletePrefix);
         assert!(
             cmd_rx.try_recv().is_err(),
-            "the two behaviorless actions must not send any IpcCommand"
+            "opening the action panel, and the still-behaviorless CompletePrefix, must not \
+             themselves send any IpcCommand"
         );
+        // Reset: `self.indicator` is already parented under this window's
+        // own `adw::ApplicationWindow` from `build` onward (it does not
+        // wait for `present()`), so the `SecondaryAction` dispatch above
+        // really did open the panel, even though this window itself is not
+        // yet on screen. Left open, it would make the Dismiss check below
+        // close only the panel (per its own new guard) instead of the
+        // window, which is not what this section of the test is about —
+        // that interaction has its own dedicated coverage in
+        // `assert_escape_with_the_panel_open_closes_only_the_panel` below.
+        window.action_panel.dismiss();
 
         // Dismiss closes the pre-built (hide_on_close) window.
         window.present_with_token(None);
@@ -1221,6 +1791,57 @@ mod tests {
         }
 
         println!("mouse-click activation assertions passed");
+    }
+
+    /// SPEC decision 6: "double-click = single click." Checked directly
+    /// against GTK 4.14.5's own source
+    /// (`gtk/gtklistfactorywidget.c`,
+    /// `gtk_list_factory_widget_click_gesture_released`) while writing this
+    /// test: with `single-click-activate` true (`build` sets this), the
+    /// guard is `if (n_press == 1 && priv->single_click_activate)` — an
+    /// *exact* equality on `n_press`, not `>=` — so only the *first* press
+    /// of a genuine double-click ever satisfies it. The second press
+    /// (`n_press == 2`) falls through to the `selectable` branch
+    /// (`list.select-item`, a plain re-select) instead of firing
+    /// `list.activate-item` a second time. A real double-click therefore
+    /// activates exactly once at the GTK gesture level, *before* this
+    /// crate's own `wire_list_activation` closure ever runs — there is
+    /// nothing for that closure to debounce, and nothing it could debounce
+    /// even if it tried, since GTK itself never emits a second `activate`
+    /// for the second press.
+    ///
+    /// This crate's own test environment cannot synthesize a real
+    /// two-press click gesture to prove that GTK-level guard directly (this
+    /// file's own top doc comment makes the identical finding for
+    /// synthetic key events, and the same absence of a public GDK4
+    /// event-construction API applies to pointer events too — confirmed
+    /// while investigating this: no `gtk_test_widget_send_key`-shaped
+    /// helper, nor its click equivalent, exists in this workspace's
+    /// `gtk4-sys`/`gdk4-sys` bindings). What this test *can*, and does,
+    /// prove is the half that is this crate's own code rather than GTK's:
+    /// `wire_list_activation`'s closure sends exactly one `Execute` per
+    /// `activate` emission it receives, with no accidental double-
+    /// registration (a future edit connecting a second handler to the same
+    /// signal, say) multiplying one genuine activation into two commands.
+    fn assert_activate_signal_produces_exactly_one_execute_per_emission() {
+        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.ActivateOnce");
+        model::replace(&window.store, vec![test_item(1, "only row")]);
+
+        window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+
+        assert!(
+            cmd_rx.try_recv().is_ok(),
+            "one activate emission must produce one Execute command"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "one activate emission must never produce a second Execute command — this is the \
+             wiring's own idempotency, complementing the GTK-source-verified guarantee (this \
+             function's own doc comment) that a real double-click never emits activate twice \
+             in the first place"
+        );
+
+        println!("assert_activate_signal_produces_exactly_one_execute_per_emission passed");
     }
 
     /// Reads back the one attribute [`marker_highlight::apply`] would have
@@ -1441,5 +2062,406 @@ mod tests {
         );
 
         println!("the offline indicator shows on Disconnected and hides on Connected");
+    }
+
+    /// Issue #254's own wiring slice: `Action::SecondaryAction`'s dispatch
+    /// (ctrl+K by default — `crate::keymap::Action::default_spelling`) now
+    /// opens `HopWindow`'s own [`ActionPanel`], and `Action::Dismiss` (the
+    /// default Escape binding) must close only that panel when one is open,
+    /// never the window underneath it. Bundled into one `#[test]` fn
+    /// sharing one `BroadwayServer`/re-exec'd child, for the identical
+    /// reason `keyboard_and_mouse_dispatch_use_the_keymap_and_the_real_window`
+    /// and `offline_indicator_reflects_connection_state` already are: every
+    /// `#[test]` fn in this one binary shares one process id, so each needs
+    /// its own `base` to avoid two of them racing to bind the same
+    /// broadway display. `700` is the first base this file has not already
+    /// claimed (`400`, `550`).
+    ///
+    /// Every assertion below drives `HopWindow::dispatch_action` directly,
+    /// not a real `GdkEvent` — this file's own top doc comment already
+    /// makes the case for why (GTK4 exposes no synthetic-key-event
+    /// constructor on any backend in this environment), and
+    /// `ActionPanel::handle_key` (issue #254's own panel) takes the
+    /// identical "call the resolved function, not a synthesized event"
+    /// shape for the same reason, one file over.
+    #[test]
+    fn ctrl_k_action_panel_opens_pins_and_dispatches_through_the_keymap() {
+        run_under_broadway(
+            "ui::window::tests::ctrl_k_action_panel_opens_pins_and_dispatches_through_the_keymap",
+            700,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        assert_secondary_action_opens_the_panel_for_a_selected_item_with_actions();
+        assert_secondary_action_does_nothing_without_a_selection();
+        assert_secondary_action_does_not_open_for_an_item_with_no_actions();
+        assert_choosing_an_action_sends_execute_with_that_actions_id_not_the_default();
+        assert_choosing_pins_the_item_opened_for_not_whatever_is_selected_later();
+        assert_escape_with_the_panel_open_closes_only_the_panel();
+        assert_escape_with_the_panel_closed_still_dismisses_the_window();
+
+        println!("ctrl-K action panel wiring assertions passed");
+    }
+
+    /// `ActionPanel::present`'s own "a popover needs a realized `gtk::Native`"
+    /// requirement (see that method's doc comment) is why every assertion
+    /// function below calls `window.present_with_token(None)` before
+    /// dispatching `SecondaryAction` — without it, `popup()` would silently
+    /// no-op (a logged `g_critical`, not a panic) and every "must open"
+    /// assertion would read `false` regardless of whether dispatch itself
+    /// was correct, proving nothing. `assert_dispatch_action_moves_selection_and_activates`
+    /// above hits the identical requirement for `window.window.is_visible()`.
+    fn assert_secondary_action_opens_the_panel_for_a_selected_item_with_actions() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.PanelOpens");
+        window.present_with_token(None);
+        model::replace(&window.store, vec![test_item(1, "has actions")]);
+        window.selection.set_selected(0);
+
+        window.dispatch_action(Action::SecondaryAction);
+
+        assert!(
+            window.action_panel.popover().is_visible(),
+            "SecondaryAction must open the panel for a selected item that has actions"
+        );
+
+        println!("assert_secondary_action_opens_the_panel_for_a_selected_item_with_actions passed");
+    }
+
+    fn assert_secondary_action_does_nothing_without_a_selection() {
+        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.PanelNoSelection");
+        window.present_with_token(None);
+        // An empty store: `selection.selected()` reads `INVALID_LIST_POSITION`,
+        // the same "nothing to act on" state `activate_selected` already
+        // treats as a no-op.
+        model::replace(&window.store, vec![]);
+
+        window.dispatch_action(Action::SecondaryAction);
+
+        assert!(
+            !window.action_panel.popover().is_visible(),
+            "SecondaryAction with no selection must not open the panel"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no selection must send no IpcCommand either"
+        );
+
+        println!("assert_secondary_action_does_nothing_without_a_selection passed");
+    }
+
+    fn assert_secondary_action_does_not_open_for_an_item_with_no_actions() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.PanelZeroActions");
+        window.present_with_token(None);
+        model::replace(
+            &window.store,
+            vec![test_item_without_actions(1, "no actions")],
+        );
+        window.selection.set_selected(0);
+
+        window.dispatch_action(Action::SecondaryAction);
+
+        assert!(
+            !window.action_panel.popover().is_visible(),
+            "an item with zero actions must not open the panel — ActionPanel::present's own \
+             'no mystery box' rule"
+        );
+
+        println!("assert_secondary_action_does_not_open_for_an_item_with_no_actions passed");
+    }
+
+    /// The panel's own callback must be turned into the same `IpcCommand::Execute`
+    /// shape `activate_at` sends for the default action — but carrying
+    /// *this* choice's id, not `item.default_action`. Row 0 of a freshly
+    /// presented panel is `item.actions[0]` (`"open"`, the fixture's own
+    /// default); this test moves off it before choosing.
+    fn assert_choosing_an_action_sends_execute_with_that_actions_id_not_the_default() {
+        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.PanelChoose");
+        window.present_with_token(None);
+        let item = test_item_with_actions(1, "multi", &["open", "reveal"]);
+        model::replace(&window.store, vec![item.clone()]);
+        window.selection.set_selected(0);
+
+        window.dispatch_action(Action::SecondaryAction);
+        assert!(window.action_panel.popover().is_visible());
+
+        window.action_panel.handle_key(gdk::Key::Down); // row 1: "reveal"
+        window.action_panel.handle_key(gdk::Key::Return);
+
+        match cmd_rx
+            .try_recv()
+            .expect("choosing an action must send an Execute command")
+        {
+            IpcCommand::Execute { item_id, action_id } => {
+                assert_eq!(item_id, item.id);
+                assert_eq!(
+                    action_id.as_str(),
+                    "reveal",
+                    "the chosen action's own id must be sent, not item.default_action (\"open\")"
+                );
+            }
+            other => panic!("expected Execute, got {other:?}"),
+        }
+
+        println!(
+            "assert_choosing_an_action_sends_execute_with_that_actions_id_not_the_default passed"
+        );
+    }
+
+    /// The sharpest edge in this slice, per this issue's own brief: the
+    /// item a choice runs against is the one the panel was *opened* for,
+    /// fixed at that moment, even if the results selection moves to a
+    /// different item while the panel stays open. A naive implementation
+    /// that re-read `self.selection.selected()` inside the panel's
+    /// `on_choose` callback would pass every other test above (none of them
+    /// move the selection after opening) and fail only this one.
+    fn assert_choosing_pins_the_item_opened_for_not_whatever_is_selected_later() {
+        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.PanelPinned");
+        window.present_with_token(None);
+        let item_a = test_item(1, "item A");
+        let item_b = test_item(2, "item B");
+        model::replace(&window.store, vec![item_a.clone(), item_b.clone()]);
+        window.selection.set_selected(0); // item_a
+
+        window.dispatch_action(Action::SecondaryAction); // opens the panel for item_a
+        assert!(window.action_panel.popover().is_visible());
+
+        // The results selection moves to item_b *while the panel is still
+        // open* — nothing about `ActionPanel` or this window's own key
+        // dispatch freezes `self.selection` for as long as a panel is
+        // presented.
+        window.selection.set_selected(1);
+
+        window.action_panel.handle_key(gdk::Key::Return); // chooses item_a's only action
+
+        match cmd_rx
+            .try_recv()
+            .expect("choosing an action must send an Execute command")
+        {
+            IpcCommand::Execute { item_id, .. } => assert_eq!(
+                item_id, item_a.id,
+                "the action must run against the item the panel was opened for (item_a), not \
+                 whatever the results selection moved to while the panel stayed open (item_b)"
+            ),
+            other => panic!("expected Execute, got {other:?}"),
+        }
+
+        println!("assert_choosing_pins_the_item_opened_for_not_whatever_is_selected_later passed");
+    }
+
+    /// Issue #254: Escape must close an open panel without also closing the
+    /// window underneath it — `Action::Dismiss`'s arm in `dispatch_action`
+    /// is what this pins, driven directly rather than through a real
+    /// Escape keypress, per this test module's own established precedent.
+    fn assert_escape_with_the_panel_open_closes_only_the_panel() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.EscapePanelOpen");
+        window.present_with_token(None);
+        model::replace(&window.store, vec![test_item(1, "has actions")]);
+        window.selection.set_selected(0);
+        window.dispatch_action(Action::SecondaryAction);
+        assert!(
+            window.action_panel.popover().is_visible(),
+            "setup: the panel must be open before this test's own assertion means anything"
+        );
+
+        window.dispatch_action(Action::Dismiss);
+
+        assert!(
+            !window.action_panel.popover().is_visible(),
+            "Dismiss (Escape's default binding) must close an open panel"
+        );
+        assert!(
+            window.window.is_visible(),
+            "Dismiss must not also close the window while the panel was open — Escape returns \
+             to the list, it does not dismiss hop"
+        );
+
+        println!("assert_escape_with_the_panel_open_closes_only_the_panel passed");
+    }
+
+    /// The other direction of the same contract: with no panel open,
+    /// Dismiss must still behave exactly as it did before this issue —
+    /// closing the window.
+    fn assert_escape_with_the_panel_closed_still_dismisses_the_window() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.EscapeWindowOnly");
+        window.present_with_token(None);
+        assert!(
+            !window.action_panel.popover().is_visible(),
+            "setup: the panel must be closed before this test's own assertion means anything"
+        );
+
+        window.dispatch_action(Action::Dismiss);
+
+        assert!(
+            !window.window.is_visible(),
+            "Dismiss with no panel open must still dismiss the window, exactly as before this \
+             issue"
+        );
+
+        println!("assert_escape_with_the_panel_closed_still_dismisses_the_window passed");
+    }
+
+    /// Issue #254 AC2's own wiring slice: a right-click selects the row
+    /// under the cursor and opens [`ActionPanel`] anchored at the exact
+    /// click point, atomically — the sharpest edge this issue's own brief
+    /// names. `850` is the first base this file has not already claimed
+    /// (`400`, `550`, `700`), matching every other `#[test]` fn's own
+    /// reasoning for why it needs one (`BroadwayServer::start`'s doc
+    /// comment).
+    ///
+    /// Every assertion below drives [`HopWindow::open_secondary_action_menu_at`]
+    /// directly — this file's own top doc comment already makes the case
+    /// for calling a resolved function rather than synthesizing a real
+    /// `GdkEvent` (unreachable via any public GDK4/GTK4 API in this
+    /// environment); [`HopWindow::wire_row_right_click`]'s own doc comment
+    /// is the (separately-checked, against GTK 4.14.5's real source) proof
+    /// that a real secondary-button press reaches this exact function with
+    /// `(x, y)` in `list_view`'s own coordinate space, which is what lets
+    /// this test's own hand-picked `(x, y)` values stand in for a real
+    /// click faithfully.
+    #[test]
+    fn right_click_selects_the_row_under_the_cursor_and_opens_the_panel_at_that_point() {
+        run_under_broadway(
+            "ui::window::tests::right_click_selects_the_row_under_the_cursor_and_opens_the_panel_at_that_point",
+            850,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        assert_right_click_selects_the_row_under_the_cursor_and_opens_at_that_point();
+        assert_right_click_with_no_row_under_the_cursor_does_nothing();
+        assert_ctrl_k_after_a_right_click_clears_the_stale_pointing_to();
+
+        println!("right-click action-panel assertions passed");
+    }
+
+    /// `ActionPanel::present`'s own "a popover needs a realized `gtk::Native`"
+    /// requirement is why this, like every `SecondaryAction`-dispatching
+    /// assertion elsewhere in this file, calls `window.present_with_token(None)`
+    /// first.
+    fn assert_right_click_selects_the_row_under_the_cursor_and_opens_at_that_point() {
+        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.RightClick");
+        window.present_with_token(None);
+        let item_a = test_item(1, "item A");
+        let item_b = test_item(2, "item B");
+        model::replace(&window.store, vec![item_a.clone(), item_b.clone()]);
+        // Selected row is item_a, but the click below lands in item_b's own
+        // row band — the exact divergence this issue's brief calls the
+        // sharpest edge: a naive handler that opened the panel for
+        // whatever was *already* selected, without moving the selection
+        // first, would pass every other assertion in this file and fail
+        // only this one.
+        window.selection.set_selected(0);
+
+        let row_h = *tokens::ROW_HEIGHT_PX;
+        let click_x = 37.0;
+        let click_y = f64::from(row_h) + 5.0; // inside row 1's own band
+        window.open_secondary_action_menu_at(click_x, click_y);
+
+        assert_eq!(
+            window.selection.selected(),
+            1,
+            "a right-click on the second row must select that row, not leave whatever was \
+             selected before the click"
+        );
+        assert!(
+            window.action_panel.popover().is_visible(),
+            "a right-click on a row with actions must open the panel"
+        );
+        let (has_point, rect) = window.action_panel.popover().pointing_to();
+        assert!(
+            has_point,
+            "a right-click open must set a real pointing-to rectangle, not leave the popover \
+             anchored generically to its parent"
+        );
+        assert_eq!(rect.x(), click_x.round() as i32);
+        assert_eq!(rect.y(), click_y.round() as i32);
+
+        // Choosing the panel's only action must run against item_b — the
+        // row genuinely under the cursor — never item_a, which was
+        // selected before the right-click landed.
+        window.action_panel.handle_key(gdk::Key::Return);
+        match cmd_rx
+            .try_recv()
+            .expect("choosing the action must send an Execute command")
+        {
+            IpcCommand::Execute { item_id, .. } => assert_eq!(
+                item_id, item_b.id,
+                "the action must run against the item under the cursor (item_b), never \
+                 whatever was selected before the right-click (item_a)"
+            ),
+            other => panic!("expected Execute, got {other:?}"),
+        }
+
+        println!(
+            "assert_right_click_selects_the_row_under_the_cursor_and_opens_at_that_point passed"
+        );
+    }
+
+    /// A click landing outside every real row — here, the blank space
+    /// below a one-row list's only row — must select nothing and open
+    /// nothing, matching [`row_index_at_y`]'s own documented `None` for
+    /// exactly this case.
+    fn assert_right_click_with_no_row_under_the_cursor_does_nothing() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.RightClickEmptySpace");
+        window.present_with_token(None);
+        model::replace(&window.store, vec![test_item(1, "only row")]);
+        window.selection.set_selected(0);
+
+        let row_h = *tokens::ROW_HEIGHT_PX;
+        window.open_secondary_action_menu_at(10.0, f64::from(row_h) + 10.0);
+
+        assert_eq!(
+            window.selection.selected(),
+            0,
+            "a right-click below the last real row must not change the selection"
+        );
+        assert!(
+            !window.action_panel.popover().is_visible(),
+            "a right-click with no row under the cursor must not open the panel"
+        );
+
+        println!("assert_right_click_with_no_row_under_the_cursor_does_nothing passed");
+    }
+
+    /// [`HopWindow::present_action_panel_for_selected`]'s own documented
+    /// load-bearing detail: a ctrl-K open that follows a right-click must
+    /// not inherit that click's `pointing_to` rectangle. Without this,
+    /// [`ActionPanel`]'s single, built-once popover (never rebuilt per
+    /// open) would keep anchoring a "general overlay" ctrl-K open to a
+    /// stale cursor position from whichever row was right-clicked earlier.
+    fn assert_ctrl_k_after_a_right_click_clears_the_stale_pointing_to() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.RightClickThenCtrlK");
+        window.present_with_token(None);
+        model::replace(&window.store, vec![test_item(1, "only row")]);
+        window.selection.set_selected(0);
+
+        window.open_secondary_action_menu_at(20.0, 5.0);
+        assert!(
+            window.action_panel.popover().is_visible(),
+            "setup: the right-click must have opened the panel before this test's own \
+             assertion means anything"
+        );
+        window.action_panel.dismiss();
+
+        window.dispatch_action(Action::SecondaryAction);
+        assert!(
+            window.action_panel.popover().is_visible(),
+            "setup: ctrl-K must reopen the panel for this test's own assertion to mean anything"
+        );
+        let (has_point, _rect) = window.action_panel.popover().pointing_to();
+        assert!(
+            !has_point,
+            "ctrl-K opening after a previous right-click must clear that click's pointing-to \
+             rectangle, not silently keep anchoring to the stale cursor point"
+        );
+
+        println!("assert_ctrl_k_after_a_right_click_clears_the_stale_pointing_to passed");
     }
 }
