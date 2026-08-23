@@ -445,6 +445,46 @@ impl HopWindow {
             cmd_tx,
         };
 
+        // Issue #254 review, finding 4: the row's own overflow chevron
+        // (`ui::row::overflow_button_widget`) invokes a *second* GAction,
+        // `row.open-actions` — see `ui::row`'s top doc comment, "A second
+        // GAction, not a third `(item_id, action_id)` target", for why
+        // this is not folded into `row_run_action` above. Registered here,
+        // after `hop_window` exists rather than alongside `row_run_action`
+        // above: its own handler,
+        // [`HopWindow::open_action_panel_for_overflow`], needs a real
+        // `&HopWindow` to select a row and present the panel on, which
+        // does not exist yet at the point `row_run_action` is built — that
+        // handler only ever needed `cmd_tx`, a plain clone available long
+        // before `hop_window` is. `row_action_group` is still the same
+        // `gio::SimpleActionGroup` already installed on `window` above (by
+        // reference, not by value), so adding a second action to it here
+        // extends the same, already-inserted group rather than installing
+        // a second one under the same prefix.
+        let row_open_actions_target_type =
+            glib::VariantTy::new(row::ROW_OPEN_ACTIONS_TARGET_TYPE).ok();
+        let row_open_actions =
+            gio::SimpleAction::new(row::ROW_OPEN_ACTIONS_NAME, row_open_actions_target_type);
+        {
+            let hop_window = hop_window.clone();
+            row_open_actions.connect_activate(move |_action, parameter| {
+                let Some(parameter) = parameter else {
+                    return;
+                };
+                let Some(item_id) = parameter.get::<String>() else {
+                    return;
+                };
+                // Re-validated rather than trusted, matching
+                // `row_run_action`'s own posture on the identical strings
+                // just above.
+                let Ok(item_id) = ItemId::new(item_id) else {
+                    return;
+                };
+                hop_window.open_action_panel_for_overflow(&item_id);
+            });
+        }
+        row_action_group.add_action(&row_open_actions);
+
         hop_window.wire_entry();
         hop_window.wire_selection_indicator();
         hop_window.wire_row_right_click();
@@ -672,24 +712,51 @@ impl HopWindow {
     /// panel is actually showing.
     ///
     /// Anchored to [`Self::indicator`] — the one widget in this window that
-    /// already tracks the selected row's on-screen position
+    /// tracks the selected row's on-screen position
     /// ([`position_indicator`], driven by [`wire_selection_indicator`]) —
     /// rather than a `GtkListView` row widget reached by walking the list's
     /// own recycled children. `ui::view` and `ui::row` own that recycling
     /// machinery, and pulling a live row widget back out of it here would
     /// mean either growing a new, public seam on those modules for one
-    /// caller or duplicating their own position bookkeeping — `indicator`
-    /// already sits at exactly the selected row's `y`, updated on every
-    /// selection change and every scroll, for free. Design spec decision 6
-    /// backs this choice independently: ctrl-K is named there as opening
-    /// the panel "as a general overlay," in contrast with a right-click,
-    /// which opens it pinned to the literal cursor point — see
+    /// caller or duplicating their own position bookkeeping. Design spec
+    /// decision 6 backs this choice independently: ctrl-K is named there as
+    /// opening the panel "as a general overlay," in contrast with a
+    /// right-click, which opens it pinned to the literal cursor point — see
     /// [`Self::open_secondary_action_menu_at`], issue #254 AC2's own
     /// handler for that path, for why *it* anchors to `self.list_view` and
     /// a real `gtk::Popover::set_pointing_to` rectangle instead. A popover
     /// parented to `indicator` reads as "near the selected row," which is
     /// what "general overlay" asks for, without this method claiming the
     /// pixel-exact row anchoring decision 6 reserves for the cursor path.
+    ///
+    /// # Issue #254 review, finding 3: the row must be scrolled into view
+    /// *before* `indicator` is trusted
+    ///
+    /// `indicator` tracks the selected row's position only for a row that
+    /// is actually within the scrolled window's own viewport —
+    /// [`position_indicator`]'s `offset = selected*row_h - scroll_value`
+    /// is a real on-screen `y` only when that subtraction comes out
+    /// non-negative. [`HopWindow::move_selection`] moves `self.selection`
+    /// directly and does not itself keep the moved-to row scrolled into
+    /// view, so a selection reached by holding `Down` can easily sit above
+    /// the current viewport by the time ctrl-K runs. Before this review
+    /// finding, this method anchored to `indicator` regardless: `position_
+    /// indicator`'s own `.max(0)` clamp (correct for *its* job — see that
+    /// function's own doc comment, and [`scroll_value_to_reveal_row`]'s,
+    /// "Why this scrolls the list rather than changing `position_
+    /// indicator`'s own clamp") then pinned the indicator to the
+    /// viewport's literal top instead of leaving it honestly off-screen,
+    /// and the panel opened anchored there — floating over whichever row
+    /// actually occupied that pixel, never the selected item the panel was
+    /// about to act on.
+    ///
+    /// [`Self::ensure_selected_row_visible`], called first below, is the
+    /// fix: it scrolls `self.scrolled` so the selected row's own band is
+    /// fully within the viewport *before* `indicator`'s position is ever
+    /// read, which is what makes the "already tracks the selected row's
+    /// on-screen position" claim above actually true by the time this
+    /// method reaches [`Self::present_action_panel_for_selected`], rather
+    /// than true only for a selection that already happened to be in view.
     ///
     /// The actual "resolve the selected item, pin it, present the panel"
     /// work lives in [`Self::present_action_panel_for_selected`] — shared
@@ -698,8 +765,101 @@ impl HopWindow {
     /// they select a row first. See that method's own doc comment,
     /// "Pinning the item at open time, not choose time," for the reasoning
     /// this split carries forward unchanged from before it existed.
+    /// [`Self::open_secondary_action_menu_at`] needs no equivalent call to
+    /// [`Self::ensure_selected_row_visible`] of its own: a real right-click
+    /// can only ever land on a row already painted somewhere in the
+    /// viewport, so the row it selects is never the out-of-view case this
+    /// method's own fix exists for.
     fn open_secondary_action_menu(&self) {
+        self.ensure_selected_row_visible();
         self.present_action_panel_for_selected(&self.indicator, None);
+    }
+
+    /// Scrolls `self.scrolled` so the selected row's own band is fully
+    /// within its viewport, or does nothing if there is no selection or it
+    /// is already fully visible — [`scroll_value_to_reveal_row`]'s own doc
+    /// comment has the full account of the anchor-detachment bug this
+    /// exists to fix (issue #254 review, finding 3) and why scrolling the
+    /// list, rather than loosening [`position_indicator`]'s own clamp, is
+    /// the fix. Called once, by [`Self::open_secondary_action_menu`],
+    /// before it ever reads `self.indicator`'s position.
+    fn ensure_selected_row_visible(&self) {
+        let selected = self.selection.selected();
+        if selected == gtk::INVALID_LIST_POSITION {
+            return;
+        }
+        let adjustment = self.scrolled.vadjustment();
+        if let Some(value) = scroll_value_to_reveal_row(
+            selected,
+            *tokens::ROW_HEIGHT_PX,
+            adjustment.value(),
+            adjustment.page_size(),
+        ) {
+            adjustment.set_value(value);
+        }
+    }
+
+    /// Issue #254 review, finding 4's own window-layer handler: the row's
+    /// overflow chevron (`ui::row::overflow_button_widget`) invokes
+    /// `row.open-actions` with its row's own item id as target, and this is
+    /// where that name resolves to real behavior —
+    /// `ui::window::HopWindow::build`'s registered `gio::SimpleAction`
+    /// calls this directly from its `connect_activate` closure.
+    ///
+    /// Reuses the identical "select, then present" shape
+    /// [`Self::open_secondary_action_menu_at`] (right-click) already
+    /// establishes, per this review finding's own "reusing the same
+    /// select-then-present path right-click already uses ... do not grow a
+    /// third copy of that logic" instruction — the one real difference is
+    /// *how* the target row is found: a right-click already knows which
+    /// row it landed on from a pixel `y`
+    /// ([`row_index_at_y`]); this chevron instead names its own row's item
+    /// by id (a GAction target survives a recycle the same way
+    /// `ui::row`'s own dedicated action-icon buttons already rely on — see
+    /// `ui::row`'s top doc comment, "How a click runs the right action"),
+    /// so [`position_of_item_id`] is the one new lookup this path needs:
+    /// turning that id back into the position [`gtk::SingleSelection::
+    /// set_selected`] and [`Self::ensure_selected_row_visible`] both need.
+    ///
+    /// `item_id` naming no row currently in the store — stale by the time
+    /// this runs, in principle, though `ui::row::resolve_overflow_button`'s
+    /// own recycling constraint should never actually produce one — does
+    /// nothing, the same "nothing honest to open a panel for" judgment
+    /// [`Self::open_secondary_action_menu_at`] already makes for a click
+    /// landing outside every real row.
+    ///
+    /// # Anchoring: the row's own trailing edge, not the chevron's literal
+    /// pixel bounds
+    ///
+    /// `parent`/`pointing_to` are `self.list_view`/a `gdk::Rectangle` built
+    /// from the *row's* own known geometry (`tokens::ROW_HEIGHT_PX`, the
+    /// selected position, and `self.scrolled`'s own scroll offset — the
+    /// identical arithmetic [`position_indicator`] and [`row_index_at_y`]
+    /// already share), at the row's trailing edge
+    /// (`self.list_view.width()`). This is a deliberate approximation, not
+    /// the chevron button's own precise allocated rectangle: `ui::row` owns
+    /// the recycled per-button widget instances, and reaching into that
+    /// layer from here to read one button's real on-screen bounds would
+    /// mean growing a new, public seam on a module whose own top doc
+    /// comment already draws this exact line for a live row widget
+    /// (`Self::open_secondary_action_menu`'s own doc comment makes the
+    /// identical call, for `self.indicator`, one paragraph over). Every row
+    /// lays its action icons and this chevron out flush against its own
+    /// trailing edge (`ui::row::build`'s own `hexpand`-carries-the-
+    /// trailing-child layout), so anchoring at that edge, at the selected
+    /// row's own vertical band, reads as "opened from that row" without
+    /// this module needing to know the chevron's exact pixel rectangle.
+    fn open_action_panel_for_overflow(&self, item_id: &ItemId) {
+        let Some(position) = position_of_item_id(&self.store, item_id) else {
+            return;
+        };
+        self.selection.set_selected(position);
+        self.ensure_selected_row_visible();
+
+        let row_h = *tokens::ROW_HEIGHT_PX;
+        let row_top = (position as i32) * row_h - self.scrolled.vadjustment().value() as i32;
+        let rect = gdk::Rectangle::new(self.list_view.width(), row_top.max(0), 1, row_h);
+        self.present_action_panel_for_selected(&self.list_view, Some(&rect));
     }
 
     /// Issue #254 AC2's own handler: a right-click on a row selects that
@@ -1172,6 +1332,120 @@ fn row_index_at_y(y: f64, scroll_offset: f64, row_h: i32, item_count: u32) -> Op
     Some(index as u32)
 }
 
+/// The `vadjustment` value that would bring `selected`'s own row band fully
+/// into a viewport of height `page_size` currently scrolled to
+/// `current_value` — or `None` if it is already fully visible and no scroll
+/// is needed. Issue #254 review, finding 3.
+///
+/// # The bug this exists to fix
+///
+/// [`HopWindow::open_secondary_action_menu`] (ctrl-K) anchors the action
+/// panel to [`HopWindow::indicator`] — the persistent highlight
+/// [`position_indicator`] moves to sit over the selected row. Before this
+/// function existed, ctrl-K opened the panel with the scroll position
+/// exactly wherever the user had left it: if `selected`'s own row had
+/// scrolled above the viewport (a keyboard `Down` past the last visible
+/// row — `HopWindow::move_selection` moves `self.selection` directly and
+/// does not itself keep the selection scrolled into view), `position_
+/// indicator`'s own `offset = selected*row_h - scroll_value` came out
+/// negative and its `.max(0)` clamp pinned the indicator to the viewport's
+/// literal top instead. The panel then opened anchored there — over
+/// whichever row actually occupied that pixel, never the selected item the
+/// panel was about to act on, with nothing on screen to explain the
+/// mismatch.
+///
+/// # Why this scrolls the list rather than changing [`position_indicator`]'s
+/// own clamp
+///
+/// `position_indicator`'s `.max(0)` is correct for what it protects today:
+/// nothing currently asks it to place the indicator at a genuinely
+/// negative margin, which would push part of the highlight above the
+/// scrolled window's own visible area and clip it. Loosening that clamp
+/// would not fix the panel's anchor either — an indicator honestly
+/// rendered off-screen is still not a widget a `gtk::Popover::set_pointing_to`-
+/// free `set_parent` anchor can point at meaningfully. The real defect is
+/// upstream of the indicator entirely: the *selection* was allowed to
+/// scroll out of view in the first place. [`HopWindow::open_secondary_
+/// action_menu`] calling this function to scroll the row back into view
+/// before it ever reads `self.indicator`'s position is what makes
+/// `position_indicator`'s existing arithmetic honest again — `offset` comes
+/// out non-negative on its own once the row is genuinely back in the
+/// viewport, with no change needed to `position_indicator` itself, and
+/// nothing about its own contract for a row that is *already* in view
+/// changes at all.
+///
+/// # The two directions, and why both are handled the same way
+///
+/// `row_index_at_y`, `position_indicator`, and this function all agree on
+/// one coordinate space: `0` is the very first item's own top, and every
+/// row's own band is `[selected*row_h, selected*row_h + row_h)` within it.
+/// A row named by `selected` can be out of view two ways — its top can sit
+/// above `current_value` (scrolled past it, the finding's own named case),
+/// or its bottom can sit below `current_value + page_size` (scrolled short
+/// of it, the direction `HopWindow::move_selection`'s `Down` can reach the
+/// same way just by moving past the last visible row without this
+/// function). Revealing either means moving the *nearer* edge of the
+/// viewport to meet the row: scrolling up until the row's own top is the
+/// viewport's top, or down until the row's own bottom is the viewport's
+/// bottom — never further than that, so a row already partially visible
+/// moves the shortest distance that makes it fully visible rather than
+/// re-centering it. A row that already satisfies both bounds needs neither
+/// adjustment, which is `None`, not `Some(current_value)`: `HopWindow::
+/// open_secondary_action_menu` only calls `gtk::Adjustment::set_value` when
+/// this returns `Some`, so an already-visible selection produces no
+/// redundant scroll event at all.
+///
+/// GTK-free and independently unit-tested
+/// (`tests::scroll_value_to_reveal_row_only_moves_when_the_row_is_not_
+/// already_fully_visible`), matching [`row_index_at_y`]'s own precedent for
+/// isolating this file's pure row-geometry arithmetic from the real
+/// `gtk::Adjustment` [`HopWindow::open_secondary_action_menu`] drives it
+/// against.
+fn scroll_value_to_reveal_row(
+    selected: u32,
+    row_h: i32,
+    current_value: f64,
+    page_size: f64,
+) -> Option<f64> {
+    let row_top = f64::from(selected) * f64::from(row_h);
+    let row_bottom = row_top + f64::from(row_h);
+    if row_top < current_value {
+        Some(row_top)
+    } else if row_bottom > current_value + page_size {
+        Some(row_bottom - page_size)
+    } else {
+        None
+    }
+}
+
+/// The position of the item whose id is `item_id` in `store`'s current
+/// contents, or `None` if no item there carries it — issue #254 review,
+/// finding 4's own overflow-chevron handler
+/// ([`HopWindow::open_action_panel_for_overflow`]) is the one caller: the
+/// chevron's own GAction target names an item id, not a position (the
+/// identical choice `ui::row`'s dedicated action-icon buttons already make
+/// for their own `(item_id, action_id)` target — see that module's top doc
+/// comment for why a position would not survive the list reordering a
+/// later query can produce between a bind and a click, where an id still
+/// names the same item), so this is the one place that id is turned back
+/// into a position [`gtk::SingleSelection::set_selected`] can use.
+///
+/// A plain linear scan, not a lookup table this module maintains
+/// alongside `store`: hop's own results list is bounded for exactly the
+/// reason a per-frame, human-driven click never needs faster than this —
+/// nothing here runs on a hot path measured in anything other than mouse
+/// clicks.
+fn position_of_item_id(store: &gio::ListStore, item_id: &ItemId) -> Option<u32> {
+    for position in 0..store.n_items() {
+        let object = store.item(position)?;
+        let item: Item = model::item_of(&object);
+        if &item.id == item_id {
+            return Some(position);
+        }
+    }
+    None
+}
+
 /// Sends `cmd_tx.send(IpcCommand::Execute { item_id, action_id })` — the
 /// one call every route that turns a chosen item and action into a real
 /// command shares: [`activate_at`] (default-action activation, keyboard or
@@ -1407,6 +1681,61 @@ mod tests {
 
         // A non-positive row height cannot honestly name a row either.
         assert_eq!(row_index_at_y(0.0, 0.0, 0, 3), None);
+    }
+
+    /// [`scroll_value_to_reveal_row`]'s own truth table — GTK-free, the
+    /// same shape [`row_index_at_y`]'s own test above already establishes
+    /// for a different pure decision this file makes about row geometry.
+    /// Issue #254 review, finding 3: this is the function
+    /// [`HopWindow::open_secondary_action_menu`] calls before anchoring the
+    /// panel to [`HopWindow::indicator`], so that indicator (driven by
+    /// [`position_indicator`]) is never left describing a row that is not
+    /// actually on screen.
+    #[test]
+    fn scroll_value_to_reveal_row_only_moves_when_the_row_is_not_already_fully_visible() {
+        // A 5-row-tall viewport (`page_size = 5 * 56`), scrolled to its very
+        // top. Row 2 (spanning [112, 168)) is already fully inside
+        // [0, 280) — nothing to do.
+        assert_eq!(
+            scroll_value_to_reveal_row(2, 56, 0.0, 280.0),
+            None,
+            "a row already fully within the viewport must not trigger a scroll"
+        );
+
+        // The exact scenario this issue's own finding names: the list has
+        // been scrolled well past row 2's own band (current value = 8 rows
+        // down), so row 2's top (112) sits *above* the viewport's own top
+        // (448) — scrolled out of view above it, not below.
+        assert_eq!(
+            scroll_value_to_reveal_row(2, 56, 8.0 * 56.0, 280.0),
+            Some(112.0),
+            "a row scrolled above the viewport must reveal it by scrolling up to the row's \
+             own top, not leave the scroll position untouched"
+        );
+
+        // The opposite direction: row 9 (spanning [504, 560)) sits below a
+        // viewport currently showing [0, 280) — its own bottom, not top,
+        // is what must land exactly on the viewport's trailing edge.
+        assert_eq!(
+            scroll_value_to_reveal_row(9, 56, 0.0, 280.0),
+            Some(280.0),
+            "a row scrolled below the viewport must reveal it by scrolling down until the \
+             row's own bottom is flush with the viewport's trailing edge"
+        );
+
+        // A row exactly flush with either edge already is already fully
+        // visible — the boundary itself must not be treated as "out of
+        // view" in either direction.
+        assert_eq!(
+            scroll_value_to_reveal_row(0, 56, 0.0, 280.0),
+            None,
+            "a row flush with the viewport's own top edge is already fully visible"
+        );
+        assert_eq!(
+            scroll_value_to_reveal_row(4, 56, 0.0, 280.0),
+            None,
+            "a row flush with the viewport's own bottom edge is already fully visible"
+        );
     }
 
     /// Set on the re-exec'd child so it knows to run the real assertions
@@ -2103,6 +2432,7 @@ mod tests {
         assert_choosing_pins_the_item_opened_for_not_whatever_is_selected_later();
         assert_escape_with_the_panel_open_closes_only_the_panel();
         assert_escape_with_the_panel_closed_still_dismisses_the_window();
+        assert_ctrl_k_scrolls_a_row_selected_above_the_viewport_back_into_view();
 
         println!("ctrl-K action panel wiring assertions passed");
     }
@@ -2304,6 +2634,67 @@ mod tests {
         println!("assert_escape_with_the_panel_closed_still_dismisses_the_window passed");
     }
 
+    /// Issue #254 review, finding 3: a real anchor bug. `self.scrolled`'s
+    /// own `vadjustment` is configured directly, via
+    /// [`gtk::Adjustment::configure`], rather than trusted to arrive at a
+    /// particular value from real widget layout — this suite deliberately
+    /// runs no `glib::MainContext::iteration` anywhere (see this module's
+    /// own top doc comment for why every other geometry-shaped assertion
+    /// here already drives a resolved pure function or reads a value
+    /// GtkAdjustment initializes to `0.0` on its own), and a real broadway
+    /// layout pass's *timing* is not this test's own concern — only that
+    /// [`HopWindow::open_secondary_action_menu`] reacts correctly to
+    /// whatever the adjustment currently reports.
+    ///
+    /// A 5-row-tall viewport (`page_size = 5 * row_h`) scrolled to its
+    /// 9th row's own band (`value = 8 * row_h`) puts row 2 — the one this
+    /// test selects — eight rows above the visible viewport, the exact
+    /// "selected row scrolled above the viewport" scenario this review
+    /// finding names. Before [`HopWindow::ensure_selected_row_visible`]
+    /// existed, `open_secondary_action_menu` left `value` untouched and
+    /// anchored the panel to `self.indicator`, which `position_indicator`'s
+    /// own `.max(0)` clamp had pinned to the viewport's literal top —
+    /// wherever *that* pixel actually was, it was never row 2, since the
+    /// scroll position itself never moved to bring row 2 there. This test
+    /// pins the actual, load-bearing evidence that it now does.
+    fn assert_ctrl_k_scrolls_a_row_selected_above_the_viewport_back_into_view() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.CtrlKScrollIntoView");
+        window.present_with_token(None);
+        let items: Vec<Item> = (0..10)
+            .map(|n| test_item(n, &format!("item {n}")))
+            .collect();
+        model::replace(&window.store, items);
+        window.selection.set_selected(2);
+
+        let row_h = f64::from(*tokens::ROW_HEIGHT_PX);
+        let page_size = row_h * 5.0;
+        window.scrolled.vadjustment().configure(
+            row_h * 8.0,
+            0.0,
+            row_h * 10.0,
+            row_h,
+            page_size,
+            page_size,
+        );
+
+        window.dispatch_action(Action::SecondaryAction);
+
+        assert_eq!(
+            window.scrolled.vadjustment().value(),
+            row_h * 2.0,
+            "opening the panel for a row selected above the viewport must scroll the list so \
+             that row's own top becomes the viewport's own top, not leave the scroll position \
+             untouched and let the panel anchor to whatever row the indicator's own clamp left \
+             it pinned over instead"
+        );
+        assert!(
+            window.action_panel.popover().is_visible(),
+            "the panel must still open once the selected row has been scrolled back into view"
+        );
+
+        println!("assert_ctrl_k_scrolls_a_row_selected_above_the_viewport_back_into_view passed");
+    }
+
     /// Issue #254 AC2's own wiring slice: a right-click selects the row
     /// under the cursor and opens [`ActionPanel`] anchored at the exact
     /// click point, atomically — the sharpest edge this issue's own brief
@@ -2463,5 +2854,120 @@ mod tests {
         );
 
         println!("assert_ctrl_k_after_a_right_click_clears_the_stale_pointing_to passed");
+    }
+
+    /// Issue #254 review, finding 4 (maintainer decision, 2026-08-23): the
+    /// row's own overflow chevron (`ui::row::overflow_button_widget`)
+    /// invokes `row.open-actions` with its row's own item id as target —
+    /// [`HopWindow::open_action_panel_for_overflow`] is where that name
+    /// resolves to real behavior, reusing
+    /// [`HopWindow::present_action_panel_for_selected`] exactly the way
+    /// [`HopWindow::open_secondary_action_menu_at`] (right-click) already
+    /// does, per this review finding's own "do not grow a third copy of
+    /// that logic" instruction. `1000` is the first base this file has not
+    /// already claimed (`400`, `550`, `700`, `850`).
+    #[test]
+    fn overflow_chevron_selects_the_rows_item_and_opens_the_panel_anchored_there() {
+        run_under_broadway(
+            "ui::window::tests::overflow_chevron_selects_the_rows_item_and_opens_the_panel_anchored_there",
+            1000,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        assert_overflow_chevron_selects_the_rows_item_and_opens_the_panel_at_that_point();
+        assert_overflow_chevron_does_nothing_for_an_unknown_item_id();
+
+        println!("overflow chevron wiring assertions passed");
+    }
+
+    /// The sharpest edge this review finding shares with the right-click
+    /// path: the chevron's own target names *its* row's item, which is not
+    /// necessarily whatever `self.selection` already points at — a naive
+    /// handler that opened the panel for the current selection, ignoring
+    /// the target entirely, would pass every ctrl-K assertion above and
+    /// fail only this one.
+    fn assert_overflow_chevron_selects_the_rows_item_and_opens_the_panel_at_that_point() {
+        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.OverflowChevron");
+        window.present_with_token(None);
+        let item_a = test_item(1, "item A");
+        // Three actions — one more than `ui::row::ROW_ACTION_ICON_CAP` —
+        // so this is genuinely the item a real overflow chevron would show
+        // on: `ui::row::resolve_overflow_button`'s own condition.
+        let item_b = test_item_with_actions(2, "item B", &["open", "reveal", "copy"]);
+        model::replace(&window.store, vec![item_a.clone(), item_b.clone()]);
+        window.selection.set_selected(0); // item_a — deliberately not item_b
+
+        window.open_action_panel_for_overflow(&item_b.id);
+
+        assert_eq!(
+            window.selection.selected(),
+            1,
+            "the overflow chevron must select the row it actually belongs to (item_b), not \
+             leave whatever the results selection already happened to be (item_a)"
+        );
+        assert!(
+            window.action_panel.popover().is_visible(),
+            "the overflow chevron must open the panel for an item that has actions"
+        );
+        let (has_point, _rect) = window.action_panel.popover().pointing_to();
+        assert!(
+            has_point,
+            "the overflow chevron must anchor the panel at a real point on that row, reusing \
+             the same present_action_panel_for_selected(..., Some(pointing_to)) path a \
+             right-click already uses — not ctrl-K's own pointing_to-free \"general overlay\" \
+             anchor"
+        );
+
+        // Choosing an action must run against item_b — the row the
+        // chevron actually belonged to — never item_a, which was selected
+        // before this call ran.
+        window.action_panel.handle_key(gdk::Key::Return);
+        match cmd_rx
+            .try_recv()
+            .expect("choosing an action must send an Execute command")
+        {
+            IpcCommand::Execute { item_id, .. } => assert_eq!(
+                item_id, item_b.id,
+                "the action must run against the item the chevron belonged to (item_b), never \
+                 whatever was selected before the chevron was clicked (item_a)"
+            ),
+            other => panic!("expected Execute, got {other:?}"),
+        }
+
+        println!(
+            "assert_overflow_chevron_selects_the_rows_item_and_opens_the_panel_at_that_point \
+             passed"
+        );
+    }
+
+    /// An item id naming no row currently in the store — stale by the time
+    /// the click is processed, in principle, though `ui::row`'s own
+    /// recycling constraint should never actually produce one — must do
+    /// nothing, not panic and not open a panel for whatever the selection
+    /// already was.
+    fn assert_overflow_chevron_does_nothing_for_an_unknown_item_id() {
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.OverflowChevronUnknown");
+        window.present_with_token(None);
+        model::replace(&window.store, vec![test_item(1, "only row")]);
+        window.selection.set_selected(0);
+
+        let unknown_id = ItemId::new("test:does-not-exist").unwrap();
+        window.open_action_panel_for_overflow(&unknown_id);
+
+        assert_eq!(
+            window.selection.selected(),
+            0,
+            "an unknown item id must not change the current selection"
+        );
+        assert!(
+            !window.action_panel.popover().is_visible(),
+            "an unknown item id must not open the panel"
+        );
+
+        println!("assert_overflow_chevron_does_nothing_for_an_unknown_item_id passed");
     }
 }

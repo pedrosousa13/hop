@@ -414,13 +414,26 @@ listview > row:hover {
 }
 
 /* ============================================================
-   .hop-row-actions / .hop-row-action-icon — `ui/row.rs` (issue #254,
-   SPEC decisions 5 and 6)
+   .hop-row-actions / .hop-row-action-icon / .hop-row-overflow-icon —
+   `ui/row.rs` (issue #254, SPEC decisions 5 and 6; the overflow chevron,
+   issue #254 review finding 4, maintainer decision 2026-08-22)
    The row's own clickable action-icon buttons — see `ui::row`'s own doc
    comment ("Issue #254: clickable action icons") for why exactly
    `ROW_ACTION_ICON_CAP` (2) of them exist per row, and how a click on one
    reaches an `IpcCommand::Execute` for that exact action, not the row's
    default one.
+
+   `.hop-row-overflow-icon` is the trailing chevron `ui::row::build` appends
+   as `.hop-row-actions`'s *third* child, after the two action icons — see
+   that module's own top doc comment, "the overflow chevron", for when it
+   shows (an item with more actions than the row has dedicated icons for)
+   and why it lives inside this same wrapper rather than a separate one.
+   It carries both `.hop-row-action-icon` and `.hop-row-overflow-icon` (see
+   `ui::row::OVERFLOW_CHILD_NAME`'s own doc comment) — the rules below are
+   therefore written against *both* selectors together, wherever the two
+   share a treatment, rather than duplicated: one real value, spent twice,
+   the same "no literal repeated, only a token" discipline this file keeps
+   everywhere else.
 
    # Why this is plain `:hover`/`:selected`, with no Rust-driven class at
    all — unlike every other fade this file declares
@@ -491,7 +504,8 @@ listview > row:selected .hop-row-actions {
   opacity: 1;
 }
 
-.hop-row-action-icon {
+.hop-row-action-icon,
+.hop-row-overflow-icon {
   min-width: {{hop-icon-size}};
   min-height: {{hop-icon-size}};
   padding: 0;
@@ -519,7 +533,8 @@ listview > row:selected .hop-row-actions {
    text" — that reservation predates this rule and this rule does not
    widen it), and a hover fill on a new, fourth kind of element is exactly
    the widening it warns against. */
-.hop-row-action-icon:hover {
+.hop-row-action-icon:hover,
+.hop-row-overflow-icon:hover {
   background-color: {{hop-line}};
 }
 

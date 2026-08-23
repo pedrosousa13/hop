@@ -1115,6 +1115,8 @@ fn run_assertions() {
         .expect("build must give the row a named first action-icon button");
     let action_icon_2 = row::action_icon_widget(&container, 1)
         .expect("build must give the row a named second action-icon button");
+    let overflow_button = row::overflow_button_widget(&container)
+        .expect("build must give the row a named overflow chevron button");
     assert!(
         row::action_icon_widget(&container, 2).is_none(),
         "there must be no third action-icon button — ROW_ACTION_ICON_CAP is 2, not \
@@ -1127,6 +1129,12 @@ fn run_assertions() {
     assert!(
         !action_icon_2.is_visible(),
         "an item with only one action must not show a second action icon"
+    );
+    assert!(
+        !overflow_button.is_visible(),
+        "issue #254 review, finding 4: an item with only one action — fewer than \
+         ROW_ACTION_ICON_CAP — must not show the overflow chevron; every one of its actions \
+         already has a dedicated icon"
     );
     assert_eq!(
         row_layout(&container, &icon),
@@ -1147,6 +1155,10 @@ fn run_assertions() {
         "an item with zero actions must hide the first action icon too"
     );
     assert!(!action_icon_2.is_visible());
+    assert!(
+        !overflow_button.is_visible(),
+        "an item with zero actions has nothing to overflow into a panel either"
+    );
 
     // Two actions of two different kinds — both slots must show, each
     // carrying that exact action's own icon, tooltip, and GAction target,
@@ -1158,6 +1170,13 @@ fn run_assertions() {
     );
     assert!(action_icon_1.is_visible());
     assert!(action_icon_2.is_visible());
+    assert!(
+        !overflow_button.is_visible(),
+        "issue #254 review, finding 4: exactly ROW_ACTION_ICON_CAP (2) actions must not show \
+         the overflow chevron either — every one of this item's actions already has a \
+         dedicated icon, so there is nothing left for the panel to hold that the row does not \
+         already offer directly"
+    );
     assert_eq!(
         action_icon_1.tooltip_text().as_deref(),
         Some("Open"),
@@ -1209,6 +1228,23 @@ fn run_assertions() {
     );
     assert_eq!(action_icon_1.tooltip_text().as_deref(), Some("Open"));
     assert_eq!(action_icon_2.tooltip_text().as_deref(), Some("Copy path"));
+    assert!(
+        overflow_button.is_visible(),
+        "issue #254 review, finding 4: an item declaring one more action than \
+         ROW_ACTION_ICON_CAP must show the overflow chevron — \"reveal\" has nowhere else to \
+         go from this row"
+    );
+    let overflow_target = overflow_button
+        .action_target_value()
+        .expect("a visible overflow chevron must carry a real action target")
+        .get::<String>()
+        .expect("the overflow chevron's action target must unpack as a bare item id string");
+    assert_eq!(
+        overflow_target,
+        three_actions_item.id.as_str(),
+        "the overflow chevron's target must name this row's own item, so the window can \
+         select and re-present the panel for the same item a click on it opens"
+    );
     let target_2_of_three = action_icon_2
         .action_target_value()
         .expect("a visible action-icon button must carry a real action target")
@@ -1243,6 +1279,18 @@ fn run_assertions() {
         "recycling from a two-action item onto a one-action item must not leave the second \
          action icon visible — a recycled row must not carry a stale icon forward"
     );
+    assert!(
+        !overflow_button.is_visible(),
+        "issue #254 review, finding 4: recycling a row that showed the overflow chevron (three \
+         actions) onto an item with only one action must hide it again — the exact \"must not \
+         persist onto a rebound row whose item has ≤2 actions\" hazard this review finding \
+         names for a per-row affordance with no Rust-side shown/hidden memory of its own"
+    );
+    assert!(
+        overflow_button.action_target_value().is_none(),
+        "recycling away from the overflow chevron must clear its stale target too, not merely \
+         hide the button"
+    );
     let target_after_recycle = action_icon_1
         .action_target_value()
         .expect("a visible action-icon button must carry a real action target")
@@ -1268,6 +1316,14 @@ fn run_assertions() {
     assert!(
         action_icon_1.action_target_value().is_none(),
         "unbind must clear the action target, not merely hide the button"
+    );
+    assert!(
+        !overflow_button.is_visible(),
+        "unbind must hide the overflow chevron too, matching every other optional row element"
+    );
+    assert!(
+        overflow_button.action_target_value().is_none(),
+        "unbind must clear the overflow chevron's action target, not merely hide the button"
     );
 
     // Neither the title nor the subtitle label can be text-selected — SPEC

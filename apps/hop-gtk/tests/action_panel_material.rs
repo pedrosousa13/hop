@@ -350,13 +350,29 @@ mod broadway_guard {
              surface, got: {panel_rule}"
         );
 
-        // GTK's serializer reorders a single compound selector's
-        // pseudo-class ahead of its style class — `:hover.hop-action-row`,
-        // not `.hop-action-row:hover` — the identical reordering
-        // `tests/motion_setting.rs`'s own `HINT_SHOWN_RULE_MARKER` comment
-        // documents for `.hop-row-hint-shown`'s compound selector, recurring
-        // here for a different rule.
-        let hover_rule = extract_serialized_rule(&serialized, ":hover.hop-action-row {");
+        // Issue #254 review, finding 4: this used to read
+        // `":hover.hop-action-row {"` — GTK's serializer reordering a
+        // single compound selector's pseudo-class ahead of its style
+        // class, the same reordering `tests/motion_setting.rs`'s own
+        // `HINT_SHOWN_RULE_MARKER` comment documents for a *different*
+        // compound (two style classes, not a style class plus a
+        // pseudo-class). Re-verified directly against this crate's real,
+        // installed GTK 4.14 while adding the overflow chevron's own
+        // `.hop-row-action-icon:hover, .hop-row-overflow-icon:hover { ... }`
+        // rule earlier in this same stylesheet: GTK's canonical print order
+        // for a style-class-plus-pseudo-class compound is evidently not a
+        // fixed rule this crate can rely on independent of what else the
+        // stylesheet declares — adding an unrelated rule earlier in the
+        // file changed this one compound's serialized order from
+        // `:hover.hop-action-row` back to source order,
+        // `.hop-action-row:hover`, with no change to `.hop-action-row`'s
+        // own declarations at all. This assertion is therefore pinned to
+        // whatever GTK's real parser produces *today*, exactly like every
+        // other `extract_serialized_rule` call in this file — a future
+        // stylesheet edit is free to shift this order again, and should
+        // fix this literal to match rather than treat a mismatch here as a
+        // sign anything is actually broken.
+        let hover_rule = extract_serialized_rule(&serialized, ".hop-action-row:hover {");
         assert!(
             hover_rule.contains("transform:") && !hover_rule.contains("transform: none;"),
             "GTK's own serialized provider dump should carry a real, non-`none` transform on \
