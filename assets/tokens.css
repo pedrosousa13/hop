@@ -163,6 +163,7 @@
   /* --hop-accent-light-hover:   #2B8A5E;           */ /* 4.07:1 on paper — hover is a state colour, never text */
   /* --hop-accent-light-subdued: rgba(29, 120, 78, 0.10); */ /* composites to #e4ece5 */
   /* --hop-accent-light-ring:    rgba(29, 120, 78, 0.35); */
+
   /* ---- CORAL ------------------------------------------------ */
   /* --hop-accent:              #E6685C;            */ /* 5.79:1 on the window ground; 4.89:1 on its selected row (#301e1e) */
   /* --hop-accent-hover:        #F08378;            */ /* 7.33:1 on the window ground */
@@ -172,6 +173,7 @@
                                                         WAS the as-specified #E6685C — 3.07:1 on paper, failed 4.5:1 */
   /* --hop-accent-light-hover:   #B96259;           */ /* 4.03:1 on paper — hover is a state colour, never text */
   /* --hop-accent-light-subdued: rgba(170, 77, 68, 0.10); */ /* composites to #f2e8e4 */
+  /* --hop-accent-light-ring:    rgba(170, 77, 68, 0.35); */
 
   /* ---- IRIS -------------------------------------------------- */
   /* --hop-accent:              #8F7FF0;            */ /* 5.76:1 on the window ground; 4.82:1 on its selected row (#242133) */

@@ -6,6 +6,19 @@ Source: decision D5 in
 and §8a of
 [`docs/superpowers/specs/2026-07-30-hop-launcher-v1-design.md`](superpowers/specs/2026-07-30-hop-launcher-v1-design.md)
 
+> **Accent superseded, 2026-08-23 (issue #253).** Every amber reading below —
+> `#E3A83B` dark / `#875C0F` light, and the `#2f2719` composited selected-row
+> fill sampled against them — records the M3 build as it stood when this walk
+> was run. The M7 design refresh
+> ([`design/2026-08-22-design-refresh/SPEC.md`](design/2026-08-22-design-refresh/SPEC.md),
+> decision 7) replaced that fixed amber with a swappable accent family whose
+> live preset is ice, `#5AA9E6` dark / `#3A6E96` light. The captured figures
+> are deliberately left as they were: they are observations from a dated audit
+> run, and rewriting them would turn a record of what was seen into a claim
+> about a build nobody inspected. Re-run the walk against the current accent
+> before treating any colour figure below as current fact — the *rules* each
+> item states still bind; only the sampled values moved.
+
 ## What this is
 
 D5 settled which GNOME Human Interface Guidelines rules bind on hop and which
