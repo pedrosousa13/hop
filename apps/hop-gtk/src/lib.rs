@@ -20,6 +20,7 @@ mod icon_roots;
 pub mod ipc;
 pub mod keymap;
 pub mod layer_shell;
+pub mod material;
 pub mod screenshot;
 pub mod session;
 pub mod style;
