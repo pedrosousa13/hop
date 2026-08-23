@@ -289,6 +289,26 @@
   --hop-duration-fast:     80ms;
   --hop-delay-hint:        40ms;  /* kills hint flicker during fast traversal */
 
+  /* Issue #254 — the ctrl-K action panel's own open fade (SPEC decision 5's
+     panel, decision 2's motion posture). Decision 2's own ≤140ms ceiling is
+     scoped, in its own text, to "hover/selection transitions"; the panel's
+     entrance is a different transition class the decision does not bound,
+     and issue #254's own brief sets that class's ceiling at ≤220ms instead.
+     A distinct token, not a reuse of --hop-duration-open above (140ms, the
+     *window's* own open) — the window and the panel are two different
+     surfaces this issue deliberately leaves free to diverge under their own
+     ceilings; folding the panel into --hop-duration-open would make a
+     future window-timing change silently retime the panel too, and vice
+     versa. Fade only: no matching transform token exists for this rule
+     (unlike --hop-lift-transform), because decision 2 and this issue both
+     rule out any spring/slide/scale on the panel's entrance — see
+     `assets/stylesheet.css`'s `.hop-action-panel.hop-action-panel-shown`
+     rule, the token's own consumer, for the full account (an earlier draft
+     of that rule lived on `popover.background` instead; that rule's own
+     corrected comment explains why the class-driven fade had to move to
+     the popover's *child* to animate at all). */
+  --hop-duration-panel-open: 220ms;
+
   --hop-ease-out: cubic-bezier(0.16, 1, 0.3, 1);   /* open, resolve  */
   --hop-ease-in:  cubic-bezier(0.4, 0, 1, 1);      /* close          */
   --hop-ease-sel: cubic-bezier(0.22, 1, 0.36, 1);  /* selection      */
@@ -413,6 +433,14 @@
     --hop-duration-state:  1ms;
     --hop-duration-resolve: 1ms;
     --hop-delay-hint:      0ms;
+    /* Issue #254: the panel-open fade is opacity-only already — no transform
+       token exists for it, unlike --hop-lift-transform just below — so it
+       gets the same treatment --hop-duration-open/-close already get in
+       this block: shortened, not zeroed. An opacity-only fade carries none
+       of the vestibular trigger a translate/scale would (this block's own
+       header comment), so reduced motion still lets it play, just faster
+       than the ≤220ms full-motion ceiling issue #254 sets. */
+    --hop-duration-panel-open: 85ms;
     /* Issue #253: the row-lift hover transform (SPEC decision 6) is a
        translation — the vestibular trigger this block exists to strip.
        `assets/stylesheet.css`'s hovered-row rule consumes it through a

@@ -279,9 +279,22 @@ listview {
    Decision 2 bounds it: "hover/selection transitions (≤140ms) ... no row
    cascades, no panel springs, nothing decorative" and "`Motion::Reduced`
    collapses what remains to opacity-only." This rule pair is the row-lift
-   half of that contract (the actions-fade-in half is `.hop-row-hint`/
-   `.hop-row-hint-shown` above, a different, class-driven mechanism this
-   rule does not touch).
+   half of that contract.
+
+   Correction, issue #254: an earlier draft of this comment named
+   `.hop-row-hint`/`.hop-row-hint-shown` (further below) as "the
+   actions-fade-in half" of decision 6. That was wrong, not merely stale —
+   the hint is a *keyboard* affordance (the default action's label and the
+   key that runs it, e.g. "Open" / "Enter"), entrance-faded once at bind
+   time whenever the bound item has one, regardless of the pointer ever
+   touching the row; it is not clickable and shows only one action. Decision
+   6's own words are "click an *action icon* = that exact action" —
+   plural affordances, mouse-clickable, appearing specifically "on hover/
+   selection" rather than unconditionally once bound. `.hop-row-actions`
+   below, `ui/row.rs`'s real per-row action-icon buttons (issue #254), is
+   the rule this parenthetical should always have pointed at. Left here in
+   full, rather than quietly edited away, because a reader who remembers
+   the old wording deserves to see why it changed and to what.
 
    Three tokens, none of them literals, all already declared in
    `tokens.css` by an earlier session (this issue's own Task 1, MATERIAL
@@ -398,6 +411,131 @@ listview > row:hover {
   background-color: {{hop-bg-hover}};
   box-shadow: {{hop-elev}};
   transform: {{motion:hop-lift-transform}};
+}
+
+/* ============================================================
+   .hop-row-actions / .hop-row-action-icon / .hop-row-overflow-icon —
+   `ui/row.rs` (issue #254, SPEC decisions 5 and 6; the overflow chevron,
+   issue #254 review finding 4, maintainer decision 2026-08-22)
+   The row's own clickable action-icon buttons — see `ui::row`'s own doc
+   comment ("Issue #254: clickable action icons") for why exactly
+   `ROW_ACTION_ICON_CAP` (2) of them exist per row, and how a click on one
+   reaches an `IpcCommand::Execute` for that exact action, not the row's
+   default one.
+
+   `.hop-row-overflow-icon` is the trailing chevron `ui::row::build` appends
+   as `.hop-row-actions`'s *third* child, after the two action icons — see
+   that module's own top doc comment, "the overflow chevron", for when it
+   shows (an item with more actions than the row has dedicated icons for)
+   and why it lives inside this same wrapper rather than a separate one.
+   It carries both `.hop-row-action-icon` and `.hop-row-overflow-icon` (see
+   `ui::row::OVERFLOW_CHILD_NAME`'s own doc comment) — the rules below are
+   therefore written against *both* selectors together, wherever the two
+   share a treatment, rather than duplicated: one real value, spent twice,
+   the same "no literal repeated, only a token" discipline this file keeps
+   everywhere else.
+
+   # Why this is plain `:hover`/`:selected`, with no Rust-driven class at
+   all — unlike every other fade this file declares
+
+   `.hop-row-hint-shown` (below) and `.hop-action-panel-shown` both need a
+   *Rust*-decided class because what they gate on — "did this widget's
+   bound content genuinely just start being shown, as opposed to staying
+   shown across a recycle" (`ui::row::bind`'s "the recycling constraint") —
+   is not a live GTK input state at all; nothing about GTK's own CSS engine
+   knows whether a bind just happened. Hover and selection are the opposite
+   shape of question: both are ordinary, continuously-tracked GTK widget
+   state (`:hover` needs no cooperation from any app code; `:selected` is
+   the same `GTK_STATE_FLAG_SELECTED` `.hop-action-row:selected`'s own
+   comment already documents `listview > row` carrying), re-evaluated by
+   GTK itself on every pointer motion and every selection change with no
+   help from `ui::row` at all. A row recycled onto a new item while the
+   pointer sits elsewhere is simply not `:hover`, the instant it is bound —
+   there is no stale "shown" flag for `ui::row::bind`/`unbind` to manage
+   here, and no equivalent of `HINT_SHOWN_CLASS` exists for this rule pair
+   because nothing here needs one. This is *simpler* than the hint's own
+   mechanism, not a shortcut around an equally-hard problem: the row-icon-
+   fade the row's own `:hover` rule above already proves — a plain CSS
+   pseudo-class pair reused, not a third pattern invented.
+
+   `listview > row`'s own auto-select-on-hover behaviour (GTK 4.14.5's
+   `gtk_list_factory_widget_hover_cb`, `gtk/gtklistfactorywidget.c`: with
+   `single-click-activate` true — `ui::window::HopWindow::build`'s own
+   setting — entering a row's hover fires `list.select-item` for it) means
+   `:hover` and `:selected` coincide for the row under the pointer almost
+   always; `:selected` is still named explicitly here for the one case they
+   diverge — a keyboard-navigated selection (arrow keys) with the pointer
+   resting somewhere else entirely, where decision 6's "hover/selection"
+   wording is explicit that the *selected* row's icons should still be
+   reachable without first moving the mouse onto it.
+
+   # Opacity only — no lift, no scale, on this element
+
+   Decision 2's reduced-motion collapse ("`Motion::Reduced` ... opacity-
+   only") is satisfied by construction, not by a `{{motion:...}}`-gated
+   transform override the way `--hop-lift-transform` supplies one for the
+   row itself: this rule never declares `transform` in the first place,
+   full motion or reduced. The row's own lift (above) is what already
+   signals "this row is interactive" on hover; the icons fading in on top
+   of it need no second, independent motion of their own to read as part
+   of the same affordance.
+
+   # Timing: the row-lift's own clock, not the hint's
+
+   `{{motion:hop-duration-state}}`/`{{motion:hop-ease-std}}` — the exact
+   pair `listview > row`'s own `transition:` above uses — rather than
+   `.hop-row-hint-shown`'s `{{motion:hop-duration-fast}}`/
+   `{{motion:hop-delay-hint}}` pairing below. Deliberate: the hint's timing
+   is tuned for *its* trigger ("kills hint flicker during fast [keyboard]
+   traversal", `tokens.css`'s own comment on `--hop-delay-hint`) — a bind-
+   time content change, arriving in bursts as a user types. This rule's
+   trigger is a live pointer/selection event, the identical one the row's
+   own background/shadow/lift already animate on; sharing that exact clock
+   is what keeps one hover producing one coherent motion instead of the
+   lift and the icons visibly settling at two different speeds.
+   ============================================================ */
+.hop-row-actions {
+  opacity: 0;
+  transition: opacity {{motion:hop-duration-state}} {{motion:hop-ease-std}};
+}
+
+listview > row:hover .hop-row-actions,
+listview > row:selected .hop-row-actions {
+  opacity: 1;
+}
+
+.hop-row-action-icon,
+.hop-row-overflow-icon {
+  min-width: {{hop-icon-size}};
+  min-height: {{hop-icon-size}};
+  padding: 0;
+  border-radius: {{hop-radius-sm}};
+  color: {{hop-fg-2}};
+  transition: background-color {{motion:hop-duration-state}} {{motion:hop-ease-std}};
+}
+
+/* `{{hop-line}}` — the hairline/divider token, not `{{hop-bg-hover}}` —
+   for this hover fill specifically: the row beneath is already painted
+   `{{hop-bg-hover}}` the instant the pointer is anywhere over it (`listview
+   > row:hover` above), icon included, so re-using that exact token here
+   would paint the button in a colour already indistinguishable from what
+   is under it — no visible "this specific icon is hovered" affordance at
+   all. `{{hop-line}}` is a different ramp step already promoted as a
+   semantic alias in both palettes (`tokens.css`'s SEMANTIC LAYER), so it
+   is palette-correct out of the box the way a bare `--hop-neutral-700`
+   ("raised surface" — commented, but never promoted to a semantic alias
+   for either palette) would not be, and it is a genuinely different value
+   from `{{hop-bg-hover}}`, so the button reads as its own hoverable chip
+   sitting on top of the row's own hover tint rather than disappearing into
+   it. Never `{{hop-accent}}`/`{{hop-sel-fill}}`: `tokens.css`'s own ACCENT
+   FAMILY comment reserves the accent to exactly three consumers ("the
+   selection indicator, the focus ring, and action hints ... Never for body
+   text" — that reservation predates this rule and this rule does not
+   widen it), and a hover fill on a new, fourth kind of element is exactly
+   the widening it warns against. */
+.hop-row-action-icon:hover,
+.hop-row-overflow-icon:hover {
+  background-color: {{hop-line}};
 }
 
 /* ============================================================
@@ -635,6 +773,377 @@ listview > row:hover {
 .hop-selection-indicator {
   background-color: {{hop-sel-fill}};
   border-radius: {{hop-radius-md}};
+}
+
+/* ============================================================
+   ACTION PANEL — POPOVER CHROME — issue #254 (SPEC decision 5)
+   The ctrl-K action panel (`ui::action_panel`) is a `gtk::Popover`. GTK
+   generates its own CSS node tree around whatever child the widget gives
+   it — confirmed against the Gtk-4.0 gir's own "CSS nodes" section for
+   GtkPopover: "popover.background ├── arrow ╰── contents ╰── <child>" — so
+   `.hop-action-panel` (the class contract's own container class, set on
+   the widget's child, not on the Popover itself) renders *inside* two GTK
+   nodes this file has never had reason to style before: `popover.background`
+   itself and its `contents` child. Both carry a stock Adwaita "bubble" look
+   by default (an opaque background, its own border-radius, and its own
+   box-shadow) — left alone, that stock chrome paints *behind and around*
+   `.hop-action-panel`'s own surface below, doubling the rounded-rectangle
+   outline and the elevation shadow, and very likely showing a mismatched
+   corner peeking out from behind ours since nothing ties the two radii
+   together. The three rules below exist solely to strip that stock paint
+   so `.hop-action-panel` is the only node in the chain that paints
+   anything — the same "stop stock chrome showing through" job
+   `window.background`'s own rule does for the toplevel, applied here to a
+   popup instead.
+
+   These three selectors are written unscoped (`popover.background`, not
+   e.g. `popover.background.hop-action-panel-host`) because hop has exactly
+   one `gtk::Popover` anywhere in this crate as of this issue — confirmed by
+   grepping `apps/hop-gtk/src` for `Popover` before writing this rule — and
+   the class contract this file styles against grants no class on the
+   Popover node itself to scope narrower with. GTK's CSS subset also has no
+   `:has()` or other parent-selecting construct that could reach "the
+   popover containing `.hop-action-panel`" from a rule anchored on the
+   child, so an unscoped rule is not a shortcut taken over a scoped
+   alternative — it is the only shape available today. If hop ever grows a
+   second, differently-themed `gtk::Popover`, whichever issue adds it must
+   revisit these three rules, not silently inherit them.
+
+   The `arrow` node is neutralized rather than left alone for the same
+   reason as `popover.background`/`contents`: the approved frame
+   (`docs/design/2026-08-22-design-refresh/mocks3.html`'s own `.panel`) shows
+   the action panel as a free-floating card with no pointer triangle
+   connecting it to a specific row, matching decision 5's own "opens at the
+   cursor" framing (a cursor-anchored popup, not one pointing at a fixed
+   widget edge) — so an arrow, if the widget's positioning ever produces one,
+   must render invisible rather than as a second, unstyled shape. Per the
+   gir doc quoted above, `arrow` "does not support any border shape other
+   than solid, no border-radius, ... and no box-shadow" — `background-color`
+   is not on that unsupported list, so it is the one property this rule
+   needs to make the triangle disappear.
+   ============================================================ */
+popover.background {
+  background-color: transparent;
+  box-shadow: none;
+
+  /* CORRECTED (issue #254 follow-up): an earlier draft of this rule
+     declared `transition: opacity {{motion:hop-duration-panel-open}}
+     {{motion:hop-ease-out}};` here, with a comment claiming `GtkPopover`
+     reads this node's `transition-duration`/`-timing-function` to time its
+     own native present/dismiss animation "the identical mechanism every
+     stock GNOME app's own popover fade relies on." That claim is false,
+     checked directly against this workspace's pinned GTK 4.14.5 source
+     (`pkg-config --modversion gtk4`):
+
+       - `gtk/gtkpopover.c`: `gtk_popover_popup()` is exactly
+         `gtk_widget_set_visible(GTK_WIDGET(popover), TRUE)`, and
+         `gtk_popover_popdown()` is `gtk_widget_set_visible(..., FALSE)`
+         plus bookkeeping in `cascade_popdown()`. Neither reads any
+         `transition-*` property, touches a `GtkCssAnimatedStyle`, or
+         references a duration or easing curve anywhere in the file.
+         `gtkpopovermenu.c` has no fade/crossfade code either.
+       - `gtk/gtkwidget.c`: `gtk_widget_hide()` calls
+         `gtk_css_node_set_visible(cssnode, FALSE)` and unmaps the widget
+         synchronously, in the same call — there is no frame-clock
+         deferral that waits for a transition to finish before the widget
+         actually disappears.
+       - GTK3 *did* fade a popover's present/dismiss; GTK4 removed that
+         machinery. This node's declared `transition:` here was therefore
+         legal CSS, parsed without error, and completely inert — the panel
+         appeared and vanished instantly regardless of what duration this
+         rule named, while its own comment claimed otherwise.
+
+     The declaration is removed rather than left as decoration: a
+     `transition:` that never transitions anything is worse than none,
+     because it reads as a working feature to the next person who greps
+     this file. The real, working fade this issue actually wants lives on
+     `.hop-action-panel`/`.hop-action-panel-shown` below instead — see that
+     rule's own comment for the mechanism that *does* work in GTK 4.14
+     (`opacity` is registered `GTK_STYLE_PROPERTY_ANIMATED`, and a class
+     toggle on a widget that stays mapped across the toggle animates), and
+     `apps/hop-gtk/src/ui/action_panel.rs`'s module doc comment, "The state
+     class the stylesheet needs for its fade", for why the class add is
+     deferred by one main-loop turn to give that mechanism an earlier value
+     to interpolate from. */
+}
+
+popover.background > contents {
+  background-color: transparent;
+  box-shadow: none;
+  padding: 0;
+  border-radius: 0;
+}
+
+popover.background > arrow {
+  background-color: transparent;
+}
+
+/* ============================================================
+   .hop-action-panel — issue #254 (SPEC decisions 1 and 5)
+   The panel's own visible surface, now that POPOVER CHROME above has
+   cleared every stock node around it. Decision 1's "layered surface,
+   hairline border, soft elevation" is not a second material invented for
+   this one popup — it is `window.background`'s own recipe (ground colour +
+   hairline ring + soft shadow), reused verbatim for a second, floating
+   surface, which is what "must read as the same material system, not a
+   second one" (this issue's own brief) actually requires: not a matching
+   *palette*, a matching *formula*.
+
+   `{{hop-bg}}` — the same semantic alias `window.background` paints with,
+   not a new "raised surface" tone. Reusing the window's own ground here
+   (rather than inventing a lighter panel-only fill) is what keeps
+   `.hop-action-row:hover`/`:selected` below sitting in the *correct*
+   direction on the ramp: `--hop-bg-hover` is one ramp step lighter than
+   `--hop-bg` everywhere else this file uses it (`listview > row:hover`
+   above), and reusing that exact pair here keeps the row states reading
+   the same "one step up on hover" as the main list — a distinct,
+   panel-only ground one step *above* `--hop-bg` would have put the hover
+   state one step *below* the panel's own resting surface, inverting the
+   elevation cue decision 6 relies on everywhere else. No new colour token
+   was introduced to make this work; `--hop-bg` already existed with its
+   own contrast annotations in tokens.css's NEUTRAL RAMP comments
+   (16.87:1 dark / 15.64:1 light for `--hop-fg` against it), unchanged by
+   this rule, so `.hop-action-row-label`/`-kind` below need no new ratios
+   computed either — they render on the identical ground those ratios were
+   already computed against.
+
+   `{{hop-elev}}` and `{{hop-line}}` — named for reuse in this issue's own
+   brief, combined in one `box-shadow` the way no rule in this file has
+   before: `{{hop-elev}}` alone expands to its own two comma-separated
+   shadow layers (tokens.css's MATERIAL LAYERS comment), and this rule adds
+   a third, `inset 0 0 0 1px {{hop-line}}`, after it — the same inset-ring
+   shape `window.background`'s own `box-shadow` already uses for its
+   hairline, just riding alongside elevation in the same property instead
+   of being the property's only value. `tests/action_panel_material.rs`'s
+   broadway guard is what proves GTK 4.14 actually keeps all three layers
+   through a real `gtk::CssProvider` rather than silently dropping a shape
+   this file had not exercised before.
+
+   `{{hop-radius-lg}}` — the *window panel* radius (tokens.css's own
+   comment on that token), reused because this popup is, materially, a
+   second window panel, not a row-scaled element that would call for
+   `--hop-radius-md` instead.
+
+   `opacity: 0` here, and `.hop-action-panel.hop-action-panel-shown`'s
+   `opacity: 1` immediately below, are this issue's *real* open fade —
+   moved here from `popover.background` after that rule's own comment was
+   found to describe a mechanism GTK 4.14 does not have (see that rule's
+   own corrected comment for the full account, checked against
+   `gtk/gtkpopover.c` and `gtk/gtkwidget.c`). `opacity` is different from
+   `popover.background`'s own visibility: GTK's CSS style-property table
+   registers `opacity` as `GTK_STYLE_PROPERTY_ANIMATED`
+   (`gtk/gtkcssstylepropertyimpl.c`, the same registration
+   `listview > row`'s own ROW HOVER LIFT comment already cites for
+   `transform`/`box-shadow`), so a CSS transition on it *does* interpolate
+   — but only across two computed styles of a node that stays mapped the
+   whole time, the same constraint that comment documents for the hover
+   lift. `.hop-action-panel` (this rule) is the popover's child, and it is
+   *this* node — not the popover itself — whose class this file keys the
+   fade on: see `.hop-action-panel-shown`'s own comment immediately below
+   for why, and `apps/hop-gtk/src/ui/action_panel.rs`'s `PANEL_SHOWN_CLASS`
+   doc comment for the widget-side half of the mechanism.
+   ============================================================ */
+.hop-action-panel {
+  background-color: {{hop-bg}};
+  border-radius: {{hop-radius-lg}};
+  box-shadow: {{hop-elev}}, inset 0 0 0 1px {{hop-line}};
+  padding: {{hop-space-2}} 0;
+  opacity: 0;
+}
+
+/* ============================================================
+   .hop-action-panel.hop-action-panel-shown — issue #254 follow-up
+   The open fade itself: SPEC decision 2's "Open/close fade ... no panel
+   springs, nothing decorative," at issue #254's own ≤220ms ceiling for this
+   transition class (`--hop-duration-panel-open`'s own tokens.css comment
+   explains why that is a distinct ceiling from decision 2's ≤140ms
+   hover/selection figure, not the same one re-quoted).
+
+   Declared the same way `.hop-row-hint`/`.hop-row-hint-shown` above
+   declares issue #207's own hint entrance fade — base rule at `opacity: 0`,
+   `transition:` on the *entered* class alone, nothing on the base rule —
+   and for the identical reason given there: this is an entrance-only fade
+   by design, not a reversible affordance like the row hover lift. Removing
+   `.hop-action-panel-shown` (`ui::action_panel::ActionPanel::dismiss`) snaps
+   straight back to `opacity: 0` with no reverse animation, and that is
+   correct, not an oversight: `apps/hop-gtk/src/ui/action_panel.rs`'s own
+   module doc comment records that `gtk_popover_popdown()` unmaps the
+   widget synchronously in the same call (`gtk/gtkwidget.c`'s
+   `gtk_widget_hide()`, no frame-clock deferral) — the popover, and this
+   panel inside it, are gone from the screen before a single frame of any
+   dismiss transition could ever paint. A fade-out is not achievable here
+   without this module reinventing GTK's own popdown as a two-step
+   hide-after-timeout sequence, which is out of scope for this issue; the
+   honest choice is to animate the entrance only and say so, not to declare
+   a symmetrical-looking transition that dismissal can never actually play.
+
+   Why this rule's class lives on `.hop-action-panel` (the popover's child)
+   and not on `popover.background` (the popover node itself): the popover
+   node is what GTK maps/unmaps wholesale on `popup()`/`popdown()`, so a
+   transition declared there has no "already mapped, different style"
+   moment to interpolate across — the exact dead end `popover.background`'s
+   own corrected comment documents. `.hop-action-panel`, by contrast, stays
+   mapped for the entire time the popover is open; only *its own class*
+   changes underneath it, which is precisely the case
+   `gtk_css_animated_style_create_css_transitions`
+   (`gtk/gtkcssanimatedstyle.c` — see `listview > row`'s own comment for the
+   fuller citation of this function) can actually animate.
+
+   `apps/hop-gtk/src/ui/action_panel.rs`'s `ActionPanel::present` defers
+   adding this class by one turn of the main loop
+   (`glib::idle_add_local_once`) rather than adding it in the same call that
+   pops the popover up — read that module's own doc comment, "The state
+   class the stylesheet needs for its fade", for why: without the
+   deferral, the widget goes from unmapped straight to
+   mapped-with-`.hop-action-panel-shown`-already-on-it in one turn, so the
+   very first computed style it ever has *is* `opacity: 1`, with no earlier
+   `opacity: 0` moment for this transition to animate away from — a second,
+   different-looking way to write an inert fade, not a fix for the first
+   one. `tests/action_panel.rs`'s
+   `assert_present_defers_the_shown_class_until_the_widget_is_already_mapped`
+   pins that ordering directly, and `tests/action_panel_material.rs`'s own
+   motion test pins that this rule's `opacity`/`transition` values actually
+   differ between the base and shown states and between motion settings —
+   together, the two are meant to fail if either half of this mechanism
+   regresses back to inert.
+   ============================================================ */
+.hop-action-panel.hop-action-panel-shown {
+  opacity: 1;
+  transition: opacity {{motion:hop-duration-panel-open}} {{motion:hop-ease-out}};
+}
+
+/* ============================================================
+   .hop-action-panel-entry — issue #254
+   The panel's type-to-filter field (SPEC decision 5: "type-to-filter").
+   `font`/`color` reuse `--hop-text-title` and `--hop-fg` — the exact pair
+   `.hop-action-row-label` below renders with — so the text a user types and
+   the action names it filters share one scale; only the trailing kind hint
+   drops to the smaller hint scale (see that rule's own comment). Caret
+   colour reuses `{{hop-hint-accent}}`, the same semantic alias
+   `.hop-query-entry` above already uses for the launcher's own caret and
+   `.hop-row-hint-key` uses for the action-hint key glyph — both already on
+   this file's own record (issue #214, `.hop-row-hint-key`'s comment) for
+   why the semantic alias, never the bare `--hop-accent` ramp name, is the
+   only spelling that resolves correctly under `Palette::Light`. A blinking
+   caret is a state indicator, not body text, so it stays inside the
+   accent's three-element reservation (`tokens.css`'s own header) the same
+   way the query entry's caret already does.
+
+   `background-color`/`box-shadow`/`border` are neutralized for the same
+   "stop stock chrome showing through" reason POPOVER CHROME above gives:
+   `gtk::Entry`'s own default style paints a bordered, backgrounded pill
+   (Adwaita's ordinary text-entry look), which would read as a second boxed
+   control nested inside a panel already carrying its own hairline border —
+   a doubled-chrome outcome, not a missing one, so it gets the identical
+   treatment rather than being assumed away.
+   ============================================================ */
+.hop-action-panel-entry {
+  font: {{font:hop-text-title}};
+  color: {{hop-fg}};
+  caret-color: {{hop-hint-accent}};
+  background-color: transparent;
+  box-shadow: none;
+  border: none;
+  padding: {{hop-space-2}} {{hop-space-3}};
+}
+
+/* ============================================================
+   .hop-action-row / :hover / :selected — issue #254 (SPEC decisions 2, 5, 6)
+   One action row inside the panel's own list. No sixth class exists for
+   "hovered" or "selected" — the class contract this file styles against
+   fixes exactly five classes the widget sets, so hover and selection must
+   be, and are, read off GTK's own state pseudo-classes: `:hover` is tracked
+   by GTK for any realized widget with no cooperation required from
+   `ui::action_panel` at all, and `:selected` is the same `GTK_STATE_FLAG_
+   SELECTED` bit a real row-selection widget sets on itself that
+   `listview > row`'s own selection already rides on elsewhere in GTK's own
+   list widgets — this rule assumes nothing about *how* the widget marks a
+   row selected beyond that shared, ordinary GTK mechanism.
+
+   This issue's own brief names the two tokens to reuse for these two
+   states — `{{hop-bg-hover}}`, `{{hop-sel-fill}}` — precisely so this panel
+   "reads consistently with how list rows already do it": both are the
+   identical aliases `listview > row:hover` and `.hop-selection-indicator`
+   already consume, not a parallel pair invented for this one widget. The
+   hover rule goes one step further than a plain colour swap, reusing the
+   *entire* ROW HOVER LIFT mechanism above (`{{hop-elev}}` for the shadow,
+   `{{motion:hop-lift-transform}}` for the lift) rather than only its
+   colour half — "reads consistently" is read here as the same mechanism,
+   not merely a matching hue, the same way this file's own POPOVER CHROME
+   and PANEL SURFACE sections above already read decision 1's "layered
+   surface" as `window.background`'s own formula, not a look-alike. The
+   selected rule, by contrast, stays fill-only — no elevation — matching
+   `.hop-selection-indicator`'s own shape above (fill + radius, no shadow):
+   selection is a persistent state a user may leave a row in for a while,
+   not a transient pointer affordance, and this file's existing selection
+   indicator already establishes that persistent states don't lift.
+
+   `transition:` lives on the resting `.hop-action-row` rule, never on
+   `:hover`, for the exact reason `listview > row`'s own ROW HOVER LIFT
+   comment argues at length and checks against GTK 4.14.5's own source:
+   `gtk_css_animated_style_create_css_transitions` always reads
+   `transition-duration`/`-property`/`-timing-function` off the style being
+   transitioned *into*, so only a transition declared on the always-matching
+   base rule animates both the lift-in and the settle-back-out. A future
+   edit must not move it onto `:hover` "to simplify" — that would silently
+   reintroduce the one-directional snap that comment already rules out once,
+   for a state this rule's own contract, like the row lift's, is not scoped
+   to one direction.
+   ============================================================ */
+.hop-action-row {
+  border-radius: {{hop-radius-md}};
+  padding: 0 {{hop-space-3}};
+  transition: background-color {{motion:hop-duration-state}} {{motion:hop-ease-std}},
+              box-shadow {{motion:hop-duration-state}} {{motion:hop-ease-std}},
+              transform {{motion:hop-duration-state}} {{motion:hop-ease-std}};
+}
+
+.hop-action-row:hover {
+  background-color: {{hop-bg-hover}};
+  box-shadow: {{hop-elev}};
+  transform: {{motion:hop-lift-transform}};
+}
+
+.hop-action-row:selected {
+  background-color: {{hop-sel-fill}};
+}
+
+/* ============================================================
+   .hop-action-row-label / .hop-action-row-kind — issue #254
+   The action's own name (e.g. "Copy result") and a small trailing
+   kind/type hint (e.g. "calculator"). `.hop-action-row-label` shares
+   `--hop-text-title` and `--hop-fg` with `.hop-action-panel-entry` above —
+   see that rule's own comment for why the typed query and the action names
+   it filters are deliberately the same scale.
+
+   `.hop-action-row-kind` reuses `--hop-text-hint-label` and
+   `--hop-tracking-hint` — the exact pair `.hop-row-hint-label` above
+   already uses for a small, secondary, non-editable trailing hint — rather
+   than the smaller `--hop-text-hint-key`/mono treatment, since a "kind"
+   word (a provider name, a category) is prose, not the machine-text
+   TYPE SCALE reserves mono for. Colour is `{{hop-fg-2}}`, not `{{hop-fg-3}}`:
+   `{{hop-fg-3}}` is the ramp step already annotated 5.77:1 (dark) / 5.51:1
+   (light) against `--hop-bg`/`--hop-neutral-0-light` in tokens.css's own
+   NEUTRAL RAMP comments, and `.hop-action-panel` above renders on that
+   exact ground (see its own comment), so `{{hop-fg-3}}` would in fact still
+   clear 4.5:1 here — but this rule reaches for `{{hop-fg-2}}` regardless,
+   matching `.hop-row-subtitle`'s own precedent above of using the brighter
+   secondary tier for a row's own prose-bearing secondary text, and leaving
+   `{{hop-fg-3}}`'s dimmer tier for badge-like trailing text
+   (`.hop-mode-label`) rather than ordinary row content. No new colour ratio
+   is computed for either token here because neither is new and neither
+   renders on a new ground — both ratios above are the ones tokens.css
+   already carries.
+   ============================================================ */
+.hop-action-row-label {
+  font: {{font:hop-text-title}};
+  color: {{hop-fg}};
+}
+
+.hop-action-row-kind {
+  font: {{font:hop-text-hint-label}};
+  letter-spacing: {{hop-tracking-hint}};
+  color: {{hop-fg-2}};
 }
 
 /* ============================================================

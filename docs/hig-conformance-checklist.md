@@ -459,7 +459,9 @@ structural in hop."
 **Check.** From a cold launch, using no mouse input at all, confirm: results
 navigate (Up/Down/Page Up/Page Down/Home/End), the selected result executes
 (Enter), a row's secondary action is reachable (the configured
-`SecondaryAction` binding, `Menu` by default), a prefix completes (Tab by
+`SecondaryAction` binding, `ctrl+k` by default as of issue #254 — see
+`keymap::Action::default_spelling`'s own doc comment for why that replaced
+`Menu`), a prefix completes (Tab by
 default), and the window dismisses (Escape). Confirm the keymap is
 configurable via `config.toml` rather than hardcoded (issue #182), per D5's
 "already structural" claim. **Pass condition:** every action above is

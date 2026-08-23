@@ -229,13 +229,253 @@
 //! establishes the hint's base, un-shown `opacity: 0` state
 //! (`assets/stylesheet.css`'s `.hop-row-hint` rule), never the `-shown`
 //! modifier that actually triggers a transition.
+//!
+//! # Issue #254: clickable action icons — mouse parity of affordance
+//!
+//! SPEC decision 5/6 (`docs/design/2026-08-22-design-refresh/SPEC.md`) asks
+//! for "per-row action icons [that] appear on hover/selection for mouse"
+//! and, decision 6's own wording, "click an action icon = that exact
+//! action" — a *different* requirement from the hint above: the hint names
+//! one action (the default) as text, for keyboard users, unconditionally
+//! once bound; this is a small number of genuinely clickable buttons, for
+//! mouse users, that only appear while the pointer is over the row (or the
+//! row is the keyboard selection — see `assets/stylesheet.css`'s own
+//! `.hop-row-actions` comment for why hover *and* selection both matter).
+//!
+//! ## How many icons: [`ROW_ACTION_ICON_CAP`], not `item.actions.len()`
+//!
+//! See that constant's own doc comment for the bound and why it is fixed
+//! at 2, independent of how many actions a provider declares (up to
+//! [`hop_protocol::limits::MAX_ACTIONS_PER_ITEM`], 32) — the short version:
+//! one icon would only duplicate what clicking the row's own body already
+//! does (decision 6: "click row = default action"), two covers the default
+//! plus the next most useful action without needing a second, measurement-
+//! driven collapse the way [`should_show_label_chip`] needs for the hint,
+//! and the ctrl-K/right-click action panel (`ui::action_panel`, issue #254
+//! phase 1) is the deliberate, already-built overflow route for the rest —
+//! nothing an item can do becomes unreachable by mouse, only the long tail
+//! costs one more click or keystroke to reach.
+//!
+//! ## Which two: the first [`ROW_ACTION_ICON_CAP`] of `item.actions`, in
+//! wire order
+//!
+//! Not "the default action plus the next distinct one" — that would need
+//! [`default_action_label`]'s own id-search repeated here, and a provider
+//! is already free to put its most mouse-relevant actions first in
+//! `item.actions` if it wants them to be the ones a row surfaces (the wire
+//! protocol makes no promise that `default_action` is `actions[0]`, and
+//! this module does not invent one). [`resolve_action_icons`] is the one
+//! place this rule is applied; see its own doc comment.
+//!
+//! ## How a click runs the *right* action: a GAction target, not a
+//! `gtk::ListItem`-capturing closure
+//!
+//! A row's action-icon buttons are built exactly once, in [`build`], and
+//! rebound to a different item's different actions on every recycle — the
+//! identical constraint [`HINT_SHOWN_CLASS`]'s own doc comment describes
+//! for the hint, except here the data that must survive a recycle without
+//! going stale is not a boolean fade flag but *which item and which action*
+//! a click should send.
+//!
+//! An earlier draft of this doc comment claimed here that two shapes were
+//! considered and both dead-ended without `unsafe` GObject qdata, making
+//! the GAction shape below the only one that worked at all. That claim was
+//! false, and this crate's own `ui::view` module is what disproves it:
+//! issue #181's `ui::view::build` keeps the `&gtk::ListItem` GTK hands its
+//! `connect_setup` closure alive for that slot's entire recycled lifetime
+//! (GTK reuses the *same* `ListItem` object across every rebind of one
+//! visual row), and its `connect_bind`/`connect_unbind` closures call
+//! `list_item.item()` to read back whichever object is *currently* bound,
+//! decoded through [`crate::ui::model::item_of`]. A `connect_clicked`
+//! closure built once in [`build`] could equally have cloned that same
+//! `gtk::ListItem` handle — an ordinary, reference-counted GObject clone,
+//! not qdata or any interior-mutability trick of this crate's own — and,
+//! at click time, called `.item()` on it fresh to find out which item, and
+//! which `item.actions[slot]`, that click should send. No `Rc<RefCell<_>>`
+//! bridging one `build` call to a later `bind` call would even be needed:
+//! the `ListItem` itself is already the thing GTK keeps alive across the
+//! recycle. That shape is genuinely `unsafe`-free, exactly like the one
+//! actually used below — the choice between them was a design judgment,
+//! not a safety one, and the two shapes below are named for the judgment
+//! that separates them, not to claim only one of them could have worked.
+//!
+//! - **A `connect_clicked` closure capturing a cloned `gtk::ListItem`,
+//!   read back via `.item()` at click time.** Rejected on layering, not
+//!   safety: nothing under `ui::row` today — not [`build`], not [`bind`],
+//!   not [`unbind`] — takes or names a `gtk::ListItem` anywhere, and that
+//!   is this module's own boundary, drawn deliberately by issue #181 (see
+//!   this file's top doc comment, above): `ui::view` owns the
+//!   `GtkListView` factory and everything `gtk::ListItem`-shaped, and
+//!   dispatches down to this module's plain [`build`]/[`bind`]/[`unbind`]
+//!   functions with already-resolved, `gtk::ListItem`-free values (an
+//!   [`Item`], a `&gtk::Widget`) once it has done that resolving. Giving
+//!   [`build`] a `&gtk::ListItem` parameter so its buttons' closures could
+//!   hold onto it would thread a view-layer, list-recycling type into the
+//!   one module in this crate whose whole job is to not need to know that
+//!   machinery exists — an ongoing coupling cost paid on every later
+//!   change to how a row is built, not a one-time expedient.
+//! - **A [`gio::SimpleAction`] target, set via
+//!   [`gtk::prelude::ActionableExt::set_action_target_value`].** Chosen.
+//!   GTK's own `Actionable` interface already gives every widget an
+//!   `action-target` *property* — ordinary GObject state GTK stores and
+//!   retrieves for the widget itself, reachable from exactly the
+//!   `&gtk::Widget`/`&gtk::Box`-shaped functions this module already has
+//!   ([`bind`], via [`resolve_action_icons`]) — so this mechanism needs no
+//!   new parameter threaded through the `build`/`bind`/`unbind` boundary
+//!   the rejected shape above would require: [`resolve_action_icons`] can
+//!   simply call `set_action_target_value` again on every `bind`, exactly
+//!   like it already calls `set_icon_name`/`set_tooltip_text` on the same
+//!   button. [`build`] sets each button's `action-name` once
+//!   (`{{ROW_ACTION_GROUP_PREFIX}}.{{ROW_ACTION_NAME}}`, see those
+//!   constants' own doc comment) and never touches it again; only the
+//!   *target* — an `(item_id, action_id)` pair, packed as a `(String,
+//!   String)` [`glib::Variant`] via [`glib::variant::ToVariant`] — changes
+//!   per bind. `ui::window::HopWindow::build` is where the actual
+//!   [`gio::SimpleAction`] this name resolves to is registered, and where
+//!   the target is unpacked back into an [`hop_protocol::ItemId`]/
+//!   [`hop_protocol::ActionId`] pair and turned into an `IpcCommand::
+//!   Execute` — this module never imports `crate::ipc` to do any of that,
+//!   matching `ui::action_panel`'s own "this is the widget, not the
+//!   wiring" scope discipline.
+//!
+//! ## Icon glyph: derived from [`hop_protocol::ActionKind`], not carried
+//! on the wire
+//!
+//! [`hop_protocol::item::Action`] has no icon field of its own — only
+//! `id`, `kind`, and `label` (the same three fields
+//! `ui::action_panel::kind_hint` already maps `kind` off of, for that
+//! panel's own trailing kind hint). [`action_kind_icon_name`] is this
+//! module's own exhaustive mapping from [`ActionKind`] to a themed,
+//! symbolic icon name, deliberately mirroring [`resolve_icon`]'s own
+//! `IconSpec::Name` arm: [`gtk::Button::set_icon_name`] hands the lookup to
+//! GTK's icon theme the same way [`gtk::Image::set_icon_name`] already does
+//! for an item's own leading icon, and GTK's own documented fallback
+//! (`image-missing`-shaped) covers a theme that lacks the name — no second
+//! fallback mechanism is invented here for a Button that already has one.
+//!
+//! ## Issue #254 review, finding 4 (maintainer decision, 2026-08-23): the
+//! overflow chevron
+//!
+//! AC2 asks for "mouse parity of affordance, not just outcome" — every
+//! action clickable through a row hover icon *or* the ctrl-K/right-click
+//! panel. [`ROW_ACTION_ICON_CAP`]'s own doc comment already argues the
+//! panel is where the long tail past two icons goes, but a row whose item
+//! declares a third action gave a mouse user no on-row hint that a long
+//! tail exists at all — the panel was reachable, never discoverable, from
+//! the row itself. The maintainer's ruling: keep the 2-icon cap (unchanged
+//! by this finding), and add a third, trailing affordance — the overflow
+//! chevron below — that opens the panel, anchored at that point, whenever
+//! a row genuinely has more to offer than its two dedicated icons show.
+//!
+//! [`build`] appends this button as the *third* child of `actions_wrapper`,
+//! after the [`ROW_ACTION_ICON_CAP`] action-icon buttons and still inside
+//! the same `.hop-row-actions` wrapper those buttons already share — not a
+//! fourth, independent widget with a fade rule of its own. That placement
+//! is what this finding's own "fades in ... through the same pure-CSS
+//! state mechanism" requirement gets for free: `assets/stylesheet.css`'s
+//! `.hop-row-actions` opacity rule already keys off `listview > row:hover`/
+//! `:selected` with no Rust-driven class at all (see that rule's own
+//! comment for why), and every child of that wrapper — this one included —
+//! fades with it identically. Nothing new is needed on the Rust side to
+//! make the chevron fade; only [`resolve_overflow_button`] deciding whether
+//! it is visible *at all* for the currently bound item is new.
+//!
+//! ### When it shows: `item.actions.len() > `[`ROW_ACTION_ICON_CAP`]`, every
+//! bind, unconditionally
+//!
+//! [`resolve_overflow_button`] recomputes this fresh on every [`bind`], the
+//! same "no before/after comparison, just the current item's own length"
+//! discipline [`resolve_action_icons`]'s own "the recycling constraint"
+//! section already established for the two dedicated icons — not a
+//! variant of [`HINT_SHOWN_CLASS`]'s shown/hidden memory, because nothing
+//! here depends on what the *previous* bind on this recycled widget
+//! decided. A row recycled from a three-action item (chevron shown) onto a
+//! one-action item must show no chevron the instant it rebinds, and a
+//! plain, unconditional recomputation already guarantees that with no
+//! flag to forget to clear — see `tests/view_tree_renderer.rs`'s own
+//! "issue #254 review, finding 4" assertions, driven through the same
+//! 1→0→2→3→1-action recycling sequence that section's original coverage
+//! already binds one widget through.
+//!
+//! Exactly `>`, not `>=`: an item with precisely [`ROW_ACTION_ICON_CAP`]
+//! actions already has a dedicated icon for every one of them — showing a
+//! chevron there would open a panel listing nothing the row does not
+//! already offer directly, the exact "empty mystery box" shape
+//! `ui::action_panel`'s own "Zero actions" section refuses for a different
+//! reason. The chevron exists only for the genuine long tail.
+//!
+//! ### The glyph: `view-more-symbolic`, not anything from `mocks3.html`
+//!
+//! `docs/design/2026-08-22-design-refresh/mocks3.html`, the one approved
+//! frame this design refresh works from, never renders a row with more
+//! than two actions, so it names no glyph for this case at all. `view-more-
+//! symbolic` is chosen here instead: it is the symbolic icon GNOME's own
+//! icon themes ship specifically for an in-content "more options" overflow
+//! affordance (the horizontal-dots glyph GTK/GNOME apps already use for
+//! exactly this shape of "there is more here, click to see it" button),
+//! resolved through [`gtk::Button::set_icon_name`] the identical way
+//! [`action_kind_icon_name`]'s own icons are — GTK's own documented
+//! fallback covers a theme that lacks it, so no second fallback mechanism
+//! is invented here either. Set once, in [`build`]: unlike an action
+//! icon's glyph (one of seven [`ActionKind`]-derived names, chosen fresh
+//! per bind), this chevron always means the same thing regardless of which
+//! item is bound, so its icon name never needs to change.
+//!
+//! ### No new size or spacing literal
+//!
+//! The chevron reuses [`ACTION_ICON_CLASS`] (`assets/stylesheet.css`'s
+//! `.hop-row-action-icon`/`.hop-row-overflow-icon` rule pair — see that
+//! rule's own comment) for its size and hover treatment, and
+//! `actions_wrapper`'s own [`tokens::HINT_CHIP_GAP_PX`] gap (the
+//! `gtk::Box::new` constructor argument, already applied uniformly between
+//! every child that wrapper holds) for its spacing from the icon before
+//! it — both already-declared tokens, spent again rather than a third
+//! value invented for what is, visually, the same size of button in the
+//! same row.
+//!
+//! ### A second GAction, not a third `(item_id, action_id)` target
+//!
+//! The chevron does not run an action — it opens [`ui::action_panel`] for
+//! this row's *item*, so its own GAction target is a bare item id
+//! ([`ROW_OPEN_ACTIONS_TARGET_TYPE`], `"s"`), not the `(ss)` pair
+//! [`ROW_ACTION_TARGET_TYPE`] names for [`ROW_ACTION_NAME`]. Reusing
+//! `ROW_ACTION_NAME` with a synthetic, meaningless action id in the second
+//! slot of that same pair would be dishonest about what the click actually
+//! does and would need `ui::window::HopWindow`'s own handler to
+//! special-case that fake id — a second GAction,
+//! [`ROW_OPEN_ACTIONS_NAME`] ("open-actions"), installed under the same
+//! [`ROW_ACTION_GROUP_PREFIX`] group, says plainly that this button does a
+//! *different* thing, with a parameter type that only ever holds what that
+//! different thing needs. `ui::window::HopWindow::build` is, again, where
+//! this name resolves to a real `gio::SimpleAction`, and where clicking it
+//! is turned into the same select-then-present path a right-click already
+//! uses ([`ui::window::HopWindow::present_action_panel_for_selected`]) —
+//! this module never imports `ui::action_panel` or `crate::ipc` to do any
+//! of that, the identical "this is the widget, not the wiring" boundary
+//! its dedicated action icons already keep.
+//!
+//! ## No text selection inside these rows
+//!
+//! SPEC decision 6, verbatim: "no text selection inside rows (the copy
+//! action owns that)." [`gtk::Label`]'s own documented default for
+//! `selectable` is already `false`, so [`title_widget`]'s and
+//! [`subtitle_widget`]'s labels were never selectable — but [`build`] now
+//! sets `set_selectable(false)` on both explicitly rather than leaning on
+//! that default silently, the identical judgment
+//! `ui::action_panel::ActionPanel::reset_selection`'s own doc comment
+//! already makes for a different GTK default ("state this crate's contract
+//! explicitly rather than lean on a GTK default's incidental behavior").
+//! The hint's two chips get the same explicit call for the same reason,
+//! even though their text is short-lived and unlikely to be dragged over
+//! by accident.
 
 use std::io::Read;
 
+use glib::variant::ToVariant;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 
-use hop_protocol::{IconPath, IconSpec, Item, ItemSubtitle};
+use hop_protocol::{ActionKind, IconPath, IconSpec, Item, ItemSubtitle};
 
 use crate::icon_roots;
 use crate::tokens;
@@ -343,6 +583,131 @@ const HINT_LABEL_CHILD_NAME: &str = "hop-row-hint-label";
 /// proportional one.
 const HINT_KEY_CHILD_NAME: &str = "hop-row-hint-key";
 
+/// The maximum number of an item's actions that get a dedicated, always-
+/// built row icon — this module's top doc comment, "Issue #254: clickable
+/// action icons", "How many icons" section, has the full argument; this is
+/// the short version pinned as a named constant rather than a bare literal
+/// wherever a slot count is needed below.
+///
+/// [`hop_protocol::limits::MAX_ACTIONS_PER_ITEM`] permits up to 32 actions
+/// per item; a row is a fixed, 56px-tall (`tokens::ROW_HEIGHT_PX`) band
+/// that already carries a leading icon, a title, a subtitle, and the
+/// hint's two chips, all sized and positioned before any item is ever
+/// bound (this module's "fixed-height reserved rows" and "the icon slot"
+/// sections) — 32 icon buttons would neither fit nor read as affordance,
+/// and worse, would make the row's own reserved trailing width a function
+/// of `item.actions.len()`, which every other element of this widget goes
+/// out of its way *not* to be.
+///
+/// Fixed at exactly **2**: one icon alone would only ever mirror what
+/// clicking the row's own body already does (SPEC decision 6: "click row =
+/// default action"), buying no new affordance. A second slot gives mouse
+/// users a one-click path to whichever action `item.actions` lists next
+/// (see [`resolve_action_icons`]'s own doc comment for exactly which two),
+/// without this module needing a [`should_show_label_chip`]-shaped
+/// measured collapse to decide how many fit — a fixed count of built
+/// widgets, hidden per [`resolve_action_icons`] rather than reflowed, is
+/// enough because two 26px (`tokens::ICON_SIZE_PX`) buttons plus their gap
+/// never come close to contending with the hint's own responsive-collapse
+/// budget. Every action beyond this cap — on any item that has more than
+/// two — is still reachable, in full, through `ui::action_panel`'s already-
+/// built ctrl-K/right-click panel; this cap only ever decides how many get
+/// a *dedicated row icon*, never how many are runnable at all.
+pub const ROW_ACTION_ICON_CAP: usize = 2;
+
+/// The GAction group prefix and bare action name every action-icon button
+/// [`build`] constructs invokes on click (composed together, see
+/// [`build`]'s own call site) — spelled once here rather than as a literal
+/// at the two places that must agree on it: this module's [`build`], which
+/// calls [`gtk::prelude::ActionableExt::set_action_name`] with the composed
+/// string, and `ui::window::HopWindow::build`, which registers the
+/// `gio::SimpleAction` this prefix and name resolve to and installs it
+/// under this exact prefix via `gtk::prelude::WidgetExt::insert_action_group`.
+/// The same "one name, spelled once" discipline [`SUBTITLE_CHILD_NAME`]'s
+/// own doc comment argues for a widget-name/CSS-class pair, applied here to
+/// a GAction prefix/name pair instead. See this module's top doc comment,
+/// "How a click runs the right action", for why a GAction — rather than a
+/// `connect_clicked` closure with its own separately-tracked mutable state —
+/// is the mechanism at all.
+pub const ROW_ACTION_GROUP_PREFIX: &str = "row";
+/// The bare action name half of the pair [`ROW_ACTION_GROUP_PREFIX`]'s own
+/// doc comment describes.
+pub const ROW_ACTION_NAME: &str = "run-action";
+
+/// The GVariant type string every action-icon button's own action target
+/// carries — an `(item_id, action_id)` pair of strings, per this module's
+/// top doc comment, "How a click runs the right action". Named once here so
+/// [`build`]'s own `glib::VariantTy::new` call and
+/// `ui::window::HopWindow::build`'s matching `gio::SimpleAction::new` call
+/// (which must declare the identical parameter type for the action to ever
+/// activate at all) read off the same string rather than two hand-typed
+/// copies of `"(ss)"` that could silently drift apart.
+pub const ROW_ACTION_TARGET_TYPE: &str = "(ss)";
+
+/// The widget name **and** CSS class [`build`] gives the wrapper `gtk::Box`
+/// holding the row's action-icon buttons — the doubled-identity precedent
+/// [`SUBTITLE_CHILD_NAME`]'s own doc comment documents, applied here so
+/// `assets/stylesheet.css`'s `.hop-row-actions` rule (the hover/selection
+/// fade — see that rule's own comment for why this is plain `:hover`/
+/// `:selected`, with no Rust-driven "-shown" class the way [`HINT_CHILD_NAME`]
+/// needs one) has a selector, and [`find_named_child`] has a name, from one
+/// string rather than two that could drift.
+const ACTIONS_CHILD_NAME: &str = "hop-row-actions";
+
+/// The CSS class every action-icon button carries, shared across all
+/// [`ROW_ACTION_ICON_CAP`] of them — unlike [`HINT_LABEL_CHILD_NAME`]/
+/// [`HINT_KEY_CHILD_NAME`], which need two *different* classes because the
+/// label and key chips carry two different typographic treatments, every
+/// action-icon button gets the identical visual treatment
+/// (`assets/stylesheet.css`'s `.hop-row-action-icon` rule), so one shared
+/// class is the right shape here, not one class per button. Each button
+/// still gets its own, *distinct* widget name — see
+/// [`action_icon_widget_name`] — since a shared name would make
+/// [`find_named_child`] unable to tell the buttons apart at all.
+const ACTION_ICON_CLASS: &str = "hop-row-action-icon";
+
+/// The widget name **and** CSS class of the trailing overflow chevron —
+/// issue #254 review, finding 4 (this module's top doc comment, "the
+/// overflow chevron", has the full account). Doubled identity, the same
+/// [`SUBTITLE_CHILD_NAME`] precedent every other named-and-styled child in
+/// this module already follows: [`find_named_child`] needs the name,
+/// `assets/stylesheet.css`'s `.hop-row-overflow-icon` rule needs the class.
+/// This button also carries [`ACTION_ICON_CLASS`] (see [`build`]) for the
+/// size/hover treatment it shares with the two dedicated action icons —
+/// this second class is what lets a future rule style the chevron alone
+/// without touching that shared one.
+const OVERFLOW_CHILD_NAME: &str = "hop-row-overflow-icon";
+
+/// The symbolic icon name [`build`] gives the overflow chevron — see this
+/// module's top doc comment, "The glyph: `view-more-symbolic`", for why
+/// this exact name and why it is set once, in [`build`], rather than
+/// re-resolved on every [`bind`] the way [`action_kind_icon_name`]'s
+/// per-action icons are.
+const OVERFLOW_ICON_NAME: &str = "view-more-symbolic";
+
+/// The tooltip [`build`] gives the overflow chevron — fixed, unlike an
+/// action icon's own tooltip (that exact action's label): this button
+/// always does the same thing regardless of which item is bound, so its
+/// tooltip never needs to change on [`bind`] either.
+const OVERFLOW_TOOLTIP: &str = "More actions";
+
+/// The GAction name the overflow chevron invokes — see this module's top
+/// doc comment, "A second GAction, not a third `(item_id, action_id)`
+/// target", for why this is a distinct action from [`ROW_ACTION_NAME`]
+/// rather than a second, synthetic entry sharing its target shape.
+/// Composed with [`ROW_ACTION_GROUP_PREFIX`] the identical way
+/// [`ROW_ACTION_NAME`] is, by [`build`] and by
+/// `ui::window::HopWindow::build`, which must agree on the same string.
+pub const ROW_OPEN_ACTIONS_NAME: &str = "open-actions";
+
+/// The GVariant type string the overflow chevron's own action target
+/// carries — a bare item id, unlike [`ROW_ACTION_TARGET_TYPE`]'s
+/// `(item_id, action_id)` pair, because opening the panel for an item
+/// needs no particular action singled out. Named once here for the same
+/// "one string, not two hand-typed copies" reason [`ROW_ACTION_TARGET_TYPE`]
+/// is.
+pub const ROW_OPEN_ACTIONS_TARGET_TYPE: &str = "s";
+
 /// The `Row` page's leading icon, reached out of `container` (the `gtk::Box`
 /// [`build`] returns) by the name [`build`] gave it — see [`find_named_child`]
 /// for why a name search is used instead of trusting append order.
@@ -397,6 +762,42 @@ pub fn hint_key_widget(container: &gtk::Box) -> Option<gtk::Label> {
     find_named_child(container, HINT_KEY_CHILD_NAME)
 }
 
+/// The action-icons wrapper — the `gtk::Box` `assets/stylesheet.css`'s
+/// `.hop-row-actions` rule fades in and out, added by issue #254.
+pub fn action_icons_widget(container: &gtk::Box) -> Option<gtk::Box> {
+    find_named_child(container, ACTIONS_CHILD_NAME)
+}
+
+/// The widget name [`build`] gives the `slot`-th action-icon button
+/// (`slot` in `0..ROW_ACTION_ICON_CAP`) — computed from `slot` rather than
+/// drawn from a fixed list of named constants, so [`ROW_ACTION_ICON_CAP`]
+/// stays the *one* place this row's icon count is decided: bumping it
+/// needs no matching bump to a hand-written list of name constants here.
+/// [`find_named_child`] still resolves each button by this exact string —
+/// the same "name, not position" discipline every other named child in
+/// this module already follows, only computed rather than hand-spelled.
+fn action_icon_widget_name(slot: usize) -> String {
+    format!("hop-row-action-icon-{}", slot + 1)
+}
+
+/// The row's `slot`-th action-icon button (`slot` in
+/// `0..ROW_ACTION_ICON_CAP`), or `None` if `slot` is out of range or the
+/// widget cannot be found. `pub` for the same reason [`icon_widget`] is:
+/// `tests/view_tree_renderer.rs` and this module's own `#[cfg(test)]`
+/// module both need to reach the exact widget instance [`bind`]/[`unbind`]
+/// mutate, rather than a second, independently-derived handle to it.
+pub fn action_icon_widget(container: &gtk::Box, slot: usize) -> Option<gtk::Button> {
+    find_named_child(container, &action_icon_widget_name(slot))
+}
+
+/// The row's trailing overflow chevron — issue #254 review, finding 4.
+/// `pub` for the same reason [`action_icon_widget`] is:
+/// `tests/view_tree_renderer.rs` reaches this exact widget instance
+/// [`resolve_overflow_button`]/[`clear_overflow_button`] mutate.
+pub fn overflow_button_widget(container: &gtk::Box) -> Option<gtk::Button> {
+    find_named_child(container, OVERFLOW_CHILD_NAME)
+}
+
 /// Builds one `Row` node's widget: a horizontal `gtk::Box` holding a
 /// leading icon and a title, sized to [`tokens::ROW_HEIGHT_PX`] before any
 /// item is known — see this module's "fixed-height reserved rows" and "the
@@ -432,6 +833,13 @@ pub fn build() -> gtk::Box {
     title.set_widget_name(TITLE_CHILD_NAME);
     title.set_xalign(0.0);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    // SPEC decision 6: "no text selection inside rows (the copy action
+    // owns that)." `gtk::Label`'s own documented default for `selectable`
+    // is already `false`, so this is not changing this label's behaviour —
+    // it is stating the contract explicitly rather than leaning on that
+    // default silently, the same judgment this module's top doc comment's
+    // "No text selection inside these rows" section names.
+    title.set_selectable(false);
     text_column.append(&title);
 
     // The subtitle label — created once here, never in `bind`, per this
@@ -446,9 +854,113 @@ pub fn build() -> gtk::Box {
     subtitle.set_xalign(0.0);
     subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
     subtitle.set_visible(false);
+    // See `title.set_selectable(false)`'s own comment just above — the
+    // identical explicit statement of SPEC decision 6's "no text selection
+    // inside rows", applied to the row's other prose label.
+    subtitle.set_selectable(false);
     text_column.append(&subtitle);
 
     container.append(&text_column);
+
+    // The action-icon buttons — issue #254. A third direct child of the
+    // outer horizontal `container`, appended *before* `hint` below (not
+    // nested inside `text_column`, for the identical reason `hint` itself
+    // is not — see this module's "Issue #197" doc section above): both are
+    // trailing, vertically-centred affordances at the row's own trailing
+    // edge, not more lines of the title/subtitle stack. `text_column`'s own
+    // `hexpand(true)` (set above) still supplies every pixel neither the
+    // icon slot, this wrapper, nor `hint` claims.
+    //
+    // See this module's top doc comment, "Issue #254: clickable action
+    // icons", for why exactly `ROW_ACTION_ICON_CAP` buttons are built here,
+    // why each one's action-*name* is fixed at build time while its
+    // action-*target* is the only thing `bind` ever changes, and why a
+    // GAction target — not a `connect_clicked` closure capturing a cloned
+    // `gtk::ListItem` — is the mechanism chosen here: both are `unsafe`-free,
+    // and the doc comment linked above names the real (layering, not
+    // safety) reason this one won.
+    let actions_wrapper = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::HINT_CHIP_GAP_PX);
+    actions_wrapper.set_widget_name(ACTIONS_CHILD_NAME);
+    actions_wrapper.add_css_class(ACTIONS_CHILD_NAME);
+    actions_wrapper.set_valign(gtk::Align::Center);
+    // Reusing the hint's own start-margin token rather than inventing a
+    // second one for an identical concept ("the gap between the text
+    // column and the next trailing element") — see `tokens::
+    // HINT_MARGIN_START_PX`'s own doc comment; nothing about that value is
+    // hint-specific in `tokens.css` itself (it resolves `--hop-space-3`,
+    // the generic spacing scale), only its Rust name is.
+    actions_wrapper.set_margin_start(*tokens::HINT_MARGIN_START_PX);
+
+    let row_action_full_name = format!("{ROW_ACTION_GROUP_PREFIX}.{ROW_ACTION_NAME}");
+    for slot in 0..ROW_ACTION_ICON_CAP {
+        let button = gtk::Button::new();
+        button.set_widget_name(&action_icon_widget_name(slot));
+        button.add_css_class(ACTION_ICON_CLASS);
+        // A plain icon-only affordance, not GTK's own raised button chrome
+        // — `.flat` is the standard GNOME idiom for exactly this shape of
+        // small, in-content clickable icon (a toolbar button, a list row's
+        // own inline action), and `assets/stylesheet.css` carries no rule
+        // of its own for a bare `button`/`.flat` that this could collide
+        // with (checked: this file declares neither selector anywhere
+        // before this issue).
+        button.add_css_class("flat");
+        // Hidden until `bind`/`resolve_action_icons` decides this slot has
+        // a real action for the bound item — "hide, don't reserve", this
+        // module's own precedent (see "The absent case" section above) for
+        // every other optional row element: a freshly built row's very
+        // first bind might resolve to zero or one action, and this button
+        // must occupy no space, and be un-clickable, before that decision
+        // has ever been made even once.
+        button.set_visible(false);
+        // The action *name* is fixed here, once, and [`bind`] never
+        // touches it again — only the action *target*
+        // ([`resolve_action_icons`], every bind) changes per rebind. See
+        // [`ROW_ACTION_GROUP_PREFIX`]'s own doc comment for why a GAction,
+        // whose `action-target` property GTK itself stores and hands back
+        // per widget instance, is the mechanism this module uses to make
+        // that split possible with no new parameter threaded through the
+        // `build`/`bind`/`unbind` boundary — not the only `unsafe`-free
+        // shape available, per that doc comment's own account.
+        button.set_action_name(Some(&row_action_full_name));
+        actions_wrapper.append(&button);
+    }
+
+    // The overflow chevron — issue #254 review, finding 4. A third child
+    // of `actions_wrapper`, after the `ROW_ACTION_ICON_CAP` action-icon
+    // buttons above and inside the same wrapper (not a fourth, standalone
+    // widget) so it fades in and out with them through the identical,
+    // Rust-bookkeeping-free `.hop-row-actions` opacity rule — see this
+    // module's top doc comment, "the overflow chevron", for the full
+    // account of why this button lives here rather than beside `hint`.
+    let overflow_button = gtk::Button::new();
+    overflow_button.set_widget_name(OVERFLOW_CHILD_NAME);
+    overflow_button.add_css_class(OVERFLOW_CHILD_NAME);
+    // The same shared size/hover treatment the two action icons above
+    // carry — see [`OVERFLOW_CHILD_NAME`]'s own doc comment for why this
+    // button carries both classes rather than only its own.
+    overflow_button.add_css_class(ACTION_ICON_CLASS);
+    overflow_button.add_css_class("flat");
+    // Hidden until `bind`/`resolve_overflow_button` decides the bound item
+    // genuinely has more actions than `ROW_ACTION_ICON_CAP` — "hide, don't
+    // reserve", the identical precedent every other optional row element
+    // in this module already follows.
+    overflow_button.set_visible(false);
+    // The icon and tooltip are fixed here, once, and never change on any
+    // later `bind` — see [`OVERFLOW_ICON_NAME`]'s and [`OVERFLOW_TOOLTIP`]'s
+    // own doc comments for why, unlike an action icon's own per-action
+    // glyph and label.
+    overflow_button.set_icon_name(OVERFLOW_ICON_NAME);
+    overflow_button.set_tooltip_text(Some(OVERFLOW_TOOLTIP));
+    // Only the action *target* — this row's own item id, alone, see
+    // [`ROW_OPEN_ACTIONS_TARGET_TYPE`]'s own doc comment — changes per
+    // bind, via [`resolve_overflow_button`]; the action *name* is fixed
+    // here, exactly like the two dedicated action-icon buttons above.
+    overflow_button.set_action_name(Some(&format!(
+        "{ROW_ACTION_GROUP_PREFIX}.{ROW_OPEN_ACTIONS_NAME}"
+    )));
+    actions_wrapper.append(&overflow_button);
+
+    container.append(&actions_wrapper);
 
     // The action hint — issue #197. A third, direct child of the outer
     // horizontal `container`, a sibling of `icon` and `text_column`, never
@@ -485,12 +997,17 @@ pub fn build() -> gtk::Box {
     hint_label.set_widget_name(HINT_LABEL_CHILD_NAME);
     hint_label.add_css_class(HINT_LABEL_CHILD_NAME);
     hint_label.set_visible(false);
+    // See `title.set_selectable(false)`'s own comment above — SPEC
+    // decision 6's "no text selection inside rows", stated explicitly for
+    // this chip too rather than left to `gtk::Label`'s own default.
+    hint_label.set_selectable(false);
     hint.append(&hint_label);
 
     let hint_key = gtk::Label::new(None);
     hint_key.set_widget_name(HINT_KEY_CHILD_NAME);
     hint_key.add_css_class(HINT_KEY_CHILD_NAME);
     hint_key.set_visible(false);
+    hint_key.set_selectable(false);
     hint.append(&hint_key);
 
     container.append(&hint);
@@ -747,6 +1264,119 @@ pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str
         let now_shown = hint_key.is_visible();
         sync_hint_shown_class(&hint, was_shown, now_shown);
     }
+    resolve_action_icons(container, item);
+    resolve_overflow_button(container, item);
+}
+
+/// Maps an [`ActionKind`] to a themed, symbolic icon name — this module's
+/// top doc comment, "Icon glyph", has the full argument for why this is
+/// derived rather than carried on the wire, and why no fallback beyond
+/// GTK's own is needed here. Deliberately exhaustive, no `_` arm: a future
+/// `ActionKind` variant fails this match at compile time rather than
+/// silently rendering a blank icon — the identical discipline
+/// `ui::action_panel::kind_hint` already applies to the same enum, for the
+/// same enum-completeness reason.
+fn action_kind_icon_name(kind: &ActionKind) -> &'static str {
+    match kind {
+        ActionKind::Open => "document-open-symbolic",
+        ActionKind::Focus => "view-restore-symbolic",
+        ActionKind::Copy => "edit-copy-symbolic",
+        ActionKind::Run => "system-run-symbolic",
+        ActionKind::CloseWindow => "window-close-symbolic",
+        ActionKind::MoveToWorkspace => "view-grid-symbolic",
+        ActionKind::OpenUrl => "external-link-symbolic",
+    }
+}
+
+/// Populates every one of this row's `ROW_ACTION_ICON_CAP` action-icon
+/// buttons from `item.actions`, in wire order — this module's top doc
+/// comment, "Which two", is the argument for why the first
+/// [`ROW_ACTION_ICON_CAP`] actions in that order, not a default-action
+/// search: slot `n` gets `item.actions[n]` when it exists (icon, tooltip,
+/// and the `(item_id, action_id)` GAction target a click sends — see
+/// [`ROW_ACTION_GROUP_PREFIX`]'s own doc comment), and is hidden and
+/// cleared via [`clear_action_icon`] when it does not, exactly the "hide,
+/// don't reserve" rule this module already applies to the subtitle and the
+/// hint's own chips.
+///
+/// # The recycling constraint
+///
+/// A row bound to a three-action item and later recycled onto a one-action
+/// item must not go on offering the second action after that rebind — the
+/// same "a recycled row does not carry stale [content]" hazard this
+/// module's own "build and bind do not blindly animate" section warns
+/// about for a different mechanism. Unlike [`HINT_SHOWN_CLASS`], no
+/// before/after comparison is needed here to get that right: every slot's
+/// button is either given `item.actions[slot]`'s real data or explicitly
+/// cleared, unconditionally, on every single bind — there is no shown/
+/// hidden *history* this function needs to consult, only `item.actions`'s
+/// current length against `slot`.
+fn resolve_action_icons(container: &gtk::Box, item: &Item) {
+    for slot in 0..ROW_ACTION_ICON_CAP {
+        let Some(button) = action_icon_widget(container, slot) else {
+            continue;
+        };
+        match item.actions.get(slot) {
+            Some(action) => {
+                button.set_icon_name(action_kind_icon_name(&action.kind));
+                button.set_tooltip_text(Some(action.label.as_str()));
+                button.set_action_target_value(Some(
+                    &(item.id.as_str(), action.id.as_str()).to_variant(),
+                ));
+                button.set_visible(true);
+            }
+            None => clear_action_icon(&button),
+        }
+    }
+}
+
+/// Hides one action-icon button and clears everything [`resolve_action_icons`]
+/// can set on it — [`unbind`]'s own symmetry rule ("every property `bind`
+/// can set here, `unbind` resets") applied to this widget, and
+/// [`resolve_action_icons`]'s own "does not exist for this item" branch.
+/// Clearing the action target specifically (`set_action_target_value(None)`)
+/// is the load-bearing half: an invisible, un-clickable button cannot be
+/// clicked by a real pointer, but leaving a stale target on it would still
+/// be exactly the kind of "holds stale application data it should not
+/// have" this module's own `unbind` doc comment calls out, defensive
+/// rather than reachable in practice.
+fn clear_action_icon(button: &gtk::Button) {
+    button.set_visible(false);
+    button.set_tooltip_text(None);
+    button.set_action_target_value(None);
+    button.set_icon_name("");
+}
+
+/// Shows or hides the row's overflow chevron for the currently bound
+/// `item` — issue #254 review, finding 4. See this module's top doc
+/// comment, "When it shows", for why `item.actions.len() >
+/// ROW_ACTION_ICON_CAP` (strictly greater, not `>=`) is the one condition
+/// checked, recomputed fresh on every single [`bind`] with no shown/hidden
+/// memory carried from the previous one — the identical "no before/after
+/// comparison, just the current item's own shape" discipline
+/// [`resolve_action_icons`]'s own "the recycling constraint" section
+/// already establishes for the two dedicated action icons, applied here to
+/// a third, boolean decision instead of a per-slot one.
+fn resolve_overflow_button(container: &gtk::Box, item: &Item) {
+    let Some(button) = overflow_button_widget(container) else {
+        return;
+    };
+    if item.actions.len() > ROW_ACTION_ICON_CAP {
+        button.set_action_target_value(Some(&item.id.as_str().to_variant()));
+        button.set_visible(true);
+    } else {
+        clear_overflow_button(&button);
+    }
+}
+
+/// Hides the overflow chevron and clears its action target —
+/// [`resolve_overflow_button`]'s own "does not apply to this item" branch,
+/// and [`unbind`]'s symmetry rule applied to this button, the identical
+/// shape [`clear_action_icon`] already gives the two dedicated action
+/// icons.
+fn clear_overflow_button(button: &gtk::Button) {
+    button.set_visible(false);
+    button.set_action_target_value(None);
 }
 
 /// Whether a hint that was in `was_shown`'s state before this bind and is
@@ -1093,6 +1723,14 @@ pub fn unbind(widget: &gtk::Widget) {
         (hint_label_widget(container), hint_key_widget(container))
     {
         clear_hint(&hint_label, &hint_key);
+    }
+    for slot in 0..ROW_ACTION_ICON_CAP {
+        if let Some(button) = action_icon_widget(container, slot) {
+            clear_action_icon(&button);
+        }
+    }
+    if let Some(button) = overflow_button_widget(container) {
+        clear_overflow_button(&button);
     }
 }
 
