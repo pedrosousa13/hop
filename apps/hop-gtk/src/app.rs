@@ -327,8 +327,13 @@ fn run_interactive(socket_path: PathBuf, keymap: crate::keymap::Keymap) -> ExitC
         }
 
         let (cmd_tx, evt_rx) = ipc::spawn(socket_path.clone());
-        let window =
-            ui::window::HopWindow::build(app, cmd_tx, keymap.clone(), resolve_overlay_strategy());
+        let window = ui::window::HopWindow::build(
+            app,
+            cmd_tx,
+            keymap.clone(),
+            resolve_overlay_strategy(),
+            ui::window::RunPurpose::Interactive,
+        );
         window.present_with_token(activation_token.as_deref());
 
         glib::spawn_future_local({
@@ -426,6 +431,13 @@ fn run_screenshot(
                 cmd_tx.clone(),
                 keymap.clone(),
                 resolve_overlay_strategy(),
+                // Issue #261 AC3: a capture harness has no user to dismiss
+                // for, so close-on-focus-loss must not be wired onto its
+                // window at all. (Reproducing the CI flake locally showed a
+                // separate latent payoff: a background focus loss really did
+                // hide a wired capture window and hang the run to its own
+                // timeout — not the reported signature, but gone all the same.)
+                ui::window::RunPurpose::Screenshot,
             );
             window.present_with_token(None);
 

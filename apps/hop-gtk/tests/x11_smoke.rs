@@ -42,6 +42,9 @@
 //! duplication is the established, documented pattern here.
 #![allow(clippy::unwrap_used)]
 
+use std::io::Read as _;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -69,53 +72,84 @@ struct XvfbServer {
 }
 
 impl XvfbServer {
-    /// Spawns Xvfb on the first free display number tried, or `None` when
-    /// the `Xvfb` binary is not installed — the documented skip condition.
+    /// Spawns `Xvfb`, or `None` when the `Xvfb` binary is not installed —
+    /// the documented skip condition.
     ///
-    /// Display numbers derive from this process's pid (the same trick
-    /// `BroadwayServer::start` uses) so parallel test invocations do not
-    /// collide; a stale lock file from a previous crashed run is skipped
-    /// over rather than removed, since deleting another live server's lock
-    /// file would be worse than trying the next number.
+    /// # Why `-displayfd`, not a guessed display number (issue #261)
+    ///
+    /// An earlier revision derived candidate display numbers from this
+    /// process's pid and probed `/tmp/.X11-unix/X{n}-lock` before claiming
+    /// one. Under CI's default parallelism every `#[test]` fn in this binary
+    /// runs as a thread of the *same* process — the same pid, therefore the
+    /// same candidate list — so two concurrent tests could both observe "no
+    /// lock yet" and both spawn on the same number. The loser exits, but
+    /// Xvfb startup is slow enough on a loaded runner that its owner's fixed
+    /// 400 ms liveness check could see it still alive, adopt it, and then
+    /// sit out the rest of the test on a server that was about to die — or
+    /// worse, find the *winner's* socket already present and conclude its
+    /// own doomed server had come up. When the winner's owner finished and
+    /// dropped its server, the loser's `hop-gtk` subprocess lost its X
+    /// connection mid-run — GDK's X11 IO-error handler reports that with a
+    /// `g_debug` (silent unless `G_MESSAGES_DEBUG` names the domain) and
+    /// `_exit(1)` — producing exactly the flake's signature: exit 1, no
+    /// error print, both deadlines unexpired.
+    ///
+    /// `-displayfd n` hands the whole question to the people who own the
+    /// race: the server probes for a free display itself and writes the
+    /// number it bound to file descriptor `n` once it is ready to accept
+    /// connections (the same mechanism `xvfb-run` uses). Display numbers
+    /// stop being guessed entirely; two servers cannot collide because the
+    /// kernel refuses the second bind rather than a lock-file heuristic.
     fn start() -> Option<Self> {
         let xvfb = find_in_path("Xvfb")?;
-        let base = 100 + (std::process::id() % 5000);
-        for offset in 0..8 {
-            let display = base + offset;
-            let lock = PathBuf::from(format!("/tmp/.X11-unix/X{display}-lock"));
-            if lock.exists() {
-                continue;
+        // The write half travels to the child as its *stdin* (`-displayfd 0`
+        // reads the descriptor number it is given, and fd 0 is whatever we
+        // hand `stdin()`): std's `Command` has no pass-fds mechanism, and
+        // mapping an owned descriptor onto one of the three standard slots
+        // is the supported way to inherit one. Xvfb only ever writes the
+        // display number to it — never reading — so stdin is as good a slot
+        // as any.
+        let (mut reader, writer) =
+            UnixStream::pair().expect("creating the displayfd socketpair must not fail");
+        let mut child = Command::new(&xvfb)
+            .arg("-displayfd")
+            .arg("0")
+            // An explicit screen: 24-bit depth, a size comfortably larger
+            // than the overlay, and no TCP listener — the test talks to
+            // the server over its Unix socket only.
+            .args(["-screen", "0", "1280x1024x24", "-nolisten", "tcp"])
+            .stdin(Stdio::from(OwnedFd::from(writer)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Xvfb was found on $PATH but could not be spawned");
+
+        // Xvfb writes the decimal display number plus newline once the
+        // server is accepting connections. Reading it back is the readiness
+        // signal — no separate socket poll is needed, and unlike a sleep-
+        // and-hope check this cannot report ready before the fact.
+        reader
+            .set_nonblocking(true)
+            .expect("setting the displayfd reader non-blocking must not fail");
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        let mut buf = String::new();
+        loop {
+            match reader.read_to_string(&mut buf) {
+                Ok(0) => panic!("Xvfb closed the displayfd before reporting its number"),
+                Ok(_) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("reading the displayfd reply: {err}"),
             }
-            let mut child = Command::new(&xvfb)
-                .arg(format!(":{display}"))
-                // An explicit screen: 24-bit depth, a size comfortably larger
-                // than the overlay, and no TCP listener — the test talks to
-                // the server over its Unix socket only.
-                .args(["-screen", "0", "1280x1024x24", "-nolisten", "tcp"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("Xvfb was found on $PATH but could not be spawned");
-            // Xvfb exits immediately when its display is taken; give it a
-            // moment, then either trust the socket or move to the next
-            // number.
-            std::thread::sleep(Duration::from_millis(400));
-            if child.try_wait().expect("polling Xvfb").is_some() {
-                let _ = child.kill();
-                let _ = child.wait();
-                continue;
+            if Instant::now() >= deadline {
+                panic!("Xvfb started but never reported its display number");
             }
-            let socket = PathBuf::from(format!("/tmp/.X11-unix/X{display}"));
-            let deadline = Instant::now() + POLL_TIMEOUT;
-            while Instant::now() < deadline {
-                if socket.exists() {
-                    return Some(XvfbServer { child, display });
-                }
-                std::thread::sleep(Duration::from_millis(50));
+            if let Ok(Some(_)) = child.try_wait() {
+                panic!("Xvfb exited before reporting its display number");
             }
-            panic!("Xvfb :{display} started but never created its socket");
+            std::thread::sleep(Duration::from_millis(10));
         }
-        None
+        let display: u32 = buf.trim().parse().expect("Xvfb reported a display number");
+        Some(XvfbServer { child, display })
     }
 
     /// The `DISPLAY` value every client of this server needs.

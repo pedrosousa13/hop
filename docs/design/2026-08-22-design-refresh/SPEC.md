@@ -77,6 +77,19 @@ provider) carry over from the approved M3 pass verbatim.
 - GTK4 draws CSD shadows inside the X11 surface (5px/side inset measured in
   #246): capture assertions encode declared-size-minus-inset, not naively
   WINDOW_SIZE_PX.
-- The runner geometry flake class (socket-exists vs listening, dropped queries
-  during IPC reconnect windows) is fixed on main as of #250; new UI slices must
-  keep x11_smoke green under CI's no-WM Xvfb.
+- The runner geometry flake class: root causes identified and fixed in #261
+  (the #250 fix covered only the socket-vs-listening and dropped-query
+  halves). The reported signature — `--screenshot` exiting 1 silently, no
+  error print, both 10s deadlines unexpired — is GDK's X11 IO-error handler
+  (`g_debug`, silent by default, then `_exit(1)`) on a lost X connection,
+  caused by x11_smoke's pid-derived Xvfb display numbers racing between
+  concurrently running tests; fixed by adopting `-displayfd`. Reproducing
+  it surfaced a separate latent failure mode — `--screenshot` had wired
+  close-on-focus-loss onto its capture window, so a background focus loss
+  hid the window and hung the run to a printed timeout — fixed on its own
+  merits (a capture harness has no user to dismiss for), not as the cause
+  of the reported signature. Verified locally by 25 consecutive green
+  x11_smoke runs under 2-CPU-pinned conditions that reproduced the flake
+  pre-fix; the 10-consecutive-CI-run acceptance criterion still has to
+  confirm on CI. New UI slices must keep x11_smoke green under CI's no-WM
+  Xvfb.
