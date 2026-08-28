@@ -60,7 +60,9 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read as _};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -96,44 +98,53 @@ struct XvfbServer {
 }
 
 impl XvfbServer {
-    /// Spawns Xvfb on the first free display number tried, or `None` when
-    /// the binary is missing — the documented skip condition. Display
-    /// numbers derive from this process's pid so parallel invocations do
-    /// not collide, exactly as `x11_smoke.rs` does.
+    /// Spawns Xvfb, or `None` when the binary is missing — the documented
+    /// skip condition.
+    //
+    // `-displayfd` makes Xvfb atomically select and report a free display,
+    // so parallel tests in this binary cannot race on a guessed display
+    // number. This mirrors the allocator in `x11_smoke.rs`.
     fn start() -> Option<Self> {
         let xvfb = find_in_path("Xvfb")?;
-        let base = 100 + (std::process::id() % 5000);
-        for offset in 0..8u32 {
-            let display = base + offset;
-            let lock = PathBuf::from(format!("/tmp/.X11-unix/X{display}-lock"));
-            if lock.exists() {
-                continue;
+        // The write half travels to the child as its stdin (`-displayfd 0`);
+        // Xvfb writes the chosen display number there once it is ready.
+        let (mut reader, writer) =
+            UnixStream::pair().expect("creating the displayfd socketpair must not fail");
+        let mut child = Command::new(&xvfb)
+            .arg("-displayfd")
+            .arg("0")
+            .args(["-screen", "0", "1280x1024x24", "-nolisten", "tcp"])
+            .stdin(Stdio::from(OwnedFd::from(writer)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Xvfb was found on $PATH but could not be spawned");
+
+        reader
+            .set_nonblocking(true)
+            .expect("setting the displayfd reader non-blocking must not fail");
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        let mut buf = String::new();
+        loop {
+            match reader.read_to_string(&mut buf) {
+                Ok(0) => panic!("Xvfb closed the displayfd before reporting its number"),
+                Ok(_) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("reading the displayfd reply: {err}"),
             }
-            let mut child = Command::new(&xvfb)
-                .arg(format!(":{display}"))
-                .args(["-screen", "0", "1280x1024x24", "-nolisten", "tcp"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("Xvfb was found on $PATH but could not be spawned");
-            std::thread::sleep(Duration::from_millis(400));
-            if child.try_wait().expect("polling Xvfb").is_some() {
-                continue;
+            if Instant::now() >= deadline {
+                panic!("Xvfb started but never reported its display number");
             }
-            let socket = PathBuf::from(format!("/tmp/.X11-unix/X{display}"));
-            let deadline = Instant::now() + POLL_TIMEOUT;
-            while Instant::now() < deadline {
-                if socket.exists() {
-                    return Some(XvfbServer {
-                        child,
-                        display: format!(":{display}"),
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(50));
+            if let Ok(Some(_)) = child.try_wait() {
+                panic!("Xvfb exited before reporting its display number");
             }
-            panic!("Xvfb :{display} started but never created its socket");
+            std::thread::sleep(Duration::from_millis(10));
         }
-        None
+        let display: u32 = buf.trim().parse().expect("Xvfb reported a display number");
+        Some(XvfbServer {
+            child,
+            display: format!(":{display}"),
+        })
     }
 }
 
@@ -572,13 +583,6 @@ fn config_with_hotkey() -> String {
 /// at both ends — hop-hotkeyd still alive holding the grab, and the
 /// dismissed overlay back on screen after the synthetic keypress.
 #[test]
-#[ignore = "the XTEST chord -> grab dispatch -> toggle chain still fails \
-            inside this harness while the identical steps pass when driven \
-            manually against the same private Xvfb (see issue #251); the \
-            surrounding links are covered: the grab itself and its \
-            arbitration by `second_hotkeyd_exits_instead_of_double_grabbing`, \
-            and the whole toggle-activation half by \
-            `hop_toggle_activates_the_resident_instance`"]
 fn hotkey_grab_triggers_toggle_end_to_end() {
     let Some(env) = Environment::start(&config_with_hotkey()) else {
         return; // reason already printed
