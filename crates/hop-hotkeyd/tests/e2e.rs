@@ -37,12 +37,14 @@
 //! hotkey fires, which means its window is **already mapped** before the
 //! interesting moment. The presentation that a toggle causes is therefore
 //! observed differentially: the test dismisses the resident window first —
-//! by moving the X input focus away, the exact primitive `x11_smoke.rs`
-//! proves drives hop-gtk's focus-loss dismissal (`SetInputFocus(None)` →
-//! FocusOut → `close()` on the `hide_on_close` window → unmapped, gone from
-//! the tree) — and then waits for a *new* root-window child to appear once
-//! the toggle re-presents it. A hidden GTK window is an unmapped one, so
-//! presence in the tree is the whole signal.
+//! by moving the X input focus to X11's PointerRoot target, the root window
+//! on the screen where the pointer resides, the exact primitive `x11_smoke.rs`
+//! proves drives hop-gtk's focus-loss dismissal (FocusOut → `close()` on the
+//! `hide_on_close` window → unmapped, gone from the tree) — and then waits for
+//! a *new* root-window child to appear once the toggle re-presents it. Unlike
+//! X11's None target, PointerRoot leaves a valid focus target for the root
+//! passive XGrabKey to receive the XTEST chord. A hidden GTK window is an
+//! unmapped one, so presence in the tree is the whole signal.
 //!
 //! # What each test proves
 //!
@@ -60,7 +62,9 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read as _};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -83,6 +87,10 @@ const BINDING: &str = "ctrl+alt+space";
 const CTRL_KEYSYM: u32 = 0xffe3; // Control_L
 const ALT_KEYSYM: u32 = 0xffe9; // Alt_L
 const SPACE_KEYSYM: u32 = 0x0020;
+// X11's special PointerRoot focus target: the root window on the screen where
+// the pointer resides. Unlike X11 None, it leaves keyboard events targeted at
+// a real root window for the passive XGrabKey.
+const X_POINTER_ROOT: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Process plumbing — duplicated from apps/hop-gtk/tests/x11_smoke.rs, per
@@ -96,44 +104,53 @@ struct XvfbServer {
 }
 
 impl XvfbServer {
-    /// Spawns Xvfb on the first free display number tried, or `None` when
-    /// the binary is missing — the documented skip condition. Display
-    /// numbers derive from this process's pid so parallel invocations do
-    /// not collide, exactly as `x11_smoke.rs` does.
+    /// Spawns Xvfb, or `None` when the binary is missing — the documented
+    /// skip condition.
+    //
+    // `-displayfd` makes Xvfb atomically select and report a free display,
+    // so parallel tests in this binary cannot race on a guessed display
+    // number. This mirrors the allocator in `x11_smoke.rs`.
     fn start() -> Option<Self> {
         let xvfb = find_in_path("Xvfb")?;
-        let base = 100 + (std::process::id() % 5000);
-        for offset in 0..8u32 {
-            let display = base + offset;
-            let lock = PathBuf::from(format!("/tmp/.X11-unix/X{display}-lock"));
-            if lock.exists() {
-                continue;
+        // The write half travels to the child as its stdin (`-displayfd 0`);
+        // Xvfb writes the chosen display number there once it is ready.
+        let (mut reader, writer) =
+            UnixStream::pair().expect("creating the displayfd socketpair must not fail");
+        let mut child = Command::new(&xvfb)
+            .arg("-displayfd")
+            .arg("0")
+            .args(["-screen", "0", "1280x1024x24", "-nolisten", "tcp"])
+            .stdin(Stdio::from(OwnedFd::from(writer)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Xvfb was found on $PATH but could not be spawned");
+
+        reader
+            .set_nonblocking(true)
+            .expect("setting the displayfd reader non-blocking must not fail");
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        let mut buf = String::new();
+        loop {
+            match reader.read_to_string(&mut buf) {
+                Ok(0) => panic!("Xvfb closed the displayfd before reporting its number"),
+                Ok(_) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("reading the displayfd reply: {err}"),
             }
-            let mut child = Command::new(&xvfb)
-                .arg(format!(":{display}"))
-                .args(["-screen", "0", "1280x1024x24", "-nolisten", "tcp"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("Xvfb was found on $PATH but could not be spawned");
-            std::thread::sleep(Duration::from_millis(400));
-            if child.try_wait().expect("polling Xvfb").is_some() {
-                continue;
+            if Instant::now() >= deadline {
+                panic!("Xvfb started but never reported its display number");
             }
-            let socket = PathBuf::from(format!("/tmp/.X11-unix/X{display}"));
-            let deadline = Instant::now() + POLL_TIMEOUT;
-            while Instant::now() < deadline {
-                if socket.exists() {
-                    return Some(XvfbServer {
-                        child,
-                        display: format!(":{display}"),
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(50));
+            if let Ok(Some(_)) = child.try_wait() {
+                panic!("Xvfb exited before reporting its display number");
             }
-            panic!("Xvfb :{display} started but never created its socket");
+            std::thread::sleep(Duration::from_millis(10));
         }
-        None
+        let display: u32 = buf.trim().parse().expect("Xvfb reported a display number");
+        Some(XvfbServer {
+            child,
+            display: format!(":{display}"),
+        })
     }
 }
 
@@ -156,10 +173,11 @@ struct SessionBus {
 }
 
 impl SessionBus {
-    fn start() -> Option<Self> {
+    fn start(runtime_dir: &Path) -> Option<Self> {
         let dbus_daemon = find_in_path("dbus-daemon")?;
         let mut child = Command::new(dbus_daemon)
             .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+            .env("XDG_RUNTIME_DIR", runtime_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -273,11 +291,15 @@ impl Environment {
             }
         }
 
-        let xvfb = XvfbServer::start()?;
-        let bus = SessionBus::start()?;
-
         let runtime = tempfile::tempdir().unwrap();
         let runtime_dir = runtime.path().to_path_buf();
+        // Start the real private bus inside the same runtime directory given
+        // to every child. Creating the directory first keeps dbus-daemon's
+        // socket namespace and the applications' XDG runtime namespace
+        // aligned.
+        let xvfb = XvfbServer::start()?;
+        let bus = SessionBus::start(&runtime_dir)?;
+
         // The isolated XDG tree, pre-created the way `x11_smoke.rs`'s
         // `spawn_daemon` does: hopd's state-dir resolution creates only the
         // leaf under an existing base, so the bases must exist first.
@@ -458,10 +480,12 @@ impl XConnection {
 
     /// Drives hop-gtk's focus-loss dismissal the way `x11_smoke.rs` does —
     /// in both directions: focus *onto* the overlay first (FocusIn, so GTK
-    /// reports the window active), then onto nothing (FocusOut, keyboard
-    /// events discarded → `close()` on the `hide_on_close` window →
-    /// unmapped, out of [`Self::viewable_overlay`]). Skipping the FocusIn
-    /// half does not dismiss: a window that never had focus cannot lose it.
+    /// reports the window active), then onto X11's PointerRoot target
+    /// (FocusOut → `close()` on the `hide_on_close` window → unmapped, out of
+    /// [`Self::viewable_overlay`]). PointerRoot resolves to the X root window
+    /// under the pointer and remains a valid focus target, so its passive
+    /// XGrabKey can receive the later XTEST chord. Skipping the FocusIn half
+    /// does not dismiss: a window that never had focus cannot lose it.
     fn focus_then_defocus_overlay(&self) {
         let xid = self
             .viewable_overlay()
@@ -471,8 +495,8 @@ impl XConnection {
             .expect("SetInputFocus onto the overlay");
         std::thread::sleep(Duration::from_millis(500));
         self.conn
-            .set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME)
-            .expect("SetInputFocus away from the overlay");
+            .set_input_focus(InputFocus::NONE, X_POINTER_ROOT, x11rb::CURRENT_TIME)
+            .expect("SetInputFocus onto the X root after dismissing the overlay");
     }
 }
 
@@ -572,13 +596,6 @@ fn config_with_hotkey() -> String {
 /// at both ends — hop-hotkeyd still alive holding the grab, and the
 /// dismissed overlay back on screen after the synthetic keypress.
 #[test]
-#[ignore = "the XTEST chord -> grab dispatch -> toggle chain still fails \
-            inside this harness while the identical steps pass when driven \
-            manually against the same private Xvfb (see issue #251); the \
-            surrounding links are covered: the grab itself and its \
-            arbitration by `second_hotkeyd_exits_instead_of_double_grabbing`, \
-            and the whole toggle-activation half by \
-            `hop_toggle_activates_the_resident_instance`"]
 fn hotkey_grab_triggers_toggle_end_to_end() {
     let Some(env) = Environment::start(&config_with_hotkey()) else {
         return; // reason already printed
