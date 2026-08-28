@@ -37,12 +37,14 @@
 //! hotkey fires, which means its window is **already mapped** before the
 //! interesting moment. The presentation that a toggle causes is therefore
 //! observed differentially: the test dismisses the resident window first —
-//! by moving the X input focus away, the exact primitive `x11_smoke.rs`
-//! proves drives hop-gtk's focus-loss dismissal (`SetInputFocus(None)` →
-//! FocusOut → `close()` on the `hide_on_close` window → unmapped, gone from
-//! the tree) — and then waits for a *new* root-window child to appear once
-//! the toggle re-presents it. A hidden GTK window is an unmapped one, so
-//! presence in the tree is the whole signal.
+//! by moving the X input focus to X11's PointerRoot target, the root window
+//! on the screen where the pointer resides, the exact primitive `x11_smoke.rs`
+//! proves drives hop-gtk's focus-loss dismissal (FocusOut → `close()` on the
+//! `hide_on_close` window → unmapped, gone from the tree) — and then waits for
+//! a *new* root-window child to appear once the toggle re-presents it. Unlike
+//! X11's None target, PointerRoot leaves a valid focus target for the root
+//! passive XGrabKey to receive the XTEST chord. A hidden GTK window is an
+//! unmapped one, so presence in the tree is the whole signal.
 //!
 //! # What each test proves
 //!
@@ -85,6 +87,10 @@ const BINDING: &str = "ctrl+alt+space";
 const CTRL_KEYSYM: u32 = 0xffe3; // Control_L
 const ALT_KEYSYM: u32 = 0xffe9; // Alt_L
 const SPACE_KEYSYM: u32 = 0x0020;
+// X11's special PointerRoot focus target: the root window on the screen where
+// the pointer resides. Unlike X11 None, it leaves keyboard events targeted at
+// a real root window for the passive XGrabKey.
+const X_POINTER_ROOT: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Process plumbing — duplicated from apps/hop-gtk/tests/x11_smoke.rs, per
@@ -167,10 +173,11 @@ struct SessionBus {
 }
 
 impl SessionBus {
-    fn start() -> Option<Self> {
+    fn start(runtime_dir: &Path) -> Option<Self> {
         let dbus_daemon = find_in_path("dbus-daemon")?;
         let mut child = Command::new(dbus_daemon)
             .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+            .env("XDG_RUNTIME_DIR", runtime_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -284,11 +291,15 @@ impl Environment {
             }
         }
 
-        let xvfb = XvfbServer::start()?;
-        let bus = SessionBus::start()?;
-
         let runtime = tempfile::tempdir().unwrap();
         let runtime_dir = runtime.path().to_path_buf();
+        // Start the real private bus inside the same runtime directory given
+        // to every child. Creating the directory first keeps dbus-daemon's
+        // socket namespace and the applications' XDG runtime namespace
+        // aligned.
+        let xvfb = XvfbServer::start()?;
+        let bus = SessionBus::start(&runtime_dir)?;
+
         // The isolated XDG tree, pre-created the way `x11_smoke.rs`'s
         // `spawn_daemon` does: hopd's state-dir resolution creates only the
         // leaf under an existing base, so the bases must exist first.
@@ -469,10 +480,12 @@ impl XConnection {
 
     /// Drives hop-gtk's focus-loss dismissal the way `x11_smoke.rs` does —
     /// in both directions: focus *onto* the overlay first (FocusIn, so GTK
-    /// reports the window active), then onto nothing (FocusOut, keyboard
-    /// events discarded → `close()` on the `hide_on_close` window →
-    /// unmapped, out of [`Self::viewable_overlay`]). Skipping the FocusIn
-    /// half does not dismiss: a window that never had focus cannot lose it.
+    /// reports the window active), then onto X11's PointerRoot target
+    /// (FocusOut → `close()` on the `hide_on_close` window → unmapped, out of
+    /// [`Self::viewable_overlay`]). PointerRoot resolves to the X root window
+    /// under the pointer and remains a valid focus target, so its passive
+    /// XGrabKey can receive the later XTEST chord. Skipping the FocusIn half
+    /// does not dismiss: a window that never had focus cannot lose it.
     fn focus_then_defocus_overlay(&self) {
         let xid = self
             .viewable_overlay()
@@ -482,8 +495,8 @@ impl XConnection {
             .expect("SetInputFocus onto the overlay");
         std::thread::sleep(Duration::from_millis(500));
         self.conn
-            .set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME)
-            .expect("SetInputFocus away from the overlay");
+            .set_input_focus(InputFocus::NONE, X_POINTER_ROOT, x11rb::CURRENT_TIME)
+            .expect("SetInputFocus onto the X root after dismissing the overlay");
     }
 }
 
