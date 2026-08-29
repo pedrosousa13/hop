@@ -9,8 +9,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-use gtk::prelude::*;
 use gtk::glib;
+use gtk::prelude::*;
 
 const TOAST_NAME: &str = "hop-toast";
 const SHOWN_CLASS: &str = "hop-toast-shown";
@@ -143,8 +143,7 @@ impl Toast {
         }
         drop(sources);
 
-        self.generation
-            .set(self.generation.get().wrapping_add(1));
+        self.generation.set(self.generation.get().wrapping_add(1));
         self.widget.remove_css_class(SHOWN_CLASS);
         self.widget.remove_css_class(EXITING_CLASS);
     }
