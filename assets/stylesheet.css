@@ -774,6 +774,44 @@ listview > row:selected .hop-row-actions {
   background-color: {{hop-sel-fill}};
   border-radius: {{hop-radius-md}};
 }
+/* ============================================================
+   .hop-toast — issue #255
+   The copy result is a floating overlay child, not normal content: its
+   bottom margin leaves the future footer region clear without changing the
+   results list's geometry. The base state is translated and transparent;
+   the shown state is added by `ui::toast` on a later main-loop turn so GTK
+   has a mapped, styled opacity/transform pair to animate from.
+
+   All motion values use the motion token axis. Full motion slides the toast
+   up and fades it in/out; reduced motion resolves the transform and the
+   transform half of each transition to nothing, leaving opacity only.
+   ============================================================ */
+.hop-toast {
+  background-color: {{hop-bg}};
+  color: {{hop-fg}};
+  font: {{font:hop-text-subtitle}};
+  border-radius: {{hop-radius-md}};
+  box-shadow: {{hop-elev}}, inset 0 0 0 1px {{hop-line}};
+  padding: {{hop-space-2}} {{hop-space-4}};
+  margin-bottom: {{hop-space-8}};
+  opacity: 0;
+  transform: {{motion:hop-toast-transform}};
+}
+
+.hop-toast.hop-toast-shown {
+  opacity: 1;
+  transform: none;
+  transition: {{motion:hop-toast-transition-in}};
+}
+.hop-toast.hop-toast-exiting {
+  opacity: 0;
+  transform: {{motion:hop-toast-exit-transform}};
+  transition: {{motion:hop-toast-transition-out}};
+}
+
+.hop-toast.hop-toast-error {
+  font: {{font:hop-text-error}};
+}
 
 /* ============================================================
    ACTION PANEL — POPOVER CHROME — issue #254 (SPEC decision 5)

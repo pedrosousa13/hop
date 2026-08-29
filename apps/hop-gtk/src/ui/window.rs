@@ -82,6 +82,7 @@ use crate::keymap::{Action, Keymap};
 use crate::tokens;
 use crate::ui::action_panel::ActionPanel;
 use crate::ui::offline_indicator::OfflineIndicator;
+use crate::ui::toast::Toast;
 use crate::ui::{marker_highlight, mode_label, model, row, view};
 
 /// Rows moved per [`Action::PageUp`]/[`Action::PageDown`]. A fixed step
@@ -243,6 +244,14 @@ pub struct HopWindow {
     /// [`HopWindow::apply_event`] for the one place it is ever shown or
     /// hidden.
     offline_indicator: OfflineIndicator,
+    /// Issue #255's one reusable feedback widget, kept above the future footer
+    /// in the window overlay rather than in normal content geometry.
+    toast: Toast,
+    /// Whether the most recently dispatched execute is a copy action. The
+    /// IPC error event carries no action identity, so this is the smallest
+    /// client-side correlation state and is cleared by completion or a stale
+    /// query/connection transition.
+    pending_copy: Rc<Cell<bool>>,
     /// Issue #254's ctrl-K action panel — built once here, alongside every
     /// other widget `build` constructs, per this module's "never rebuilt"
     /// convention (this struct's own top doc comment) and
@@ -353,6 +362,7 @@ impl HopWindow {
         entry_overlay.add_overlay(&mode_label);
 
         let store = model::new_store();
+        let pending_copy = Rc::new(Cell::new(false));
         let selection = gtk::SingleSelection::new(Some(store.clone()));
         // `autoselect` off: an empty result list, or one the user has not
         // touched yet, should have nothing highlighted. GTK's default is to
@@ -397,6 +407,7 @@ impl HopWindow {
             &local_actions,
             &user_actions,
             &pending_user_executions,
+            &pending_copy,
         );
 
         let scrolled = gtk::ScrolledWindow::builder()
@@ -448,6 +459,9 @@ impl HopWindow {
         status.set_xalign(0.0);
         status.set_visible(false);
         status.set_wrap(true);
+        let toast = Toast::build();
+        toast.widget.set_halign(gtk::Align::Center);
+        toast.widget.set_valign(gtk::Align::End);
 
         // Issue #200's offline indicator — built once, alongside every other
         // widget here, and starts hidden (`OfflineIndicator::build`'s own doc
@@ -478,6 +492,7 @@ impl HopWindow {
             let local_actions = Rc::clone(&local_actions);
             let user_actions = Rc::clone(&user_actions);
             let pending_user_executions = Rc::clone(&pending_user_executions);
+            let pending_copy_for_panel = Rc::clone(&pending_copy);
             ActionPanel::new(move |action_id| {
                 // `take()`, not a borrow-and-clone: once a choice is
                 // reported the pin has done its job for this `present`
@@ -502,6 +517,7 @@ impl HopWindow {
                     // from its own signature alone.
                     return;
                 };
+                pending_copy_for_panel.set(is_copy_action(&item, &action_id));
                 dispatch_item_action(
                     &cmd_tx,
                     &item,
@@ -518,11 +534,16 @@ impl HopWindow {
         content.append(&offline_indicator.widget);
         content.append(&state_header);
         content.append(&state_stack);
+
+        let window_overlay = gtk::Overlay::new();
+        window_overlay.set_child(Some(&content));
+        window_overlay.add_overlay(&toast.widget);
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(window_w)
             .default_height(window_h)
-            .content(&content)
+            .content(&window_overlay)
             .hide_on_close(true)
             .build();
         // Issue #253: the material mode (translucent vs. opaque window
@@ -596,6 +617,8 @@ impl HopWindow {
         let row_action_target_type = glib::VariantTy::new(row::ROW_ACTION_TARGET_TYPE).ok();
         let row_run_action = gio::SimpleAction::new(row::ROW_ACTION_NAME, row_action_target_type);
         {
+            let store_for_row = store.clone();
+            let pending_copy_for_row = Rc::clone(&pending_copy);
             let cmd_tx = cmd_tx.clone();
             let local_actions = Rc::clone(&local_actions);
             let user_actions = Rc::clone(&user_actions);
@@ -618,6 +641,11 @@ impl HopWindow {
                 else {
                     return;
                 };
+                let is_copy = position_of_item_id(&store_for_row, &item_id)
+                    .and_then(|position| store_for_row.item(position))
+                    .map(|object| is_copy_action(&model::item_of(&object), &action_id))
+                    .unwrap_or(false);
+                pending_copy_for_row.set(is_copy);
                 dispatch_id_action(
                     &cmd_tx,
                     &item_id,
@@ -635,6 +663,8 @@ impl HopWindow {
         let hop_window = HopWindow {
             window,
             entry,
+            toast,
+            pending_copy,
             mode_label,
             store,
             selection,
@@ -758,6 +788,7 @@ impl HopWindow {
         let cmd_tx = self.cmd_tx.clone();
         let hop_window = self.clone();
         self.entry.connect_changed(move |entry| {
+            hop_window.pending_copy.set(false);
             hop_window.begin_query(entry.text().as_str());
             cmd_tx.send(IpcCommand::Query(entry.text().to_string()));
         });
@@ -836,6 +867,7 @@ impl HopWindow {
                     &self.local_actions,
                     &self.user_actions,
                     &self.pending_user_executions,
+                    &self.pending_copy,
                 );
             }
             Action::SecondaryAction => self.open_secondary_action_menu(),
@@ -1345,6 +1377,7 @@ impl HopWindow {
         match event {
             IpcEvent::Connected => {
                 self.pending_user_executions.set(0);
+                self.pending_copy.set(false);
                 row::set_offline_state(false, None);
                 self.status.set_visible(false);
                 self.offline_indicator.apply(None);
@@ -1352,10 +1385,12 @@ impl HopWindow {
                 self.rebind_current_items();
             }
             IpcEvent::ConnectFailed(reason) => {
+                self.pending_copy.set(false);
                 self.set_status(&format!("Can't reach hopd: {reason}"));
             }
             IpcEvent::Disconnected => {
                 self.pending_user_executions.set(0);
+                self.pending_copy.set(false);
                 // Issue #200: `IpcEvent::Disconnected` — a connection that
                 // *was* established and has now been lost, `ipc`'s own
                 // reconnect loop already retrying in the background (per
@@ -1426,6 +1461,7 @@ impl HopWindow {
                 query_text,
                 pending_providers,
             } => {
+                self.pending_copy.set(false);
                 // D3's "mirrors `exclusive`, and nothing else" rule, made
                 // concrete right here: the mode label is shown only when
                 // `exclusive` is true, computed once and handed to
@@ -1443,6 +1479,7 @@ impl HopWindow {
                 }
             }
             IpcEvent::Results(items) => {
+                self.pending_copy.set(false);
                 row::set_offline_state(false, None);
                 self.local_actions.borrow_mut().clear();
                 self.list_view.remove_css_class("hop-state-offline");
@@ -1464,6 +1501,7 @@ impl HopWindow {
                 }
             }
             IpcEvent::QueryDone => {
+                self.pending_copy.set(false);
                 if !self.query_pending.replace(false) {
                     return;
                 }
@@ -1482,7 +1520,13 @@ impl HopWindow {
                 }
             }
             IpcEvent::Executed(outcome) => self.handle_outcome(outcome),
-            IpcEvent::Error(message) => self.show_error(&message),
+            IpcEvent::Error(message) => {
+                if self.pending_copy.take() {
+                    self.toast.show_error(&message);
+                } else {
+                    self.show_error(&message);
+                }
+            }
         }
     }
 
@@ -1669,9 +1713,13 @@ impl HopWindow {
             return;
         }
         self.pending_user_executions.set(pending - 1);
+        self.pending_copy.set(false);
         match outcome {
             ExecOutcome::Done => {}
-            ExecOutcome::CopyText(text) => self.user_actions.copy_text(text.as_str()),
+            ExecOutcome::CopyText(text) => {
+                self.user_actions.copy_text(text.as_str());
+                self.toast.show_success();
+            }
             ExecOutcome::OpenUrl(url) => {
                 if let Err(err) = self.user_actions.launch_uri(url.as_str()) {
                     self.set_status(&format!("couldn't open {}: {err}", url.as_str()));
@@ -2108,6 +2156,11 @@ fn position_of_item_id(store: &gio::ListStore, item_id: &ItemId) -> Option<u32> 
     }
     None
 }
+fn is_copy_action(item: &Item, action_id: &ActionId) -> bool {
+    item.actions
+        .iter()
+        .any(|action| action.id == *action_id && action.kind == ActionKind::Copy)
+}
 
 /// Sends `cmd_tx.send(IpcCommand::Execute { item_id, action_id })` for a
 /// daemon-owned item, or performs a locally rendered fallback action only
@@ -2184,12 +2237,20 @@ fn send_execute(
     }
 }
 
+/// Sends an [`IpcCommand::Execute`] for the currently selected item's
+/// default action, or does nothing if no item is selected — an empty or
+/// no-results list, where Enter has nothing to run. [`Action::Activate`]'s
+/// own handler, reached from [`HopWindow::dispatch_action`]; mouse-click
+/// activation ([`wire_list_activation`]) reaches [`activate_at`] directly
+/// instead, since a click already carries the row's position and has no
+/// need to re-derive it from `selection.selected()`.
 fn activate_selected(
     selection: &gtk::SingleSelection,
     cmd_tx: &CommandSender,
     local_actions: &Rc<RefCell<LocalActionRegistry>>,
     user_actions: &Rc<dyn UserActionSink>,
     pending_user_executions: &Rc<Cell<u32>>,
+    pending_copy: &Cell<bool>,
 ) {
     let selected = selection.selected();
     if selected == gtk::INVALID_LIST_POSITION {
@@ -2201,16 +2262,25 @@ fn activate_selected(
         local_actions,
         user_actions,
         pending_user_executions,
+        pending_copy,
         selected,
     );
 }
 
+/// Sends an [`IpcCommand::Execute`] for the item at `position` in
+/// `selection`'s underlying model, or does nothing if `position` names no
+/// item — shared by [`activate_selected`] (which resolves `position` from
+/// the model's own current selection) and [`wire_list_activation`]'s mouse
+/// click handler (which already has the position GTK's `activate` signal
+/// reported), so both routes run the identical "turn a chosen item into an
+/// `Execute`" lookup instead of growing two copies of it.
 fn activate_at(
     selection: &gtk::SingleSelection,
     cmd_tx: &CommandSender,
     local_actions: &Rc<RefCell<LocalActionRegistry>>,
     user_actions: &Rc<dyn UserActionSink>,
     pending_user_executions: &Rc<Cell<u32>>,
+    pending_copy: &Cell<bool>,
     position: u32,
 ) {
     let Some(object) = selection.item(position) else {
@@ -2224,6 +2294,7 @@ fn activate_at(
     {
         return;
     }
+    pending_copy.set(is_copy_action(&item, &item.default_action));
     dispatch_item_action(
         cmd_tx,
         &item,
@@ -2241,12 +2312,14 @@ fn wire_list_activation(
     local_actions: &Rc<RefCell<LocalActionRegistry>>,
     user_actions: &Rc<dyn UserActionSink>,
     pending_user_executions: &Rc<Cell<u32>>,
+    pending_copy: &Rc<Cell<bool>>,
 ) {
     let selection = selection.clone();
     let cmd_tx = cmd_tx.clone();
     let local_actions = Rc::clone(local_actions);
     let user_actions = Rc::clone(user_actions);
     let pending_user_executions = Rc::clone(pending_user_executions);
+    let pending_copy = Rc::clone(pending_copy);
     list_view.connect_activate(move |_list_view, position| {
         activate_at(
             &selection,
@@ -2254,6 +2327,7 @@ fn wire_list_activation(
             &local_actions,
             &user_actions,
             &pending_user_executions,
+            &pending_copy,
             position,
         );
     });
@@ -2388,7 +2462,8 @@ mod tests {
     use adw::prelude::AdwApplicationWindowExt;
     use gtk::gdk;
     use hop_protocol::{
-        Action as WireAction, ActionId, ActionKind, ItemId, ItemTitle, Kind, MarkerSpan, Mode,
+        Action as WireAction, ActionId, ActionKind, CopyText, ExecOutcome, ItemId, ItemTitle, Kind,
+        MarkerSpan, Mode,
     };
 
     use super::*;
@@ -3218,6 +3293,108 @@ mod tests {
         );
 
         println!("the offline indicator shows on Disconnected and hides on Connected");
+    }
+    /// Issue #255's widget-level regression: a successful copy shows the
+    /// reusable toast, holds it on screen, fades it out, and hides it after
+    /// the exit transition. A newer copy retriggered before the old hold
+    /// expires must keep the toast alive and replace the message rather than
+    /// allowing the stale timer to hide it.
+    #[test]
+    fn copy_toast_shows_holds_fades_and_retrigger_cancels_stale_lifecycle() {
+        run_under_broadway(
+            "ui::window::tests::copy_toast_shows_holds_fades_and_retrigger_cancels_stale_lifecycle",
+            1000,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.CopyToast");
+        window.present_with_token(None);
+        window.apply_event(IpcEvent::Error("unrelated failure".to_string()));
+        assert!(!window.toast.widget.is_visible());
+        assert!(window.status.is_visible());
+        assert_eq!(window.status.text(), "unrelated failure");
+
+        let mut item = test_item(1, "copy result");
+        item.actions[0].id = ActionId::new("copy").unwrap();
+        item.actions[0].kind = ActionKind::Copy;
+        item.default_action = ActionId::new("copy").unwrap();
+        model::replace(&window.store, vec![item]);
+        window.selection.set_selected(0);
+        window.status.set_visible(false);
+
+        // The production copy path records this pending action before the
+        // daemon outcome arrives, then the successful outcome drives the
+        // toast through the same HopWindow seam users exercise.
+        window.dispatch_action(Action::Activate);
+        window.apply_event(IpcEvent::Executed(ExecOutcome::CopyText(
+            CopyText::new("copied").unwrap(),
+        )));
+        drain_pending_glib_events();
+        assert_eq!(window.toast.text(), "Result copied");
+        assert!(window.toast.widget.is_visible());
+        assert!(window.toast.widget.has_css_class("hop-toast-shown"));
+
+        assert_eq!(
+            window.toast.widget.accessible_role(),
+            gtk::AccessibleRole::Status,
+            "copy feedback must be exposed as a status for assistive technology"
+        );
+        pump_for(Duration::from_millis(1900));
+        assert!(
+            window.toast.widget.is_visible(),
+            "the toast must remain visible during its roughly two-second hold"
+        );
+        assert!(window.toast.widget.has_css_class("hop-toast-shown"));
+
+        pump_for(Duration::from_millis(200));
+        assert!(
+            !window.toast.widget.has_css_class("hop-toast-shown"),
+            "the hold timer must start the exit fade"
+        );
+        assert!(window.toast.widget.has_css_class("hop-toast-exiting"));
+        assert!(
+            window.toast.widget.is_visible(),
+            "the widget must stay visible while the exit transition runs"
+        );
+        pump_for(Duration::from_millis(200));
+        assert!(!window.toast.widget.is_visible());
+
+        // Retrigger just before the first lifecycle would naturally finish;
+        // the old sources must not hide this newer error toast.
+        window.dispatch_action(Action::Activate);
+        window.apply_event(IpcEvent::Executed(ExecOutcome::CopyText(
+            CopyText::new("copied again").unwrap(),
+        )));
+        drain_pending_glib_events();
+        pump_for(Duration::from_millis(1000));
+        window.dispatch_action(Action::Activate);
+        window.apply_event(IpcEvent::Error("clipboard unavailable".to_string()));
+        drain_pending_glib_events();
+        assert_eq!(window.toast.text(), "Copy failed: clipboard unavailable");
+        assert!(window.toast.widget.is_visible());
+
+        pump_for(Duration::from_millis(1100));
+        assert!(
+            window.toast.widget.is_visible(),
+            "a stale timer from the previous toast must not hide the retriggered toast"
+        );
+        println!("copy toast lifecycle and stale-timer protection assertions passed");
+    }
+
+    fn pump_for(duration: Duration) {
+        std::thread::sleep(duration);
+        drain_pending_glib_events();
+    }
+
+    fn drain_pending_glib_events() {
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
     }
 
     /// Issue #254's own wiring slice: `Action::SecondaryAction`'s dispatch
