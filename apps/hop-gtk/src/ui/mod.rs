@@ -19,5 +19,6 @@ pub mod mode_label;
 pub mod model;
 pub mod offline_indicator;
 pub mod row;
+pub mod toast;
 pub mod view;
 pub mod window;

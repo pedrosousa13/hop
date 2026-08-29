@@ -257,6 +257,14 @@
   --hop-bg-translucent-light: rgba(250, 249, 246, 0.82);
 
   --hop-lift-transform: translateY(-1px);
+  /* Issue #255: the copy-feedback toast enters from below, exits with a
+     slight upward drift, and keeps reduced motion opacity-only. Composite
+     transition tokens let the reduced overlay remove transform transitions
+     without introducing a second motion preference path in Rust. */
+  --hop-toast-transform: translateY(8px);
+  --hop-toast-exit-transform: translateY(-4px);
+  --hop-toast-transition-in: opacity var(--hop-duration-open) var(--hop-ease-out), transform var(--hop-duration-open) var(--hop-ease-out);
+  --hop-toast-transition-out: opacity var(--hop-duration-close) var(--hop-ease-in), transform var(--hop-duration-close) var(--hop-ease-in);
 
   /* ==========================================================
      GEOMETRY
@@ -448,5 +456,9 @@
        `none` while the shadow and background halves of the same hover
        state stay, at --hop-duration-state's 1ms reduced value. */
     --hop-lift-transform: none;
+    --hop-toast-transform: none;
+    --hop-toast-exit-transform: none;
+    --hop-toast-transition-in: opacity var(--hop-duration-open) var(--hop-ease-out);
+    --hop-toast-transition-out: opacity var(--hop-duration-close) var(--hop-ease-in);
   }
 }
