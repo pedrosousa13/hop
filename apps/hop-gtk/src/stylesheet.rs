@@ -732,6 +732,48 @@ mod tests {
              collapsing to 0ms (one of the six overrides), got: {reduced_rule}"
         );
     }
+    /// Issue #255's motion contract: full motion slides the toast with an
+    /// opacity/transform transition, while reduced motion resolves both the
+    /// resting transform and transition list to opacity-only values through
+    /// the existing motion-token resolver.
+    #[test]
+    fn toast_motion_is_opacity_only_when_reduced() {
+        let full = resolve(Palette::Dark, Motion::Full);
+        let reduced = resolve(Palette::Dark, Motion::Reduced);
+
+        let full_base = extract_rule(&full, ".hop-toast {");
+        let reduced_base = extract_rule(&reduced, ".hop-toast {");
+        let full_shown = extract_rule(&full, ".hop-toast.hop-toast-shown");
+        let reduced_shown = extract_rule(&reduced, ".hop-toast.hop-toast-shown");
+        let full_exiting = extract_rule(&full, ".hop-toast.hop-toast-exiting");
+        let reduced_exiting = extract_rule(&reduced, ".hop-toast.hop-toast-exiting");
+
+        assert!(
+            full_base.contains("transform: translateY(8px);"),
+            "full motion must start the toast translated upward, got: {full_base}"
+        );
+        assert!(
+            full_exiting.contains("transform: translateY(-4px);")
+                && full_exiting.contains("transform 110ms cubic-bezier(0.4, 0, 1, 1)"),
+            "full motion must include the token-resolved exit slide and fade, got: {full_exiting}"
+        );
+        assert!(
+            full_shown.contains("transform 140ms cubic-bezier(0.16, 1, 0.3, 1)"),
+            "full motion must include the token-resolved entrance transform transition, got: {full_shown}"
+        );
+        assert!(
+            reduced_base.contains("transform: none;")
+                && reduced_shown.contains("transform: none;")
+                && reduced_exiting.contains("transform: none;"),
+            "reduced motion must remove the toast transforms, got base: {reduced_base}, shown: {reduced_shown}, exiting: {reduced_exiting}"
+        );
+        assert!(
+            reduced_exiting.contains("transition: opacity 85ms cubic-bezier(0.4, 0, 1, 1);")
+                && reduced_shown
+                    .contains("transition: opacity 85ms cubic-bezier(0.16, 1, 0.3, 1);"),
+            "reduced motion must retain opacity-only transitions, got shown: {reduced_shown}, exiting: {reduced_exiting}"
+        );
+    }
 
     /// Finds `selector`'s first `{ ... }` block in `sheet` (a resolved
     /// stylesheet, comments already stripped by `resolve`), inclusive of
