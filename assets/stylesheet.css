@@ -46,8 +46,8 @@
  * `{{motion:name}}` — issue #207. Resolves `name` against
  * `apps/hop-gtk/src/tokens.rs`'s `resolve_motion`, not `resolve`: the value
  * varies by the live `Gtk.Settings:gtk-enable-animations` reading
- * `apps/hop-gtk/src/style.rs` follows, never by palette. Used only by the
- * `.hop-row-hint-shown` rule below, today — a placeholder with this prefix
+ * `apps/hop-gtk/src/style.rs` follows, never by palette. Consumed by the
+ * `.hop-row-hint-shown` and `.hop-toast` rules below — a placeholder with this prefix
  * naming a token that has no reduced-motion override (most of MOTION's
  * seven durations plus all four easing curves) is not an error; it simply
  * resolves to the same unconditional value under both motion states, the
