@@ -663,7 +663,9 @@ impl HopWindow {
             Action::PageDown => self.move_selection(PAGE_STEP),
             Action::Home => self.select_first(),
             Action::End => self.select_last(),
-            Action::Activate => activate_selected(&self.selection, &self.cmd_tx, &self.pending_copy),
+            Action::Activate => {
+                activate_selected(&self.selection, &self.cmd_tx, &self.pending_copy)
+            }
             Action::SecondaryAction => self.open_secondary_action_menu(),
             Action::CompletePrefix => self.complete_prefix(),
             Action::Dismiss => {
