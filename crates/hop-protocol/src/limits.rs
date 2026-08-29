@@ -808,6 +808,16 @@ pub(crate) fn de_results_items<'de, D: Deserializer<'de>>(
     vec(d, "DaemonMsg::Results.items", MAX_ITEMS_PER_RESULTS_FRAME)
 }
 
+pub(crate) fn de_recent_items<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<crate::item::RecentItem>, D::Error> {
+    vec(
+        d,
+        "DaemonMsg::RecentItems.items",
+        MAX_ITEMS_PER_RESULTS_FRAME,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

@@ -193,7 +193,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use hop_protocol::{ItemId, MAX_ITEM_ID, MAX_PROVIDER_ID, MAX_QUERY_TEXT};
+use hop_protocol::{Item, ItemId, MAX_ITEM_ID, MAX_PROVIDER_ID, MAX_QUERY_TEXT};
 
 use crate::provider::APPS_PROVIDER_ID;
 
@@ -2360,6 +2360,34 @@ impl Learning {
         entries
     }
 
+    /// Return the most recent launches whose current provider items are
+    /// available, preserving the learning store's order and dropping deleted
+    /// or unresolved ids. Matching recomputes the same canonical
+    /// provider-scoped persistence key used by [`Learning::record_launch`];
+    /// hashed keys are never decoded or exposed.
+    pub fn recent_items_for(&self, candidates: &[Item], limit: usize) -> Vec<(Item, u64)> {
+        if limit == 0 || candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut by_key = HashMap::with_capacity(candidates.len());
+        for item in candidates {
+            let persist_plaintext = self.plaintext_providers.contains(&item.provider);
+            let key = persistence_key(&item.provider, item.id.as_str(), persist_plaintext);
+            by_key.entry(key).or_insert(item);
+        }
+
+        self.recent_launches(usize::MAX)
+            .into_iter()
+            .filter_map(|(key, launched_at_ms)| {
+                by_key
+                    .remove(&key)
+                    .map(|item| (item.clone(), launched_at_ms))
+            })
+            .take(limit)
+            .collect()
+    }
+
     /// Return the most frequently launched result IDs, sorted by count descending,
     /// excluding the given IDs.
     pub fn frequent_launches(&self, limit: usize, exclude: &[String]) -> Vec<(String, u32)> {
@@ -2763,6 +2791,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use std::time::Duration;
 
     // --- Ported from the salvage, behavior unmodified. ---
 
@@ -2951,6 +2980,62 @@ mod tests {
             recent[1].0,
             persistence_key(APPS_PROVIDER_ID, "app:first", false)
         );
+    }
+
+    #[test]
+    fn recent_items_for_maps_persisted_keys_to_live_items_in_order() {
+        use hop_protocol::{ActionId, Item, ItemTitle, Kind};
+
+        fn item(id: &str, title: &str) -> Item {
+            Item {
+                id: ItemId::new(id).unwrap(),
+                kind: Kind::Action,
+                title: ItemTitle::new(title).unwrap(),
+                subtitle: None,
+                icon: None,
+                actions: Vec::new(),
+                default_action: ActionId::new("open").unwrap(),
+                copy_text: None,
+                append_to_end: false,
+                provider: "third-party".to_string(),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.json");
+        let mut store = Learning::load(&path);
+        store.sync_plaintext_providers(Vec::<String>::new());
+        store.record_launch(
+            "third-party",
+            "first",
+            &ItemId::new("secret:first").unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        store.record_launch(
+            "third-party",
+            "deleted",
+            &ItemId::new("secret:deleted").unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        store.record_launch(
+            "third-party",
+            "second",
+            &ItemId::new("secret:second").unwrap(),
+        );
+        store.save(&path).unwrap();
+
+        let loaded = Learning::load(&path);
+        let candidates = vec![
+            item("secret:first", "First"),
+            item("secret:first", "First duplicate"),
+            item("secret:second", "Second"),
+        ];
+        let recent = loaded.recent_items_for(&candidates, 2);
+
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].0.title.as_str(), "Second");
+        assert_eq!(recent[1].0.title.as_str(), "First");
+        assert!(recent[0].1 >= recent[1].1);
     }
 
     #[test]

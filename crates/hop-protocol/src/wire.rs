@@ -31,7 +31,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::content::{CopyText, OpenUrl};
-use crate::item::{ActionId, Item, ItemId};
+use crate::item::{ActionId, Item, ItemId, RecentItem};
 use crate::limits;
 use crate::marker_span::MarkerSpan;
 use crate::mode::Mode;
@@ -270,6 +270,17 @@ pub enum DaemonMsg {
         /// accumulation happens and how it is enforced.
         #[serde(deserialize_with = "limits::de_results_items")]
         items: Vec<Item>,
+    },
+
+    /// Recent items resolved by the daemon for an empty query.
+    ///
+    /// This additive frame pairs each currently available [`Item`] with its
+    /// persisted learning timestamp. A client may receive no frame when no
+    /// persisted id still resolves to a live item.
+    RecentItems {
+        query_id: u64,
+        #[serde(deserialize_with = "limits::de_recent_items")]
+        items: Vec<RecentItem>,
     },
     /// The one terminal frame of a query exchange; sent when the source finishes,
     /// when the exchange ends at a cap — the result source's accumulator at
@@ -835,6 +846,41 @@ mod tests {
             )
         );
         assert_eq!(serde_json::from_str::<DaemonMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn daemon_recent_items_round_trip_with_timestamp() {
+        let msg = DaemonMsg::RecentItems {
+            query_id: 7,
+            items: vec![RecentItem {
+                item: sample_item(),
+                launched_at_ms: 1_725_000_000_000,
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""type":"recent_items""#),
+            "recent metadata needs its own additive frame: {json}"
+        );
+        assert!(json.contains(r#""launched_at_ms":1725000000000"#));
+        assert_eq!(serde_json::from_str::<DaemonMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn daemon_recent_items_frame_refuses_over_limit() {
+        let recent = RecentItem {
+            item: sample_item(),
+            launched_at_ms: 1,
+        };
+        let frame = serde_json::json!({
+            "type": "recent_items",
+            "query_id": 7,
+            "items": vec![serde_json::to_value(recent).unwrap(); limits::MAX_ITEMS_PER_RESULTS_FRAME + 1],
+        });
+        assert!(
+            serde_json::from_value::<DaemonMsg>(frame).is_err(),
+            "recent-items frames must share the results-frame item cap"
+        );
     }
 
     #[test]

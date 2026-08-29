@@ -74,7 +74,7 @@ use gtk::{gdk, glib};
 
 use hop_protocol::{
     Action as WireAction, ActionId, ActionKind, CopyText, ExecOutcome, Item, ItemId, ItemSubtitle,
-    ItemTitle, Kind, MAX_TITLE,
+    ItemTitle, Kind, RecentItem, MAX_TITLE,
 };
 
 use crate::ipc::{CommandSender, IpcCommand, IpcEvent};
@@ -97,12 +97,6 @@ const PAGE_STEP: i64 = 5;
 /// both, the doubled-identity precedent `ui::row`'s `SUBTITLE_CHILD_NAME`
 /// doc comment documents. `assets/stylesheet.css`'s `.hop-query-entry`
 /// rule (issue #253's accent caret) selects on it.
-
-#[derive(Clone)]
-struct RecentItem {
-    item: Item,
-    launched_at: SystemTime,
-}
 
 #[derive(Clone)]
 enum LocalAction {
@@ -169,7 +163,6 @@ pub struct HopWindow {
     error_pin: gtk::Box,
     error_title: gtk::Label,
     error_subtitle: gtk::Label,
-    recent_items: Rc<RefCell<Vec<RecentItem>>>,
     local_actions: Rc<RefCell<HashMap<String, LocalAction>>>,
     query_had_results: Rc<Cell<bool>>,
     query_pending: Rc<Cell<bool>>,
@@ -299,7 +292,6 @@ impl HopWindow {
         let query_had_results = Rc::new(Cell::new(false));
         let query_pending = Rc::new(Cell::new(false));
         let local_actions = Rc::new(RefCell::new(HashMap::new()));
-        let recent_items = Rc::new(RefCell::new(Vec::new()));
         let factory = view::build(keymap.clone());
         let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory));
         // Single click activates a row rather than GTK's own double-click
@@ -529,7 +521,6 @@ impl HopWindow {
             error_pin,
             error_title,
             error_subtitle,
-            recent_items,
             local_actions: Rc::clone(&local_actions),
             query_had_results,
             query_pending,
@@ -640,12 +631,19 @@ impl HopWindow {
             hop_window.begin_query(entry.text().as_str());
             cmd_tx.send(IpcCommand::Query(entry.text().to_string()));
         });
-
         // Enter running the selection's default action (acceptance
         // criterion 6) is wired in `wire_keyboard` now, through the keymap —
         // see this module's top doc comment, "Key dispatch is keymap-driven,
         // not hardcoded", for why `GtkEntry`'s own `activate` signal is no
         // longer connected to anything here.
+    }
+
+    /// Requests the daemon's persisted recents for the empty query. Unlike
+    /// `set_query_text`, this sends even when the entry is already empty,
+    /// which is required when a fresh window connects.
+    pub fn request_empty_query(&self) {
+        self.begin_query("");
+        self.cmd_tx.send(IpcCommand::Query(String::new()));
     }
 
     /// Attaches the one [`gtk::EventControllerKey`] this window has, in
@@ -1305,14 +1303,23 @@ impl HopWindow {
             IpcEvent::Results(items) => {
                 row::set_offline_state(false);
                 self.list_view.remove_css_class("hop-state-offline");
+                if !items.is_empty() {
+                    self.sync_pending_providers(&items);
+                }
                 if items.is_empty() {
-                    if self.entry.text().is_empty() {
+                    if self.entry.text().is_empty() && !self.query_pending.get() {
                         self.render_empty_state();
                     }
-                } else {
+                } else if !self.entry.text().is_empty() {
                     self.query_had_results.set(true);
                     *self.cached_items.borrow_mut() = items.clone();
                     self.show_results(items);
+                }
+            }
+            IpcEvent::RecentItems(items) => {
+                if self.entry.text().is_empty() {
+                    self.query_had_results.set(!items.is_empty());
+                    self.render_recent_items(items);
                 }
             }
             IpcEvent::QueryDone => {
@@ -1320,7 +1327,11 @@ impl HopWindow {
                     return;
                 }
                 if self.entry.text().is_empty() {
-                    self.render_empty_state();
+                    if !self.query_had_results.get() {
+                        self.render_empty_state();
+                    } else {
+                        self.pending_surface.set_visible(false);
+                    }
                 } else if !self.query_had_results.get() {
                     self.render_no_results_state(self.entry.text().as_str());
                 } else {
@@ -1336,12 +1347,13 @@ impl HopWindow {
     fn begin_query(&self, text: &str) {
         row::set_offline_state(false);
         self.query_had_results.set(false);
-        self.query_pending.set(!text.is_empty());
+        self.query_pending.set(true);
         self.local_actions.borrow_mut().clear();
         self.error_pin.set_visible(false);
         self.list_view.remove_css_class("hop-state-offline");
         if text.is_empty() {
             self.render_empty_state();
+            self.query_pending.set(true);
         } else {
             self.show_pending();
         }
@@ -1349,6 +1361,7 @@ impl HopWindow {
 
     fn show_pending(&self) {
         self.replace_state_items(Vec::new());
+        self.sync_pending_providers(&[]);
         self.state_header.set_text("Working…");
         self.state_header.set_visible(true);
         self.pending_surface.set_visible(true);
@@ -1356,6 +1369,25 @@ impl HopWindow {
         self.update_pending_motion_class();
         self.state_stack.set_visible_child_name("results");
         self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+    }
+
+    fn sync_pending_providers(&self, answered_items: &[Item]) {
+        let mut child = self.pending_surface.first_child();
+        while let Some(widget) = child {
+            let next = widget.next_sibling();
+            if let Ok(attribution) = widget.clone().downcast::<gtk::Label>() {
+                if attribution.has_css_class("hop-pending-attribution") {
+                    let answered = answered_items
+                        .iter()
+                        .any(|item| item.provider.as_str() == attribution.text().as_str());
+                    attribution.set_visible(!answered);
+                    if let Some(row) = next.as_ref() {
+                        row.set_visible(!answered);
+                    }
+                }
+            }
+            child = next;
+        }
     }
 
     fn show_results(&self, items: Vec<Item>) {
@@ -1377,12 +1409,25 @@ impl HopWindow {
             self.selection.set_selected(gtk::INVALID_LIST_POSITION);
         }
     }
-
     fn render_empty_state(&self) {
         self.query_pending.set(false);
-        self.show_results(empty_state_items(&self.recent_items.borrow()));
+        self.show_results(empty_state_items(&[]));
         self.state_header.set_text("Recent");
         self.state_header.set_visible(true);
+    }
+
+    fn render_recent_items(&self, recents: Vec<RecentItem>) {
+        self.replace_state_items(empty_state_items(&recents));
+        self.state_stack.set_visible_child_name("results");
+        self.status.set_visible(false);
+        self.pending_surface.set_visible(false);
+        self.state_header.set_text("Recent");
+        self.state_header.set_visible(true);
+        if self.store.n_items() > 0 {
+            self.selection.set_selected(0);
+        } else {
+            self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+        }
     }
 
     fn render_no_results_state(&self, query: &str) {
@@ -1435,29 +1480,6 @@ impl HopWindow {
         }
     }
 
-    fn record_selected_recent(&self) {
-        let selected = self.selection.selected();
-        if selected == gtk::INVALID_LIST_POSITION {
-            return;
-        }
-        let Some(object) = self.selection.item(selected) else {
-            return;
-        };
-        let item = model::item_of(&object);
-        if item.id.as_str().starts_with("hop:") {
-            return;
-        }
-        let mut recents = self.recent_items.borrow_mut();
-        recents.retain(|recent| recent.item.id != item.id);
-        recents.insert(
-            0,
-            RecentItem {
-                item,
-                launched_at: SystemTime::now(),
-            },
-        );
-        recents.truncate(5);
-    }
 
     fn set_status(&self, text: &str) {
         self.status.set_text(text);
@@ -1471,9 +1493,6 @@ impl HopWindow {
     /// the action itself (an app launch, a window focus) and there is
     /// nothing left for this process to do.
     fn handle_outcome(&self, outcome: ExecOutcome) {
-        if matches!(outcome, ExecOutcome::Done) {
-            self.record_selected_recent();
-        }
         match outcome {
             ExecOutcome::Done => {}
             ExecOutcome::CopyText(text) => {
@@ -1617,7 +1636,7 @@ fn empty_state_items(recents: &[RecentItem]) -> Vec<Item> {
         .iter()
         .filter_map(|recent| {
             let mut item = recent.item.clone();
-            item.subtitle = relative_subtitle(&item.provider, recent.launched_at);
+            item.subtitle = relative_subtitle_ms(&item.provider, recent.launched_at_ms);
             Some(item)
         })
         .collect::<Vec<_>>();
@@ -1634,6 +1653,11 @@ fn empty_state_items(recents: &[RecentItem]) -> Vec<Item> {
         items.push(prefixes);
     }
     items
+}
+
+fn relative_subtitle_ms(provider: &str, launched_at_ms: u64) -> Option<ItemSubtitle> {
+    let launched_at = SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(launched_at_ms))?;
+    relative_subtitle(provider, launched_at)
 }
 
 fn relative_subtitle(provider: &str, launched_at: SystemTime) -> Option<ItemSubtitle> {
@@ -1660,7 +1684,7 @@ fn no_results_state_items(query: &str) -> Vec<Item> {
         state_item(
             "hop:fallback-web-search",
             Kind::WebSearch,
-            &format!("Search web for “{query}”"),
+            &format!("Search the web for “{query}”"),
             Some("fallback · GNOME Web"),
             Some(("open", ActionKind::OpenUrl, "Open")),
             None,
@@ -1684,7 +1708,7 @@ fn no_results_state_items(query: &str) -> Vec<Item> {
 }
 
 fn truncate_query(query: &str) -> String {
-    const PREFIX: &str = "Search web for “";
+    const PREFIX: &str = "Search the web for “";
     const SUFFIX: &str = "”";
     let budget = MAX_TITLE.saturating_sub(PREFIX.len() + SUFFIX.len());
     let mut end = query.len().min(budget);
@@ -3588,12 +3612,22 @@ mod tests {
         window.apply_event(IpcEvent::Results(vec![test_item(7, "Learned app")]));
         window.apply_event(IpcEvent::Executed(ExecOutcome::Done));
         window.set_query_text("");
+        window.apply_event(IpcEvent::RecentItems(vec![
+            hop_protocol::RecentItem {
+                item: test_item(7, "Learned app"),
+                launched_at_ms: (SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock is after Unix epoch")
+                    .as_millis() as u64)
+                    .saturating_sub(7_200_000),
+            },
+        ]));
         assert_eq!(window.state_items.borrow()[0].title.as_str(), "Learned app");
         assert!(
             window.state_items.borrow()[0]
                 .subtitle
                 .as_ref()
-                .is_some_and(|subtitle| subtitle.as_str().contains("just now"))
+                .is_some_and(|subtitle| subtitle.as_str().contains("2h ago"))
         );
         let two_hours_ago = SystemTime::now()
             .checked_sub(Duration::from_secs(7_200))
@@ -3605,9 +3639,9 @@ mod tests {
             "apps · 2h ago"
         );
 
-        // Pending: provider attribution remains visible while the real rows
-        // are not yet available, and remains beside partial results until
-        // QueryDone says every provider has answered.
+        // Pending: provider attribution remains visible until that provider
+        // answers, then its own material collapses while other providers can
+        // continue resolving until QueryDone.
         window.set_query_text("par");
         assert!(window.pending_surface.get_visible());
         assert!(window.pending_surface.has_css_class("hop-state-pending"));
@@ -3617,7 +3651,23 @@ mod tests {
                 .and_then(|child| child.downcast::<gtk::Label>().ok())
                 .is_some_and(|label| label.text().contains("calculator"))
         );
-        window.apply_event(IpcEvent::Results(vec![test_item(1, "Parity")]));
+        let mut parity = test_item(1, "Parity");
+        parity.provider = "calculator".to_string();
+        window.apply_event(IpcEvent::Results(vec![parity]));
+        assert!(
+            !window
+                .pending_surface
+                .first_child()
+                .is_some_and(|provider| provider.get_visible()),
+            "a responding provider's attribution must collapse its pending material"
+        );
+        assert!(
+            window
+                .pending_surface
+                .first_child()
+                .and_then(|provider| provider.next_sibling())
+                .is_some_and(|row| !row.get_visible())
+        );
         assert!(window.pending_surface.get_visible());
         window.apply_event(IpcEvent::QueryDone);
         assert!(!window.pending_surface.get_visible());
@@ -3630,7 +3680,7 @@ mod tests {
         assert_eq!(window.store.n_items(), 2);
         assert_eq!(
             window.state_items.borrow()[0].title.as_str(),
-            "Search web for “zzqq”"
+            "Search the web for “zzqq”"
         );
         assert_eq!(
             window.state_items.borrow()[1].title.as_str(),
@@ -3641,11 +3691,12 @@ mod tests {
         window.set_query_text("terminal-only");
         window.apply_event(IpcEvent::QueryDone);
         assert_eq!(window.state_header.text(), "No local matches");
-        assert_eq!(window.state_items.borrow()[0].title.as_str(), "Search web for “terminal-only”");
+        assert_eq!(
+            window.state_items.borrow()[0].title.as_str(),
+            "Search the web for “terminal-only”"
+        );
         assert_eq!(window.selection.selected(), 0);
         while cmd_rx.try_recv().is_ok() {}
-        // Fallback actions are frontend-owned: activating copy updates the
-        // clipboard without sending an Execute for an item hopd never saw.
         window.list_view.emit_by_name::<()>("activate", &[&1u32]);
         assert!(
             cmd_rx.try_recv().is_err(),
@@ -3685,6 +3736,13 @@ mod tests {
         assert_eq!(window.state_header.text(), "Cached · daemon unreachable");
         assert!(window.list_view.has_css_class("hop-state-offline"));
         assert!(window.offline_indicator.widget.get_visible());
+        let cached_row = row::build();
+        row::bind(cached_row.upcast_ref(), &test_item(2, "last launch"), None);
+        assert!(
+            row::stamp_widget(&cached_row)
+                .is_some_and(|stamp| stamp.get_visible() && stamp.text().starts_with("as of ")),
+            "offline cached rows must expose a visible mono as-of timestamp"
+        );
 
         // Reduced motion makes pending bars static dim rather than animated.
         let settings = gtk::Settings::default().expect("broadway settings");

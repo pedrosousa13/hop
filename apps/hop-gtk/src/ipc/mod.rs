@@ -47,7 +47,7 @@ mod client;
 
 use std::path::PathBuf;
 
-use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, MarkerSpan, Mode};
+use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, MarkerSpan, Mode, RecentItem};
 
 /// A request the UI sends to the IPC thread. Carries no wire-protocol id —
 /// [`client::run`] assigns and tracks the `Query`/`Execute` frame's `id`
@@ -120,6 +120,9 @@ pub enum IpcEvent {
     /// whatever the UI is holding — the same replace rule
     /// `DaemonMsg::Results` documents.
     Results(Vec<Item>),
+
+    /// Persisted learning recents resolved by the daemon against live items.
+    RecentItems(Vec<RecentItem>),
     /// The active query finished; nothing more will arrive for it.
     QueryDone,
     /// The active query's `Execute` completed.

@@ -211,8 +211,15 @@ async fn serve_one_connection(
                         let query_text = current_query_text.clone().unwrap_or_default();
                         let _ = evt_tx.send(IpcEvent::Routed { mode, exclusive, marker_span, query_text }).await;
                     }
-                    Some(ReadEvent::Message(DaemonMsg::Results { query_id, items, .. })) if Some(query_id) == current_id => {
+                    Some(ReadEvent::Message(DaemonMsg::Results { query_id, items, .. }))
+                        if Some(query_id) == current_id =>
+                    {
                         let _ = evt_tx.send(IpcEvent::Results(items)).await;
+                    }
+                    Some(ReadEvent::Message(DaemonMsg::RecentItems { query_id, items }))
+                        if Some(query_id) == current_id =>
+                    {
+                        let _ = evt_tx.send(IpcEvent::RecentItems(items)).await;
                     }
                     Some(ReadEvent::Message(DaemonMsg::QueryDone { query_id })) if Some(query_id) == current_id => {
                         let _ = evt_tx.send(IpcEvent::QueryDone).await;

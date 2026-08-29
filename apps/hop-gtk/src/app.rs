@@ -524,10 +524,10 @@ async fn capture_once_mapped(
 
 /// Drives the window to the state `query` describes, then returns:
 ///
-/// - An empty `query` needs nothing sent — the empty-query state is
-///   whatever the window already shows once presented (and however `ipc`'s
-///   `Connected`/`ConnectFailed` status resolves), so this returns on the
-///   very first event.
+/// - An empty `query` is explicitly sent once `ipc` reports `Connected` via
+///   [`HopWindow::request_empty_query`]. That asks the daemon for persisted
+///   learning recents instead of treating the pre-connection placeholder as
+///   the final frame, and waits for that query's `QueryDone`.
 /// - A non-empty `query` is **typed into the entry** once `ipc` reports
 ///   `Connected`, which fires the same `connect_changed` handler a real
 ///   keystroke does and sends the query from there — see
@@ -536,27 +536,37 @@ async fn capture_once_mapped(
 ///   `QueryDone` before returning — capturing any earlier could race a
 ///   `Results` frame that has not arrived yet.
 ///
+/// [`HopWindow::request_empty_query`]: crate::ui::window::HopWindow::request_empty_query
 /// [`HopWindow::set_query_text`]: crate::ui::window::HopWindow::set_query_text
 async fn drive_to_state(
     window: &ui::window::HopWindow,
     evt_rx: &crate::ipc::EventReceiver,
     query: &str,
 ) {
-    let mut query_sent = query.is_empty();
+    let mut query_sent = false;
     loop {
         let Some(event) = evt_rx.recv().await else {
             return;
         };
         let is_connected = matches!(event, IpcEvent::Connected);
         let is_query_done = matches!(event, IpcEvent::QueryDone);
+        let is_connection_failure =
+            matches!(event, IpcEvent::ConnectFailed(_) | IpcEvent::Disconnected);
         window.apply_event(event);
 
         if is_connected && !query_sent {
-            window.set_query_text(query);
+            if query.is_empty() {
+                window.request_empty_query();
+            } else {
+                window.set_query_text(query);
+            }
             query_sent = true;
             continue;
         }
-        if query.is_empty() || (query_sent && is_query_done) {
+        if is_connection_failure && !query_sent {
+            return;
+        }
+        if query_sent && is_query_done {
             return;
         }
     }
