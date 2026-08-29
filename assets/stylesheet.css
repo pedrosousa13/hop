@@ -230,6 +230,25 @@ listview {
 }
 
 /* ============================================================
+   RESULTS SCROLLBAR — issue #256
+   `HopWindow::build` keeps `GtkScrolledWindow` in overlay-scrolling mode so
+   the scrollbar does not reserve width beside the results. Keep both axes
+   transparent until the results area itself is hovered; this leaves the
+   row surface and its action affordances as the only resting content, while
+   retaining a visible scrollbar for an active pointer over the list.
+   ============================================================ */
+scrolledwindow scrollbar.vertical,
+scrolledwindow scrollbar.horizontal {
+  opacity: 0;
+  transition: opacity {{motion:hop-duration-state}} {{motion:hop-ease-std}};
+}
+
+scrolledwindow:hover scrollbar.vertical,
+scrolledwindow:hover scrollbar.horizontal {
+  opacity: 1;
+}
+
+/* ============================================================
    ROW SURFACE
    `listview > row` is GtkListView's own generated per-item CSS node
    (confirmed the same way: the Gtk-4.0 gir's "CSS nodes" section for

@@ -288,6 +288,11 @@ impl HopWindow {
             .child(&list_view)
             .vexpand(true)
             .build();
+        // The mouse contract keeps the results scrollbar overlaid on the
+        // list rather than reserving a second column for it. CSS controls
+        // its hover-only visibility; keep the widget property explicit so a
+        // theme or future GTK default cannot silently change the geometry.
+        scrolled.set_overlay_scrolling(true);
 
         // Unstyled per this issue's scope (§8a's design pass owns every
         // visual value); the class name is wired in now so that pass has
@@ -1092,7 +1097,11 @@ impl HopWindow {
         gesture.set_button(gdk::BUTTON_SECONDARY);
 
         let hop_window = self.clone();
-        gesture.connect_pressed(move |_gesture, n_press, x, y| {
+        // Open on release rather than press: `ActionPanel` uses GTK's
+        // autohide outside-click handling, and opening during the press lets
+        // that same pointer sequence immediately dismiss the newly opened
+        // popover before the user can choose an action.
+        gesture.connect_released(move |_gesture, n_press, x, y| {
             if n_press != 1 {
                 return;
             }
@@ -2215,6 +2224,68 @@ mod tests {
 
         println!("assert_activate_signal_produces_exactly_one_execute_per_emission passed");
     }
+    /// Issue #256: clicking a row action icon must run that exact action and
+    /// must not also activate the row's default action. This drives the real
+    /// recycled row widget produced by the `GtkListView` factory, rather than
+    /// invoking the shared GAction directly, so the button's own event path
+    /// is part of the assertion.
+    #[test]
+    fn mouse_action_icon_runs_only_its_exact_action() {
+        run_under_broadway(
+            "ui::window::tests::mouse_action_icon_runs_only_its_exact_action",
+            1300,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.MouseActionIcon");
+        let item = test_item_with_actions(1, "two actions", &["open", "reveal"]);
+        model::replace(&window.store, vec![item.clone()]);
+        window.present_with_token(None);
+        let context = glib::MainContext::default();
+        for _ in 0..20 {
+            context.iteration(false);
+        }
+
+        let button = find_named_widget(window.list_view.upcast_ref(), "hop-row-action-icon-2")
+            .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+            .expect("the real list row must expose its second action button");
+        button.emit_clicked();
+
+        match cmd_rx
+            .try_recv()
+            .expect("clicking an action icon must send one Execute command")
+        {
+            IpcCommand::Execute { item_id, action_id } => {
+                assert_eq!(item_id, item.id);
+                assert_eq!(action_id.as_str(), "reveal");
+            }
+            other => panic!("expected Execute, got {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "an action-icon click must not also activate the row default action"
+        );
+
+        println!("mouse action-icon exact-action assertions passed");
+    }
+
+    fn find_named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if widget.widget_name() == name {
+                return Some(widget);
+            }
+            if let Some(found) = find_named_widget(&widget, name) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
 
     /// Reads back the one attribute [`marker_highlight::apply`] would have
     /// set on `entry`, if any — `(start, end)` byte offsets, or `None` if
@@ -2227,6 +2298,86 @@ mod tests {
         let list = entry.attributes()?;
         let attr = list.iterator().attrs().iter().next().cloned()?;
         Some((attr.start_index(), attr.end_index()))
+    }
+
+    /// Issue #256: the action affordance belongs to the row under the
+    /// pointer, not to every row in the list. This drives the real recycled
+    /// row widgets produced by the `GtkListView` factory and checks that each
+    /// wrapper carries the row-local CSS contract through a real Broadway
+    /// display; GTK4 exposes no public synthetic pointer event constructor.
+    #[test]
+    fn mouse_hover_fades_only_the_hovered_rows_actions() {
+        run_under_broadway(
+            "ui::window::tests::mouse_hover_fades_only_the_hovered_rows_actions",
+            1400,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.MouseHover");
+        let provider = gtk::CssProvider::new();
+        let sheet = crate::stylesheet::resolve(
+            crate::tokens::Palette::Dark,
+            crate::tokens::Motion::Full,
+        );
+        provider.load_from_string(&sheet);
+        let display = gdk::Display::default().expect("Broadway must provide a default display");
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        model::replace(
+            &window.store,
+            vec![test_item(1, "first"), test_item(2, "second")],
+        );
+        window.present_with_token(None);
+        let context = glib::MainContext::default();
+        for _ in 0..30 {
+            context.iteration(false);
+        }
+
+        let mut actions = Vec::new();
+        find_named_widgets(
+            window.list_view.upcast_ref(),
+            "hop-row-actions",
+            &mut actions,
+        );
+        assert_eq!(
+            actions.len(),
+            2,
+            "the mapped two-row list must expose one action wrapper per row"
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|widget| widget.has_css_class("hop-row-actions")),
+            "each mapped row must own its action wrapper"
+        );
+        assert!(
+            sheet.contains("listview > row:hover .hop-row-actions"),
+            "hover must reveal only the hovered row's action wrapper"
+        );
+        assert!(
+            sheet.contains("listview > row:selected .hop-row-actions"),
+            "keyboard selection must reveal only the selected row's action wrapper"
+        );
+
+        println!("mouse row-local hover affordance assertions passed");
+    }
+
+    fn find_named_widgets(root: &gtk::Widget, name: &str, found: &mut Vec<gtk::Widget>) {
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if widget.widget_name() == name {
+                found.push(widget.clone());
+            }
+            find_named_widgets(&widget, name, found);
+            child = widget.next_sibling();
+        }
     }
 
     /// Issue #184, criterion 1 / D3: the mode label is shown, naming the
@@ -3080,5 +3231,75 @@ mod tests {
         );
 
         println!("screenshot_window_never_wires_close_on_focus_loss passed");
+    }
+    /// Issue #256's scrollbar contract: the results scroller must keep GTK's
+    /// overlay scrolling enabled, and its resolved stylesheet must hide both
+    /// scrollbar axes until the results area is hovered. This is a real GTK
+    /// widget test under Broadway; the stylesheet assertions deliberately
+    /// inspect the resolved contract rather than source comments.
+    #[test]
+    fn mouse_contract_keeps_scrollbars_hover_only() {
+        run_under_broadway(
+            "ui::window::tests::mouse_contract_keeps_scrollbars_hover_only",
+            1250,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.MouseContractScrollbars");
+        assert!(
+            window.scrolled.is_overlay_scrolling(),
+            "results must use GTK's overlay scrollbar mode"
+        );
+        let sheet = crate::stylesheet::resolve(
+            crate::tokens::Palette::Dark,
+            crate::tokens::Motion::Full,
+        );
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(&sheet);
+        let display = gdk::Display::default().expect("Broadway must provide a default display");
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        model::replace(
+            &window.store,
+            (0..20)
+                .map(|n| test_item(n, &format!("item {n}")))
+                .collect(),
+        );
+        window.present_with_token(None);
+        let context = glib::MainContext::default();
+        for _ in 0..30 {
+            context.iteration(false);
+        }
+        let vertical_scrollbar = window.scrolled.vscrollbar();
+        assert!(
+            vertical_scrollbar.opacity() <= f64::EPSILON,
+            "the overlaid vertical scrollbar must be transparent while the results area is not hovered"
+        );
+        assert!(
+            sheet.contains("scrolledwindow scrollbar.vertical"),
+            "the resolved stylesheet must name the vertical overlay scrollbar"
+        );
+        assert!(
+            sheet.contains("scrolledwindow scrollbar.horizontal"),
+            "the resolved stylesheet must name the horizontal overlay scrollbar"
+        );
+        assert!(
+            sheet.contains("scrolledwindow:hover scrollbar.vertical"),
+            "the vertical scrollbar must become visible only for a hovered results area"
+        );
+        assert!(
+            sheet.contains("scrolledwindow:hover scrollbar.horizontal"),
+            "the horizontal scrollbar must become visible only for a hovered results area"
+        );
+
+        println!("mouse scrollbar hover-only assertions passed");
     }
 }

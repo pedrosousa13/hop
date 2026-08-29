@@ -19,6 +19,25 @@ The full design is at
 The normative [v1 theme token contract](docs/theme-token-contract.md) defines
 the author-facing theme boundary.
 
+## Keyboard and mouse contracts
+
+### Keyboard
+
+From the query field, Up/Down move through results; Page Up/Page Down move by
+pages; Home/End jump to the first or last result; Enter runs the selected
+item's default action; Ctrl+K opens its action panel; Tab completes the query;
+and Escape dismisses the launcher. Bindings come from `[keymap]` in
+`~/.config/hop/config.toml`.
+
+### Mouse
+
+Hover lifts only the row under the pointer and fades in only that row's action
+icons. A single- or double-click on a row runs its default action once. Clicking
+an action icon runs only that exact action. Right-clicking a row opens its
+action panel at the cursor. The results list scrolls with the wheel, and its
+overlay scrollbar appears only while the results area is hovered. Row text is
+not selectable; use the copy action instead.
+
 ## Crates
 
 - `crates/hop-protocol` — the typed IPC contract: every type that crosses a
