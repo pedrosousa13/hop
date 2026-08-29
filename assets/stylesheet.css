@@ -1147,6 +1147,80 @@ popover.background > arrow {
 }
 
 /* ============================================================
+   SIX STATE SURFACES — issue #258
+   These are presentation classes on the existing list/view widgets. State
+   meaning stays in the event-driven window reducer; this block only supplies
+   the approved frame's typography, material, and honesty treatment.
+   ============================================================ */
+.hop-state-header {
+  font: {{font:hop-text-section}};
+  letter-spacing: {{hop-tracking-section}};
+  color: {{hop-fg-3}};
+  padding: {{hop-space-2}} {{hop-space-3}} {{hop-space-1}};
+}
+
+.hop-row-stamp {
+  font: {{font:hop-text-timestamp}};
+  color: {{hop-fg-2}};
+}
+
+.hop-row-prefixes {
+  opacity: 0.72;
+}
+
+.hop-row-fallback {
+  background-color: {{hop-bg-hover}};
+}
+
+.hop-pending-attribution {
+  font: {{font:hop-text-hint-key}};
+  color: {{hop-fg-3}};
+  margin: {{hop-space-2}} {{hop-space-3}} 0;
+}
+
+.hop-pending-row {
+  min-height: {{hop-row-h}};
+  padding: 0 {{hop-space-3}};
+}
+
+.hop-pending-bar {
+  background-color: {{hop-fg-3}};
+  border-radius: {{hop-radius-sm}};
+  opacity: 0.48;
+}
+
+.hop-pending-bar.hop-shimmer-active {
+  background-color: {{hop-fg-2}};
+  opacity: 0.82;
+}
+
+.hop-state-pending.hop-state-reduced-motion .hop-pending-bar {
+  opacity: 0.42;
+}
+
+.hop-error-pin {
+  background-color: {{hop-bg-hover}};
+  border-radius: {{hop-radius-md}};
+  box-shadow: inset 0 0 0 1px {{hop-line}};
+  padding: {{hop-space-2}} {{hop-space-3}};
+}
+
+.hop-error-pin-icon {
+  font: {{font:hop-text-error}};
+  color: {{hop-fg-2}};
+}
+
+.hop-error-pin-title {
+  font: {{font:hop-text-error}};
+  color: {{hop-fg}};
+}
+
+.hop-error-pin-subtitle {
+  font: {{font:hop-text-subtitle}};
+  color: {{hop-fg-2}};
+}
+
+/* ============================================================
    .hop-status — `ui/window.rs:190`
    The connection/error status line (`HopWindow::set_status`). Coloured with
    the ordinary foreground, not a dedicated "error" colour — `tokens.css`'s

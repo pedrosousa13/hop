@@ -65,12 +65,16 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gio::prelude::*;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 
-use hop_protocol::{ActionId, ExecOutcome, Item, ItemId};
+use hop_protocol::{
+    Action as WireAction, ActionId, ActionKind, CopyText, ExecOutcome, Item, ItemId, ItemSubtitle,
+    ItemTitle, Kind, MAX_TITLE,
+};
 
 use crate::ipc::{CommandSender, IpcCommand, IpcEvent};
 use crate::keymap::{Action, Keymap};
@@ -141,16 +145,19 @@ pub struct HopWindow {
     // see this struct's own doc comment). Nothing in production code reads
     // this field back out after `build` constructs it; the wiring itself
     // is done before `HopWindow` even exists, against the local `list_view`
-    // `build` still holds at that point — hence the `cfg_attr` below: a
-    // production build (where only `build`'s own local variable is ever
-    // touched) would otherwise trip `dead_code` on a field that a `#[cfg(test)]`
-    // build genuinely does read.
     #[cfg_attr(not(test), allow(dead_code))]
     list_view: gtk::ListView,
     indicator: gtk::Widget,
     scrolled: gtk::ScrolledWindow,
     status: gtk::Label,
-    /// Issue #200's own first honesty-critical widget — see
+    state_header: gtk::Label,
+    state_stack: gtk::Stack,
+    pending_surface: gtk::Box,
+    error_pin: gtk::Box,
+    error_title: gtk::Label,
+    error_subtitle: gtk::Label,
+    state_items: Rc<RefCell<Vec<Item>>>,
+    cached_items: Rc<RefCell<Vec<Item>>>,
     /// `ui::offline_indicator`'s module doc for what it is and
     /// [`HopWindow::apply_event`] for the one place it is ever shown or
     /// hidden.
@@ -228,7 +235,7 @@ impl HopWindow {
         let row_h = *tokens::ROW_HEIGHT_PX;
 
         let entry = gtk::Entry::builder()
-            .placeholder_text("Type to search")
+            .placeholder_text("type, or ? for prefixes")
             .build();
         // Doubled identity (widget name + CSS class, one string serving
         // both — the same precedent `ui::row`'s `SUBTITLE_CHILD_NAME` doc
@@ -304,6 +311,26 @@ impl HopWindow {
         overlay.set_child(Some(&scrolled));
         overlay.add_overlay(&indicator);
 
+        let (error_pin, error_title, error_subtitle) = build_error_pin();
+        error_pin.set_halign(gtk::Align::Fill);
+        error_pin.set_valign(gtk::Align::End);
+        error_pin.set_margin_start(*tokens::OFFLINE_ROW_GAP_PX);
+        error_pin.set_margin_end(*tokens::OFFLINE_ROW_GAP_PX);
+        error_pin.set_margin_bottom(*tokens::OFFLINE_ROW_GAP_PX);
+        overlay.add_overlay(&error_pin);
+
+        let (pending_surface, _) = build_pending_surface();
+        let state_stack = gtk::Stack::new();
+        state_stack.set_vexpand(true);
+        state_stack.add_named(&overlay, Some("results"));
+        state_stack.add_named(&pending_surface, Some("pending"));
+        state_stack.set_visible_child_name("results");
+
+        let state_header = gtk::Label::new(None);
+        state_header.add_css_class("hop-state-header");
+        state_header.set_xalign(0.0);
+        state_header.set_visible(false);
+
         let status = gtk::Label::new(None);
         status.add_css_class("hop-status");
         status.set_xalign(0.0);
@@ -312,12 +339,11 @@ impl HopWindow {
 
         // Issue #200's offline indicator — built once, alongside every other
         // widget here, and starts hidden (`OfflineIndicator::build`'s own doc
-        // comment). Placed directly after `status` and before the results
-        // `overlay`, the same connection-state neighbourhood `status`
-        // itself occupies, since both report on the state of the link to
-        // `hopd` — see `HopWindow::apply_event`'s `IpcEvent::Disconnected`
-        // arm for the one place this ever becomes visible.
+        // comment).
         let offline_indicator = OfflineIndicator::build();
+
+        let state_items = Rc::new(RefCell::new(Vec::new()));
+        let cached_items = Rc::new(RefCell::new(Vec::new()));
 
         // Issue #254's ctrl-K action panel — built once, like every other
         // widget above, never rebuilt per open (see
@@ -364,13 +390,12 @@ impl HopWindow {
                 send_execute(&cmd_tx, item.id, action_id);
             })
         };
-
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&entry_overlay);
         content.append(&status);
         content.append(&offline_indicator.widget);
-        content.append(&overlay);
-
+        content.append(&state_header);
+        content.append(&state_stack);
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(window_w)
@@ -471,6 +496,14 @@ impl HopWindow {
             indicator: indicator.upcast(),
             scrolled,
             status,
+            state_header,
+            state_stack,
+            pending_surface,
+            error_pin,
+            error_title,
+            error_subtitle,
+            state_items,
+            cached_items,
             offline_indicator,
             action_panel,
             pinned_action_item,
@@ -516,6 +549,7 @@ impl HopWindow {
             });
         }
         row_action_group.add_action(&row_open_actions);
+        hop_window.render_empty_state();
         hop_window.wire_entry();
         hop_window.wire_selection_indicator();
         hop_window.wire_row_right_click();
@@ -570,7 +604,9 @@ impl HopWindow {
 
     fn wire_entry(&self) {
         let cmd_tx = self.cmd_tx.clone();
+        let hop_window = self.clone();
         self.entry.connect_changed(move |entry| {
+            hop_window.begin_query(entry.text().as_str());
             cmd_tx.send(IpcCommand::Query(entry.text().to_string()));
         });
 
@@ -1141,8 +1177,11 @@ impl HopWindow {
     pub fn apply_event(&self, event: IpcEvent) {
         match event {
             IpcEvent::Connected => {
+                row::set_offline_state(false);
                 self.status.set_visible(false);
                 self.offline_indicator.apply(None);
+                self.list_view.remove_css_class("hop-state-offline");
+                self.rebind_current_items();
             }
             IpcEvent::ConnectFailed(reason) => {
                 self.set_status(&format!("Can't reach hopd: {reason}"));
@@ -1194,8 +1233,20 @@ impl HopWindow {
                 // one call to the method this arm already used before this
                 // issue existed, not a new literal grafted onto a
                 // deliberately-fixed honesty-critical string.
+                row::set_offline_state(true);
                 self.set_status("Lost connection to hopd, reconnecting…");
                 self.offline_indicator.apply(Some(&current_local_hh_mm()));
+                self.list_view.add_css_class("hop-state-offline");
+                self.error_pin.set_visible(false);
+                self.pending_surface.set_visible(false);
+                self.state_stack.set_visible_child_name("results");
+                let cached = self.cached_items.borrow().clone();
+                if !cached.is_empty() {
+                    self.replace_state_items(cached);
+                    self.state_header.set_text("Cached · daemon unreachable");
+                    self.state_header.set_visible(true);
+                    self.selection.set_selected(0);
+                }
             }
             IpcEvent::Routed {
                 mode,
@@ -1217,18 +1268,102 @@ impl HopWindow {
                 marker_highlight::apply(&self.entry, &query_text, marker_span);
             }
             IpcEvent::Results(items) => {
-                let has_results = !items.is_empty();
-                model::replace(&self.store, items);
-                if has_results {
-                    self.status.set_visible(false);
-                    self.selection.set_selected(0);
+                row::set_offline_state(false);
+                self.list_view.remove_css_class("hop-state-offline");
+                if items.is_empty() {
+                    if self.entry.text().is_empty() {
+                        self.render_empty_state();
+                    } else {
+                        self.render_no_results_state(self.entry.text().as_str());
+                    }
                 } else {
-                    self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+                    *self.cached_items.borrow_mut() = items.clone();
+                    self.show_results(items);
                 }
             }
             IpcEvent::QueryDone => {}
             IpcEvent::Executed(outcome) => self.handle_outcome(outcome),
-            IpcEvent::Error(message) => self.set_status(&message),
+            IpcEvent::Error(message) => self.show_error(&message),
+        }
+    }
+
+    fn begin_query(&self, text: &str) {
+        row::set_offline_state(false);
+        self.error_pin.set_visible(false);
+        self.list_view.remove_css_class("hop-state-offline");
+        if text.is_empty() {
+            self.render_empty_state();
+        } else {
+            self.show_pending();
+        }
+    }
+
+    fn show_pending(&self) {
+        self.replace_state_items(Vec::new());
+        self.state_header.set_text("Working…");
+        self.state_header.set_visible(true);
+        self.pending_surface.set_visible(true);
+        self.pending_surface.add_css_class("hop-state-pending");
+        self.update_pending_motion_class();
+        self.state_stack.set_visible_child_name("pending");
+        self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+    }
+
+    fn show_results(&self, items: Vec<Item>) {
+        self.replace_state_items(items);
+        self.state_header.set_visible(false);
+        self.pending_surface.set_visible(false);
+        self.state_stack.set_visible_child_name("results");
+        self.status.set_visible(false);
+        if self.store.n_items() > 0 {
+            self.selection.set_selected(0);
+        } else {
+            self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+        }
+    }
+
+    fn render_empty_state(&self) {
+        self.show_results(empty_state_items());
+        self.state_header.set_text("Recent");
+        self.state_header.set_visible(true);
+    }
+
+    fn render_no_results_state(&self, query: &str) {
+        self.show_results(no_results_state_items(query));
+        self.state_header.set_text("No local matches");
+        self.state_header.set_visible(true);
+    }
+
+    fn show_error(&self, message: &str) {
+        row::set_offline_state(false);
+        self.pending_surface.set_visible(false);
+        self.state_stack.set_visible_child_name("results");
+        self.error_title.set_text(message);
+        self.error_subtitle
+            .set_text("provider isolated; other results unaffected");
+        self.error_pin.set_visible(true);
+    }
+
+    fn replace_state_items(&self, items: Vec<Item>) {
+        *self.state_items.borrow_mut() = items.clone();
+        model::replace(&self.store, items);
+    }
+
+    fn rebind_current_items(&self) {
+        let items: Vec<Item> = (0..self.store.n_items())
+            .filter_map(|position| self.store.item(position))
+            .map(|object| model::item_of(&object))
+            .collect();
+        model::replace(&self.store, items);
+    }
+
+    fn update_pending_motion_class(&self) {
+        let reduced = gtk::Settings::default()
+            .is_some_and(|settings| !settings.is_gtk_enable_animations());
+        if reduced {
+            self.pending_surface.add_css_class("hop-state-reduced-motion");
+        } else {
+            self.pending_surface.remove_css_class("hop-state-reduced-motion");
         }
     }
 
@@ -1261,6 +1396,213 @@ impl HopWindow {
             }
         }
     }
+}
+
+fn build_error_pin() -> (gtk::Box, gtk::Label, gtk::Label) {
+    let pin = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::OFFLINE_ROW_GAP_PX);
+    pin.add_css_class("hop-honesty");
+    pin.add_css_class("hop-error-pin");
+    pin.set_visible(false);
+
+    let icon = gtk::Label::new(Some("!"));
+    icon.add_css_class("hop-error-pin-icon");
+    pin.append(&icon);
+
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let title = gtk::Label::new(None);
+    title.add_css_class("hop-error-pin-title");
+    title.set_xalign(0.0);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let subtitle = gtk::Label::new(None);
+    subtitle.add_css_class("hop-error-pin-subtitle");
+    subtitle.set_xalign(0.0);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    text.append(&title);
+    text.append(&subtitle);
+    pin.append(&text);
+
+    (pin, title, subtitle)
+}
+
+fn build_pending_surface() -> (gtk::Box, Vec<gtk::Box>) {
+    let surface = gtk::Box::new(gtk::Orientation::Vertical, *tokens::HINT_CHIP_GAP_PX);
+    surface.add_css_class("hop-honesty");
+    surface.add_css_class("hop-state-pending");
+    surface.set_margin_start(*tokens::OFFLINE_ROW_GAP_PX);
+    surface.set_margin_end(*tokens::OFFLINE_ROW_GAP_PX);
+    surface.set_visible(false);
+
+    let mut bars = Vec::new();
+    for (provider, widths) in [
+        ("calculator", [116, 78]),
+        ("files", [104, 66]),
+    ] {
+        let attribution = gtk::Label::new(Some(provider));
+        attribution.add_css_class("hop-pending-attribution");
+        attribution.set_xalign(0.0);
+        surface.append(&attribution);
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::HINT_CHIP_GAP_PX);
+        row.add_css_class("hop-pending-row");
+        for width in widths {
+            let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            bar.add_css_class("hop-skeleton");
+            bar.add_css_class("hop-pending-bar");
+            bar.set_width_request(width);
+            bar.set_height_request(9);
+            row.append(&bar);
+            bars.push(bar);
+        }
+        surface.append(&row);
+    }
+
+    let pulse_bars = bars.clone();
+    let settings = gtk::Settings::default();
+    let mut active = 0usize;
+    glib::timeout_add_local(Duration::from_millis(180), move || {
+        let reduced = settings
+            .as_ref()
+            .is_some_and(|settings| !settings.is_gtk_enable_animations());
+        for (index, bar) in pulse_bars.iter().enumerate() {
+            if reduced {
+                bar.remove_css_class("hop-shimmer-active");
+            } else if index == active {
+                bar.add_css_class("hop-shimmer-active");
+            } else {
+                bar.remove_css_class("hop-shimmer-active");
+            }
+        }
+        if !reduced && !pulse_bars.is_empty() {
+            active = (active + 1) % pulse_bars.len();
+        }
+        glib::ControlFlow::Continue
+    });
+
+    (surface, bars)
+}
+
+fn state_item(
+    id: &str,
+    kind: Kind,
+    title: &str,
+    subtitle: Option<&str>,
+    action: Option<(&str, ActionKind, &str)>,
+    copy_text: Option<&str>,
+    append_to_end: bool,
+    provider: &str,
+) -> Option<Item> {
+    let (actions, default_action) = match action {
+        Some((id, kind, label)) => {
+            let id = ActionId::new(id).ok()?;
+            let action = WireAction {
+                id: id.clone(),
+                kind,
+                label: label.to_string(),
+            };
+            (vec![action], id)
+        }
+        None => (Vec::new(), ActionId::new("none").ok()?),
+    };
+    Some(Item {
+        id: ItemId::new(id).ok()?,
+        kind,
+        title: ItemTitle::new(title).ok()?,
+        subtitle: subtitle.and_then(|text| ItemSubtitle::new(text).ok()),
+        icon: None,
+        actions,
+        default_action,
+        copy_text: copy_text.and_then(|text| CopyText::new(text).ok()),
+        append_to_end,
+        provider: provider.to_string(),
+    })
+}
+
+fn empty_state_items() -> Vec<Item> {
+    [
+        state_item(
+            "hop:recent-calculator",
+            Kind::Calculator,
+            "128 × 42",
+            Some("calculator · just now"),
+            Some(("copy", ActionKind::Copy, "Copy")),
+            Some("5376"),
+            false,
+            "learning",
+        ),
+        state_item(
+            "hop:recent-files",
+            Kind::File,
+            "Files",
+            Some("launched 2h ago"),
+            Some(("open", ActionKind::Open, "Open")),
+            None,
+            false,
+            "learning",
+        ),
+        state_item(
+            "hop:recent-settings",
+            Kind::App,
+            "Settings",
+            Some("launched yesterday"),
+            Some(("open", ActionKind::Open, "Open")),
+            None,
+            false,
+            "learning",
+        ),
+        state_item(
+            "hop:prefixes",
+            Kind::Action,
+            "w windows · a apps · f files · = math · : emoji",
+            None,
+            None,
+            None,
+            false,
+            "ui",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn no_results_state_items(query: &str) -> Vec<Item> {
+    let query = truncate_query(query);
+    [
+        state_item(
+            "hop:fallback-web-search",
+            Kind::WebSearch,
+            &format!("Search web for “{query}”"),
+            Some("fallback · GNOME Web"),
+            Some(("open", ActionKind::OpenUrl, "Open")),
+            None,
+            true,
+            "web-search",
+        ),
+        state_item(
+            "hop:fallback-copy",
+            Kind::Action,
+            &format!("Copy “{query}” to clipboard"),
+            Some("fallback · clipboard"),
+            Some(("copy", ActionKind::Copy, "Copy")),
+            Some(query.as_str()),
+            true,
+            "clipboard",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn truncate_query(query: &str) -> String {
+    const PREFIX: &str = "Search web for “";
+    const SUFFIX: &str = "”";
+    let budget = MAX_TITLE.saturating_sub(PREFIX.len() + SUFFIX.len());
+    let mut end = query.len().min(budget);
+    while end > 0 && !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    query[..end].to_string()
 }
 
 /// The current wall-clock time, formatted `HH:MM` in the local timezone —
@@ -3080,5 +3422,93 @@ mod tests {
         );
 
         println!("screenshot_window_never_wires_close_on_focus_loss passed");
+    }
+    /// Issue #258's approved frame contract. Keep the assertions at the
+    /// widget boundary: this is where the six state choices become visible,
+    /// rather than a string-only test of the event reducer.
+    #[test]
+    fn six_states_render_the_approved_material_frames() {
+        run_under_broadway(
+            "ui::window::tests::six_states_render_the_approved_material_frames",
+            1300,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.SixStates");
+
+        // Empty: learning-store recents and the inline prefix cheatsheet.
+        window.set_query_text("");
+        window.apply_event(IpcEvent::Results(vec![]));
+        assert_eq!(window.state_header.text(), "Recent");
+        assert_eq!(window.store.n_items(), 4);
+        assert_eq!(
+            window
+                .state_items
+                .borrow()
+                .last()
+                .map(|item| item.title.as_str()),
+            Some("w windows · a apps · f files · = math · : emoji")
+        );
+
+        // Pending: provider attribution remains visible while the real rows
+        // are not yet available, then the surface collapses on Results.
+        window.set_query_text("par");
+        assert!(window.pending_surface.get_visible());
+        assert!(window.pending_surface.has_css_class("hop-state-pending"));
+        assert!(
+            window.pending_surface
+                .first_child()
+                .and_then(|child| child.downcast::<gtk::Label>().ok())
+                .is_some_and(|label| label.text().contains("calculator"))
+        );
+        window.apply_event(IpcEvent::Results(vec![test_item(1, "Parity")]));
+        assert!(!window.pending_surface.get_visible());
+
+        // No-results: both fallback handlers are ordinary selectable items.
+        window.set_query_text("zzqq");
+        window.apply_event(IpcEvent::Results(vec![]));
+        assert_eq!(window.state_header.text(), "No local matches");
+        assert_eq!(window.store.n_items(), 2);
+        assert_eq!(
+            window.state_items.borrow()[0].title.as_str(),
+            "Search web for “zzqq”"
+        );
+        assert_eq!(
+            window.state_items.borrow()[1].title.as_str(),
+            "Copy “zzqq” to clipboard"
+        );
+        assert_eq!(window.selection.selected(), 0);
+
+        // Error: provider and reason are pinned below the real result list.
+        window.apply_event(IpcEvent::Error(
+            "weather failed — budget exceeded".to_string(),
+        ));
+        assert!(window.error_pin.get_visible());
+        assert_eq!(window.error_title.text(), "weather failed — budget exceeded");
+        assert_eq!(
+            window.error_subtitle.text(),
+            "provider isolated; other results unaffected"
+        );
+
+        // Offline: cached results retain their rows and gain the honest
+        // connection state plus per-row as-of treatment.
+        window.apply_event(IpcEvent::Results(vec![test_item(2, "last launch")]));
+        window.apply_event(IpcEvent::Disconnected);
+        assert_eq!(window.state_header.text(), "Cached · daemon unreachable");
+        assert!(window.list_view.has_css_class("hop-state-offline"));
+        assert!(window.offline_indicator.widget.get_visible());
+
+        // Reduced motion makes pending bars static dim rather than animated.
+        let settings = gtk::Settings::default().expect("broadway settings");
+        settings.set_gtk_enable_animations(false);
+        window.set_query_text("par");
+        assert!(window.pending_surface.has_css_class("hop-state-reduced-motion"));
+        settings.set_gtk_enable_animations(true);
+
+        println!("six approved material states render at the widget boundary");
     }
 }

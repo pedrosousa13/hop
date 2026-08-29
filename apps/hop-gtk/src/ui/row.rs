@@ -470,12 +470,13 @@
 //! by accident.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glib::variant::ToVariant;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 
-use hop_protocol::{ActionKind, IconPath, IconSpec, Item, ItemSubtitle};
+use hop_protocol::{ActionKind, IconPath, IconSpec, Item, ItemSubtitle, Kind};
 
 use crate::icon_roots;
 use crate::tokens;
@@ -531,6 +532,8 @@ const TITLE_CHILD_NAME: &str = "hop-row-title";
 /// one that both needs styling and must be found again — the mode label
 /// and the subtitle simply are not the same shape of problem.
 const SUBTITLE_CHILD_NAME: &str = "hop-row-subtitle";
+static OFFLINE_STATE: AtomicBool = AtomicBool::new(false);
+const STAMP_CHILD_NAME: &str = "hop-row-stamp";
 
 /// The widget name — and, since issue #207, the CSS class too — [`build`]
 /// gives the hint's own horizontal `gtk::Box`, the third direct child of
@@ -740,6 +743,11 @@ pub fn subtitle_widget(container: &gtk::Box) -> Option<gtk::Label> {
     find_named_child(container, SUBTITLE_CHILD_NAME)
 }
 
+/// The row's offline cache age stamp, shown only while the list is in the
+/// disconnected state.
+pub fn stamp_widget(container: &gtk::Box) -> Option<gtk::Label> {
+    find_named_child(container, STAMP_CHILD_NAME)
+}
 /// The `Row` page's action hint — the outer `gtk::Box` wrapping the label
 /// and key-glyph chips, added by issue #197. See this module's "Issue
 /// #197" doc section for why it is the outer row container's third direct
@@ -859,7 +867,14 @@ pub fn build() -> gtk::Box {
     // inside rows", applied to the row's other prose label.
     subtitle.set_selectable(false);
     text_column.append(&subtitle);
-
+    let stamp = gtk::Label::new(None);
+    stamp.set_widget_name(STAMP_CHILD_NAME);
+    stamp.add_css_class(STAMP_CHILD_NAME);
+    stamp.set_xalign(0.0);
+    stamp.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    stamp.set_visible(false);
+    stamp.set_selectable(false);
+    text_column.append(&stamp);
     container.append(&text_column);
 
     // The action-icon buttons — issue #254. A third direct child of the
@@ -1245,11 +1260,15 @@ pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return;
     };
+    sync_state_classes(container, item);
     if let Some(label) = title_widget(container) {
         label.set_text(item.title.as_str());
     }
     if let Some(subtitle) = subtitle_widget(container) {
         resolve_subtitle(&subtitle, item.subtitle.as_ref());
+    }
+    if let Some(stamp) = stamp_widget(container) {
+        resolve_stamp(&stamp, OFFLINE_STATE.load(Ordering::Relaxed));
     }
     if let Some(icon) = icon_widget(container) {
         resolve_icon(&icon, item.icon.as_ref());
@@ -1266,6 +1285,35 @@ pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str
     }
     resolve_action_icons(container, item);
     resolve_overflow_button(container, item);
+}
+
+fn sync_state_classes(container: &gtk::Box, item: &Item) {
+    container.remove_css_class("hop-row-fallback");
+    container.remove_css_class("hop-row-prefixes");
+    if item.append_to_end || matches!(item.kind, Kind::WebSearch) {
+        container.add_css_class("hop-row-fallback");
+    }
+    if item.id.as_str() == "hop:prefixes" {
+        container.add_css_class("hop-row-prefixes");
+    }
+}
+
+/// Updates the connection state used when recycled rows bind cached results.
+pub fn set_offline_state(offline: bool) {
+    OFFLINE_STATE.store(offline, Ordering::Relaxed);
+}
+
+fn resolve_stamp(stamp: &gtk::Label, offline: bool) {
+    if offline {
+        let text = glib::DateTime::now_local()
+            .and_then(|now| now.format("as of %H:%M"))
+            .unwrap_or_else(|_| glib::GString::from("as of --:--"));
+        stamp.set_text(text.as_str());
+        stamp.set_visible(true);
+    } else {
+        stamp.set_text("");
+        stamp.set_visible(false);
+    }
 }
 
 /// Maps an [`ActionKind`] to a themed, symbolic icon name — this module's
@@ -1732,6 +1780,11 @@ pub fn unbind(widget: &gtk::Widget) {
     if let Some(button) = overflow_button_widget(container) {
         clear_overflow_button(&button);
     }
+    if let Some(stamp) = stamp_widget(container) {
+        resolve_stamp(&stamp, false);
+    }
+    container.remove_css_class("hop-row-fallback");
+    container.remove_css_class("hop-row-prefixes");
 }
 
 #[cfg(test)]
