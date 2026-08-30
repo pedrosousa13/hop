@@ -626,14 +626,12 @@ impl ProviderHost {
 
     /// The effective ids the host would run for `q`, in registration order.
     ///
-    /// Unlike [`ProviderHost::spawn_query`], inspecting this selection does
-    /// not log skipped providers or launch work. It lets a caller present the
-    /// actual scheduled providers before any of them has sent a result while
-    /// leaving `spawn_query` as the one place that records scheduling events.
+    /// This shares [`ProviderHost::selected`]'s filtering and log seam, so
+    /// every skipped registration is still recorded even when a caller only
+    /// needs the ids for routing metadata. It does not launch provider work.
     pub fn selected_ids(&self, q: &RoutedQuery) -> Vec<&str> {
-        self.providers
+        self.selected(q)
             .iter()
-            .filter(|registration| self.is_selected(registration, q))
             .map(|registration| registration.effective.id)
             .collect()
     }
