@@ -1602,10 +1602,7 @@ impl HopWindow {
                 LocalAction::Copy(full_query),
             ),
         ]);
-        self.show_results(no_results_state_items(
-            display_query.as_str(),
-            query,
-        ));
+        self.show_results(no_results_state_items(display_query.as_str(), query));
         self.state_header.set_text("No local matches");
         self.state_header.set_visible(true);
     }
@@ -2717,8 +2714,14 @@ mod tests {
         let strategy =
             crate::session::SessionKind::Other.overlay_strategy(crate::layer_shell::probe());
         let user_actions: Rc<dyn UserActionSink> = actions;
-        let window =
-            HopWindow::build_with_user_actions(&app, cmd_tx, Keymap::defaults(), strategy, RunPurpose::Interactive, user_actions);
+        let window = HopWindow::build_with_user_actions(
+            &app,
+            cmd_tx,
+            Keymap::defaults(),
+            strategy,
+            RunPurpose::Interactive,
+            user_actions,
+        );
         (window, cmd_rx)
     }
 
@@ -3979,7 +3982,6 @@ mod tests {
             "provider rows must expose the pending-bar selector"
         );
 
-
         let mut calculator = test_item(1, "Parity");
         calculator.provider = "calculator".to_string();
         window.apply_event(IpcEvent::Results(vec![calculator]));
@@ -4122,10 +4124,7 @@ mod tests {
 
         // One successful command send permits one matching outcome.
         window.list_view.emit_by_name::<()>("activate", &[&0u32]);
-        assert!(matches!(
-            cmd_rx.try_recv(),
-            Ok(IpcCommand::Execute { .. })
-        ));
+        assert!(matches!(cmd_rx.try_recv(), Ok(IpcCommand::Execute { .. })));
         window.apply_event(IpcEvent::Executed(outcome()));
         assert_eq!(
             actions.uris.borrow().as_slice(),
@@ -4141,10 +4140,7 @@ mod tests {
 
         // A new query clears an outstanding permission before its outcome.
         window.list_view.emit_by_name::<()>("activate", &[&0u32]);
-        assert!(matches!(
-            cmd_rx.try_recv(),
-            Ok(IpcCommand::Execute { .. })
-        ));
+        assert!(matches!(cmd_rx.try_recv(), Ok(IpcCommand::Execute { .. })));
         window.set_query_text("new-query");
         while cmd_rx.try_recv().is_ok() {}
         window.apply_event(IpcEvent::Executed(outcome()));
@@ -4158,10 +4154,7 @@ mod tests {
         while cmd_rx.try_recv().is_ok() {}
         window.apply_event(IpcEvent::Results(vec![test_item(2, "authorized again")]));
         window.list_view.emit_by_name::<()>("activate", &[&0u32]);
-        assert!(matches!(
-            cmd_rx.try_recv(),
-            Ok(IpcCommand::Execute { .. })
-        ));
+        assert!(matches!(cmd_rx.try_recv(), Ok(IpcCommand::Execute { .. })));
         window.apply_event(IpcEvent::Disconnected);
         window.apply_event(IpcEvent::Executed(outcome()));
         assert_eq!(
@@ -4179,7 +4172,9 @@ mod tests {
         drop(failed_rx);
         failed_window.set_query_text("closed");
         failed_window.apply_event(IpcEvent::Results(vec![test_item(3, "closed")]));
-        failed_window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+        failed_window
+            .list_view
+            .emit_by_name::<()>("activate", &[&0u32]);
         failed_window.apply_event(IpcEvent::Executed(outcome()));
         assert!(failed_actions.uris.borrow().is_empty());
     }
@@ -4203,10 +4198,8 @@ mod tests {
         crate::style::install_locked(&display);
 
         let actions = Rc::new(FakeUserActionSink::default());
-        let (window, cmd_rx) = build_test_window_with_action_sink(
-            "dev.hop.WindowTest.SixStates",
-            Rc::clone(&actions),
-        );
+        let (window, cmd_rx) =
+            build_test_window_with_action_sink("dev.hop.WindowTest.SixStates", Rc::clone(&actions));
         window.present_with_token(None);
 
         // Empty: a fresh learning store has no fake history; only the

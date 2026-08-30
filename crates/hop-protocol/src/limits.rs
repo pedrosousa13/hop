@@ -787,7 +787,6 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
     }
 }
 
-
 struct BoundedProviderIds {
     field: &'static str,
     max: usize,
@@ -813,8 +812,12 @@ impl<'de> Visitor<'de> for BoundedProviderIds {
                     max: self.max,
                 }));
             }
-            check_len("DaemonMsg::QueryRouted.pending_providers[]", MAX_PROVIDER_ID, provider.len())
-                .map_err(A::Error::custom)?;
+            check_len(
+                "DaemonMsg::QueryRouted.pending_providers[]",
+                MAX_PROVIDER_ID,
+                provider.len(),
+            )
+            .map_err(A::Error::custom)?;
             out.push(provider);
         }
         Ok(out)

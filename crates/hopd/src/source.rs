@@ -29,8 +29,7 @@ use hop_core::router::{Mode, RoutedQuery, route};
 use hop_core::sanitize::escape_path;
 use hop_protocol::{
     Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, ItemSubtitle, ItemTitle, Kind,
-    MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, MAX_PENDING_PROVIDERS, QueryText,
-    RecentItem,
+    MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, MAX_PENDING_PROVIDERS, QueryText, RecentItem,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -470,7 +469,6 @@ fn absorb_capped(accumulated: &mut CheckedItems, mut checked: CheckedItems, cap:
 }
 
 impl ResultSource for HostSource {
-
     fn pending_providers(&self, text: &QueryText) -> Vec<String> {
         let routed = route(text.as_str());
         self.host

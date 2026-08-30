@@ -471,8 +471,8 @@
 
 use std::io::Read;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
 use glib::variant::ToVariant;
@@ -1341,7 +1341,6 @@ fn resolve_stamp(stamp: &gtk::Label, offline: bool) {
         stamp.set_visible(false);
     }
 }
-
 
 /// Maps an [`ActionKind`] to a themed, symbolic icon name — this module's
 /// top doc comment, "Icon glyph", has the full argument for why this is
