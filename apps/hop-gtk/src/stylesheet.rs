@@ -452,27 +452,26 @@ mod tests {
     }
 
     /// [`resolve_locked_block`]'s whole reason to exist: its output must
-    /// carry exactly the four honesty-critical rules — `.hop-honesty`
-    /// itself, `.hop-honesty-text`, `.hop-honesty-stamp`, and
-    /// `.hop-honesty .hop-skeleton` — and *nothing* from the rest of the
-    /// file. The first half alone would pass for a function that
+    /// carry the honesty-critical rules for the cached stamp, pending bars,
+    /// error labels, and skeleton dimensions — and *nothing* from the rest
+    /// of the file. The first half alone would pass for a function that
     /// (incorrectly) returned the entire resolved sheet; the second half is
     /// what actually proves this is the narrow, above-user-priority slice
     /// `style.rs`'s second provider is allowed to carry, not the whole
-    /// sheet by another name — a hostile theme could otherwise contest
-    /// anything the *ordinary* provider styles, not just the locked
-    /// categories, exactly the failure this issue's brief calls out
-    /// ("raising the ordinary sheet's priority would silently revoke" the
-    /// contract's "everywhere outside the honesty-critical class"
-    /// guarantee).
+    /// sheet by another name.
     #[test]
-    fn resolved_locked_block_carries_exactly_the_four_honesty_rules_and_nothing_else() {
+    fn resolved_locked_block_carries_honesty_rules_and_nothing_else() {
         let locked = resolve_locked_block(Palette::Dark, Motion::Full);
 
         for must_contain in [
             ".hop-honesty {",
             ".hop-honesty .hop-honesty-text {",
             ".hop-honesty .hop-honesty-stamp {",
+            ".hop-honesty .hop-pending-attribution {",
+            ".hop-honesty .hop-pending-bar {",
+            ".hop-honesty .hop-pending-bar.hop-shimmer-active {",
+            ".hop-honesty .hop-error-pin-title {",
+            ".hop-honesty .hop-error-pin-subtitle {",
             ".hop-honesty .hop-skeleton {",
             "opacity: 1;",
             "min-width: 24px;",

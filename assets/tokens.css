@@ -275,6 +275,11 @@
   /* Row anatomy per the M3 visual spec: 26px icon · title · subtitle ·
      right-aligned action hint, inside the 56px --hop-row-h above. */
   --hop-icon-size:           26px;
+  /* Inline prefix cheatsheet is a secondary affordance, not a disabled
+     result. Keep its presentation opacity in the regular token surface;
+     honesty-critical opacity remains fixed in stylesheet.css's locked
+     block. */
+  --hop-opacity-prefixes:   0.72;
 
   /* ==========================================================
      MOTION

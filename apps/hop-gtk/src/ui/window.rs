@@ -64,7 +64,7 @@
 //! computation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
@@ -102,6 +102,74 @@ const PAGE_STEP: i64 = 5;
 enum LocalAction {
     WebSearch(String),
     Copy(String),
+}
+
+#[derive(Default)]
+struct LocalActionRegistry {
+    generation: u64,
+    rendered_generation: Option<u64>,
+    actions: HashMap<String, LocalAction>,
+}
+
+impl LocalActionRegistry {
+    fn begin_query(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.clear();
+    }
+
+    fn clear(&mut self) {
+        self.actions.clear();
+        self.rendered_generation = None;
+    }
+
+    fn install(&mut self, actions: impl IntoIterator<Item = (String, LocalAction)>) {
+        self.clear();
+        self.actions.extend(actions);
+        self.rendered_generation = Some(self.generation);
+    }
+
+    fn action_for(&self, item_id: &ItemId) -> Option<LocalAction> {
+        (self.rendered_generation == Some(self.generation))
+            .then(|| self.actions.get(item_id.as_str()).cloned())
+            .flatten()
+    }
+}
+
+trait UserActionSink {
+    fn copy_text(&self, text: &str);
+    fn launch_uri(&self, uri: &str) -> Result<(), String>;
+}
+
+struct GtkUserActionSink;
+
+impl UserActionSink for GtkUserActionSink {
+    fn copy_text(&self, text: &str) {
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.clipboard().set_text(text);
+        }
+    }
+
+    fn launch_uri(&self, uri: &str) -> Result<(), String> {
+        gtk::gio::AppInfo::launch_default_for_uri(uri, gtk::gio::AppLaunchContext::NONE)
+            .map_err(|err| err.to_string())
+    }
+}
+
+struct ScreenshotUserActionSink;
+
+impl UserActionSink for ScreenshotUserActionSink {
+    fn copy_text(&self, _text: &str) {}
+
+    fn launch_uri(&self, _uri: &str) -> Result<(), String> {
+        Err("navigation is disabled while capturing a screenshot".to_string())
+    }
+}
+
+struct PendingProvider {
+    id: String,
+    attribution: gtk::Label,
+    row: gtk::Box,
+    bars: [gtk::Box; 2],
 }
 const QUERY_ENTRY_NAME: &str = "hop-query-entry";
 
@@ -163,7 +231,10 @@ pub struct HopWindow {
     error_pin: gtk::Box,
     error_title: gtk::Label,
     error_subtitle: gtk::Label,
-    local_actions: Rc<RefCell<HashMap<String, LocalAction>>>,
+    local_actions: Rc<RefCell<LocalActionRegistry>>,
+    user_actions: Rc<dyn UserActionSink>,
+    pending_user_executions: Rc<Cell<u32>>,
+    pending_providers: Rc<RefCell<Vec<PendingProvider>>>,
     query_had_results: Rc<Cell<bool>>,
     query_pending: Rc<Cell<bool>>,
     state_items: Rc<RefCell<Vec<Item>>>,
@@ -241,6 +312,21 @@ impl HopWindow {
         strategy: crate::session::OverlayStrategy,
         purpose: RunPurpose,
     ) -> Self {
+        let user_actions: Rc<dyn UserActionSink> = match purpose {
+            RunPurpose::Interactive => Rc::new(GtkUserActionSink),
+            RunPurpose::Screenshot => Rc::new(ScreenshotUserActionSink),
+        };
+        Self::build_with_user_actions(app, cmd_tx, keymap, strategy, purpose, user_actions)
+    }
+
+    fn build_with_user_actions(
+        app: &adw::Application,
+        cmd_tx: CommandSender,
+        keymap: Keymap,
+        strategy: crate::session::OverlayStrategy,
+        purpose: RunPurpose,
+        user_actions: Rc<dyn UserActionSink>,
+    ) -> Self {
         let (window_w, window_h) = *tokens::WINDOW_SIZE_PX;
         let row_h = *tokens::ROW_HEIGHT_PX;
 
@@ -291,7 +377,9 @@ impl HopWindow {
         // removed from `view::build`'s own closures.
         let query_had_results = Rc::new(Cell::new(false));
         let query_pending = Rc::new(Cell::new(false));
-        let local_actions = Rc::new(RefCell::new(HashMap::new()));
+        let local_actions = Rc::new(RefCell::new(LocalActionRegistry::default()));
+        let pending_providers = Rc::new(RefCell::new(Vec::new()));
+        let pending_user_executions = Rc::new(Cell::new(0));
         let factory = view::build(keymap.clone());
         let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory));
         // Single click activates a row rather than GTK's own double-click
@@ -302,7 +390,14 @@ impl HopWindow {
         // `connect_activate` anywhere in this crate before this change: this
         // is new wiring, not a preserved default.
         list_view.set_single_click_activate(true);
-        wire_list_activation(&list_view, &selection, &cmd_tx, &local_actions);
+        wire_list_activation(
+            &list_view,
+            &selection,
+            &cmd_tx,
+            &local_actions,
+            &user_actions,
+            &pending_user_executions,
+        );
 
         let scrolled = gtk::ScrolledWindow::builder()
             .child(&list_view)
@@ -332,7 +427,7 @@ impl HopWindow {
         error_pin.set_margin_bottom(*tokens::OFFLINE_ROW_GAP_PX);
         overlay.add_overlay(&error_pin);
 
-        let (pending_surface, _) = build_pending_surface();
+        let pending_surface = build_pending_surface(Rc::clone(&pending_providers));
         pending_surface.set_halign(gtk::Align::Fill);
         pending_surface.set_valign(gtk::Align::End);
         pending_surface.set_margin_bottom(*tokens::OFFLINE_ROW_GAP_PX);
@@ -381,6 +476,8 @@ impl HopWindow {
             let cmd_tx = cmd_tx.clone();
             let pinned_action_item = Rc::clone(&pinned_action_item);
             let local_actions = Rc::clone(&local_actions);
+            let user_actions = Rc::clone(&user_actions);
+            let pending_user_executions = Rc::clone(&pending_user_executions);
             ActionPanel::new(move |action_id| {
                 // `take()`, not a borrow-and-clone: once a choice is
                 // reported the pin has done its job for this `present`
@@ -405,7 +502,14 @@ impl HopWindow {
                     // from its own signature alone.
                     return;
                 };
-                dispatch_item_action(&cmd_tx, &item, &local_actions, action_id);
+                dispatch_item_action(
+                    &cmd_tx,
+                    &item,
+                    &local_actions,
+                    action_id,
+                    &user_actions,
+                    &pending_user_executions,
+                );
             })
         };
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -480,6 +584,8 @@ impl HopWindow {
         {
             let cmd_tx = cmd_tx.clone();
             let local_actions = Rc::clone(&local_actions);
+            let user_actions = Rc::clone(&user_actions);
+            let pending_user_executions = Rc::clone(&pending_user_executions);
             row_run_action.connect_activate(move |_action, parameter| {
                 let Some(parameter) = parameter else {
                     return;
@@ -498,7 +604,14 @@ impl HopWindow {
                 else {
                     return;
                 };
-                dispatch_id_action(&cmd_tx, &item_id, &action_id, &local_actions);
+                dispatch_id_action(
+                    &cmd_tx,
+                    &item_id,
+                    &action_id,
+                    &local_actions,
+                    &user_actions,
+                    &pending_user_executions,
+                );
             });
         }
         let row_action_group = gio::SimpleActionGroup::new();
@@ -522,6 +635,9 @@ impl HopWindow {
             error_title,
             error_subtitle,
             local_actions: Rc::clone(&local_actions),
+            user_actions,
+            pending_user_executions,
+            pending_providers,
             query_had_results,
             query_pending,
             state_items,
@@ -700,7 +816,13 @@ impl HopWindow {
             Action::Home => self.select_first(),
             Action::End => self.select_last(),
             Action::Activate => {
-                activate_selected(&self.selection, &self.cmd_tx, &self.local_actions)
+                activate_selected(
+                    &self.selection,
+                    &self.cmd_tx,
+                    &self.local_actions,
+                    &self.user_actions,
+                    &self.pending_user_executions,
+                );
             }
             Action::SecondaryAction => self.open_secondary_action_menu(),
             Action::CompletePrefix => self.complete_prefix(),
@@ -1208,7 +1330,7 @@ impl HopWindow {
     pub fn apply_event(&self, event: IpcEvent) {
         match event {
             IpcEvent::Connected => {
-                row::set_offline_state(false);
+                row::set_offline_state(false, None);
                 self.status.set_visible(false);
                 self.offline_indicator.apply(None);
                 self.list_view.remove_css_class("hop-state-offline");
@@ -1264,12 +1386,14 @@ impl HopWindow {
                 // one call to the method this arm already used before this
                 // issue existed, not a new literal grafted onto a
                 // deliberately-fixed honesty-critical string.
-                row::set_offline_state(true);
+                let as_of = current_local_hh_mm();
+                row::set_offline_state(true, Some(as_of.as_str()));
                 self.set_status("Lost connection to hopd, reconnecting…");
-                self.offline_indicator.apply(Some(&current_local_hh_mm()));
+                self.offline_indicator.apply(Some(as_of.as_str()));
                 self.list_view.add_css_class("hop-state-offline");
                 self.error_pin.set_visible(false);
                 self.pending_surface.set_visible(false);
+                self.clear_pending_providers();
                 self.state_stack.set_visible_child_name("results");
                 let cached = self.cached_items.borrow().clone();
                 if !cached.is_empty() {
@@ -1284,6 +1408,7 @@ impl HopWindow {
                 exclusive,
                 marker_span,
                 query_text,
+                pending_providers,
             } => {
                 // D3's "mirrors `exclusive`, and nothing else" rule, made
                 // concrete right here: the mode label is shown only when
@@ -1297,13 +1422,15 @@ impl HopWindow {
                 // that binding against this window's *current* entry text.
                 mode_label::apply(&self.mode_label, exclusive.then_some(mode));
                 marker_highlight::apply(&self.entry, &query_text, marker_span);
+                if !query_text.is_empty() && self.query_pending.get() {
+                    self.set_pending_providers(pending_providers);
+                }
             }
             IpcEvent::Results(items) => {
-                row::set_offline_state(false);
+                row::set_offline_state(false, None);
+                self.local_actions.borrow_mut().clear();
                 self.list_view.remove_css_class("hop-state-offline");
-                if !items.is_empty() {
-                    self.sync_pending_providers(&items);
-                }
+                self.resolve_pending_providers(&items);
                 if items.is_empty() {
                     if self.entry.text().is_empty() && !self.query_pending.get() {
                         self.render_empty_state();
@@ -1324,6 +1451,7 @@ impl HopWindow {
                 if !self.query_pending.replace(false) {
                     return;
                 }
+                self.clear_pending_providers();
                 if self.entry.text().is_empty() {
                     if !self.query_had_results.get() {
                         self.render_empty_state();
@@ -1343,10 +1471,11 @@ impl HopWindow {
     }
 
     fn begin_query(&self, text: &str) {
-        row::set_offline_state(false);
+        row::set_offline_state(false, None);
         self.query_had_results.set(false);
         self.query_pending.set(true);
-        self.local_actions.borrow_mut().clear();
+        self.local_actions.borrow_mut().begin_query();
+        self.clear_pending_providers();
         self.error_pin.set_visible(false);
         self.list_view.remove_css_class("hop-state-offline");
         if text.is_empty() {
@@ -1359,33 +1488,56 @@ impl HopWindow {
 
     fn show_pending(&self) {
         self.replace_state_items(Vec::new());
-        self.sync_pending_providers(&[]);
+        self.clear_pending_providers();
         self.state_header.set_text("Working…");
         self.state_header.set_visible(true);
-        self.pending_surface.set_visible(true);
         self.pending_surface.add_css_class("hop-state-pending");
         self.update_pending_motion_class();
         self.state_stack.set_visible_child_name("results");
         self.selection.set_selected(gtk::INVALID_LIST_POSITION);
     }
 
-    fn sync_pending_providers(&self, answered_items: &[Item]) {
-        let mut child = self.pending_surface.first_child();
-        while let Some(widget) = child {
-            let next = widget.next_sibling();
-            if let Ok(attribution) = widget.clone().downcast::<gtk::Label>()
-                && attribution.has_css_class("hop-pending-attribution")
-            {
-                let answered = answered_items
-                    .iter()
-                    .any(|item| item.provider.as_str() == attribution.text().as_str());
-                attribution.set_visible(!answered);
-                if let Some(row) = next.as_ref() {
-                    row.set_visible(!answered);
-                }
+    fn set_pending_providers(&self, provider_ids: Vec<String>) {
+        self.clear_pending_providers();
+        let mut seen = HashSet::with_capacity(provider_ids.len());
+        let mut pending = self.pending_providers.borrow_mut();
+        for provider_id in provider_ids {
+            if !seen.insert(provider_id.clone()) {
+                continue;
             }
-            child = next;
+            let provider = build_pending_provider(provider_id);
+            self.pending_surface.append(&provider.attribution);
+            self.pending_surface.append(&provider.row);
+            pending.push(provider);
         }
+        self.pending_surface.set_visible(!pending.is_empty());
+    }
+
+    fn resolve_pending_providers(&self, items: &[Item]) {
+        let pending = self.pending_providers.borrow();
+        for provider in pending.iter() {
+            if provider.attribution.get_visible()
+                && items
+                    .iter()
+                    .any(|item| item.provider.as_str() == provider.id)
+            {
+                provider.attribution.set_visible(false);
+                provider.row.set_visible(false);
+            }
+        }
+        let any_pending = pending
+            .iter()
+            .any(|provider| provider.attribution.get_visible());
+        self.pending_surface
+            .set_visible(self.query_pending.get() && any_pending);
+    }
+
+    fn clear_pending_providers(&self) {
+        self.pending_providers.borrow_mut().clear();
+        while let Some(child) = self.pending_surface.first_child() {
+            self.pending_surface.remove(&child);
+        }
+        self.pending_surface.set_visible(false);
     }
 
     fn show_results(&self, items: Vec<Item>) {
@@ -1396,7 +1548,12 @@ impl HopWindow {
         if keep_pending {
             self.state_header.set_text("Working…");
             self.state_header.set_visible(true);
-            self.pending_surface.set_visible(true);
+            self.pending_surface.set_visible(
+                self.pending_providers
+                    .borrow()
+                    .iter()
+                    .any(|provider| provider.attribution.get_visible()),
+            );
         } else {
             self.state_header.set_visible(false);
             self.pending_surface.set_visible(false);
@@ -1429,23 +1586,28 @@ impl HopWindow {
     }
 
     fn render_no_results_state(&self, query: &str) {
-        let query = truncate_query(query);
+        let full_query = query.to_string();
+        let display_query = truncate_query(query);
         self.query_pending.set(false);
-        self.local_actions.borrow_mut().clear();
-        self.local_actions.borrow_mut().insert(
-            "hop:fallback-web-search".to_string(),
-            LocalAction::WebSearch(query.clone()),
-        );
-        self.local_actions.borrow_mut().insert(
-            "hop:fallback-copy".to_string(),
-            LocalAction::Copy(query.clone()),
-        );
-        self.show_results(no_results_state_items(query.as_str()));
+        self.local_actions.borrow_mut().install([
+            (
+                "hop:fallback-web-search".to_string(),
+                LocalAction::WebSearch(full_query.clone()),
+            ),
+            (
+                "hop:fallback-copy".to_string(),
+                LocalAction::Copy(full_query),
+            ),
+        ]);
+        self.show_results(no_results_state_items(
+            display_query.as_str(),
+            query,
+        ));
         self.state_header.set_text("No local matches");
         self.state_header.set_visible(true);
     }
     fn show_error(&self, message: &str) {
-        row::set_offline_state(false);
+        row::set_offline_state(false, None);
         self.query_pending.set(false);
         self.pending_surface.set_visible(false);
         self.state_stack.set_visible_child_name("results");
@@ -1484,26 +1646,15 @@ impl HopWindow {
         self.status.set_text(text);
         self.status.set_visible(true);
     }
-
-    /// Carries out an [`ExecOutcome`] the daemon reported for the last
-    /// `Execute` — the two variants that ask the *client* to act
-    /// (`CopyText`, `OpenUrl`; see that type's doc comment in
-    /// `hop_protocol::wire`). `Done` means the provider already performed
-    /// the action itself (an app launch, a window focus) and there is
-    /// nothing left for this process to do.
+    /// Carries out an [`ExecOutcome`] through the injected user-action
+    /// boundary. Interactive windows use the real clipboard/URI launcher;
+    /// screenshot and widget-test windows use a non-launching sink.
     fn handle_outcome(&self, outcome: ExecOutcome) {
         match outcome {
             ExecOutcome::Done => {}
-            ExecOutcome::CopyText(text) => {
-                if let Some(display) = gtk::gdk::Display::default() {
-                    display.clipboard().set_text(text.as_str());
-                }
-            }
+            ExecOutcome::CopyText(text) => self.user_actions.copy_text(text.as_str()),
             ExecOutcome::OpenUrl(url) => {
-                if let Err(err) = gtk::gio::AppInfo::launch_default_for_uri(
-                    url.as_str(),
-                    gtk::gio::AppLaunchContext::NONE,
-                ) {
+                if let Err(err) = self.user_actions.launch_uri(url.as_str()) {
                     self.set_status(&format!("couldn't open {}: {err}", url.as_str()));
                 }
             }
@@ -1526,8 +1677,10 @@ fn build_error_pin() -> (gtk::Box, gtk::Label, gtk::Label) {
     title.add_css_class("hop-error-pin-title");
     title.set_xalign(0.0);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.add_css_class("hop-honesty-text");
     let subtitle = gtk::Label::new(None);
     subtitle.add_css_class("hop-error-pin-subtitle");
+    subtitle.add_css_class("hop-honesty-text");
     subtitle.set_xalign(0.0);
     subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
     text.append(&title);
@@ -1537,7 +1690,7 @@ fn build_error_pin() -> (gtk::Box, gtk::Label, gtk::Label) {
     (pin, title, subtitle)
 }
 
-fn build_pending_surface() -> (gtk::Box, Vec<gtk::Box>) {
+fn build_pending_surface(pending_providers: Rc<RefCell<Vec<PendingProvider>>>) -> gtk::Box {
     let surface = gtk::Box::new(gtk::Orientation::Vertical, *tokens::HINT_CHIP_GAP_PX);
     surface.add_css_class("hop-honesty");
     surface.add_css_class("hop-state-pending");
@@ -1545,50 +1698,63 @@ fn build_pending_surface() -> (gtk::Box, Vec<gtk::Box>) {
     surface.set_margin_end(*tokens::OFFLINE_ROW_GAP_PX);
     surface.set_visible(false);
 
-    let mut bars = Vec::new();
-    for (provider, widths) in [("calculator", [116, 78]), ("files", [104, 66])] {
-        let attribution = gtk::Label::new(Some(provider));
-        attribution.add_css_class("hop-pending-attribution");
-        attribution.set_xalign(0.0);
-        surface.append(&attribution);
-
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::HINT_CHIP_GAP_PX);
-        row.add_css_class("hop-pending-row");
-        for width in widths {
-            let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            bar.add_css_class("hop-skeleton");
-            bar.add_css_class("hop-pending-bar");
-            bar.set_width_request(width);
-            bar.set_height_request(9);
-            row.append(&bar);
-            bars.push(bar);
-        }
-        surface.append(&row);
-    }
-
-    let pulse_bars = bars.clone();
     let settings = gtk::Settings::default();
     let mut active = 0usize;
     glib::timeout_add_local(Duration::from_millis(180), move || {
         let reduced = settings
             .as_ref()
             .is_some_and(|settings| !settings.is_gtk_enable_animations());
-        for (index, bar) in pulse_bars.iter().enumerate() {
-            if reduced {
-                bar.remove_css_class("hop-shimmer-active");
-            } else if index == active {
-                bar.add_css_class("hop-shimmer-active");
-            } else {
-                bar.remove_css_class("hop-shimmer-active");
+        let pending = pending_providers.borrow();
+        let mut bar_count = 0;
+        for provider in pending.iter() {
+            for bar in &provider.bars {
+                if reduced {
+                    bar.remove_css_class("hop-shimmer-active");
+                } else if bar_count == active {
+                    bar.add_css_class("hop-shimmer-active");
+                } else {
+                    bar.remove_css_class("hop-shimmer-active");
+                }
+                bar_count += 1;
             }
         }
-        if !reduced && !pulse_bars.is_empty() {
-            active = (active + 1) % pulse_bars.len();
+        if !reduced && bar_count != 0 {
+            active = (active + 1) % bar_count;
         }
         glib::ControlFlow::Continue
     });
 
-    (surface, bars)
+    surface
+}
+
+fn build_pending_provider(id: String) -> PendingProvider {
+    let attribution = gtk::Label::new(Some(&id));
+    attribution.add_css_class("hop-pending-attribution");
+    attribution.add_css_class("hop-honesty-text");
+    attribution.set_xalign(0.0);
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::HINT_CHIP_GAP_PX);
+    row.add_css_class("hop-pending-row");
+    row.set_homogeneous(true);
+    let first = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    first.add_css_class("hop-skeleton");
+    first.add_css_class("hop-pending-bar");
+    first.add_css_class("hop-honesty");
+    first.set_hexpand(true);
+    row.append(&first);
+    let second = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    second.add_css_class("hop-skeleton");
+    second.add_css_class("hop-pending-bar");
+    second.add_css_class("hop-honesty");
+    second.set_hexpand(true);
+    row.append(&second);
+
+    PendingProvider {
+        id,
+        attribution,
+        row,
+        bars: [first, second],
+    }
 }
 
 fn state_item(
@@ -1673,13 +1839,12 @@ fn relative_subtitle(provider: &str, launched_at: SystemTime) -> Option<ItemSubt
     ItemSubtitle::new(format!("{provider} · {suffix}")).ok()
 }
 
-fn no_results_state_items(query: &str) -> Vec<Item> {
-    let query = truncate_query(query);
+fn no_results_state_items(display_query: &str, copy_query: &str) -> Vec<Item> {
     [
         state_item(
             "hop:fallback-web-search",
             Kind::WebSearch,
-            &format!("Search the web for “{query}”"),
+            &format!("Search the web for “{display_query}”"),
             Some("fallback · GNOME Web"),
             Some(("open", ActionKind::OpenUrl, "Open")),
             None,
@@ -1688,10 +1853,10 @@ fn no_results_state_items(query: &str) -> Vec<Item> {
         state_item(
             "hop:fallback-copy",
             Kind::Action,
-            &format!("Copy “{query}” to clipboard"),
+            &format!("Copy “{display_query}” to clipboard"),
             Some("fallback · clipboard"),
             Some(("copy", ActionKind::Copy, "Copy")),
-            Some(query.as_str()),
+            Some(copy_query),
             ("clipboard", true),
         ),
     ]
@@ -1926,45 +2091,53 @@ fn position_of_item_id(store: &gio::ListStore, item_id: &ItemId) -> Option<u32> 
 }
 
 /// Sends `cmd_tx.send(IpcCommand::Execute { item_id, action_id })` for a
-/// daemon-owned item, or performs a frontend-owned fallback action locally.
+/// daemon-owned item, or performs a locally rendered fallback action only
+/// while the action registry still belongs to the current query generation.
 fn dispatch_id_action(
     cmd_tx: &CommandSender,
     item_id: &ItemId,
     action_id: &ActionId,
-    local_actions: &Rc<RefCell<HashMap<String, LocalAction>>>,
+    local_actions: &Rc<RefCell<LocalActionRegistry>>,
+    user_actions: &Rc<dyn UserActionSink>,
+    pending_user_executions: &Rc<Cell<u32>>,
 ) {
-    if let Some(action) = local_actions.borrow().get(item_id.as_str()).cloned() {
-        perform_local_action(action);
+    if let Some(action) = local_actions.borrow().action_for(item_id) {
+        perform_local_action(action, user_actions.as_ref());
     } else {
-        send_execute(cmd_tx, item_id.clone(), action_id.clone());
+        send_execute(
+            cmd_tx,
+            item_id.clone(),
+            action_id.clone(),
+            pending_user_executions,
+        );
     }
 }
 
 fn dispatch_item_action(
     cmd_tx: &CommandSender,
     item: &Item,
-    local_actions: &Rc<RefCell<HashMap<String, LocalAction>>>,
+    local_actions: &Rc<RefCell<LocalActionRegistry>>,
     action_id: ActionId,
+    user_actions: &Rc<dyn UserActionSink>,
+    pending_user_executions: &Rc<Cell<u32>>,
 ) {
-    if let Some(action) = local_actions.borrow().get(item.id.as_str()).cloned() {
-        perform_local_action(action);
-    } else {
-        send_execute(cmd_tx, item.id.clone(), action_id);
-    }
+    dispatch_id_action(
+        cmd_tx,
+        &item.id,
+        &action_id,
+        local_actions,
+        user_actions,
+        pending_user_executions,
+    );
 }
 
-fn perform_local_action(action: LocalAction) {
+fn perform_local_action(action: LocalAction, user_actions: &dyn UserActionSink) {
     match action {
-        LocalAction::Copy(text) => {
-            if let Some(display) = gtk::gdk::Display::default() {
-                display.clipboard().set_text(&text);
-            }
-        }
+        LocalAction::Copy(text) => user_actions.copy_text(&text),
         LocalAction::WebSearch(query) => {
             let encoded = percent_encode_query(&query);
             let uri = format!("https://www.google.com/search?q={encoded}");
-            let _ =
-                gtk::gio::AppInfo::launch_default_for_uri(&uri, gtk::gio::AppLaunchContext::NONE);
+            let _ = user_actions.launch_uri(&uri);
         }
     }
 }
@@ -1981,47 +2154,88 @@ fn percent_encode_query(query: &str) -> String {
         .collect()
 }
 
-fn send_execute(cmd_tx: &CommandSender, item_id: ItemId, action_id: ActionId) {
+fn send_execute(
+    cmd_tx: &CommandSender,
+    item_id: ItemId,
+    action_id: ActionId,
+    pending_user_executions: &Rc<Cell<u32>>,
+) {
+    pending_user_executions.set(pending_user_executions.get().saturating_add(1));
     cmd_tx.send(IpcCommand::Execute { item_id, action_id });
 }
 
 fn activate_selected(
     selection: &gtk::SingleSelection,
     cmd_tx: &CommandSender,
-    local_actions: &Rc<RefCell<HashMap<String, LocalAction>>>,
+    local_actions: &Rc<RefCell<LocalActionRegistry>>,
+    user_actions: &Rc<dyn UserActionSink>,
+    pending_user_executions: &Rc<Cell<u32>>,
 ) {
     let selected = selection.selected();
     if selected == gtk::INVALID_LIST_POSITION {
         return;
     }
-    activate_at(selection, cmd_tx, local_actions, selected);
+    activate_at(
+        selection,
+        cmd_tx,
+        local_actions,
+        user_actions,
+        pending_user_executions,
+        selected,
+    );
 }
 
 fn activate_at(
     selection: &gtk::SingleSelection,
     cmd_tx: &CommandSender,
-    local_actions: &Rc<RefCell<HashMap<String, LocalAction>>>,
+    local_actions: &Rc<RefCell<LocalActionRegistry>>,
+    user_actions: &Rc<dyn UserActionSink>,
+    pending_user_executions: &Rc<Cell<u32>>,
     position: u32,
 ) {
     let Some(object) = selection.item(position) else {
         return;
     };
     let item: Item = model::item_of(&object);
-    let action_id = item.default_action.clone();
-    dispatch_item_action(cmd_tx, &item, local_actions, action_id);
+    if !item
+        .actions
+        .iter()
+        .any(|action| action.id == item.default_action)
+    {
+        return;
+    }
+    dispatch_item_action(
+        cmd_tx,
+        &item,
+        local_actions,
+        item.default_action.clone(),
+        user_actions,
+        pending_user_executions,
+    );
 }
 
 fn wire_list_activation(
     list_view: &gtk::ListView,
     selection: &gtk::SingleSelection,
     cmd_tx: &CommandSender,
-    local_actions: &Rc<RefCell<HashMap<String, LocalAction>>>,
+    local_actions: &Rc<RefCell<LocalActionRegistry>>,
+    user_actions: &Rc<dyn UserActionSink>,
+    pending_user_executions: &Rc<Cell<u32>>,
 ) {
     let selection = selection.clone();
     let cmd_tx = cmd_tx.clone();
     let local_actions = Rc::clone(local_actions);
+    let user_actions = Rc::clone(user_actions);
+    let pending_user_executions = Rc::clone(pending_user_executions);
     list_view.connect_activate(move |_list_view, position| {
-        activate_at(&selection, &cmd_tx, &local_actions, position);
+        activate_at(
+            &selection,
+            &cmd_tx,
+            &local_actions,
+            &user_actions,
+            &pending_user_executions,
+            position,
+        );
     });
 }
 
@@ -2147,9 +2361,11 @@ mod tests {
     // server) — see `tests/headless_smoke.rs`'s top doc comment for how
     // that was diagnosed.
 
+    use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
+    use adw::prelude::AdwApplicationWindowExt;
     use gtk::gdk;
     use hop_protocol::{
         Action as WireAction, ActionId, ActionKind, ItemId, ItemTitle, Kind, MarkerSpan, Mode,
@@ -2157,6 +2373,44 @@ mod tests {
 
     use super::*;
     use crate::keymap::{Action, Keymap};
+    #[derive(Default)]
+    struct FakeUserActionSink {
+        copies: RefCell<Vec<String>>,
+        uris: RefCell<Vec<String>>,
+    }
+
+    impl UserActionSink for FakeUserActionSink {
+        fn copy_text(&self, text: &str) {
+            self.copies.borrow_mut().push(text.to_string());
+        }
+
+        fn launch_uri(&self, uri: &str) -> Result<(), String> {
+            self.uris.borrow_mut().push(uri.to_string());
+            Ok(())
+        }
+    }
+    fn capture_six_state(window: &HopWindow, state: &str) {
+        let context = glib::MainContext::default();
+        let path = PathBuf::from(format!("/tmp/hop-258-sixstates-{state}.png"));
+        let content = window
+            .window
+            .content()
+            .expect("presented test window has a content root");
+        for _ in 0..100 {
+            while context.iteration(false) {}
+            match crate::screenshot::capture(content.upcast_ref(), &path) {
+                Ok(()) => {
+                    println!("captured {state} state at {}", path.display());
+                    return;
+                }
+                Err(crate::screenshot::ScreenshotError::NoRenderNode) => {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                Err(err) => panic!("capturing {state} state at {path:?}: {err}"),
+            }
+        }
+        panic!("capturing {state} state at {path:?}: widget produced no drawing");
+    }
 
     /// [`row_index_at_y`]'s own truth table — GTK-free, no display needed,
     /// matching `ui::row::tests`'s own precedent of pinning a pure
@@ -2442,6 +2696,21 @@ mod tests {
             crate::session::SessionKind::Other.overlay_strategy(crate::layer_shell::probe()),
             RunPurpose::Interactive,
         )
+    }
+    fn build_test_window_with_action_sink(
+        app_id: &str,
+        actions: Rc<FakeUserActionSink>,
+    ) -> (HopWindow, async_channel::Receiver<IpcCommand>) {
+        let app = adw::Application::new(Some(app_id), gio::ApplicationFlags::NON_UNIQUE);
+        app.register(gio::Cancellable::NONE)
+            .expect("registering a NON_UNIQUE test application must not fail");
+        let (cmd_tx, cmd_rx) = crate::ipc::test_channel();
+        let strategy =
+            crate::session::SessionKind::Other.overlay_strategy(crate::layer_shell::probe());
+        let user_actions: Rc<dyn UserActionSink> = actions;
+        let window =
+            HopWindow::build_with_user_actions(&app, cmd_tx, Keymap::defaults(), strategy, RunPurpose::Interactive, user_actions);
+        (window, cmd_rx)
     }
 
     /// [`build_test_window`] with the overlay strategy and run purpose
@@ -2737,6 +3006,7 @@ mod tests {
             exclusive: true,
             marker_span: None,
             query_text: String::new(),
+            pending_providers: vec![],
         });
         assert!(
             window.mode_label.get_visible(),
@@ -2749,6 +3019,7 @@ mod tests {
             exclusive: false,
             marker_span: None,
             query_text: String::new(),
+            pending_providers: vec![],
         });
         assert!(
             !window.mode_label.get_visible(),
@@ -2780,6 +3051,7 @@ mod tests {
             exclusive: true,
             marker_span: Some(MarkerSpan::new(0, 2).unwrap()),
             query_text: "w firefox".to_string(),
+            pending_providers: vec![],
         });
         assert_eq!(
             entry_highlighted_range(&window.entry),
@@ -2795,6 +3067,7 @@ mod tests {
             exclusive: false,
             marker_span: None,
             query_text: "w firefox".to_string(),
+            pending_providers: vec![],
         });
         assert!(
             entry_highlighted_range(&window.entry).is_none(),
@@ -2834,6 +3107,7 @@ mod tests {
             exclusive: true,
             marker_span: Some(MarkerSpan::new(0, 2).unwrap()),
             query_text: "w ".to_string(),
+            pending_providers: vec![],
         });
 
         assert!(
@@ -3632,6 +3906,180 @@ mod tests {
         println!("interactive connection requests one empty recents query per connection");
     }
 
+    fn pending_provider_ids(surface: &gtk::Box) -> Vec<String> {
+        let mut providers = Vec::new();
+        let mut child = surface.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if let Ok(label) = widget.downcast::<gtk::Label>()
+                && label.has_css_class("hop-pending-attribution")
+                && label.get_visible()
+            {
+                providers.push(label.text().to_string());
+            }
+        }
+        providers
+    }
+
+    #[test]
+    fn pending_provider_attribution_tracks_the_routed_selection_until_done() {
+        run_under_broadway(
+            "ui::window::tests::pending_provider_attribution_tracks_the_routed_selection_until_done",
+            1600,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let (window, _cmd_rx) = build_test_window("dev.hop.WindowTest.PendingProviders");
+        window.set_query_text("par");
+        window.apply_event(IpcEvent::Routed {
+            mode: Mode::All,
+            exclusive: false,
+            marker_span: None,
+            query_text: "par".to_string(),
+            pending_providers: vec![
+                "calculator".to_string(),
+                "files".to_string(),
+                "zero".to_string(),
+            ],
+        });
+        assert_eq!(
+            pending_provider_ids(&window.pending_surface),
+            vec!["calculator", "files", "zero"],
+            "the skeleton rows must come from the daemon's real selection, not a fixed UI list"
+        );
+        let first_pending_row = window
+            .pending_surface
+            .first_child()
+            .and_then(|child| child.next_sibling())
+            .and_then(|child| child.downcast::<gtk::Box>().ok())
+            .expect("pending attribution must be followed by its material row");
+        let first_pending_bar = first_pending_row
+            .first_child()
+            .and_then(|child| child.downcast::<gtk::Box>().ok())
+            .expect("pending material row must contain its first shimmer bar");
+        assert!(
+            first_pending_bar.has_css_class("hop-honesty"),
+            "every provider shimmer bar must carry the honesty lock class"
+        );
+        assert!(
+            first_pending_bar.has_css_class("hop-pending-bar"),
+            "provider rows must expose the pending-bar selector"
+        );
+
+
+        let mut calculator = test_item(1, "Parity");
+        calculator.provider = "calculator".to_string();
+        window.apply_event(IpcEvent::Results(vec![calculator]));
+        assert_eq!(
+            pending_provider_ids(&window.pending_surface),
+            vec!["files", "zero"],
+            "a partial replacement list resolves only the provider it names"
+        );
+
+        window.apply_event(IpcEvent::Results(vec![]));
+        assert_eq!(
+            pending_provider_ids(&window.pending_surface),
+            vec!["files", "zero"],
+            "an empty replacement list cannot claim that a provider completed"
+        );
+
+        let mut files = test_item(2, "Manifest");
+        files.provider = "files".to_string();
+        window.apply_event(IpcEvent::Results(vec![files]));
+        assert_eq!(pending_provider_ids(&window.pending_surface), vec!["zero"]);
+        assert!(window.pending_surface.get_visible());
+
+        window.apply_event(IpcEvent::QueryDone);
+        assert!(!window.pending_surface.get_visible());
+    }
+
+    #[test]
+    fn local_fallbacks_keep_the_full_query_and_cannot_capture_provider_rows() {
+        run_under_broadway(
+            "ui::window::tests::local_fallbacks_keep_the_full_query_and_cannot_capture_provider_rows",
+            1750,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let actions = Rc::new(FakeUserActionSink::default());
+        let (window, cmd_rx) = build_test_window_with_action_sink(
+            "dev.hop.WindowTest.LocalFallbacks",
+            Rc::clone(&actions),
+        );
+
+        let full_query = format!("{} /?&", "x".repeat(MAX_TITLE));
+        window.set_query_text(&full_query);
+        window.apply_event(IpcEvent::QueryDone);
+        assert!(
+            !window.state_items.borrow()[1]
+                .title
+                .as_str()
+                .contains(full_query.as_str()),
+            "the visible fallback copy must truncate independently of its payload"
+        );
+        window.list_view.emit_by_name::<()>("activate", &[&1u32]);
+        assert_eq!(actions.copies.borrow().as_slice(), [full_query.as_str()]);
+
+        window.set_query_text("a b/c?&");
+        window.apply_event(IpcEvent::QueryDone);
+        window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+        assert_eq!(
+            actions.uris.borrow().as_slice(),
+            ["https://www.google.com/search?q=a%20b%2Fc%3F%26"]
+        );
+        while cmd_rx.try_recv().is_ok() {}
+
+        let mut provider_item = test_item(3, "Provider-owned collision");
+        provider_item.id = ItemId::new("hop:fallback-web-search").unwrap();
+        provider_item.provider = "provider".to_string();
+        window.apply_event(IpcEvent::Results(vec![provider_item]));
+        window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+        match cmd_rx
+            .try_recv()
+            .expect("a provider row that collides with a fallback id must execute through hopd")
+        {
+            IpcCommand::Execute { item_id, action_id } => {
+                assert_eq!(item_id.as_str(), "hop:fallback-web-search");
+                assert_eq!(action_id.as_str(), "open");
+            }
+            other => panic!("expected daemon Execute for provider row, got {other:?}"),
+        }
+        assert_eq!(
+            actions.uris.borrow().as_slice(),
+            ["https://www.google.com/search?q=a%20b%2Fc%3F%26"],
+            "provider-controlled ids must never invoke a stale local fallback"
+        );
+
+        window.apply_event(IpcEvent::Executed(ExecOutcome::OpenUrl(
+            hop_protocol::OpenUrl::new("https://example.test/from-provider").unwrap(),
+        )));
+        assert_eq!(
+            actions.uris.borrow().as_slice(),
+            [
+                "https://www.google.com/search?q=a%20b%2Fc%3F%26",
+                "https://example.test/from-provider",
+            ]
+        );
+
+        while cmd_rx.try_recv().is_ok() {}
+        window.set_query_text("");
+        while cmd_rx.try_recv().is_ok() {}
+        window.apply_event(IpcEvent::Results(vec![]));
+        window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "the prefix helper is a non-action affordance, never an Execute"
+        );
+    }
+
     /// Issue #258's approved frame contract. Keep the assertions at the
     /// widget boundary: this is where the six state choices become visible,
     /// rather than a string-only test of the event reducer.
@@ -3646,8 +4094,16 @@ mod tests {
         }
         gtk::init()
             .expect("gtk init under the broadway display this process's environment selects");
+        let display = gtk::gdk::Display::default().expect("Broadway provides a display");
+        crate::style::install(&display);
+        crate::style::install_locked(&display);
 
-        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.SixStates");
+        let actions = Rc::new(FakeUserActionSink::default());
+        let (window, cmd_rx) = build_test_window_with_action_sink(
+            "dev.hop.WindowTest.SixStates",
+            Rc::clone(&actions),
+        );
+        window.present_with_token(None);
 
         // Empty: a fresh learning store has no fake history; only the
         // always-available inline prefix cheatsheet is shown.
@@ -3664,6 +4120,8 @@ mod tests {
         // a computed relative-time subtitle rather than a hard-coded row.
         window.set_query_text("launch");
         window.apply_event(IpcEvent::Results(vec![test_item(7, "Learned app")]));
+        window.apply_event(IpcEvent::QueryDone);
+        capture_six_state(&window, "results");
         window.apply_event(IpcEvent::Executed(ExecOutcome::Done));
         window.set_query_text("");
         window.apply_event(IpcEvent::RecentItems(vec![hop_protocol::RecentItem {
@@ -3690,12 +4148,21 @@ mod tests {
                 .as_str(),
             "apps · 2h ago"
         );
+        capture_six_state(&window, "empty");
 
         // Pending: provider attribution remains visible until that provider
         // answers, then its own material collapses while other providers can
         // continue resolving until QueryDone.
         window.set_query_text("par");
+        window.apply_event(IpcEvent::Routed {
+            mode: Mode::All,
+            exclusive: false,
+            marker_span: None,
+            query_text: "par".to_string(),
+            pending_providers: vec!["calculator".to_string(), "files".to_string()],
+        });
         assert!(window.pending_surface.get_visible());
+        capture_six_state(&window, "pending");
         assert!(window.pending_surface.has_css_class("hop-state-pending"));
         assert!(
             window
@@ -3739,6 +4206,7 @@ mod tests {
             window.state_items.borrow()[1].title.as_str(),
             "Copy “zzqq” to clipboard"
         );
+        capture_six_state(&window, "no-results");
         // A query that receives no Results frame still resolves to
         // No-results when its terminal QueryDone arrives.
         window.set_query_text("terminal-only");
@@ -3755,16 +4223,11 @@ mod tests {
             cmd_rx.try_recv().is_err(),
             "frontend fallback activation must not reach the daemon"
         );
-        let copied = glib::MainContext::default()
-            .block_on(
-                gtk::gdk::Display::default()
-                    .expect("broadway display")
-                    .clipboard()
-                    .read_text_future(),
-            )
-            .expect("clipboard read")
-            .map(|text| text.to_string());
-        assert_eq!(copied.as_deref(), Some("terminal-only"));
+        assert_eq!(
+            actions.copies.borrow().as_slice(),
+            ["terminal-only"],
+            "copy fallback must use the injected action sink in widget tests"
+        );
         window.set_query_text("webonly");
         window.apply_event(IpcEvent::QueryDone);
         while cmd_rx.try_recv().is_ok() {}
@@ -3784,9 +4247,17 @@ mod tests {
             window.error_subtitle.text(),
             "provider isolated; other results unaffected"
         );
+        assert!(window.error_title.has_css_class("hop-honesty-text"));
+        assert!(window.error_subtitle.has_css_class("hop-honesty-text"));
+        assert!(
+            window.error_pin.has_css_class("hop-honesty"),
+            "the pinned provider error must use the honesty-critical surface"
+        );
+        capture_six_state(&window, "error");
 
         // Offline: cached results retain their rows and gain the honest
         // connection state plus per-row as-of treatment.
+
         window.apply_event(IpcEvent::Results(vec![test_item(2, "last launch")]));
         window.apply_event(IpcEvent::Disconnected);
         assert_eq!(window.state_header.text(), "Cached · daemon unreachable");
@@ -3794,6 +4265,23 @@ mod tests {
         assert!(window.offline_indicator.widget.get_visible());
         let cached_row = row::build();
         row::bind(cached_row.upcast_ref(), &test_item(2, "last launch"), None);
+        let cached_stamp = row::stamp_widget(&cached_row).expect("cached row stamp");
+        assert!(
+            cached_stamp
+                .parent()
+                .and_then(|metadata| metadata.parent())
+                .is_some_and(|parent| parent == cached_row.clone().upcast::<gtk::Widget>()),
+            "cached age metadata must be a trailing row child, not part of the text column"
+        );
+        assert!(cached_stamp.has_css_class("hop-honesty-stamp"));
+        let first_stamp = cached_stamp.text().to_string();
+        row::bind(cached_row.upcast_ref(), &test_item(2, "last launch"), None);
+        assert_eq!(
+            cached_stamp.text(),
+            first_stamp,
+            "the cache snapshot time must remain stable when a recycled row rebinds"
+        );
+        capture_six_state(&window, "offline");
         assert!(
             row::stamp_widget(&cached_row)
                 .is_some_and(|stamp| stamp.get_visible() && stamp.text().starts_with("as of ")),

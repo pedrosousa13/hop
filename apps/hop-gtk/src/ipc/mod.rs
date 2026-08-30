@@ -115,6 +115,11 @@ pub enum IpcEvent {
         exclusive: bool,
         marker_span: Option<MarkerSpan>,
         query_text: String,
+        /// The provider ids the daemon selected at route time. This is
+        /// scheduling state, not an inference from result rows: it is what
+        /// lets the pending surface name zero-item providers truthfully until
+        /// the terminal event arrives.
+        pending_providers: Vec<String>,
     },
     /// The complete current result list for the active query, replacing
     /// whatever the UI is holding — the same replace rule

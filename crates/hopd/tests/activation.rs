@@ -243,6 +243,7 @@ fn a_query_over_an_inherited_listener_is_served_without_hopd_rebinding_the_socke
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec!["skeleton".to_string()],
         }
     );
 

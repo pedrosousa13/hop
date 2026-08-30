@@ -238,6 +238,7 @@ fn the_round_trip_returns_one_item_end_to_end() {
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec!["skeleton".to_string()],
         }
     );
 

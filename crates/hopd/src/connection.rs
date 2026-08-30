@@ -357,6 +357,7 @@ async fn handle_message<S: ResultSource>(
                      MarkerSpan::new's bound and ordering checks",
                 )
             });
+            let pending_providers = source.pending_providers(&text);
             send_msg(
                 write_half,
                 &DaemonMsg::QueryRouted {
@@ -364,6 +365,7 @@ async fn handle_message<S: ResultSource>(
                     mode: routed.mode,
                     exclusive: routed.exclusive,
                     marker_span,
+                    pending_providers,
                 },
             )
             .await?;

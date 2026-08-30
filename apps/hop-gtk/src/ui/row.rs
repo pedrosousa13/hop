@@ -470,7 +470,10 @@
 //! by accident.
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 
 use glib::variant::ToVariant;
 use gtk::prelude::*;
@@ -533,6 +536,7 @@ const TITLE_CHILD_NAME: &str = "hop-row-title";
 /// and the subtitle simply are not the same shape of problem.
 const SUBTITLE_CHILD_NAME: &str = "hop-row-subtitle";
 static OFFLINE_STATE: AtomicBool = AtomicBool::new(false);
+static OFFLINE_SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
 const STAMP_CHILD_NAME: &str = "hop-row-stamp";
 
 /// The widget name — and, since issue #207, the CSS class too — [`build`]
@@ -864,18 +868,28 @@ pub fn build() -> gtk::Box {
     subtitle.set_visible(false);
     // See `title.set_selectable(false)`'s own comment just above — the
     // identical explicit statement of SPEC decision 6's "no text selection
-    // inside rows", applied to the row's other prose label.
     subtitle.set_selectable(false);
     text_column.append(&subtitle);
+    container.append(&text_column);
+
+    // Cached rows keep their age metadata at the trailing edge, beside
+    // actions and the keyboard hint, rather than in the title/subtitle
+    // column. This preserves the approved frame's mono "as of HH:MM"
+    // treatment without changing title centring for live rows.
     let stamp = gtk::Label::new(None);
     stamp.set_widget_name(STAMP_CHILD_NAME);
     stamp.add_css_class(STAMP_CHILD_NAME);
+    stamp.add_css_class("hop-honesty-stamp");
     stamp.set_xalign(0.0);
     stamp.set_ellipsize(gtk::pango::EllipsizeMode::End);
     stamp.set_visible(false);
     stamp.set_selectable(false);
-    text_column.append(&stamp);
-    container.append(&text_column);
+    let stamp_wrapper = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    stamp_wrapper.add_css_class("hop-honesty");
+    stamp_wrapper.set_valign(gtk::Align::Center);
+    stamp_wrapper.set_margin_start(*tokens::HINT_MARGIN_START_PX);
+    stamp_wrapper.append(&stamp);
+    container.append(&stamp_wrapper);
 
     // The action-icon buttons — issue #254. A third direct child of the
     // outer horizontal `container`, appended *before* `hint` below (not
@@ -1297,24 +1311,37 @@ fn sync_state_classes(container: &gtk::Box, item: &Item) {
         container.add_css_class("hop-row-prefixes");
     }
 }
-
-/// Updates the connection state used when recycled rows bind cached results.
-pub fn set_offline_state(offline: bool) {
+/// `as_of_hh_mm` is captured once when the connection is lost and reused by
+/// every cached row, so recycling cannot make the cache appear to move
+/// forward in time.
+pub fn set_offline_state(offline: bool, as_of_hh_mm: Option<&str>) {
     OFFLINE_STATE.store(offline, Ordering::Relaxed);
+    if let Ok(mut snapshot) = OFFLINE_SNAPSHOT.lock() {
+        *snapshot = if offline {
+            as_of_hh_mm.map(str::to_owned)
+        } else {
+            None
+        };
+    }
 }
 
 fn resolve_stamp(stamp: &gtk::Label, offline: bool) {
     if offline {
-        let text = glib::DateTime::now_local()
-            .and_then(|now| now.format("as of %H:%M"))
-            .unwrap_or_else(|_| glib::GString::from("as of --:--"));
-        stamp.set_text(text.as_str());
+        let snapshot = OFFLINE_SNAPSHOT
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.clone());
+        let text = snapshot
+            .map(|as_of| format!("as of {as_of}"))
+            .unwrap_or_else(|| "as of --:--".to_string());
+        stamp.set_text(&text);
         stamp.set_visible(true);
     } else {
         stamp.set_text("");
         stamp.set_visible(false);
     }
 }
+
 
 /// Maps an [`ActionKind`] to a themed, symbolic icon name — this module's
 /// top doc comment, "Icon glyph", has the full argument for why this is

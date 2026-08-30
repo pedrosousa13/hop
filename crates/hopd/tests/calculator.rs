@@ -161,6 +161,7 @@ fn input_that_is_not_an_expression_yields_a_clean_query_done_with_no_items() {
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec![],
         }
     );
     assert_eq!(recv(&mut stream), DaemonMsg::QueryDone { query_id: 1 });
@@ -190,6 +191,7 @@ fn an_inferred_math_query_reports_calculator_without_exclusivity() {
             mode: Mode::Calculator,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec!["calculator".to_string()],
         }
     );
 }

@@ -211,11 +211,32 @@ pub enum DaemonMsg {
     /// offsets into text the client already holds rather than as the
     /// marker's characters, and for what those offsets do and do not
     /// guarantee about landing on a real character boundary.
+    ///
     QueryRouted {
         query_id: u64,
         mode: Mode,
         exclusive: bool,
         marker_span: Option<MarkerSpan>,
+        /// The effective provider ids selected for this routed query, in the
+        /// host's registration order. It is a snapshot of real scheduling
+        /// state, not a client-side guess based on a fixed display list: a
+        /// provider excluded by its mode or minimum-term rule does not appear,
+        /// and an inferred route includes the general providers the host
+        /// augments it with.
+        ///
+        /// There is deliberately no empty-provider-arrival frame. A client
+        /// removes one of these rows when a later [`DaemonMsg::Results`] list
+        /// contains an item from that provider; a provider that answered with
+        /// zero items remains pending until [`DaemonMsg::QueryDone`]. That is
+        /// the only honest presentation the replace-frame protocol permits:
+        /// absence from a replacement list cannot distinguish "still running"
+        /// from "completed empty".
+        ///
+        /// The list and each id are bounded at the receiving parse by
+        /// [`MAX_PENDING_PROVIDERS`](crate::limits::MAX_PENDING_PROVIDERS) and
+        /// [`MAX_PROVIDER_ID`](crate::limits::MAX_PROVIDER_ID).
+        #[serde(deserialize_with = "limits::de_pending_providers")]
+        pending_providers: Vec<String>,
     },
     /// One frame of a query's results.
     ///
@@ -758,13 +779,49 @@ mod tests {
             mode: Mode::Weather,
             exclusive: true,
             marker_span: Some(MarkerSpan::new(0, 3).unwrap()),
+            pending_providers: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"query_routed","query_id":7,"mode":"weather","exclusive":true,"marker_span":{"start":0,"end":3}}"#
+            r#"{"type":"query_routed","query_id":7,"mode":"weather","exclusive":true,"marker_span":{"start":0,"end":3},"pending_providers":[]}"#
         );
         assert_eq!(serde_json::from_str::<DaemonMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn daemon_msg_query_routed_round_trips_selected_pending_providers() {
+        let msg = DaemonMsg::QueryRouted {
+            query_id: 7,
+            mode: Mode::All,
+            exclusive: false,
+            marker_span: None,
+            pending_providers: vec!["calculator".to_owned(), "files".to_owned()],
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":null,"pending_providers":["calculator","files"]}"#
+        );
+        assert_eq!(serde_json::from_str::<DaemonMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn query_routed_refuses_too_many_pending_providers() {
+        let frame = serde_json::json!({
+            "type": "query_routed",
+            "query_id": 7,
+            "mode": "all",
+            "exclusive": false,
+            "marker_span": null,
+            "pending_providers": vec!["provider"; limits::MAX_PENDING_PROVIDERS + 1],
+        });
+
+        assert!(
+            serde_json::from_value::<DaemonMsg>(frame).is_err(),
+            "a peer cannot make the pending surface retain an unbounded provider list"
+        );
     }
 
     #[test]
@@ -774,25 +831,26 @@ mod tests {
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":null}"#
+            r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":null,"pending_providers":[]}"#
         );
         assert_eq!(serde_json::from_str::<DaemonMsg>(&json).unwrap(), msg);
     }
 
     #[test]
     fn a_query_routed_frame_with_an_inverted_marker_span_is_refused() {
-        let json = r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":{"start":5,"end":2}}"#;
+        let json = r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":{"start":5,"end":2},"pending_providers":[]}"#;
         assert!(serde_json::from_str::<DaemonMsg>(json).is_err());
     }
 
     #[test]
     fn a_query_routed_frame_with_an_out_of_bounds_marker_span_is_refused() {
         let json = format!(
-            r#"{{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":{{"start":0,"end":{}}}}}"#,
+            r#"{{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"marker_span":{{"start":0,"end":{}}},"pending_providers":[]}}"#,
             limits::MAX_QUERY_TEXT + 1
         );
         assert!(serde_json::from_str::<DaemonMsg>(&json).is_err());
@@ -814,7 +872,7 @@ mod tests {
         // Rust type a stale binary embeds at compile time, so the risk the
         // bump closes is a stale *binary*, not a stale *frame*; this test is
         // about the latter, and the two must not be conflated.
-        let json = r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false}"#;
+        let json = r#"{"type":"query_routed","query_id":7,"mode":"all","exclusive":false,"pending_providers":[]}"#;
         assert_eq!(
             serde_json::from_str::<DaemonMsg>(json).unwrap(),
             DaemonMsg::QueryRouted {
@@ -822,6 +880,7 @@ mod tests {
                 mode: Mode::All,
                 exclusive: false,
                 marker_span: None,
+                pending_providers: vec![],
             }
         );
     }

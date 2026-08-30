@@ -29,7 +29,8 @@ use hop_core::router::{Mode, RoutedQuery, route};
 use hop_core::sanitize::escape_path;
 use hop_protocol::{
     Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, ItemSubtitle, ItemTitle, Kind,
-    MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, QueryText, RecentItem,
+    MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, MAX_PENDING_PROVIDERS, QueryText,
+    RecentItem,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -170,6 +171,19 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
     /// implementation for the production path, and any test source in this
     /// crate for the pattern a fixture-driven one uses instead.
     fn start(&self, text: QueryText) -> mpsc::Receiver<CheckedItems>;
+
+    /// Returns the provider ids this source selected for `text`, in the order
+    /// it will ask them. The connection sends this snapshot with
+    /// `QueryRouted`, before [`ResultSource::start`] can yield an arrival, so
+    /// a client can attribute pending work without inventing a provider list.
+    ///
+    /// Scripted sources default to no attribution so existing tests and narrow
+    /// sources do not claim providers they never schedule. A production source
+    /// that knows its scheduler must override this with the scheduler's actual
+    /// selection, not infer it from result items after the fact.
+    fn pending_providers(&self, _text: &QueryText) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Executes `action_id` on `item_id`, which the connection has already
     /// resolved against the items `provider` produced in a prior `start`.
@@ -456,6 +470,16 @@ fn absorb_capped(accumulated: &mut CheckedItems, mut checked: CheckedItems, cap:
 }
 
 impl ResultSource for HostSource {
+
+    fn pending_providers(&self, text: &QueryText) -> Vec<String> {
+        let routed = route(text.as_str());
+        self.host
+            .selected_ids(&routed)
+            .into_iter()
+            .take(MAX_PENDING_PROVIDERS)
+            .map(str::to_owned)
+            .collect()
+    }
     fn start(&self, text: QueryText) -> mpsc::Receiver<CheckedItems> {
         // Two channels, each capacity 1 for the reason this trait's docs
         // give: what a source buffers is daemon memory the retained-set cap
@@ -952,6 +976,18 @@ mod tests {
         assert!(
             rx.recv().await.is_none(),
             "the channel closes once the one provider has finished"
+        );
+    }
+
+    #[test]
+    fn host_source_reports_the_provider_selected_for_pending_attribution() {
+        let mut host = ProviderHost::with_log(Arc::new(NoopLog));
+        host.register(SkeletonProvider).unwrap();
+        let source = HostSource::new(Arc::new(host));
+
+        assert_eq!(
+            source.pending_providers(&QueryText::new("walking skeleton").unwrap()),
+            vec!["skeleton"]
         );
     }
 

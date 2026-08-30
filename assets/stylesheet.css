@@ -1164,8 +1164,9 @@ popover.background > arrow {
   color: {{hop-fg-2}};
 }
 
+
 .hop-row-prefixes {
-  opacity: 0.72;
+  opacity: {{hop-opacity-prefixes}};
 }
 
 .hop-row-fallback {
@@ -1178,6 +1179,9 @@ popover.background > arrow {
   margin: {{hop-space-2}} {{hop-space-3}} 0;
 }
 
+.hop-honesty .hop-pending-attribution {
+  font-family: {{font-family:hop-text-hint-key}};
+}
 .hop-pending-row {
   min-height: {{hop-row-h}};
   padding: 0 {{hop-space-3}};
@@ -1389,11 +1393,42 @@ popover.background > arrow {
   font-weight: {{font-weight:hop-text-subtitle}};
   font-size: {{font-size:hop-text-subtitle}};
 }
+.hop-honesty .hop-pending-attribution {
+  color: {{hop-fg-3}};
+  font-weight: {{font-weight:hop-text-hint-key}};
+  font-size: {{font-size:hop-text-hint-key}};
+}
 
 .hop-honesty .hop-honesty-stamp {
   color: {{hop-fg-2}};
   font-weight: {{font-weight:hop-text-timestamp}};
   font-size: {{font-size:hop-text-timestamp}};
+}
+
+.hop-honesty .hop-pending-bar {
+  background-color: {{hop-fg-3}};
+  opacity: 0.48;
+}
+
+.hop-honesty .hop-pending-bar.hop-shimmer-active {
+  background-color: {{hop-fg-2}};
+  opacity: 0.82;
+}
+
+.hop-honesty.hop-state-reduced-motion .hop-pending-bar {
+  opacity: 0.42;
+}
+
+.hop-honesty .hop-error-pin-title {
+  color: {{hop-fg}};
+  font-weight: {{font-weight:hop-text-error}};
+  font-size: {{font-size:hop-text-error}};
+}
+
+.hop-honesty .hop-error-pin-subtitle {
+  color: {{hop-fg-2}};
+  font-weight: {{font-weight:hop-text-subtitle}};
+  font-size: {{font-size:hop-text-subtitle}};
 }
 
 /* THE ONE SANCTIONED EXCEPTION to this file's own "no design value appears

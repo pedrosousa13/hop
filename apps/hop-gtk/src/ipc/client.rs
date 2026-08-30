@@ -193,7 +193,13 @@ async fn serve_one_connection(
             }
             frame = reader_rx.recv() => {
                 match frame {
-                    Some(ReadEvent::Message(DaemonMsg::QueryRouted { query_id, mode, exclusive, marker_span })) if Some(query_id) == current_id => {
+                    Some(ReadEvent::Message(DaemonMsg::QueryRouted {
+                        query_id,
+                        mode,
+                        exclusive,
+                        marker_span,
+                        pending_providers,
+                    })) if Some(query_id) == current_id => {
                         // `current_query_text` was set in the very same
                         // `IpcCommand::Query` arm above that produced
                         // `current_id`, and nothing else in this loop ever
@@ -209,7 +215,15 @@ async fn serve_one_connection(
                         // only to avoid an `unwrap()` this crate's lints warn
                         // on for a case that cannot actually occur.
                         let query_text = current_query_text.clone().unwrap_or_default();
-                        let _ = evt_tx.send(IpcEvent::Routed { mode, exclusive, marker_span, query_text }).await;
+                        let _ = evt_tx
+                            .send(IpcEvent::Routed {
+                                mode,
+                                exclusive,
+                                marker_span,
+                                query_text,
+                                pending_providers,
+                            })
+                            .await;
                     }
                     Some(ReadEvent::Message(DaemonMsg::Results { query_id, items, .. }))
                         if Some(query_id) == current_id =>

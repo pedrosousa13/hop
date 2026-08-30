@@ -241,6 +241,7 @@ fn a_hanging_provider_is_cut_off_and_the_query_still_terminates() {
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec!["hanging".to_string()],
         }
     );
     let done = recv(&mut stream);
@@ -285,6 +286,7 @@ fn a_providers_hostile_error_text_never_reaches_the_client() {
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec!["nasty".to_string()],
         }
     );
     let done = recv(&mut stream);
@@ -391,6 +393,7 @@ fn a_fast_providers_items_arrive_before_a_slow_providers_budget_expires() {
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec!["hanging".to_string(), "apps".to_string()],
         }
     );
 
