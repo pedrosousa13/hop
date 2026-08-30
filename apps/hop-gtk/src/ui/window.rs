@@ -3578,6 +3578,70 @@ mod tests {
 
         println!("screenshot_window_never_wires_close_on_focus_loss passed");
     }
+    /// The interactive app loop must request persisted recents from the real
+    /// connection event path, not only from screenshot driving. This exercises
+    /// the shared connection driver against a fresh widget: one authoritative
+    /// `Connected` sends one empty query, duplicate `Connected` events do not
+    /// resend it, `RecentItems` reaches the visible Empty frame, and a
+    /// `Disconnected`/`Connected` reconnect gets exactly one fresh request.
+    #[test]
+    fn interactive_connection_requests_empty_query_once_and_surfaces_recents() {
+        run_under_broadway(
+            "ui::window::tests::interactive_connection_requests_empty_query_once_and_surfaces_recents",
+            1450,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let (window, cmd_rx) = build_test_window("dev.hop.WindowTest.InteractiveRecents");
+        let mut connection = crate::app::InteractiveConnection::new("");
+
+        connection.apply(&window, IpcEvent::Connected);
+        match cmd_rx
+            .try_recv()
+            .expect("the first Connected event must request empty recents")
+        {
+            IpcCommand::Query(text) => assert!(text.is_empty()),
+            other => panic!("expected Query(\"\") from first Connected, got {other:?}"),
+        }
+        connection.apply(&window, IpcEvent::Connected);
+        // A duplicate Connected above must not enqueue another command.
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "duplicate Connected events for one connection must not resend Query(\"\")"
+        );
+
+        let recent = test_item(9, "Persisted launch");
+        connection.apply(
+            &window,
+            IpcEvent::RecentItems(vec![RecentItem {
+                item: recent,
+                launched_at_ms: 1,
+            }]),
+        );
+        assert_eq!(window.state_items.borrow()[0].title.as_str(), "Persisted launch");
+        assert_eq!(window.state_header.text(), "Recent");
+
+        connection.apply(&window, IpcEvent::Disconnected);
+        connection.apply(&window, IpcEvent::Connected);
+        match cmd_rx
+            .try_recv()
+            .expect("a reconnect must request one fresh empty recents query")
+        {
+            IpcCommand::Query(text) => assert!(text.is_empty()),
+            other => panic!("expected Query(\"\") after reconnect, got {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "one reconnect must still produce exactly one empty query"
+        );
+
+        println!("interactive connection requests one empty recents query per connection");
+    }
+
     /// Issue #258's approved frame contract. Keep the assertions at the
     /// widget boundary: this is where the six state choices become visible,
     /// rather than a string-only test of the event reducer.
