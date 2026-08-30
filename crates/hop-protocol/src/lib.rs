@@ -101,4 +101,13 @@ pub use wire::*;
 /// paragraph above gives: no release exists yet, and a stale binary in
 /// `~/.cargo/bin` is ordinary regardless of whether the specific field it is
 /// missing would have degraded gracefully or not.
-pub const API_VERSION: u32 = 3;
+/// **[2026-08-29] Bumped for issue #258's additive `RecentItems` response
+/// frame.** Old binaries fail at the existing handshake version check with a
+/// clear mismatch rather than attempting to consume a frame they cannot
+/// render; peers built from this workspace move together on the new contract.
+/// **[2026-09-01] Bumped again for issue #258's
+/// `QueryRouted.pending_providers` field.** Pending attribution needs the
+/// daemon's actual selection before any result can arrive; an old client would
+/// silently ignore this additive field and invent a provider list instead, so
+/// the handshake must reject that mismatch before a query begins.
+pub const API_VERSION: u32 = 5;

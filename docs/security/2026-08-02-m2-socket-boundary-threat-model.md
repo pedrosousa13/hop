@@ -1334,20 +1334,22 @@ slices, not a decision of its own, and it would not arise under the rejected
 alternative.
 
 Hashing keeps learning working for every provider, but it takes something with
-it: a hashed key cannot be turned back into an item, so it cannot be rendered.
-`Learning::recent_launches` (`Learning::recent_launches` [Amended 2026-08-10] [Amended 2026-08-18]) and
-`Learning::frequent_launches` (`Learning::frequent_launches` [Amended 2026-08-10] [Amended 2026-08-18]) both return the stored
-keys directly, and spec §8 designs the empty-query view around
-"recent/frequent items from learning". Under
-hashing alone, a third-party provider's items would be learned — and so would
-rank correctly — but would be missing from that screen, while built-ins
-appeared on it.
+it: a hashed key cannot be turned back into an item by itself. The daemon's
+`Learning::recent_launches` (`Learning::recent_launches` [Amended 2026-08-10]
+[Amended 2026-08-18]) and `Learning::frequent_launches`
+(`Learning::frequent_launches` [Amended 2026-08-10] [Amended 2026-08-18])
+return stored keys directly, so a caller must never expose those keys as UI
+content. The empty-query path now resolves them inside the daemon by
+recomputing each provider-scoped key against the live `Item` candidates before
+it sends a bounded, timestamped recent-item frame. The hash is never decoded,
+and an unresolved stored key is dropped.
 
 **The rule.** A provider declares in its manifest that its ids are safe to
 persist in plaintext. The daemon honours that declaration: ids from a provider
-that opted in persist in the clear and its items appear in the recents view
-like built-ins. Ids from a provider that did not opt in are hashed, and are
-learned but not renderable in the empty-query view.
+that opted in persist in the clear. Ids from a provider that did not opt in are
+hashed, but they can still appear in the recents view when the same live item
+is present in the current empty-query candidate set; only the daemon performs
+the hash comparison.
 
 **Why it is the right shape.** It puts the choice with the party that knows
 what its ids contain — a provider author knows whether its id embeds a path, a
@@ -1590,17 +1592,15 @@ Two facts about that worth carrying into the implementing slice:
   own hash output are dropped now, along with every other unrecognized
   legacy shape.
 - **How the empty-query view behaves for a provider that did not opt in.** The
-  consequence above settles the rule — those items are learned and not
-  renderable there — but not what the view *shows* in their place: a gap, a
-  built-ins-only list, or something that tells the user learning is working
-  even though the row is absent. M3 builds that screen (spec §8), and it should
-  arrive knowing this rather than discovering it.
-  **[Amended 2026-08-10]** Still open: issue #39's landing implemented
-  Decision 2's shape half only, and did not touch `recent_launches` /
-  `frequent_launches` beyond having them return persistence keys rather than
-  raw ids for a non-safe-shaped id (`learning.rs`) — a behaviour change with
-  no visible effect yet, since nothing surfaces either function to a user
-  today. This bullet's question is unchanged and remains M3's.
+  daemon must not decode or expose its hashed persistence key. Issue #258's
+  `Learning::recent_items_for` instead recomputes the canonical hash against
+  the current live candidates and sends only matched `Item` values paired with
+  their bounded launch timestamps in the additive `RecentItems` frame. A
+  deleted or unavailable item remains absent; a third-party item is not
+  second-class merely because its stored key is hashed.
+  **[Amended 2026-08-29]** Resolved by issue #258's daemon-side mapping and
+  GTK empty-query presentation. The wire protocol version bump makes stale
+  peers fail during handshake rather than misreading the new frame.
 
 ---
 

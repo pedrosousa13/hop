@@ -585,6 +585,7 @@ fn the_first_frame_arrives_before_the_slow_provider_finishes() {
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec!["fast".to_string(), "slow".to_string()],
         }
     );
 

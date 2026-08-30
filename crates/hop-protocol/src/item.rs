@@ -312,6 +312,17 @@ pub struct Item {
     pub provider: String,
 }
 
+/// A live query item paired with its persisted learning launch timestamp.
+///
+/// This is emitted only for the daemon's empty-query recent-items frame.
+/// `launched_at_ms` is a Unix timestamp in milliseconds; the client computes
+/// the user-facing relative age against its own wall clock.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentItem {
+    pub item: Item,
+    pub launched_at_ms: u64,
+}
+
 /// The `deserialize_with` for [`Item::copy_text`].
 ///
 /// Not [`CopyText`]'s own `Deserialize` — that would name a refusal

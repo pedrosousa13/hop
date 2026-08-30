@@ -193,7 +193,13 @@ async fn serve_one_connection(
             }
             frame = reader_rx.recv() => {
                 match frame {
-                    Some(ReadEvent::Message(DaemonMsg::QueryRouted { query_id, mode, exclusive, marker_span })) if Some(query_id) == current_id => {
+                    Some(ReadEvent::Message(DaemonMsg::QueryRouted {
+                        query_id,
+                        mode,
+                        exclusive,
+                        marker_span,
+                        pending_providers,
+                    })) if Some(query_id) == current_id => {
                         // `current_query_text` was set in the very same
                         // `IpcCommand::Query` arm above that produced
                         // `current_id`, and nothing else in this loop ever
@@ -209,10 +215,25 @@ async fn serve_one_connection(
                         // only to avoid an `unwrap()` this crate's lints warn
                         // on for a case that cannot actually occur.
                         let query_text = current_query_text.clone().unwrap_or_default();
-                        let _ = evt_tx.send(IpcEvent::Routed { mode, exclusive, marker_span, query_text }).await;
+                        let _ = evt_tx
+                            .send(IpcEvent::Routed {
+                                mode,
+                                exclusive,
+                                marker_span,
+                                query_text,
+                                pending_providers,
+                            })
+                            .await;
                     }
-                    Some(ReadEvent::Message(DaemonMsg::Results { query_id, items, .. })) if Some(query_id) == current_id => {
+                    Some(ReadEvent::Message(DaemonMsg::Results { query_id, items, .. }))
+                        if Some(query_id) == current_id =>
+                    {
                         let _ = evt_tx.send(IpcEvent::Results(items)).await;
+                    }
+                    Some(ReadEvent::Message(DaemonMsg::RecentItems { query_id, items }))
+                        if Some(query_id) == current_id =>
+                    {
+                        let _ = evt_tx.send(IpcEvent::RecentItems(items)).await;
                     }
                     Some(ReadEvent::Message(DaemonMsg::QueryDone { query_id })) if Some(query_id) == current_id => {
                         let _ = evt_tx.send(IpcEvent::QueryDone).await;
@@ -243,11 +264,9 @@ async fn serve_one_connection(
                         // gets the human-readable `Disconnected` state below
                         // either way.
                         eprintln!("hop-gtk: lost connection to hopd: {err}");
-                        let _ = evt_tx.send(IpcEvent::Disconnected).await;
                         break true;
                     }
                     None => {
-                        let _ = evt_tx.send(IpcEvent::Disconnected).await;
                         break true;
                     }
                 }
@@ -256,6 +275,12 @@ async fn serve_one_connection(
     };
 
     reader.abort();
+    // Every reconnect ends the live connection epoch once, regardless of
+    // whether its trigger was a reader failure, a connection-scoped daemon
+    // error, or a command write failure.
+    if outcome {
+        let _ = evt_tx.send(IpcEvent::Disconnected).await;
+    }
     outcome
 }
 
@@ -301,5 +326,82 @@ pub(super) async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn write_failure_emits_disconnected_before_reconnect() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the IPC lifecycle test needs a tokio runtime");
+
+        runtime.block_on(async {
+            // Keep the read peer alive and make only the write half fail.
+            // That gives this test the command-write exit specifically,
+            // instead of allowing the reader task's EOF path to mask it.
+            let (read_stream, _read_peer) =
+                StdUnixStream::pair().expect("create the held-open read socket");
+            let (write_stream, write_peer) =
+                StdUnixStream::pair().expect("create the failed write socket");
+            drop(write_peer);
+            read_stream
+                .set_nonblocking(true)
+                .expect("make the read socket tokio-compatible");
+            write_stream
+                .set_nonblocking(true)
+                .expect("make the write socket tokio-compatible");
+            let (read_half, _) = UnixStream::from_std(read_stream)
+                .expect("adopt the read socket into tokio")
+                .into_split();
+            let (_, write_half) = UnixStream::from_std(write_stream)
+                .expect("adopt the failed write socket into tokio")
+                .into_split();
+
+            let (cmd_tx, cmd_rx) = async_channel::unbounded();
+            let (evt_tx, evt_rx) = async_channel::unbounded();
+            let connection = tokio::spawn(async move {
+                serve_one_connection(read_half, write_half, &cmd_rx, &evt_tx).await
+            });
+
+            assert!(
+                matches!(evt_rx.recv().await, Ok(IpcEvent::Connected)),
+                "the live connection must begin its event epoch with Connected"
+            );
+            cmd_tx
+                .send(IpcCommand::Query(String::new()))
+                .await
+                .expect("queue the initial empty query");
+            assert!(
+                connection.await.expect("join the connection task"),
+                "a failed command write must request reconnect"
+            );
+
+            match tokio::time::timeout(Duration::from_millis(100), evt_rx.recv()).await {
+                Ok(Ok(IpcEvent::Disconnected)) => {}
+                Ok(Ok(other)) => {
+                    panic!("expected Disconnected after the failed command write, got {other:?}")
+                }
+                Ok(Err(_)) => panic!(
+                    "the failed command write ended the connection without the Disconnected \
+                     epoch transition needed before the next Connected"
+                ),
+                Err(_) => panic!(
+                    "timed out waiting for the Disconnected epoch transition after a failed \
+                     command write"
+                ),
+            }
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "one failed command write must emit one Disconnected transition"
+            );
+        });
     }
 }

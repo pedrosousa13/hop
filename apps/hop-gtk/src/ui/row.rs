@@ -470,12 +470,16 @@
 //! by accident.
 
 use std::io::Read;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use glib::variant::ToVariant;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 
-use hop_protocol::{ActionKind, IconPath, IconSpec, Item, ItemSubtitle};
+use hop_protocol::{ActionKind, IconPath, IconSpec, Item, ItemSubtitle, Kind};
 
 use crate::icon_roots;
 use crate::tokens;
@@ -531,6 +535,9 @@ const TITLE_CHILD_NAME: &str = "hop-row-title";
 /// one that both needs styling and must be found again — the mode label
 /// and the subtitle simply are not the same shape of problem.
 const SUBTITLE_CHILD_NAME: &str = "hop-row-subtitle";
+static OFFLINE_STATE: AtomicBool = AtomicBool::new(false);
+static OFFLINE_SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
+const STAMP_CHILD_NAME: &str = "hop-row-stamp";
 
 /// The widget name — and, since issue #207, the CSS class too — [`build`]
 /// gives the hint's own horizontal `gtk::Box`, the third direct child of
@@ -740,6 +747,11 @@ pub fn subtitle_widget(container: &gtk::Box) -> Option<gtk::Label> {
     find_named_child(container, SUBTITLE_CHILD_NAME)
 }
 
+/// The row's offline cache age stamp, shown only while the list is in the
+/// disconnected state.
+pub fn stamp_widget(container: &gtk::Box) -> Option<gtk::Label> {
+    find_named_child(container, STAMP_CHILD_NAME)
+}
 /// The `Row` page's action hint — the outer `gtk::Box` wrapping the label
 /// and key-glyph chips, added by issue #197. See this module's "Issue
 /// #197" doc section for why it is the outer row container's third direct
@@ -856,11 +868,28 @@ pub fn build() -> gtk::Box {
     subtitle.set_visible(false);
     // See `title.set_selectable(false)`'s own comment just above — the
     // identical explicit statement of SPEC decision 6's "no text selection
-    // inside rows", applied to the row's other prose label.
     subtitle.set_selectable(false);
     text_column.append(&subtitle);
-
     container.append(&text_column);
+
+    // Cached rows keep their age metadata at the trailing edge, beside
+    // actions and the keyboard hint, rather than in the title/subtitle
+    // column. This preserves the approved frame's mono "as of HH:MM"
+    // treatment without changing title centring for live rows.
+    let stamp = gtk::Label::new(None);
+    stamp.set_widget_name(STAMP_CHILD_NAME);
+    stamp.add_css_class(STAMP_CHILD_NAME);
+    stamp.add_css_class("hop-honesty-stamp");
+    stamp.set_xalign(0.0);
+    stamp.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    stamp.set_visible(false);
+    stamp.set_selectable(false);
+    let stamp_wrapper = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    stamp_wrapper.add_css_class("hop-honesty");
+    stamp_wrapper.set_valign(gtk::Align::Center);
+    stamp_wrapper.set_margin_start(*tokens::HINT_MARGIN_START_PX);
+    stamp_wrapper.append(&stamp);
+    container.append(&stamp_wrapper);
 
     // The action-icon buttons — issue #254. A third direct child of the
     // outer horizontal `container`, appended *before* `hint` below (not
@@ -1245,11 +1274,15 @@ pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str
     let Some(container) = widget.downcast_ref::<gtk::Box>() else {
         return;
     };
+    sync_state_classes(container, item);
     if let Some(label) = title_widget(container) {
         label.set_text(item.title.as_str());
     }
     if let Some(subtitle) = subtitle_widget(container) {
         resolve_subtitle(&subtitle, item.subtitle.as_ref());
+    }
+    if let Some(stamp) = stamp_widget(container) {
+        resolve_stamp(&stamp, OFFLINE_STATE.load(Ordering::Relaxed));
     }
     if let Some(icon) = icon_widget(container) {
         resolve_icon(&icon, item.icon.as_ref());
@@ -1266,6 +1299,47 @@ pub fn bind(widget: &gtk::Widget, item: &Item, activate_key_display: Option<&str
     }
     resolve_action_icons(container, item);
     resolve_overflow_button(container, item);
+}
+
+fn sync_state_classes(container: &gtk::Box, item: &Item) {
+    container.remove_css_class("hop-row-fallback");
+    container.remove_css_class("hop-row-prefixes");
+    if item.append_to_end || matches!(item.kind, Kind::WebSearch) {
+        container.add_css_class("hop-row-fallback");
+    }
+    if item.id.as_str() == "hop:prefixes" {
+        container.add_css_class("hop-row-prefixes");
+    }
+}
+/// `as_of_hh_mm` is captured once when the connection is lost and reused by
+/// every cached row, so recycling cannot make the cache appear to move
+/// forward in time.
+pub fn set_offline_state(offline: bool, as_of_hh_mm: Option<&str>) {
+    OFFLINE_STATE.store(offline, Ordering::Relaxed);
+    if let Ok(mut snapshot) = OFFLINE_SNAPSHOT.lock() {
+        *snapshot = if offline {
+            as_of_hh_mm.map(str::to_owned)
+        } else {
+            None
+        };
+    }
+}
+
+fn resolve_stamp(stamp: &gtk::Label, offline: bool) {
+    if offline {
+        let snapshot = OFFLINE_SNAPSHOT
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.clone());
+        let text = snapshot
+            .map(|as_of| format!("as of {as_of}"))
+            .unwrap_or_else(|| "as of --:--".to_string());
+        stamp.set_text(&text);
+        stamp.set_visible(true);
+    } else {
+        stamp.set_text("");
+        stamp.set_visible(false);
+    }
 }
 
 /// Maps an [`ActionKind`] to a themed, symbolic icon name — this module's
@@ -1732,6 +1806,11 @@ pub fn unbind(widget: &gtk::Widget) {
     if let Some(button) = overflow_button_widget(container) {
         clear_overflow_button(&button);
     }
+    if let Some(stamp) = stamp_widget(container) {
+        resolve_stamp(&stamp, false);
+    }
+    container.remove_css_class("hop-row-fallback");
+    container.remove_css_class("hop-row-prefixes");
 }
 
 #[cfg(test)]

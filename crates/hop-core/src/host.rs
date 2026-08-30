@@ -602,17 +602,21 @@ impl ProviderHost {
     /// *mode* a provider is asked under; it says nothing about the length
     /// pre-filter, so a provider declaring `min_term_len: 5` is still skipped
     /// for a 2-character inferred-route term, exactly as on any other route.
+    fn is_selected(&self, registration: &Registration, q: &RoutedQuery) -> bool {
+        let long_enough = q.term.as_str().chars().count() >= registration.effective.min_term_len;
+        let augments =
+            !q.exclusive && registration.effective.modes.contains(&Mode::All) && long_enough;
+        should_query(&registration.effective, q) || augments
+    }
+
     fn selected(&self, q: &RoutedQuery) -> Vec<&Registration> {
         self.providers
             .iter()
-            .filter(|r| {
-                let long_enough = q.term.as_str().chars().count() >= r.effective.min_term_len;
-                let augments =
-                    !q.exclusive && r.effective.modes.contains(&Mode::All) && long_enough;
-                let run = should_query(&r.effective, q) || augments;
+            .filter(|registration| {
+                let run = self.is_selected(registration, q);
                 if !run {
                     self.log.record(ProviderEvent::Skipped {
-                        provider: r.effective.id,
+                        provider: registration.effective.id,
                     });
                 }
                 run
@@ -620,12 +624,16 @@ impl ProviderHost {
             .collect()
     }
 
-    /// The ids [`ProviderHost::selected`] would run for `q`, in registration
-    /// order. Test-only: production callers want the providers, not their
-    /// names.
-    #[cfg(test)]
-    fn selected_ids(&self, q: &RoutedQuery) -> Vec<&str> {
-        self.selected(q).iter().map(|r| r.effective.id).collect()
+    /// The effective ids the host would run for `q`, in registration order.
+    ///
+    /// This shares [`ProviderHost::selected`]'s filtering and log seam, so
+    /// every skipped registration is still recorded even when a caller only
+    /// needs the ids for routing metadata. It does not launch provider work.
+    pub fn selected_ids(&self, q: &RoutedQuery) -> Vec<&str> {
+        self.selected(q)
+            .iter()
+            .map(|registration| registration.effective.id)
+            .collect()
     }
 
     /// Runs every provider this routed query reaches, each as its own task,

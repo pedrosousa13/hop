@@ -47,7 +47,7 @@ mod client;
 
 use std::path::PathBuf;
 
-use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, MarkerSpan, Mode};
+use hop_protocol::{ActionId, ExecOutcome, Item, ItemId, MarkerSpan, Mode, RecentItem};
 
 /// A request the UI sends to the IPC thread. Carries no wire-protocol id —
 /// [`client::run`] assigns and tracks the `Query`/`Execute` frame's `id`
@@ -115,11 +115,19 @@ pub enum IpcEvent {
         exclusive: bool,
         marker_span: Option<MarkerSpan>,
         query_text: String,
+        /// The provider ids the daemon selected at route time. This is
+        /// scheduling state, not an inference from result rows: it is what
+        /// lets the pending surface name zero-item providers truthfully until
+        /// the terminal event arrives.
+        pending_providers: Vec<String>,
     },
     /// The complete current result list for the active query, replacing
     /// whatever the UI is holding — the same replace rule
     /// `DaemonMsg::Results` documents.
     Results(Vec<Item>),
+
+    /// Persisted learning recents resolved by the daemon against live items.
+    RecentItems(Vec<RecentItem>),
     /// The active query finished; nothing more will arrive for it.
     QueryDone,
     /// The active query's `Execute` completed.
@@ -140,17 +148,16 @@ impl CommandSender {
     /// Queues `cmd` for the IPC thread. Never blocks and never touches the
     /// socket — it is a bounded-free, in-memory channel send; see this
     /// module's doc comment for why that is exactly the property that
-    /// matters here.
-    pub fn send(&self, cmd: IpcCommand) {
-        // The channel is unbounded and the receiver lives for the process's
-        // lifetime (`client::run` only returns when this sender — and thus
-        // every clone — has been dropped), so the one failure mode,
-        // `Closed`, means the IPC thread has already exited during process
-        // shutdown. Nothing left for the UI to do with that at this call
-        // site; a queued keystroke or execute request racing shutdown is
-        // dropped, same as it would be if the process had already exited a
-        // moment later.
-        let _ = self.0.try_send(cmd);
+    /// matters here. Returns `false` only when the IPC thread has already
+    /// closed its receiver.
+    pub fn send(&self, cmd: IpcCommand) -> bool {
+        // The channel is unbounded and the receiver normally lives for the
+        // process's lifetime (`client::run` only returns when this sender —
+        // and thus every clone — has been dropped). A closed receiver is
+        // still observable here, so callers that authorize a side effect
+        // after a queued command can avoid granting permission to a command
+        // that never entered the IPC queue.
+        self.0.try_send(cmd).is_ok()
     }
 }
 

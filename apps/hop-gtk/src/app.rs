@@ -310,10 +310,66 @@ fn resolve_overlay_strategy() -> session::OverlayStrategy {
     strategy
 }
 
-/// The ordinary, unique-instance run: builds the window once on first
-/// `activate`, presents it on every `activate` after that (this run's own
-/// first activation, or a later one forwarded from a re-invocation) — see
-/// this module's doc comment.
+/// Owns the per-connection initial query sent after IPC reports `Connected`.
+/// The interactive launcher uses an empty query to fetch persisted recents;
+/// screenshot mode passes its requested text so both modes share the same
+/// authoritative connection transition and reconnect behavior.
+pub(crate) struct InteractiveConnection {
+    initial_query: String,
+    connected: bool,
+    query_sent: bool,
+}
+
+impl InteractiveConnection {
+    pub(crate) fn new(initial_query: &str) -> Self {
+        Self {
+            initial_query: initial_query.to_string(),
+            connected: false,
+            query_sent: false,
+        }
+    }
+
+    /// Applies one IPC event on the GTK main thread and sends the mode's
+    /// initial query exactly once per established connection. `Disconnected`
+    /// starts a new connection epoch; duplicate `Connected` events within the
+    /// same epoch cannot duplicate the request.
+    pub(crate) fn apply(&mut self, window: &ui::window::HopWindow, event: IpcEvent) {
+        let is_connected = matches!(event, IpcEvent::Connected);
+        let is_disconnected = matches!(event, IpcEvent::Disconnected);
+        window.apply_event(event);
+
+        if is_disconnected {
+            self.connected = false;
+            self.query_sent = false;
+        }
+        if is_connected && !self.connected {
+            self.connected = true;
+            if !self.query_sent {
+                if self.initial_query.is_empty() {
+                    window.request_empty_query();
+                } else {
+                    window.set_query_text(&self.initial_query);
+                }
+                self.query_sent = true;
+            }
+        }
+    }
+
+    pub(crate) fn query_sent(&self) -> bool {
+        self.query_sent
+    }
+}
+
+/// Runs the ordinary interactive launcher with one pre-built window.
+///
+/// The event loop owns the connection driver so each authoritative
+/// [`IpcEvent::Connected`] transition requests persisted recents through the
+/// existing [`IpcCommand::Query`] channel. Screenshot mode uses the same
+/// driver below with its requested text.
+///
+/// [`IpcCommand::Query`]: crate::ipc::IpcCommand::Query
+///
+/// [`IpcEvent::Connected`]: crate::ipc::IpcEvent::Connected
 fn run_interactive(socket_path: PathBuf, keymap: crate::keymap::Keymap) -> ExitCode {
     let app = adw::Application::new(Some(APP_ID), gio::ApplicationFlags::empty());
     let activation_token = std::env::var("XDG_ACTIVATION_TOKEN").ok();
@@ -338,9 +394,10 @@ fn run_interactive(socket_path: PathBuf, keymap: crate::keymap::Keymap) -> ExitC
 
         glib::spawn_future_local({
             let window = window.clone();
+            let mut connection = InteractiveConnection::new("");
             async move {
                 while let Some(event) = evt_rx.recv().await {
-                    window.apply_event(event);
+                    connection.apply(&window, event);
                 }
             }
         });
@@ -524,39 +581,33 @@ async fn capture_once_mapped(
 
 /// Drives the window to the state `query` describes, then returns:
 ///
-/// - An empty `query` needs nothing sent — the empty-query state is
-///   whatever the window already shows once presented (and however `ipc`'s
-///   `Connected`/`ConnectFailed` status resolves), so this returns on the
-///   very first event.
-/// - A non-empty `query` is **typed into the entry** once `ipc` reports
-///   `Connected`, which fires the same `connect_changed` handler a real
-///   keystroke does and sends the query from there — see
-///   [`HopWindow::set_query_text`] for why this drives the UI rather than
-///   sending straight down the channel. This then waits for that query's
-///   `QueryDone` before returning — capturing any earlier could race a
-///   `Results` frame that has not arrived yet.
+/// - The shared [`InteractiveConnection`] sends the initial query once when
+///   `ipc` reports `Connected`: an empty `query` requests persisted learning
+///   recents, while a non-empty `query` is typed into the entry so it follows
+///   the same `connect_changed` path as a real keystroke.
+/// - This waits for that query's `QueryDone` before returning — capturing any
+///   earlier could race a `Results` frame that has not arrived yet.
 ///
-/// [`HopWindow::set_query_text`]: crate::ui::window::HopWindow::set_query_text
+/// [`InteractiveConnection`]: crate::app::InteractiveConnection
 async fn drive_to_state(
     window: &ui::window::HopWindow,
     evt_rx: &crate::ipc::EventReceiver,
     query: &str,
 ) {
-    let mut query_sent = query.is_empty();
+    let mut connection = InteractiveConnection::new(query);
     loop {
         let Some(event) = evt_rx.recv().await else {
             return;
         };
-        let is_connected = matches!(event, IpcEvent::Connected);
         let is_query_done = matches!(event, IpcEvent::QueryDone);
-        window.apply_event(event);
+        let is_connection_failure =
+            matches!(event, IpcEvent::ConnectFailed(_) | IpcEvent::Disconnected);
+        connection.apply(window, event);
 
-        if is_connected && !query_sent {
-            window.set_query_text(query);
-            query_sent = true;
-            continue;
+        if is_connection_failure && !connection.query_sent() {
+            return;
         }
-        if query.is_empty() || (query_sent && is_query_done) {
+        if connection.query_sent() && is_query_done {
             return;
         }
     }

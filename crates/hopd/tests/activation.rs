@@ -235,7 +235,10 @@ fn a_query_over_an_inherited_listener_is_served_without_hopd_rebinding_the_socke
     // test reads frames in order, so it is a free place to pin the ordering
     // rule that a mode label can be rendered before the first item arrives.
     // "walking skeleton" names no mode, so it routes to the `All` fallback,
-    // non-exclusive.
+    // non-exclusive. The host's non-exclusive augmentation schedules both
+    // registered Mode::All providers in order: skeleton and apps. Apps may
+    // return no matching item in this isolated test environment, but it is
+    // still part of the pending-provider attribution snapshot.
     assert_eq!(
         recv(&mut stream),
         DaemonMsg::QueryRouted {
@@ -243,6 +246,7 @@ fn a_query_over_an_inherited_listener_is_served_without_hopd_rebinding_the_socke
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
+            pending_providers: vec!["skeleton".to_string(), "apps".to_string()],
         }
     );
 

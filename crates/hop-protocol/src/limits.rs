@@ -137,6 +137,19 @@ pub const MAX_ACTION_LABEL: usize = 128;
 /// host registration for in-process provider manifests.
 pub const MAX_PROVIDER_ID: usize = 64;
 
+/// Maximum provider ids in
+/// [`DaemonMsg::QueryRouted`](crate::wire::DaemonMsg::QueryRouted)'s
+/// `pending_providers` list.
+///
+/// The list exists only to render the providers that the daemon actually
+/// selected before any of them has answered. It is not a second result set, so
+/// it shares the one-thousand-row ceiling of
+/// [`MAX_ITEMS_PER_RESULTS_FRAME`]. At the 64-byte
+/// [`MAX_PROVIDER_ID`] bound that keeps the whole list under 64 KiB before JSON
+/// syntax, while still exceeding the number of providers a launcher can
+/// meaningfully show at once.
+pub const MAX_PENDING_PROVIDERS: usize = 1_000;
+
 /// Maximum bytes of an [`IconName`](crate::content::IconName), the name arm of
 /// an [`IconSpec`](crate::item::IconSpec).
 ///
@@ -527,6 +540,19 @@ where
     })
 }
 
+/// Deserializes bounded provider identifiers, refusing an over-limit list or
+/// element before the value becomes part of a routed-query frame.
+fn provider_ids<'de, D>(
+    deserializer: D,
+    field: &'static str,
+    max: usize,
+) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedProviderIds { field, max })
+}
+
 /// Deserializes a validating newtype by handing the parsed value to `build` —
 /// the type's own constructor.
 ///
@@ -761,6 +787,42 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for BoundedVec<T> {
     }
 }
 
+struct BoundedProviderIds {
+    field: &'static str,
+    max: usize,
+}
+
+impl<'de> Visitor<'de> for BoundedProviderIds {
+    type Value = Vec<String>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} to be a sequence of at most {} provider ids",
+            self.field, self.max
+        )
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.max));
+        while let Some(provider) = seq.next_element::<String>()? {
+            if out.len() == self.max {
+                return Err(A::Error::custom(BoundError::TooMany {
+                    field: self.field,
+                    max: self.max,
+                }));
+            }
+            check_len(
+                "DaemonMsg::QueryRouted.pending_providers[]",
+                MAX_PROVIDER_ID,
+                provider.len(),
+            )
+            .map_err(A::Error::custom)?;
+            out.push(provider);
+        }
+        Ok(out)
+    }
+}
 // One `deserialize_with` target per bounded field. They are spelled out rather
 // than generated so that `grep`ping a constant finds every field it governs,
 // and so that each error names the field it came from.
@@ -806,6 +868,26 @@ pub(crate) fn de_results_items<'de, D: Deserializer<'de>>(
     d: D,
 ) -> Result<Vec<crate::item::Item>, D::Error> {
     vec(d, "DaemonMsg::Results.items", MAX_ITEMS_PER_RESULTS_FRAME)
+}
+
+pub(crate) fn de_recent_items<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<crate::item::RecentItem>, D::Error> {
+    vec(
+        d,
+        "DaemonMsg::RecentItems.items",
+        MAX_ITEMS_PER_RESULTS_FRAME,
+    )
+}
+
+pub(crate) fn de_pending_providers<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<String>, D::Error> {
+    provider_ids(
+        d,
+        "DaemonMsg::QueryRouted.pending_providers",
+        MAX_PENDING_PROVIDERS,
+    )
 }
 
 #[cfg(test)]

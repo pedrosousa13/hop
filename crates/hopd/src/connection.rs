@@ -261,7 +261,9 @@ async fn drive<S: ResultSource>(
                     return Ok(());
                 }
             }
-            Step::Batch(batch) => forward_batch(&mut exchange, &mut write_half, batch).await?,
+            Step::Batch(batch) => {
+                forward_batch(&mut exchange, &mut write_half, Some(&source), batch).await?
+            }
         }
     }
 }
@@ -355,6 +357,7 @@ async fn handle_message<S: ResultSource>(
                      MarkerSpan::new's bound and ordering checks",
                 )
             });
+            let pending_providers = source.pending_providers(&text);
             send_msg(
                 write_half,
                 &DaemonMsg::QueryRouted {
@@ -362,6 +365,7 @@ async fn handle_message<S: ResultSource>(
                     mode: routed.mode,
                     exclusive: routed.exclusive,
                     marker_span,
+                    pending_providers,
                 },
             )
             .await?;
@@ -557,9 +561,10 @@ async fn handle_message<S: ResultSource>(
 /// `source.rs`'s own accumulator already discards the pin-budget half of
 /// `Assembly::rejections` — see [`HostSource::start`] for where a rejection
 /// this daemon *does* keep is actually readable.
-async fn forward_batch(
+async fn forward_batch<S: ResultSource>(
     exchange: &mut Option<Exchange>,
     write_half: &mut OwnedWriteHalf,
+    source: Option<&S>,
     batch: Option<CheckedItems>,
 ) -> io::Result<()> {
     let Some(active) = exchange.as_mut() else {
@@ -589,6 +594,14 @@ async fn forward_batch(
     // leaves the connection dead either way, and the state that matters is
     // "what this daemon committed to delivering under this id".
     active.delivered = batch;
+    let recent_items = if active.text.is_empty() {
+        match source {
+            Some(source) => source.recent_items(&active.delivered).await,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
 
     send_msg(
         write_half,
@@ -599,6 +612,17 @@ async fn forward_batch(
         },
     )
     .await?;
+
+    if active.text.is_empty() {
+        send_msg(
+            write_half,
+            &DaemonMsg::RecentItems {
+                query_id,
+                items: recent_items,
+            },
+        )
+        .await?;
+    }
 
     if capped {
         // Dropping the receiver stops the source; QueryDone is what tells
@@ -880,12 +904,18 @@ mod tests {
         let first = vec![item_named("only-in-first"), item_named("shared")];
         let second = vec![item_named("shared"), item_named("only-in-second")];
 
-        forward_batch(&mut exchange, &mut write_half, Some(checked_items(first)))
-            .await
-            .unwrap();
-        forward_batch(
+        forward_batch::<ScriptedSource>(
             &mut exchange,
             &mut write_half,
+            None,
+            Some(checked_items(first)),
+        )
+        .await
+        .unwrap();
+        forward_batch::<ScriptedSource>(
+            &mut exchange,
+            &mut write_half,
+            None,
             Some(checked_items(second.clone())),
         )
         .await
@@ -900,6 +930,50 @@ mod tests {
         assert!(
             delivered.iter().all(|i| i.id.as_str() != "only-in-first"),
             "an item only the first list held must not survive a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_query_batch_emits_a_bounded_recent_items_frame() {
+        let source = ScriptedSource {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            launches: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let (_peer, mut write_half) = write_half_pair();
+        let mut exchange = Some(Exchange {
+            id: 7,
+            text: String::new(),
+            source: None,
+            delivered: Vec::new(),
+        });
+
+        forward_batch(
+            &mut exchange,
+            &mut write_half,
+            Some(&source),
+            Some(checked_items(vec![item_named("recent")])),
+        )
+        .await
+        .unwrap();
+
+        // The ordinary result frame remains the first response for compatible
+        // consumers; the additive metadata frame follows it for empty queries.
+        let mut peer = _peer;
+        assert!(matches!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::Results {
+                query_id: 7,
+                partial: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            read_daemon_msg(&mut peer).await,
+            DaemonMsg::RecentItems {
+                query_id: 7,
+                items: Vec::new(),
+            }
         );
     }
 
@@ -1465,7 +1539,7 @@ mod tests {
             .recv()
             .await
             .expect("OneShotSource must send query 1's item");
-        forward_batch(&mut exchange, &mut write_half, Some(batch))
+        forward_batch::<OneShotSource>(&mut exchange, &mut write_half, None, Some(batch))
             .await
             .unwrap();
         assert!(matches!(
@@ -1513,7 +1587,7 @@ mod tests {
             .recv()
             .await
             .expect("OneShotSource must send query 2's item");
-        forward_batch(&mut exchange, &mut write_half, Some(batch))
+        forward_batch::<OneShotSource>(&mut exchange, &mut write_half, None, Some(batch))
             .await
             .unwrap();
         assert!(matches!(

@@ -29,7 +29,7 @@ use hop_core::router::{Mode, RoutedQuery, route};
 use hop_core::sanitize::escape_path;
 use hop_protocol::{
     Action, ActionId, ActionKind, ExecOutcome, Item, ItemId, ItemSubtitle, ItemTitle, Kind,
-    MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, QueryText,
+    MAX_ITEMS_PER_QUERY, MAX_ITEMS_PER_RESULTS_FRAME, MAX_PENDING_PROVIDERS, QueryText, RecentItem,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -171,6 +171,19 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
     /// crate for the pattern a fixture-driven one uses instead.
     fn start(&self, text: QueryText) -> mpsc::Receiver<CheckedItems>;
 
+    /// Returns the provider ids this source selected for `text`, in the order
+    /// it will ask them. The connection sends this snapshot with
+    /// `QueryRouted`, before [`ResultSource::start`] can yield an arrival, so
+    /// a client can attribute pending work without inventing a provider list.
+    ///
+    /// Scripted sources default to no attribution so existing tests and narrow
+    /// sources do not claim providers they never schedule. A production source
+    /// that knows its scheduler must override this with the scheduler's actual
+    /// selection, not infer it from result items after the fact.
+    fn pending_providers(&self, _text: &QueryText) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Executes `action_id` on `item_id`, which the connection has already
     /// resolved against the items `provider` produced in a prior `start`.
     ///
@@ -227,6 +240,14 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
         query: &str,
         item_id: &ItemId,
     ) -> impl Future<Output = ()> + Send;
+
+    /// Resolves persisted learning launches against the live items in an
+    /// empty-query result. The default keeps scripted sources unchanged; the
+    /// production source performs canonical-key matching inside its daemon
+    /// boundary and never exposes unresolved or hashed keys.
+    fn recent_items(&self, _items: &[Item]) -> impl Future<Output = Vec<RecentItem>> + Send {
+        async { Vec::new() }
+    }
 }
 
 /// The walking skeleton's item, as a real [`Provider`].
@@ -299,6 +320,7 @@ impl Provider for SkeletonProvider {
     }
 }
 
+const MAX_RECENT_ITEMS: usize = 5;
 /// The default `max_results` the daemon passes to [`Pipeline::assemble`]
 /// on every arrival — the value [`HostSource`] built without the config-aware
 /// constructor ([`HostSource::with_config`]) uses, and what an absent config's
@@ -447,6 +469,15 @@ fn absorb_capped(accumulated: &mut CheckedItems, mut checked: CheckedItems, cap:
 }
 
 impl ResultSource for HostSource {
+    fn pending_providers(&self, text: &QueryText) -> Vec<String> {
+        let routed = route(text.as_str());
+        self.host
+            .selected_ids(&routed)
+            .into_iter()
+            .take(MAX_PENDING_PROVIDERS)
+            .map(str::to_owned)
+            .collect()
+    }
     fn start(&self, text: QueryText) -> mpsc::Receiver<CheckedItems> {
         // Two channels, each capacity 1 for the reason this trait's docs
         // give: what a source buffers is daemon memory the retained-set cap
@@ -610,6 +641,23 @@ impl ResultSource for HostSource {
             Ok(Ok(())) => {}
             Ok(Err(err)) => eprintln!("{}", learning_save_failed_line(path, &err)),
             Err(join_err) => eprintln!("{}", learning_save_panicked_line(path, &join_err)),
+        }
+    }
+
+    fn recent_items(&self, items: &[Item]) -> impl Future<Output = Vec<RecentItem>> + Send {
+        let items = items.to_vec();
+        let pipeline = Arc::clone(&self.pipeline);
+        async move {
+            let pipeline = pipeline.lock().await;
+            pipeline
+                .learning
+                .recent_items_for(&items, MAX_RECENT_ITEMS)
+                .into_iter()
+                .map(|(item, launched_at_ms)| RecentItem {
+                    item,
+                    launched_at_ms,
+                })
+                .collect()
         }
     }
 }
@@ -929,6 +977,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn host_source_reports_the_provider_selected_for_pending_attribution() {
+        let mut host = ProviderHost::with_log(Arc::new(NoopLog));
+        host.register(SkeletonProvider).unwrap();
+        let source = HostSource::new(Arc::new(host));
+
+        assert_eq!(
+            source.pending_providers(&QueryText::new("walking skeleton").unwrap()),
+            vec!["skeleton"]
+        );
+    }
+
     #[tokio::test]
     async fn the_skeleton_providers_own_item_passes_its_own_manifest() {
         // If it did not, the host would refuse it and the walking skeleton
@@ -939,6 +999,24 @@ mod tests {
         let item = hardcoded_item();
         assert_eq!(item.provider, manifest.id);
         assert!(manifest.kinds.contains(&item.kind));
+    }
+
+    #[tokio::test]
+    async fn host_source_resolves_persisted_recents_against_live_items() {
+        let mut pipeline = Pipeline::default();
+        pipeline
+            .learning
+            .sync_plaintext_providers(Vec::<String>::new());
+        let item = item(Kind::App, "third-party:firefox", "Firefox", "third-party");
+        pipeline.learning.record_launch("third-party", "", &item.id);
+
+        let host = ProviderHost::with_log(Arc::new(NoopLog));
+        let source = HostSource::with_pipeline(Arc::new(host), Arc::new(Mutex::new(pipeline)));
+        let recents = source.recent_items(std::slice::from_ref(&item)).await;
+
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].item, item);
+        assert!(recents[0].launched_at_ms > 0);
     }
 
     // --- Task 1 (issue #103): the forwarding hop must not break the
