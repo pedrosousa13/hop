@@ -232,10 +232,7 @@ pub trait ResultSource: Clone + Send + Sync + 'static {
     /// empty-query result. The default keeps scripted sources unchanged; the
     /// production source performs canonical-key matching inside its daemon
     /// boundary and never exposes unresolved or hashed keys.
-    fn recent_items(
-        &self,
-        _items: &[Item],
-    ) -> impl Future<Output = Vec<RecentItem>> + Send {
+    fn recent_items(&self, _items: &[Item]) -> impl Future<Output = Vec<RecentItem>> + Send {
         async { Vec::new() }
     }
 }
@@ -973,11 +970,11 @@ mod tests {
     #[tokio::test]
     async fn host_source_resolves_persisted_recents_against_live_items() {
         let mut pipeline = Pipeline::default();
-        pipeline.learning.sync_plaintext_providers(Vec::<String>::new());
-        let item = item(Kind::App, "third-party:firefox", "Firefox", "third-party");
         pipeline
             .learning
-            .record_launch("third-party", "", &item.id);
+            .sync_plaintext_providers(Vec::<String>::new());
+        let item = item(Kind::App, "third-party:firefox", "Firefox", "third-party");
+        pipeline.learning.record_launch("third-party", "", &item.id);
 
         let host = ProviderHost::with_log(Arc::new(NoopLog));
         let source = HostSource::with_pipeline(Arc::new(host), Arc::new(Mutex::new(pipeline)));

@@ -908,8 +908,8 @@ mod tests {
             None,
             Some(checked_items(first)),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         forward_batch::<ScriptedSource>(
             &mut exchange,
             &mut write_half,
@@ -1537,12 +1537,7 @@ mod tests {
             .recv()
             .await
             .expect("OneShotSource must send query 1's item");
-        forward_batch::<OneShotSource>(
-            &mut exchange,
-            &mut write_half,
-            None,
-            Some(batch),
-        )
+        forward_batch::<OneShotSource>(&mut exchange, &mut write_half, None, Some(batch))
             .await
             .unwrap();
         assert!(matches!(
@@ -1590,12 +1585,7 @@ mod tests {
             .recv()
             .await
             .expect("OneShotSource must send query 2's item");
-        forward_batch::<OneShotSource>(
-            &mut exchange,
-            &mut write_half,
-            None,
-            Some(batch),
-        )
+        forward_batch::<OneShotSource>(&mut exchange, &mut write_half, None, Some(batch))
             .await
             .unwrap();
         assert!(matches!(

@@ -74,7 +74,7 @@ use gtk::{gdk, glib};
 
 use hop_protocol::{
     Action as WireAction, ActionId, ActionKind, CopyText, ExecOutcome, Item, ItemId, ItemSubtitle,
-    ItemTitle, Kind, RecentItem, MAX_TITLE,
+    ItemTitle, Kind, MAX_TITLE, RecentItem,
 };
 
 use crate::ipc::{CommandSender, IpcCommand, IpcEvent};
@@ -699,11 +699,9 @@ impl HopWindow {
             Action::PageDown => self.move_selection(PAGE_STEP),
             Action::Home => self.select_first(),
             Action::End => self.select_last(),
-            Action::Activate => activate_selected(
-                &self.selection,
-                &self.cmd_tx,
-                &self.local_actions,
-            ),
+            Action::Activate => {
+                activate_selected(&self.selection, &self.cmd_tx, &self.local_actions)
+            }
             Action::SecondaryAction => self.open_secondary_action_menu(),
             Action::CompletePrefix => self.complete_prefix(),
             Action::Dismiss => {
@@ -1471,15 +1469,16 @@ impl HopWindow {
     }
 
     fn update_pending_motion_class(&self) {
-        let reduced = gtk::Settings::default()
-            .is_some_and(|settings| !settings.is_gtk_enable_animations());
+        let reduced =
+            gtk::Settings::default().is_some_and(|settings| !settings.is_gtk_enable_animations());
         if reduced {
-            self.pending_surface.add_css_class("hop-state-reduced-motion");
+            self.pending_surface
+                .add_css_class("hop-state-reduced-motion");
         } else {
-            self.pending_surface.remove_css_class("hop-state-reduced-motion");
+            self.pending_surface
+                .remove_css_class("hop-state-reduced-motion");
         }
     }
-
 
     fn set_status(&self, text: &str) {
         self.status.set_text(text);
@@ -1547,10 +1546,7 @@ fn build_pending_surface() -> (gtk::Box, Vec<gtk::Box>) {
     surface.set_visible(false);
 
     let mut bars = Vec::new();
-    for (provider, widths) in [
-        ("calculator", [116, 78]),
-        ("files", [104, 66]),
-    ] {
+    for (provider, widths) in [("calculator", [116, 78]), ("files", [104, 66])] {
         let attribution = gtk::Label::new(Some(provider));
         attribution.add_css_class("hop-pending-attribution");
         attribution.set_xalign(0.0);
@@ -1970,10 +1966,8 @@ fn perform_local_action(action: LocalAction) {
         LocalAction::WebSearch(query) => {
             let encoded = percent_encode_query(&query);
             let uri = format!("https://www.google.com/search?q={encoded}");
-            let _ = gtk::gio::AppInfo::launch_default_for_uri(
-                &uri,
-                gtk::gio::AppLaunchContext::NONE,
-            );
+            let _ =
+                gtk::gio::AppInfo::launch_default_for_uri(&uri, gtk::gio::AppLaunchContext::NONE);
         }
     }
 }
@@ -1982,13 +1976,9 @@ fn percent_encode_query(query: &str) -> String {
     query
         .bytes()
         .map(|byte| match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => (byte as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
             _ => format!("%{byte:02X}"),
         })
         .collect()
@@ -3622,7 +3612,10 @@ mod tests {
                 launched_at_ms: 1,
             }]),
         );
-        assert_eq!(window.state_items.borrow()[0].title.as_str(), "Persisted launch");
+        assert_eq!(
+            window.state_items.borrow()[0].title.as_str(),
+            "Persisted launch"
+        );
         assert_eq!(window.state_header.text(), "Recent");
 
         connection.apply(&window, IpcEvent::Disconnected);
@@ -3676,16 +3669,14 @@ mod tests {
         window.apply_event(IpcEvent::Results(vec![test_item(7, "Learned app")]));
         window.apply_event(IpcEvent::Executed(ExecOutcome::Done));
         window.set_query_text("");
-        window.apply_event(IpcEvent::RecentItems(vec![
-            hop_protocol::RecentItem {
-                item: test_item(7, "Learned app"),
-                launched_at_ms: (SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock is after Unix epoch")
-                    .as_millis() as u64)
-                    .saturating_sub(7_200_000),
-            },
-        ]));
+        window.apply_event(IpcEvent::RecentItems(vec![hop_protocol::RecentItem {
+            item: test_item(7, "Learned app"),
+            launched_at_ms: (SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after Unix epoch")
+                .as_millis() as u64)
+                .saturating_sub(7_200_000),
+        }]));
         assert_eq!(window.state_items.borrow()[0].title.as_str(), "Learned app");
         assert!(
             window.state_items.borrow()[0]
@@ -3710,7 +3701,8 @@ mod tests {
         assert!(window.pending_surface.get_visible());
         assert!(window.pending_surface.has_css_class("hop-state-pending"));
         assert!(
-            window.pending_surface
+            window
+                .pending_surface
                 .first_child()
                 .and_then(|child| child.downcast::<gtk::Label>().ok())
                 .is_some_and(|label| label.text().contains("calculator"))
@@ -3787,7 +3779,10 @@ mod tests {
             "weather failed — budget exceeded".to_string(),
         ));
         assert!(window.error_pin.get_visible());
-        assert_eq!(window.error_title.text(), "weather failed — budget exceeded");
+        assert_eq!(
+            window.error_title.text(),
+            "weather failed — budget exceeded"
+        );
         assert_eq!(
             window.error_subtitle.text(),
             "provider isolated; other results unaffected"
@@ -3812,7 +3807,11 @@ mod tests {
         let settings = gtk::Settings::default().expect("broadway settings");
         settings.set_gtk_enable_animations(false);
         window.set_query_text("par");
-        assert!(window.pending_surface.has_css_class("hop-state-reduced-motion"));
+        assert!(
+            window
+                .pending_surface
+                .has_css_class("hop-state-reduced-motion")
+        );
         settings.set_gtk_enable_animations(true);
 
         println!("six approved material states render at the widget boundary");
