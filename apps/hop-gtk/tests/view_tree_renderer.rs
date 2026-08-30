@@ -245,7 +245,7 @@ fn run_assertions() {
         .child_by_name("row")
         .expect("setup must build the Row page before any bind runs");
     let first_action_icon = row::action_icon_widget(
-        &row_container
+        row_container
             .downcast_ref::<gtk::Box>()
             .expect("the Row page must be the gtk::Box ui/row.rs builds"),
         0,
@@ -1293,7 +1293,8 @@ fn run_assertions() {
     // stale visibility (or its stale target) forward — the exact hazard
     // this module's own doc comment ("the recycling constraint") warns a
     // fixed, unconditional-every-bind rule (rather than a before/after
-    // comparison) is what rules out here.
+    // comparison) is what rules out here. Hidden buttons keep the typed
+    // placeholder target, but the real item/action ids must be gone.
     view::bind(
         &stack,
         &Node::for_item(item_a.clone(), activate_key_display.clone()),
@@ -1314,10 +1315,25 @@ fn run_assertions() {
          persist onto a rebound row whose item has ≤2 actions\" hazard this review finding \
          names for a per-row affordance with no Rust-side shown/hidden memory of its own"
     );
-    assert!(
-        overflow_button.action_target_value().is_none(),
-        "recycling away from the overflow chevron must clear its stale target too, not merely \
-         hide the button"
+    let action_icon_2_target_after_recycle = action_icon_2
+        .action_target_value()
+        .expect("a hidden action-icon button must keep the typed placeholder target")
+        .get::<(String, String)>()
+        .expect("the action target must unpack as an (item_id, action_id) pair of strings");
+    assert_eq!(
+        action_icon_2_target_after_recycle,
+        (String::new(), String::new()),
+        "hidden recycled action icons keep the placeholder target while dropping stale item/action ids"
+    );
+    let overflow_target_after_recycle = overflow_button
+        .action_target_value()
+        .expect("a hidden overflow chevron must keep the typed placeholder target")
+        .get::<String>()
+        .expect("the overflow chevron's action target must unpack as a bare item id string");
+    assert_eq!(
+        overflow_target_after_recycle,
+        "",
+        "hidden recycled overflow chevrons keep the placeholder target while dropping the stale item id"
     );
     let target_after_recycle = action_icon_1
         .action_target_value()
@@ -1332,26 +1348,39 @@ fn run_assertions() {
     );
 
     // `unbind`'s own symmetry with the title, subtitle, icon, and hint:
-    // every action-icon button must be hidden, its tooltip and target
-    // cleared — a recycled row about to be rebound to a different item
-    // must not carry stale action data across the gap.
+    // every action-icon button must be hidden and reset to the typed
+    // placeholder target — a recycled row about to be rebound to a
+    // different item must not carry stale item or action ids across the
+    // gap.
     view::unbind(
         &stack,
         &Node::for_item(item_a.clone(), activate_key_display.clone()),
     );
     assert!(!action_icon_1.is_visible());
     assert!(!action_icon_2.is_visible());
-    assert!(
-        action_icon_1.action_target_value().is_none(),
-        "unbind must clear the action target, not merely hide the button"
+    let action_icon_1_target_after_unbind = action_icon_1
+        .action_target_value()
+        .expect("an unbound action-icon button must keep the typed placeholder target")
+        .get::<(String, String)>()
+        .expect("the action target must unpack as an (item_id, action_id) pair of strings");
+    assert_eq!(
+        action_icon_1_target_after_unbind,
+        (String::new(), String::new()),
+        "unbind must leave the placeholder target in place while removing stale item/action ids"
     );
     assert!(
         !overflow_button.is_visible(),
         "unbind must hide the overflow chevron too, matching every other optional row element"
     );
-    assert!(
-        overflow_button.action_target_value().is_none(),
-        "unbind must clear the overflow chevron's action target, not merely hide the button"
+    let overflow_button_target_after_unbind = overflow_button
+        .action_target_value()
+        .expect("an unbound overflow chevron must keep the typed placeholder target")
+        .get::<String>()
+        .expect("the overflow chevron's action target must unpack as a bare item id string");
+    assert_eq!(
+        overflow_button_target_after_unbind,
+        "",
+        "unbind must leave the placeholder target in place while removing the stale item id"
     );
 
     // Neither the title nor the subtitle label can be text-selected — SPEC

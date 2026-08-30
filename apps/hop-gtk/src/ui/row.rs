@@ -912,7 +912,9 @@ pub fn build() -> gtk::Box {
     // built, though: GTK's action machinery expects a target-typed action
     // to observe a non-null target from the start, and a fixed placeholder
     // is cheaper than allocating a fresh variant shape per bind just to
-    // keep the action name stable.
+    // keep the action name stable. The placeholder starts hidden so a
+    // never-bound row still presents no clickable affordance until `bind`
+    // overwrites the target with real item/action ids.
     let actions_wrapper = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::HINT_CHIP_GAP_PX);
     actions_wrapper.set_widget_name(ACTIONS_CHILD_NAME);
     actions_wrapper.add_css_class(ACTIONS_CHILD_NAME);
@@ -942,6 +944,7 @@ pub fn build() -> gtk::Box {
         button.add_css_class("flat");
         button.set_action_name(Some(&row_action_full_name));
         button.set_action_target_value(Some(&row_action_placeholder_target));
+        button.set_visible(false);
         actions_wrapper.append(&button);
     }
 
@@ -1399,16 +1402,14 @@ fn resolve_action_icons(container: &gtk::Box, item: &Item) {
 /// can set on it — [`unbind`]'s own symmetry rule ("every property `bind`
 /// can set here, `unbind` resets") applied to this widget, and
 /// [`resolve_action_icons`]'s own "does not exist for this item" branch.
-/// Clearing the action target specifically (`set_action_target_value(None)`)
-/// is the load-bearing half: an invisible, un-clickable button cannot be
-/// clicked by a real pointer, but leaving a stale target on it would still
-/// be exactly the kind of "holds stale application data it should not
-/// have" this module's own `unbind` doc comment calls out, defensive
-/// rather than reachable in practice.
+/// Clearing the action target back to the typed `(ss)` placeholder keeps
+/// the button's action shape valid for GTK while still removing stale item
+/// or action ids; the row remains hidden, so this stays a non-affordance
+/// until the next bind overwrites the target with real data.
 fn clear_action_icon(button: &gtk::Button) {
     button.set_visible(false);
     button.set_tooltip_text(None);
-    button.set_action_target_value(None);
+    button.set_action_target_value(Some(&("", "").to_variant()));
     button.set_icon_name("");
 }
 
@@ -1434,14 +1435,15 @@ fn resolve_overflow_button(container: &gtk::Box, item: &Item) {
     }
 }
 
-/// Hides the overflow chevron and clears its action target —
+/// Hides the overflow chevron and restores its typed placeholder target —
 /// [`resolve_overflow_button`]'s own "does not apply to this item" branch,
 /// and [`unbind`]'s symmetry rule applied to this button, the identical
 /// shape [`clear_action_icon`] already gives the two dedicated action
-/// icons.
+/// icons. Clearing back to the placeholder keeps the action parameter
+/// typed for GTK while stripping stale item ids.
 fn clear_overflow_button(button: &gtk::Button) {
     button.set_visible(false);
-    button.set_action_target_value(None);
+    button.set_action_target_value(Some(&"".to_variant()));
 }
 
 /// Whether a hint that was in `was_shown`'s state before this bind and is
