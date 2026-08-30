@@ -1330,6 +1330,7 @@ impl HopWindow {
     pub fn apply_event(&self, event: IpcEvent) {
         match event {
             IpcEvent::Connected => {
+                self.pending_user_executions.set(0);
                 row::set_offline_state(false, None);
                 self.status.set_visible(false);
                 self.offline_indicator.apply(None);
@@ -1340,6 +1341,7 @@ impl HopWindow {
                 self.set_status(&format!("Can't reach hopd: {reason}"));
             }
             IpcEvent::Disconnected => {
+                self.pending_user_executions.set(0);
                 // Issue #200: `IpcEvent::Disconnected` — a connection that
                 // *was* established and has now been lost, `ipc`'s own
                 // reconnect loop already retrying in the background (per
@@ -1471,6 +1473,7 @@ impl HopWindow {
     }
 
     fn begin_query(&self, text: &str) {
+        self.pending_user_executions.set(0);
         row::set_offline_state(false, None);
         self.query_had_results.set(false);
         self.query_pending.set(true);
@@ -1650,6 +1653,11 @@ impl HopWindow {
     /// boundary. Interactive windows use the real clipboard/URI launcher;
     /// screenshot and widget-test windows use a non-launching sink.
     fn handle_outcome(&self, outcome: ExecOutcome) {
+        let pending = self.pending_user_executions.get();
+        if pending == 0 {
+            return;
+        }
+        self.pending_user_executions.set(pending - 1);
         match outcome {
             ExecOutcome::Done => {}
             ExecOutcome::CopyText(text) => self.user_actions.copy_text(text.as_str()),
@@ -2160,8 +2168,9 @@ fn send_execute(
     action_id: ActionId,
     pending_user_executions: &Rc<Cell<u32>>,
 ) {
-    pending_user_executions.set(pending_user_executions.get().saturating_add(1));
-    cmd_tx.send(IpcCommand::Execute { item_id, action_id });
+    if cmd_tx.send(IpcCommand::Execute { item_id, action_id }) {
+        pending_user_executions.set(pending_user_executions.get().saturating_add(1));
+    }
 }
 
 fn activate_selected(
@@ -4078,6 +4087,101 @@ mod tests {
             cmd_rx.try_recv().is_err(),
             "the prefix helper is a non-action affordance, never an Execute"
         );
+    }
+
+    #[test]
+    fn execute_outcomes_require_a_successful_user_activation() {
+        run_under_broadway(
+            "ui::window::tests::execute_outcomes_require_a_successful_user_activation",
+            1850,
+        );
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        gtk::init()
+            .expect("gtk init under the broadway display this process's environment selects");
+
+        let actions = Rc::new(FakeUserActionSink::default());
+        let (window, cmd_rx) = build_test_window_with_action_sink(
+            "dev.hop.WindowTest.ExecuteOutcomeGate",
+            Rc::clone(&actions),
+        );
+        let outcome = || {
+            ExecOutcome::OpenUrl(
+                hop_protocol::OpenUrl::new("https://example.test/authorized").unwrap(),
+            )
+        };
+
+        // A daemon outcome for the active query is not authorization by
+        // itself; only a user-triggered Execute may open an external URI.
+        window.set_query_text("authorized");
+        while cmd_rx.try_recv().is_ok() {}
+        window.apply_event(IpcEvent::Results(vec![test_item(1, "authorized")]));
+        window.apply_event(IpcEvent::Executed(outcome()));
+        assert!(actions.uris.borrow().is_empty());
+
+        // One successful command send permits one matching outcome.
+        window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(IpcCommand::Execute { .. })
+        ));
+        window.apply_event(IpcEvent::Executed(outcome()));
+        assert_eq!(
+            actions.uris.borrow().as_slice(),
+            ["https://example.test/authorized"]
+        );
+
+        // The permission is consumed; an extra outcome cannot launch again.
+        window.apply_event(IpcEvent::Executed(outcome()));
+        assert_eq!(
+            actions.uris.borrow().as_slice(),
+            ["https://example.test/authorized"]
+        );
+
+        // A new query clears an outstanding permission before its outcome.
+        window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(IpcCommand::Execute { .. })
+        ));
+        window.set_query_text("new-query");
+        while cmd_rx.try_recv().is_ok() {}
+        window.apply_event(IpcEvent::Executed(outcome()));
+        assert_eq!(
+            actions.uris.borrow().as_slice(),
+            ["https://example.test/authorized"]
+        );
+
+        // Disconnect also clears an outstanding permission.
+        window.set_query_text("authorized-again");
+        while cmd_rx.try_recv().is_ok() {}
+        window.apply_event(IpcEvent::Results(vec![test_item(2, "authorized again")]));
+        window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(IpcCommand::Execute { .. })
+        ));
+        window.apply_event(IpcEvent::Disconnected);
+        window.apply_event(IpcEvent::Executed(outcome()));
+        assert_eq!(
+            actions.uris.borrow().as_slice(),
+            ["https://example.test/authorized"]
+        );
+
+        // A closed command channel does not grant permission merely because
+        // activation was attempted.
+        let failed_actions = Rc::new(FakeUserActionSink::default());
+        let (failed_window, failed_rx) = build_test_window_with_action_sink(
+            "dev.hop.WindowTest.ExecuteOutcomeSendFailure",
+            Rc::clone(&failed_actions),
+        );
+        drop(failed_rx);
+        failed_window.set_query_text("closed");
+        failed_window.apply_event(IpcEvent::Results(vec![test_item(3, "closed")]));
+        failed_window.list_view.emit_by_name::<()>("activate", &[&0u32]);
+        failed_window.apply_event(IpcEvent::Executed(outcome()));
+        assert!(failed_actions.uris.borrow().is_empty());
     }
 
     /// Issue #258's approved frame contract. Keep the assertions at the
