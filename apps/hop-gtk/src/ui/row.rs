@@ -900,14 +900,19 @@ pub fn build() -> gtk::Box {
     // `hexpand(true)` (set above) still supplies every pixel neither the
     // icon slot, this wrapper, nor `hint` claims.
     //
-    // See this module's top doc comment, "Issue #254: clickable action
-    // icons", for why exactly `ROW_ACTION_ICON_CAP` buttons are built here,
-    // why each one's action-*name* is fixed at build time while its
+    // See this module's top doc comment, "How a click runs the right
+    // action", for why exactly `ROW_ACTION_ICON_CAP` buttons are built
+    // here, why each one's action-*name* is fixed at build time while its
     // action-*target* is the only thing `bind` ever changes, and why a
     // GAction target — not a `connect_clicked` closure capturing a cloned
-    // `gtk::ListItem` — is the mechanism chosen here: both are `unsafe`-free,
-    // and the doc comment linked above names the real (layering, not
+    // `gtk::ListItem` — is the mechanism chosen here: both are `unsafe`-
+    // free, and the doc comment linked above names the real (layering, not
     // safety) reason this one won.
+    // Each button still needs a valid `(ss)` target when it is first
+    // built, though: GTK's action machinery expects a target-typed action
+    // to observe a non-null target from the start, and a fixed placeholder
+    // is cheaper than allocating a fresh variant shape per bind just to
+    // keep the action name stable.
     let actions_wrapper = gtk::Box::new(gtk::Orientation::Horizontal, *tokens::HINT_CHIP_GAP_PX);
     actions_wrapper.set_widget_name(ACTIONS_CHILD_NAME);
     actions_wrapper.add_css_class(ACTIONS_CHILD_NAME);
@@ -921,6 +926,7 @@ pub fn build() -> gtk::Box {
     actions_wrapper.set_margin_start(*tokens::HINT_MARGIN_START_PX);
 
     let row_action_full_name = format!("{ROW_ACTION_GROUP_PREFIX}.{ROW_ACTION_NAME}");
+    let row_action_placeholder_target = ("", "").to_variant();
     for slot in 0..ROW_ACTION_ICON_CAP {
         let button = gtk::Button::new();
         button.set_widget_name(&action_icon_widget_name(slot));
@@ -931,26 +937,11 @@ pub fn build() -> gtk::Box {
         // own inline action), and `assets/stylesheet.css` carries no rule
         // of its own for a bare `button`/`.flat` that this could collide
         // with (checked: this file declares neither selector anywhere
-        // before this issue).
+        // else, and the `action-icon` buttons are intentionally meant to be
+        // plain content, not chrome).
         button.add_css_class("flat");
-        // Hidden until `bind`/`resolve_action_icons` decides this slot has
-        // a real action for the bound item — "hide, don't reserve", this
-        // module's own precedent (see "The absent case" section above) for
-        // every other optional row element: a freshly built row's very
-        // first bind might resolve to zero or one action, and this button
-        // must occupy no space, and be un-clickable, before that decision
-        // has ever been made even once.
-        button.set_visible(false);
-        // The action *name* is fixed here, once, and [`bind`] never
-        // touches it again — only the action *target*
-        // ([`resolve_action_icons`], every bind) changes per rebind. See
-        // [`ROW_ACTION_GROUP_PREFIX`]'s own doc comment for why a GAction,
-        // whose `action-target` property GTK itself stores and hands back
-        // per widget instance, is the mechanism this module uses to make
-        // that split possible with no new parameter threaded through the
-        // `build`/`bind`/`unbind` boundary — not the only `unsafe`-free
-        // shape available, per that doc comment's own account.
         button.set_action_name(Some(&row_action_full_name));
+        button.set_action_target_value(Some(&row_action_placeholder_target));
         actions_wrapper.append(&button);
     }
 

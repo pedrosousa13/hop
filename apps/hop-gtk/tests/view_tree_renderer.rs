@@ -241,6 +241,34 @@ fn run_assertions() {
              shape ui/row.rs built directly before this issue's seam",
         );
 
+    let row_container = stack
+        .child_by_name("row")
+        .expect("setup must build the Row page before any bind runs");
+    let first_action_icon = row::action_icon_widget(
+        &row_container
+            .downcast_ref::<gtk::Box>()
+            .expect("the Row page must be the gtk::Box ui/row.rs builds"),
+        0,
+    )
+    .expect("setup must build the first action icon button before any bind runs");
+    assert_eq!(
+        first_action_icon.action_name().as_deref(),
+        Some("row.run-action"),
+        "freshly built action buttons must already carry the fixed row action name"
+    );
+    let placeholder_target = first_action_icon
+        .action_target_value()
+        .expect("a freshly built action button must carry a non-null placeholder target")
+        .get::<(String, String)>()
+        .expect("the placeholder target must unpack as the expected (item_id, action_id) pair");
+    assert_eq!(
+        placeholder_target,
+        (String::new(), String::new()),
+        "freshly built action buttons must start with the `(ss)` placeholder target"
+    );
+
+
+
     // --- brief tests 2-4, at the level D4 of the plan names as the right
     // one: `ui::view::bind`/`unbind` directly against the stack `setup`
     // already built, not through a second real `gtk::ListItem` — a real
