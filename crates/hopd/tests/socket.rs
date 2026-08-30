@@ -230,7 +230,8 @@ fn the_round_trip_returns_one_item_end_to_end() {
     // the walking skeleton's end-to-end round trip, so pinning it here means
     // the very first test anyone reads about this protocol shows the real frame
     // order. "walking skeleton" names no mode, so it reaches the `All`
-    // fallback, which is never exclusive.
+    // fallback, which is never exclusive; the host's non-exclusive
+    // augmentation also schedules the registered Mode::All apps provider.
     assert_eq!(
         recv(&mut stream),
         DaemonMsg::QueryRouted {
@@ -238,7 +239,7 @@ fn the_round_trip_returns_one_item_end_to_end() {
             mode: Mode::All,
             exclusive: false,
             marker_span: None,
-            pending_providers: vec!["skeleton".to_string()],
+            pending_providers: vec!["skeleton".to_string(), "apps".to_string()],
         }
     );
 
