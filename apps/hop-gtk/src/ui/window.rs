@@ -1373,15 +1373,15 @@ impl HopWindow {
         let mut child = self.pending_surface.first_child();
         while let Some(widget) = child {
             let next = widget.next_sibling();
-            if let Ok(attribution) = widget.clone().downcast::<gtk::Label>() {
-                if attribution.has_css_class("hop-pending-attribution") {
-                    let answered = answered_items
-                        .iter()
-                        .any(|item| item.provider.as_str() == attribution.text().as_str());
-                    attribution.set_visible(!answered);
-                    if let Some(row) = next.as_ref() {
-                        row.set_visible(!answered);
-                    }
+            if let Ok(attribution) = widget.clone().downcast::<gtk::Label>()
+                && attribution.has_css_class("hop-pending-attribution")
+            {
+                let answered = answered_items
+                    .iter()
+                    .any(|item| item.provider.as_str() == attribution.text().as_str());
+                attribution.set_visible(!answered);
+                if let Some(row) = next.as_ref() {
+                    row.set_visible(!answered);
                 }
             }
             child = next;
@@ -1598,9 +1598,9 @@ fn state_item(
     subtitle: Option<&str>,
     action: Option<(&str, ActionKind, &str)>,
     copy_text: Option<&str>,
-    append_to_end: bool,
-    provider: &str,
+    metadata: (&str, bool),
 ) -> Option<Item> {
+    let (provider, append_to_end) = metadata;
     let (actions, default_action) = match action {
         Some((id, kind, label)) => {
             let id = ActionId::new(id).ok()?;
@@ -1630,10 +1630,10 @@ fn state_item(
 fn empty_state_items(recents: &[RecentItem]) -> Vec<Item> {
     let mut items = recents
         .iter()
-        .filter_map(|recent| {
+        .map(|recent| {
             let mut item = recent.item.clone();
             item.subtitle = relative_subtitle_ms(&item.provider, recent.launched_at_ms);
-            Some(item)
+            item
         })
         .collect::<Vec<_>>();
     if let Some(prefixes) = state_item(
@@ -1643,8 +1643,7 @@ fn empty_state_items(recents: &[RecentItem]) -> Vec<Item> {
         None,
         None,
         None,
-        false,
-        "ui",
+        ("ui", false),
     ) {
         items.push(prefixes);
     }
@@ -1684,8 +1683,7 @@ fn no_results_state_items(query: &str) -> Vec<Item> {
             Some("fallback · GNOME Web"),
             Some(("open", ActionKind::OpenUrl, "Open")),
             None,
-            true,
-            "web-search",
+            ("web-search", true),
         ),
         state_item(
             "hop:fallback-copy",
@@ -1694,8 +1692,7 @@ fn no_results_state_items(query: &str) -> Vec<Item> {
             Some("fallback · clipboard"),
             Some(("copy", ActionKind::Copy, "Copy")),
             Some(query.as_str()),
-            true,
-            "clipboard",
+            ("clipboard", true),
         ),
     ]
     .into_iter()
