@@ -267,8 +267,6 @@ fn run_assertions() {
         "freshly built action buttons must start with the `(ss)` placeholder target"
     );
 
-
-
     // --- brief tests 2-4, at the level D4 of the plan names as the right
     // one: `ui::view::bind`/`unbind` directly against the stack `setup`
     // already built, not through a second real `gtk::ListItem` — a real
@@ -1331,8 +1329,7 @@ fn run_assertions() {
         .get::<String>()
         .expect("the overflow chevron's action target must unpack as a bare item id string");
     assert_eq!(
-        overflow_target_after_recycle,
-        "",
+        overflow_target_after_recycle, "",
         "hidden recycled overflow chevrons keep the placeholder target while dropping the stale item id"
     );
     let target_after_recycle = action_icon_1
@@ -1378,8 +1375,7 @@ fn run_assertions() {
         .get::<String>()
         .expect("the overflow chevron's action target must unpack as a bare item id string");
     assert_eq!(
-        overflow_button_target_after_unbind,
-        "",
+        overflow_button_target_after_unbind, "",
         "unbind must leave the placeholder target in place while removing the stale item id"
     );
 
