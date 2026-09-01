@@ -266,6 +266,26 @@ fn run_assertions() {
         (String::new(), String::new()),
         "freshly built action buttons must start with the `(ss)` placeholder target"
     );
+    let overflow_button = row::overflow_button_widget(
+        row_container
+            .downcast_ref::<gtk::Box>()
+            .expect("the Row page must be the gtk::Box ui/row.rs builds"),
+    )
+    .expect("setup must build the overflow chevron button before any bind runs");
+    assert_eq!(
+        overflow_button.action_name().as_deref(),
+        Some("row.open-actions"),
+        "a freshly built overflow chevron must already carry the fixed row action name"
+    );
+    let overflow_placeholder_target = overflow_button
+        .action_target_value()
+        .expect("a freshly built overflow chevron must carry a non-null placeholder target")
+        .get::<String>()
+        .expect("the overflow placeholder target must unpack as the expected item id string");
+    assert_eq!(
+        overflow_placeholder_target, "",
+        "freshly built overflow chevrons must start with the `s` placeholder target"
+    );
 
     // --- brief tests 2-4, at the level D4 of the plan names as the right
     // one: `ui::view::bind`/`unbind` directly against the stack `setup`

@@ -978,6 +978,11 @@ pub fn build() -> gtk::Box {
     // [`ROW_OPEN_ACTIONS_TARGET_TYPE`]'s own doc comment — changes per
     // bind, via [`resolve_overflow_button`]; the action *name* is fixed
     // here, exactly like the two dedicated action-icon buttons above.
+    // Seed the typed empty `s` placeholder before installing that name so
+    // GTK never observes a parameterized action with a null target before
+    // the first bind overwrites it with a real item id.
+    let row_open_actions_placeholder_target = "".to_variant();
+    overflow_button.set_action_target_value(Some(&row_open_actions_placeholder_target));
     overflow_button.set_action_name(Some(&format!(
         "{ROW_ACTION_GROUP_PREFIX}.{ROW_OPEN_ACTIONS_NAME}"
     )));
