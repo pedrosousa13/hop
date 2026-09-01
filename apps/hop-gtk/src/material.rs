@@ -86,30 +86,36 @@
 //! [`Mode::Blur`] on X11. No manager present, or the probe itself failing
 //! for any reason, both degrade to [`Mode::Opaque`] — see [`decide`].
 //!
-//! # Wayland: opaque today, structured for a KDE branch later
+//! # Wayland: KDE's `org_kde_kwin_blur_manager`, detected but not yet applied
 //!
 //! GNOME's Mutter exposes no blur API of any kind to clients — the design
 //! spec's own "Known constraints" section says so, the same fact
 //! `layer_shell`'s module doc already leans on for its own GNOME arm — so
-//! there is nothing to probe there at all. KDE's KWin does have a blur
-//! protocol, `org_kde_kwin_blur`, but it is a KDE-specific Wayland
-//! extension with no binding in the `gdk4-wayland`/`gtk4` crates already in
-//! this workspace's dependency graph; reaching it would mean adding a raw
-//! Wayland-protocol crate (`wayland-client` plus a generated
-//! `org_kde_kwin_blur` binding, or hand-rolling the wire protocol) — plus a
-//! bridge to GDK's own `wl_display` rather than a second connection.
+//! there is nothing to probe there at all, ever: this is a permanent fact
+//! about Mutter, not a gap this module will one day close. KDE's KWin does
+//! have a blur protocol, `org_kde_kwin_blur`, and issue #259 adds the probe
+//! for it: [`crate::kde_blur::probe`] asks, over GDK's own Wayland
+//! connection through a dedicated event queue (see that module's own doc
+//! comment for exactly how and why), whether the compositor advertises
+//! `org_kde_kwin_blur_manager` at all. As with X11's compositor probe,
+//! presence is not proof of anything about *this specific surface* — this
+//! slice binds nothing, creates no blur object, commits nothing — only that
+//! the protocol exists to ask for it with.
 //!
-//! That is not an oversight and not a verdict: the maintainer ruled on
-//! 2026-08-23 that the KDE branch is its own slice rather than a tail on
-//! this one, and it is filed as issue #259 (blocked by #253) with the
-//! dependency cost and acceptance criteria written out. GNOME's arm, by
-//! contrast, is permanent — there is no API to reach.
+//! Deliberately incomplete, and said so out loud: issue #259 ships in two
+//! slices. This first one wires detection all the way through
+//! [`decide`] and [`report`], with unit coverage exhaustive over the widened
+//! matrix below — but until the second slice adds the surface-bound
+//! `org_kde_kwin_blur` object, a positive detection is not the same thing as
+//! honest translucency. [`resolve`] accounts for this explicitly (see its
+//! own doc comment): the call site downgrades an honestly-*detected*
+//! `Mode::Blur` on Wayland to `Mode::Opaque` until the surface work lands,
+//! rather than letting `decide` itself lie about what it found.
 //!
-//! [`decide`]'s `SessionKind::Wayland` arm is written as
-//! its own match arm, independent of X11's, precisely so a future KDE probe
-//! can be slotted in there (most plausibly by widening [`CompositorProbe`]
-//! or adding a sibling enum for a Wayland-specific fact) without touching
-//! the X11 arm, [`Mode`], or anything upstream of [`decide`] at all.
+//! [`decide`]'s `SessionKind::Wayland` arm stays its own match arm,
+//! independent of X11's, exactly as before — see [`KdeBlurProbe`] for the
+//! sibling-enum shape this module's own prior doc comment anticipated, now
+//! filled in rather than merely reserved.
 //!
 //! # Everything else: fail toward opaque, always
 //!
@@ -125,6 +131,7 @@ use gtk::prelude::*;
 use x11rb::protocol::xproto::ConnectionExt;
 use x11rb::rust_connection::RustConnection;
 
+use crate::kde_blur::KdeBlurProbe;
 use crate::session::SessionKind;
 
 /// `assets/stylesheet.css`'s `window.background.hop-material-blur` selector
@@ -198,14 +205,21 @@ impl Mode {
     }
 }
 
-/// Picks the mode for `kind`, given what [`probe_x11_compositor`] found —
-/// consulted only on [`SessionKind::X11`], per this module's doc comment.
-/// Pure with respect to everything but its two arguments: no display, no
-/// window, no I/O — the same split `layer_shell::probe`/
-/// `session::SessionKind::overlay_strategy` establish, and for the
-/// identical reason, so the whole degrade matrix is unit-tested below with
-/// no display connection at all.
-pub fn decide(kind: SessionKind, x11_compositor: CompositorProbe) -> Mode {
+/// Picks the mode for `kind`, given what [`probe_x11_compositor`] and
+/// [`crate::kde_blur::probe`] found — each consulted only on its own
+/// session kind, per this module's doc comment. Pure with respect to
+/// everything but its three arguments: no display, no window, no I/O — the
+/// same split `layer_shell::probe`/`session::SessionKind::overlay_strategy`
+/// establish, and for the identical reason, so the whole degrade matrix is
+/// unit-tested below with no display connection at all.
+///
+/// This function answers "did detection honestly confirm blur would
+/// composite" — not "is it safe to apply that answer right now". On
+/// Wayland specifically, [`resolve`]'s own doc comment records why those
+/// are different questions during issue #259's first slice, and why the
+/// gap between them is closed one call site up from here, not by weakening
+/// this function's honesty.
+pub fn decide(kind: SessionKind, x11_compositor: CompositorProbe, kde_blur: KdeBlurProbe) -> Mode {
     match kind {
         // X11: honest translucency needs proof alpha actually composites,
         // not merely that it was requested. A manager owning
@@ -214,17 +228,23 @@ pub fn decide(kind: SessionKind, x11_compositor: CompositorProbe) -> Mode {
         // this module's doc comment, "X11: what a compositing-manager
         // probe can and cannot prove", for why presence alone is treated
         // as sufficient rather than also trying (and failing) to confirm
-        // blur specifically.
+        // blur specifically. `kde_blur` is irrelevant here — never
+        // consulted on this arm.
         SessionKind::X11 => match x11_compositor {
             CompositorProbe::ManagerPresent => Mode::Blur,
             CompositorProbe::ManagerAbsent | CompositorProbe::ProbeFailed => Mode::Opaque,
         },
-        // Wayland: opaque, unconditionally, regardless of the (irrelevant
-        // here) X11 probe outcome — see this module's doc comment,
-        // "Wayland: opaque today, structured for a KDE branch later", for
-        // GNOME's total absence of a blur API and KDE's unreached
-        // `org_kde_kwin_blur`.
-        SessionKind::Wayland => Mode::Opaque,
+        // Wayland: GNOME exposes no blur API at all (permanent — see this
+        // module's doc comment, "Wayland: KDE's org_kde_kwin_blur_manager,
+        // detected but not yet applied"), so only a confirmed
+        // `org_kde_kwin_blur_manager` global earns `Mode::Blur`; absence or
+        // a failed probe both degrade to opaque, the same "I don't know
+        // gets the same answer as no" rule X11's arm follows.
+        // `x11_compositor` is irrelevant here — never consulted on this arm.
+        SessionKind::Wayland => match kde_blur {
+            KdeBlurProbe::ManagerPresent => Mode::Blur,
+            KdeBlurProbe::ManagerAbsent | KdeBlurProbe::ProbeFailed => Mode::Opaque,
+        },
         // Broadway, or any future backend this module has never heard of:
         // the same answer a detection failure would get. Fail toward
         // opaque, always.
@@ -275,7 +295,17 @@ fn probe_x11_compositor() -> CompositorProbe {
 /// house style for a startup probe report (`session::startup_report`,
 /// `layer_shell`'s doc comment on its own `probe`/`apply_or_fallback`
 /// split).
-pub fn report(kind: SessionKind, x11_compositor: CompositorProbe, mode: Mode) -> String {
+///
+/// `mode` is [`decide`]'s honest answer, not necessarily what gets applied
+/// to a real window on Wayland this slice — see [`resolve`]'s doc comment.
+/// This report always describes detection honestly; it is not the place a
+/// caller's temporary downgrade gets hidden.
+pub fn report(
+    kind: SessionKind,
+    x11_compositor: CompositorProbe,
+    kde_blur: KdeBlurProbe,
+    mode: Mode,
+) -> String {
     let reason = match kind {
         SessionKind::X11 => match x11_compositor {
             CompositorProbe::ManagerPresent => {
@@ -290,10 +320,20 @@ pub fn report(kind: SessionKind, x11_compositor: CompositorProbe, mode: Mode) ->
                  invariant"
             }
         },
-        SessionKind::Wayland => {
-            "Wayland exposes no GTK4-reachable blur API here (GNOME: none at all; KDE's \
-             org_kde_kwin_blur: unimplemented — see module doc)"
-        }
+        SessionKind::Wayland => match kde_blur {
+            KdeBlurProbe::ManagerPresent => {
+                "a Wayland global advertises org_kde_kwin_blur_manager (issue #259 slice 1: \
+                 detected only — no surface-bound blur object exists yet, see module doc)"
+            }
+            KdeBlurProbe::ManagerAbsent => {
+                "no Wayland global advertises org_kde_kwin_blur_manager (GNOME/Mutter: never \
+                 will; some other compositor: does not implement it — see module doc)"
+            }
+            KdeBlurProbe::ProbeFailed => {
+                "the KDE org_kde_kwin_blur_manager probe itself failed; degrading to opaque \
+                 per the honesty invariant"
+            }
+        },
         SessionKind::Other => "not a real display session; nothing to detect",
     };
     format!(
@@ -306,8 +346,32 @@ pub fn report(kind: SessionKind, x11_compositor: CompositorProbe, mode: Mode) ->
 /// Runs the whole decision for the default display: detects the session
 /// ([`SessionKind::detect`], reused rather than re-derived — see this
 /// module's doc comment), probes for a compositing manager when, and only
-/// when, the session is X11, decides the mode, and logs the one-line
+/// when, the session is X11, probes for KDE's blur manager when, and only
+/// when, the session is Wayland, decides the mode, and logs the one-line
 /// outcome [`report`] formats.
+///
+/// # This function stays honest; the two-phase Wayland gap is a call
+/// # site's problem, not this function's
+///
+/// [`decide`] can now honestly answer [`Mode::Blur`] for a Wayland session
+/// whose compositor advertises `org_kde_kwin_blur_manager` — this function
+/// returns exactly that answer, and [`report`] logs exactly that reasoning.
+/// It does **not** downgrade the answer to account for issue #259 being a
+/// two-slice piece of work: this slice's [`crate::kde_blur::probe`] creates
+/// no surface-bound blur object (see that module's doc comment), so a real
+/// window applying `Mode::Blur` here today would render a translucent
+/// ground the compositor is not actually blurring anything behind —
+/// exactly the failure mode the honesty invariant exists to prevent.
+///
+/// That gap is closed at `ui::window::HopWindow::build`'s call site
+/// instead of here, deliberately: this function's job is "what did
+/// detection honestly find", not "what is currently safe to paint", and
+/// conflating the two would make this function's own answer a function of
+/// which slice of #259 happens to be merged — indistinguishable from
+/// weakening the invariant. See that call site's own comment for the
+/// explicit, temporary downgrade and why it is written to be easy to find
+/// and delete once issue #259's second slice lands the surface-bound
+/// application.
 ///
 /// The `None`-display panic matches `app::install_stylesheet`'s and
 /// `app::resolve_overlay_strategy`'s identical posture: by the time
@@ -327,8 +391,27 @@ pub fn resolve() -> Mode {
         // outcome.
         SessionKind::Wayland | SessionKind::Other => CompositorProbe::ManagerAbsent,
     };
-    let mode = decide(kind, x11_compositor);
-    eprintln!("hop-gtk: {}", report(kind, x11_compositor, mode));
+    let kde_blur = match kind {
+        // `display` is already known to hold a `WaylandDisplay` — `detect`
+        // just downcast it to reach `SessionKind::Wayland` — so this
+        // second downcast cannot fail in practice; `ProbeFailed` is still
+        // the fallback rather than a panic or an `unwrap`, matching this
+        // crate's `clippy::unwrap_used` lint and the honesty invariant's
+        // "any ambiguity degrades to opaque" (a value this function cannot
+        // itself prove `Some` from `SessionKind` alone, the same posture
+        // `ui::window`'s own `let Some(item) = .. else` comment states for
+        // its structurally-unreachable case).
+        SessionKind::Wayland => match display.downcast_ref::<gdkwayland::WaylandDisplay>() {
+            Some(wayland_display) => crate::kde_blur::probe(wayland_display),
+            None => KdeBlurProbe::ProbeFailed,
+        },
+        // Never consulted for these arms (see `decide`'s match) — no
+        // Wayland connection is reached for an answer that cannot change
+        // the outcome.
+        SessionKind::X11 | SessionKind::Other => KdeBlurProbe::ManagerAbsent,
+    };
+    let mode = decide(kind, x11_compositor, kde_blur);
+    eprintln!("hop-gtk: {}", report(kind, x11_compositor, kde_blur, mode));
     mode
 }
 
@@ -347,76 +430,185 @@ pub fn apply(window: &impl IsA<gtk::Widget>, mode: Mode) {
 mod tests {
     use super::*;
 
+    /// Every [`CompositorProbe`] variant — the X11 axis of the cartesian
+    /// product [`no_session_kind_ever_resolves_to_blur_without_a_confirmed_compositor`]
+    /// walks.
+    const ALL_X11_PROBES: [CompositorProbe; 3] = [
+        CompositorProbe::ManagerPresent,
+        CompositorProbe::ManagerAbsent,
+        CompositorProbe::ProbeFailed,
+    ];
+
+    /// Every [`KdeBlurProbe`] variant — the Wayland axis of the same
+    /// product.
+    const ALL_KDE_PROBES: [KdeBlurProbe; 3] = [
+        KdeBlurProbe::ManagerPresent,
+        KdeBlurProbe::ManagerAbsent,
+        KdeBlurProbe::ProbeFailed,
+    ];
+
+    /// Every [`SessionKind`] — the third axis.
+    const ALL_SESSION_KINDS: [SessionKind; 3] =
+        [SessionKind::X11, SessionKind::Wayland, SessionKind::Other];
+
     #[test]
     fn x11_blurs_only_when_a_compositing_manager_is_confirmed_present() {
-        assert_eq!(
-            decide(SessionKind::X11, CompositorProbe::ManagerPresent),
-            Mode::Blur
-        );
-        assert_eq!(
-            decide(SessionKind::X11, CompositorProbe::ManagerAbsent),
-            Mode::Opaque
-        );
-        assert_eq!(
-            decide(SessionKind::X11, CompositorProbe::ProbeFailed),
-            Mode::Opaque
-        );
+        // `kde_blur` is irrelevant on this arm — exercised at every value
+        // to prove it, matching `kde_blurs_only_when_the_manager_is_confirmed_present`'s
+        // identical proof for the X11 probe on Wayland's arm below.
+        for kde_blur in ALL_KDE_PROBES {
+            assert_eq!(
+                decide(SessionKind::X11, CompositorProbe::ManagerPresent, kde_blur),
+                Mode::Blur
+            );
+            assert_eq!(
+                decide(SessionKind::X11, CompositorProbe::ManagerAbsent, kde_blur),
+                Mode::Opaque
+            );
+            assert_eq!(
+                decide(SessionKind::X11, CompositorProbe::ProbeFailed, kde_blur),
+                Mode::Opaque
+            );
+        }
     }
 
     #[test]
-    fn a_failed_probe_degrades_identically_to_a_confirmed_absent_compositor() {
+    fn a_failed_x11_probe_degrades_identically_to_a_confirmed_absent_compositor() {
         // "I don't know" must never be treated more favorably than a
         // confirmed "no" — the honesty invariant's own "when in doubt,
         // degrade to opaque".
         assert_eq!(
-            decide(SessionKind::X11, CompositorProbe::ProbeFailed),
-            decide(SessionKind::X11, CompositorProbe::ManagerAbsent)
+            decide(
+                SessionKind::X11,
+                CompositorProbe::ProbeFailed,
+                KdeBlurProbe::ManagerAbsent
+            ),
+            decide(
+                SessionKind::X11,
+                CompositorProbe::ManagerAbsent,
+                KdeBlurProbe::ManagerAbsent
+            )
         );
     }
 
     #[test]
-    fn wayland_is_always_opaque_regardless_of_the_irrelevant_x11_probe() {
-        for probe in [
-            CompositorProbe::ManagerPresent,
-            CompositorProbe::ManagerAbsent,
-            CompositorProbe::ProbeFailed,
-        ] {
-            assert_eq!(decide(SessionKind::Wayland, probe), Mode::Opaque);
+    fn kde_blurs_only_when_the_manager_is_confirmed_present() {
+        // The Wayland mirror of `x11_blurs_only_when_a_compositing_manager_is_confirmed_present`.
+        // `x11_compositor` is irrelevant on this arm — exercised at every
+        // value to prove it.
+        for x11_compositor in ALL_X11_PROBES {
+            assert_eq!(
+                decide(
+                    SessionKind::Wayland,
+                    x11_compositor,
+                    KdeBlurProbe::ManagerPresent
+                ),
+                Mode::Blur
+            );
+            assert_eq!(
+                decide(
+                    SessionKind::Wayland,
+                    x11_compositor,
+                    KdeBlurProbe::ManagerAbsent
+                ),
+                Mode::Opaque
+            );
+            assert_eq!(
+                decide(
+                    SessionKind::Wayland,
+                    x11_compositor,
+                    KdeBlurProbe::ProbeFailed
+                ),
+                Mode::Opaque
+            );
         }
     }
 
     #[test]
-    fn other_sessions_are_always_opaque_regardless_of_the_irrelevant_x11_probe() {
-        for probe in [
-            CompositorProbe::ManagerPresent,
-            CompositorProbe::ManagerAbsent,
-            CompositorProbe::ProbeFailed,
-        ] {
-            assert_eq!(decide(SessionKind::Other, probe), Mode::Opaque);
-        }
-    }
-
-    #[test]
-    fn no_session_kind_ever_resolves_to_blur_without_a_confirmed_x11_compositor() {
-        // The exhaustive statement of the degrade matrix above: across
-        // every session kind and every probe outcome, `Mode::Blur` comes
-        // back exactly once — X11 paired with a confirmed-present
-        // compositor. Every other combination must degrade.
-        let mut blur_count = 0;
-        for kind in [SessionKind::X11, SessionKind::Wayland, SessionKind::Other] {
-            for probe in [
-                CompositorProbe::ManagerPresent,
+    fn a_failed_kde_probe_degrades_identically_to_a_confirmed_absent_manager() {
+        // The Wayland mirror of `a_failed_x11_probe_degrades_identically_to_a_confirmed_absent_compositor`.
+        assert_eq!(
+            decide(
+                SessionKind::Wayland,
                 CompositorProbe::ManagerAbsent,
-                CompositorProbe::ProbeFailed,
-            ] {
-                if decide(kind, probe) == Mode::Blur {
-                    blur_count += 1;
-                    assert_eq!(kind, SessionKind::X11);
-                    assert_eq!(probe, CompositorProbe::ManagerPresent);
+                KdeBlurProbe::ProbeFailed
+            ),
+            decide(
+                SessionKind::Wayland,
+                CompositorProbe::ManagerAbsent,
+                KdeBlurProbe::ManagerAbsent
+            )
+        );
+    }
+
+    #[test]
+    fn other_sessions_are_always_opaque_regardless_of_either_probe() {
+        for x11_compositor in ALL_X11_PROBES {
+            for kde_blur in ALL_KDE_PROBES {
+                assert_eq!(
+                    decide(SessionKind::Other, x11_compositor, kde_blur),
+                    Mode::Opaque
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_session_kind_ever_resolves_to_blur_without_a_confirmed_compositor() {
+        // The exhaustive statement of the degrade matrix above, now over
+        // the full cartesian product of all three enums (issue #259
+        // widened this deliberately from the X11-only matrix a prior
+        // revision of this test pinned — see this module's doc comment
+        // and the issue's own triage comment for why changing this test
+        // was the intended, not incidental, part of adding the KDE
+        // branch): across every session kind × every X11 probe outcome ×
+        // every KDE probe outcome, `Mode::Blur` comes back in exactly two
+        // combinations — `(X11, ManagerPresent, *)` and
+        // `(Wayland, *, ManagerPresent)` — and never in any other. Every
+        // other combination must degrade to opaque, which is what keeps
+        // this a real guard on the honesty invariant rather than a spot
+        // check of a few hand-picked cases.
+        let mut blur_combinations: Vec<(SessionKind, CompositorProbe, KdeBlurProbe)> = Vec::new();
+        for kind in ALL_SESSION_KINDS {
+            for x11_compositor in ALL_X11_PROBES {
+                for kde_blur in ALL_KDE_PROBES {
+                    if decide(kind, x11_compositor, kde_blur) == Mode::Blur {
+                        blur_combinations.push((kind, x11_compositor, kde_blur));
+                    }
                 }
             }
         }
-        assert_eq!(blur_count, 1);
+        for (kind, x11_compositor, kde_blur) in &blur_combinations {
+            let is_x11_confirmed =
+                *kind == SessionKind::X11 && *x11_compositor == CompositorProbe::ManagerPresent;
+            let is_kde_confirmed =
+                *kind == SessionKind::Wayland && *kde_blur == KdeBlurProbe::ManagerPresent;
+            assert!(
+                is_x11_confirmed || is_kde_confirmed,
+                "unreachable Mode::Blur combination: {kind:?}, {x11_compositor:?}, {kde_blur:?}"
+            );
+        }
+        // Exactly one X11 combination (the KDE probe is irrelevant there,
+        // so it must appear once per KDE probe value) and exactly one
+        // Wayland combination per X11 probe value — `ALL_KDE_PROBES.len()`
+        // of each, `2 * ALL_KDE_PROBES.len()` total.
+        assert_eq!(blur_combinations.len(), 2 * ALL_KDE_PROBES.len());
+        assert_eq!(
+            blur_combinations
+                .iter()
+                .filter(|(kind, ..)| *kind == SessionKind::X11)
+                .count(),
+            ALL_KDE_PROBES.len(),
+            "X11 confirmed-present must blur regardless of the irrelevant KDE probe value"
+        );
+        assert_eq!(
+            blur_combinations
+                .iter()
+                .filter(|(kind, ..)| *kind == SessionKind::Wayland)
+                .count(),
+            ALL_X11_PROBES.len(),
+            "Wayland confirmed-present must blur regardless of the irrelevant X11 probe value"
+        );
     }
 
     #[test]
@@ -430,6 +622,7 @@ mod tests {
         let text = report(
             SessionKind::X11,
             CompositorProbe::ManagerAbsent,
+            KdeBlurProbe::ManagerAbsent,
             Mode::Opaque,
         );
         assert!(text.contains("X11"), "{text}");
@@ -438,11 +631,26 @@ mod tests {
 
         let text = report(
             SessionKind::Wayland,
-            CompositorProbe::ManagerPresent,
+            CompositorProbe::ManagerAbsent,
+            KdeBlurProbe::ManagerAbsent,
             Mode::Opaque,
         );
         assert!(text.contains("Wayland"), "{text}");
         assert!(text.contains("opaque"), "{text}");
-        assert!(text.contains("org_kde_kwin_blur"), "{text}");
+        assert!(text.contains("org_kde_kwin_blur_manager"), "{text}");
+
+        // The KDE-present arm's own reason: says the manager was found,
+        // and that this slice does not yet apply blur from it (issue
+        // #259's own two-slice honesty — see `resolve`'s doc comment).
+        let text = report(
+            SessionKind::Wayland,
+            CompositorProbe::ManagerAbsent,
+            KdeBlurProbe::ManagerPresent,
+            Mode::Blur,
+        );
+        assert!(text.contains("Wayland"), "{text}");
+        assert!(text.contains("blur"), "{text}");
+        assert!(text.contains("org_kde_kwin_blur_manager"), "{text}");
+        assert!(text.contains("slice 1"), "{text}");
     }
 }

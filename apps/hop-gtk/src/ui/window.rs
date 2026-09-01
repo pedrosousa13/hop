@@ -535,9 +535,50 @@ impl HopWindow {
         // `strategy` as an input: the two decisions are independent (a
         // Wayland session's overlay *strategy* depends on layer-shell
         // support; its material *mode* never does — see `material`'s own
-        // module doc for why Wayland is always opaque here), so nothing is
-        // gained by threading one through the other.
-        crate::material::apply(&window, crate::material::resolve());
+        // module doc), so nothing is gained by threading one through the
+        // other.
+        //
+        // --- ISSUE #259 SLICE 1/2: TEMPORARY WAYLAND DOWNGRADE — READ BEFORE TOUCHING ---
+        // `material::resolve` can now honestly answer `Mode::Blur` for a
+        // Wayland session whose compositor advertises
+        // `org_kde_kwin_blur_manager` (`kde_blur::probe`) — but this slice
+        // creates no surface-bound `org_kde_kwin_blur` object (see that
+        // module's doc comment on scope), so nothing is actually blurring
+        // behind THIS window yet. `material::resolve`/`decide` are
+        // deliberately left honest rather than lying about what detection
+        // found (see `material::resolve`'s own doc comment for why that
+        // dishonesty would be worse, not better) — which means the one
+        // remaining place the honesty invariant ("never render a
+        // half-transparent panel over hard pixels") can still be enforced
+        // for a real, live window is right here, at the only call site
+        // that actually applies a mode to one. So: re-detect the session
+        // (cheap — a single downcast, the same one `material::resolve`
+        // itself just did internally) and downgrade a Wayland `Mode::Blur`
+        // to `Mode::Opaque` before it ever reaches a widget. X11 is
+        // untouched — its blur was already fully implemented in #253.
+        //
+        // DELETE THIS BLOCK, and apply `resolved_mode` directly, the
+        // moment issue #259's second slice lands the `org_kde_kwin_blur`
+        // surface object/commit — at that point `material::resolve`'s
+        // answer is honest *and* safe to paint, and this downgrade would
+        // start silently hiding a working feature instead of protecting
+        // against an unfinished one.
+        let resolved_mode = crate::material::resolve();
+        // The same `gdk::Display::default()` source `material::resolve`
+        // itself just detected the session from — see that function's
+        // doc comment on why re-detecting here (rather than widening its
+        // return type to hand the kind back out) is deliberate and
+        // temporary, not a shape to build on.
+        let is_wayland = gtk::gdk::Display::default().is_some_and(|display| {
+            crate::session::SessionKind::detect(&display) == crate::session::SessionKind::Wayland
+        });
+        let presentable_mode = if is_wayland && resolved_mode == crate::material::Mode::Blur {
+            crate::material::Mode::Opaque
+        } else {
+            resolved_mode
+        };
+        crate::material::apply(&window, presentable_mode);
+        // --- END ISSUE #259 SLICE 1/2 TEMPORARY BLOCK ---
         // Issue #233: the strategy — not a second probe — decides whether
         // this window becomes a layer surface. `apply_or_fallback` still
         // re-checks the probe internally (a documented no-op unless the

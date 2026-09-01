@@ -148,8 +148,22 @@ yeslogic-fontconfig-sys = "6.0.1"
 # `gdk4` 0.11.x already in the dependency graph under `gtk`; their MIT
 # license is already on `deny.toml`'s workspace-wide allow list.
 gdkx11 = { package = "gdk4-x11", version = "0.11" }
-gdkwayland = { package = "gdk4-wayland", version = "0.11" }
+gdkwayland = { package = "gdk4-wayland", version = "0.11", features = ["wayland_crate"] }
 #
+# Issue #259 adds `wayland_crate` to `gdkwayland`'s feature set (still just
+# `gdk4-wayland`, no new crate on this line): with it enabled,
+# `gdk4-wayland` 0.11.4 exposes safe, public `WaylandDisplay::wl_display()`
+# and `WaylandSurface::wl_surface()` accessors that hand back proxies from
+# the `wayland-client` crate below, already bound to GDK's own C
+# `wl_display` (internally, `gdk4-wayland` reconstructs a `wayland-client`
+# `Connection` from that `wl_display` via `Backend::from_foreign_display` —
+# its own `unsafe`, not this crate's: `kde_blur.rs`'s probe calls only the
+# safe accessors, so this feature adds no `unsafe` to hop-gtk itself).
+# Without it, those two methods do not exist on this crate's already-`gtk`-
+# pinned 0.11 line, and `kde_blur.rs` (issue #259, the KDE
+# `org_kde_kwin_blur` detection this feature exists for) would have no safe
+# way to reach GDK's Wayland connection at all.
+
 # `x11rb` is the pure-Rust X11 client that actually sends the
 # `ConfigureWindow`. The alternative was FFI into `libX11` (`x11-dl`),
 # which would have added this workspace's next `unsafe` block for a call
@@ -169,6 +183,58 @@ gdkwayland = { package = "gdk4-wayland", version = "0.11" }
 # grab-loop harness needs, and this crate wants only core protocol —
 # keeping its own plain `"0.13"` says so.
 x11rb = "0.13"
+
+# Issue #259's KDE `org_kde_kwin_blur` detection (`src/kde_blur.rs`). GTK4's
+# own Wayland binding (`gdkwayland` above) exposes no KDE-specific protocol —
+# `org_kde_kwin_blur` is a Plasma extension, not part of `wayland-protocols`
+# core, and no gtk-rs crate wraps it — so reaching it needs a raw client
+# binding of the wire protocol, the same category of gap `x11rb` above fills
+# for X11's `ConfigureWindow`.
+#
+# `wayland-client` is that binding's runtime: the `Connection`,
+# `EventQueue`, `Dispatch`/`Proxy` machinery a client speaks the Wayland
+# wire protocol through, all safe Rust — verified against a scratch build
+# (this issue's own proof-of-compile) that `Connection::from_backend` over
+# the `WeakBackend` `wayland_crate`'s `wl_display()` hands back reconstructs
+# a connection to GDK's *own* socket, so `kde_blur::probe` opens no second
+# connection the way `probe_x11_compositor` deliberately does for X11 (that
+# module's doc comment explains why a second X connection is harmless;
+# Wayland's single-server-owns-the-socket model has no equivalent harmless
+# case, so sharing GDK's connection — through its own dedicated
+# `EventQueue`, never its default one — is the only sound approach, not a
+# stylistic choice). Pinned at `"0.31"` rather than left to float: `gdkwayland`
+# above requires `wayland-client = "0.31.10"` internally (its own
+# `Cargo.toml`), and matching that major.minor here is what lets Cargo
+# resolve to a *single* copy of `wayland-client` (and the `wayland-backend`
+# beneath it) rather than two independent bindings racing to own the one C
+# `libwayland-client.so` connection — a correctness requirement, not a size
+# optimization. The `system` feature links that system `libwayland-client.so`
+# rather than `wayland-client`'s pure-Rust reimplementation (its `dlopen`
+# feature would instead load it at runtime) — the same "let the system's own
+# library do the talking" posture `gdkwayland`/`gdkx11` above already take
+# with `libgtk-4-wayland`/`libgtk-4-x11`, and required for the shared-socket
+# claim above to hold: two independent libwayland implementations could not
+# meaningfully share one connection object even if the version numbers
+# matched. MIT OR Apache-2.0; the MIT arm satisfies `deny.toml`'s allow list
+# (already present for `x11rb` above), so no `deny.toml` entry is needed.
+wayland-client = { version = "0.31", features = ["system"] }
+
+# The generated `org_kde_kwin_blur`/`org_kde_kwin_blur_manager` bindings
+# `wayland-client` above needs a protocol description to generate code
+# from — `wayland-protocols-plasma` is the maintained crate of KDE/Plasma's
+# own protocol XML (`blur.xml` among them), the same relationship
+# `wayland-protocols` (core Wayland + wlroots + xdg-shell) has to
+# `wayland-client`, just for the Plasma-specific set core `wayland-protocols`
+# does not carry. `client` is its feature for client-side (as opposed to
+# compositor-side) bindings — `kde_blur.rs` only ever binds and calls into
+# the manager, never implements one. No version pin narrower than `"0.3"`:
+# unlike `wayland-client` there is no shared-connection correctness
+# constraint forcing an exact minor to match anything else in the graph, and
+# `blur.xml`'s interface has not changed shape across this crate's 0.3.x
+# releases (verified against the scratch build's vendored source). MIT OR
+# Apache-2.0, the identical license shape as `wayland-client` immediately
+# above, so no `deny.toml` entry is needed for this one either.
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 
 [build-dependencies]
 # Issue #198's `build.rs` — this crate's first — compiles
