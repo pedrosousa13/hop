@@ -263,6 +263,22 @@ struct BlurSession {
     blur: OrgKdeKwinBlur,
 }
 
+/// Demotes `window` to [`crate::material::Mode::Opaque`] — the honesty
+/// invariant's one enforcement point for [`apply_blur`]'s closure, called
+/// from every failure path that runs *after* the closure's `WaylandSurface`
+/// downcast has already succeeded (see that function's own doc comment,
+/// "The honesty invariant enforced on every bind-failure path", for exactly
+/// which paths those are and why the boundary sits there and nowhere
+/// earlier). `material::apply` is idempotent, so calling this on a window
+/// already wearing `Mode::Opaque` — the X11/`Other` case, which never calls
+/// this at all — would have been harmless too; the boundary is enforced by
+/// discipline at each call site regardless, because "harmless if misused
+/// here" is not the same claim as "correct to call here", and this
+/// function's only job is to be the one place that claim is made.
+fn demote_to_opaque(window: &adw::ApplicationWindow) {
+    crate::material::apply(window, crate::material::Mode::Opaque);
+}
+
 /// Wires `window` up so that every time it maps on a Wayland display whose
 /// compositor advertises `org_kde_kwin_blur_manager`, a surface-bound
 /// `org_kde_kwin_blur` object is created, region-blurred to the whole
@@ -302,12 +318,30 @@ struct BlurSession {
 /// that `create` below will succeed on *this* surface at *this* moment —
 /// a compositor could in principle advertise the global and still refuse a
 /// `create` request for a reason this module has no way to observe from
-/// here. This function handles every failure it *can* observe (the
-/// downcasts, the roundtrip, a `flush` failure) by returning early and
-/// leaving the window exactly as `material::apply` already painted it; a
-/// `create`/`commit` that is accepted by the wire protocol but silently
-/// ignored by the compositor is the one gap nothing on the client side can
-/// close, and is left to the real-KWin-session follow-up this crate's other
+/// here.
+///
+/// # The honesty invariant enforced on every bind-failure path
+///
+/// Before the first downcast to [`gdkwayland::WaylandSurface`] succeeds,
+/// nothing here is a KDE-Wayland failure at all — see "This function is its
+/// own X11/`Other` guard" above — so every exit before that point leaves the
+/// window exactly as `material::apply` already painted it, which is correct
+/// on X11 and every other backend: their blur (or lack of it) was never this
+/// function's to touch. Once that downcast has succeeded, though, this
+/// surface is one `material::decide` already committed to
+/// [`crate::material::Mode::Blur`], and every failure this function *can*
+/// observe from there on — the remaining downcasts, the roundtrip, a missing
+/// global, a `flush` error — demotes the window to
+/// [`crate::material::Mode::Opaque`] itself (see [`demote_to_opaque`])
+/// before returning; "leaving it exactly as painted" would be the dishonest,
+/// translucent-with-nothing-behind-it state `material.rs`'s own module doc
+/// forbids. `connect_map` fires again on every subsequent show, so a
+/// demotion is never permanent: once a later map's bind actually succeeds,
+/// this function re-applies [`crate::material::Mode::Blur`] before
+/// returning. The one gap nothing on the client side can close is a
+/// `create`/`commit` that the wire protocol accepts but the compositor
+/// silently ignores — that failure produces no observable signal at all, so
+/// it is left to the real-KWin-session follow-up this crate's other
 /// Wayland-only assertions already defer to (see `tests/kde_blur_probe.rs`'s
 /// own module doc for the identical shape of deferral).
 ///
@@ -338,6 +372,29 @@ struct BlurSession {
 /// session for whichever surface is currently mapped, if any" — `None`
 /// before the first successful bind, `Some` afterward, replaced (with the
 /// old one released first) on every subsequent map.
+///
+/// # Flush ordering: bookkeeping first, the flush last
+///
+/// `create` has already allocated an object id the moment it is called —
+/// before anything is flushed to the compositor at all. An earlier version
+/// of this function released the previous session's blur, stored the new
+/// one, and flushed in that order but returned *before* storing on a
+/// flush error, which meant the very object this paragraph is about could
+/// end up allocated on the wire (a `create` partially written before
+/// `flush` failed) with nothing in `session` ever pointing back to it — a
+/// permanent leak this function's own "Object lifetime" section above
+/// exists to prevent, not one it can be allowed to reintroduce on its own
+/// error path. The fix is ordering, not a new case: release the previous
+/// session's blur and store this map's `BlurSession` *before* the flush
+/// runs, over a cloned `Connection` handle (cheap — a `Connection` is a
+/// thin, `Clone`-able reference to the same backend, not a second
+/// connection), so every object this function ever creates is tracked in
+/// `session` by the time flushing can fail at all. A flush failure past
+/// that point is then just another observable failure under the honesty
+/// invariant above — [`demote_to_opaque`] and return — and the object is
+/// never orphaned: a later remap still finds it in `session` and releases
+/// it before creating its replacement, exactly as it would have on any
+/// other subsequent map.
 ///
 /// # Why `set_region(None)`, not a real region
 ///
@@ -370,6 +427,27 @@ struct BlurSession {
 /// toward "promptly" rather than "eventually": it schedules a redraw,
 /// which schedules GTK's own next commit, without this function reaching
 /// into a frame cycle it does not own.
+///
+/// # A GObject reference cycle, inert today but worth naming
+///
+/// `let win = window.clone(); window.connect_map(move |_| { .. })` closes
+/// over `win`, and the closure itself is owned by the signal handler GTK
+/// attaches to `window` — so `window` transitively keeps its own closure
+/// alive, a reference cycle neither side ever breaks. This is the identical
+/// shape `x11::apply_self_positioning` already has, and it is harmless
+/// there for the same reason it is harmless here: `hide_on_close(true)`
+/// plus `app.rs`'s single-instance `active_window()` check mean exactly one
+/// window exists for the life of the process and it is never destroyed, so
+/// nothing ever needs this cycle to break. The difference worth recording is
+/// what the cycle keeps alive: `x11.rs`'s closure captures only a copied
+/// XID, so its cycle would leak a handful of bytes if the window-lifetime
+/// model ever changed; this closure's `session` cell can hold a live
+/// `Connection`, `EventQueue` and `OrgKdeKwinBlur` (see [`BlurSession`]), so
+/// the same future change — multiple windows, or a window that is actually
+/// destroyed and rebuilt — would leak live protocol objects here where
+/// `x11.rs`'s would just no-op. Not a bug against this crate's actual
+/// window-lifetime model today, and not restructured for a model this
+/// crate does not have.
 pub fn apply_blur(window: &adw::ApplicationWindow) {
     let win = window.clone();
     let session: std::cell::RefCell<Option<BlurSession>> = std::cell::RefCell::new(None);
@@ -382,7 +460,13 @@ pub fn apply_blur(window: &adw::ApplicationWindow) {
         let Some(wayland_surface) = surface.downcast_ref::<gdkwayland::WaylandSurface>() else {
             return;
         };
+        // Past this point the downcast above has already succeeded, so
+        // every remaining exit is an observable KDE-Wayland failure and
+        // must demote rather than merely return — see this function's doc
+        // comment, "The honesty invariant enforced on every bind-failure
+        // path".
         let Some(wl_surface) = wayland_surface.wl_surface() else {
+            demote_to_opaque(&win);
             return;
         };
         let Some(wayland_display) = surface
@@ -390,12 +474,15 @@ pub fn apply_blur(window: &adw::ApplicationWindow) {
             .downcast::<gdkwayland::WaylandDisplay>()
             .ok()
         else {
+            demote_to_opaque(&win);
             return;
         };
         let Some(wl_display) = wayland_display.wl_display() else {
+            demote_to_opaque(&win);
             return;
         };
         let Some(backend) = wl_display.backend().upgrade() else {
+            demote_to_opaque(&win);
             return;
         };
         let connection = Connection::from_backend(backend);
@@ -408,9 +495,11 @@ pub fn apply_blur(window: &adw::ApplicationWindow) {
 
         let mut lookup = BlurManagerLookup { global: None };
         if event_queue.roundtrip(&mut lookup).is_err() {
+            demote_to_opaque(&win);
             return;
         }
         let Some((name, version)) = lookup.global else {
+            demote_to_opaque(&win);
             return;
         };
 
@@ -425,21 +514,34 @@ pub fn apply_blur(window: &adw::ApplicationWindow) {
         // real region".
         blur.set_region(None);
         blur.commit();
-        if connection.flush().is_err() {
-            return;
-        }
 
-        // Release the previous surface's blur object — see this function's
-        // doc comment, "Object lifetime: why a bare `OrgKdeKwinBlur` is not
-        // enough" — before this map's session replaces it.
+        // Release the previous surface's blur object and store this map's
+        // session *before* flushing — see this function's doc comment,
+        // "Flush ordering: bookkeeping first, the flush last" — so the
+        // object just created above is never left untracked if the flush
+        // below fails partway through.
         if let Some(previous) = session.borrow_mut().take() {
             previous.blur.release();
         }
+        let flush_connection = connection.clone();
         *session.borrow_mut() = Some(BlurSession {
             _connection: connection,
             _event_queue: event_queue,
             blur,
         });
+
+        if flush_connection.flush().is_err() {
+            demote_to_opaque(&win);
+            return;
+        }
+
+        // The bind succeeded end to end. If an earlier map on this same
+        // window demoted it to Mode::Opaque, restore Mode::Blur now — see
+        // this function's doc comment, "... this function re-applies
+        // Mode::Blur before returning". `material::apply` is idempotent, so
+        // this is a no-op on the common case where nothing ever demoted the
+        // window in the first place.
+        crate::material::apply(&win, crate::material::Mode::Blur);
 
         // See this function's doc comment, "Why this function never calls
         // `wl_surface.commit()`" — this schedules GTK's own next commit
@@ -464,5 +566,83 @@ mod tests {
         assert_ne!(KdeBlurProbe::ManagerPresent, KdeBlurProbe::ManagerAbsent);
         assert_ne!(KdeBlurProbe::ManagerAbsent, KdeBlurProbe::ProbeFailed);
         assert_ne!(KdeBlurProbe::ManagerPresent, KdeBlurProbe::ProbeFailed);
+    }
+
+    /// Pins [`BlurManagerLookup`]'s `Dispatch` impl directly — the
+    /// interface-name match that decides whether a `Global` event is the
+    /// blur manager at all, and the `(name, version)` capture a bind
+    /// depends on to ask for the right object with the right version. This
+    /// is the one piece of `apply_blur`'s logic that both
+    /// `tests/kde_blur_apply_live.rs` (a real but non-KDE compositor, so
+    /// the blur manager interface never appears there) and
+    /// `tests/kde_blur_apply.rs` (broadway, where the downcast guard
+    /// returns before any registry lookup runs at all) leave completely
+    /// unexercised — so it is pinned here instead, needing no real
+    /// compositor: a `Dispatch::event` call needs a `&WlRegistry`, a
+    /// `&Connection` and a `&QueueHandle`, and all three exist the moment a
+    /// `Connection` is constructed and asks for a registry — no bytes ever
+    /// need to cross the socket for that, so the other end of this
+    /// `UnixStream::pair()` is never read from or written to.
+    #[test]
+    fn blur_manager_lookup_captures_name_and_version_only_for_the_matching_interface() {
+        use std::os::unix::net::UnixStream;
+
+        assert_eq!(
+            OrgKdeKwinBlurManager::interface().name,
+            "org_kde_kwin_blur_manager",
+            "this test's whole premise is pinning the interface name apply_blur's registry \
+             lookup matches against — if the generated binding's name ever drifted from the \
+             protocol's, this is the assertion meant to catch it"
+        );
+
+        let (stream, _unused_peer) = UnixStream::pair()
+            .expect("a freshly created, unconnected-to-anything socketpair cannot fail to pair");
+        let connection = Connection::from_socket(stream)
+            .expect("wrapping a fresh socketpair as a wayland-client Backend cannot fail");
+        let event_queue = connection.new_event_queue::<BlurManagerLookup>();
+        let qh = event_queue.handle();
+        // `get_registry` only allocates a client-side object id and buffers
+        // the request; nothing is written to the socket until an explicit
+        // `flush`, which this test never calls.
+        let registry = connection.display().get_registry(&qh, ());
+
+        let mut state = BlurManagerLookup { global: None };
+
+        // An unrelated interface must never be captured.
+        <BlurManagerLookup as Dispatch<WlRegistry, ()>>::event(
+            &mut state,
+            &registry,
+            wl_registry::Event::Global {
+                name: 1,
+                interface: "wl_compositor".to_string(),
+                version: 5,
+            },
+            &(),
+            &connection,
+            &qh,
+        );
+        assert_eq!(
+            state.global, None,
+            "an unrelated global must never be captured as the blur manager"
+        );
+
+        // The blur manager's own interface, with its exact (name, version).
+        <BlurManagerLookup as Dispatch<WlRegistry, ()>>::event(
+            &mut state,
+            &registry,
+            wl_registry::Event::Global {
+                name: 42,
+                interface: OrgKdeKwinBlurManager::interface().name.to_string(),
+                version: 7,
+            },
+            &(),
+            &connection,
+            &qh,
+        );
+        assert_eq!(
+            state.global,
+            Some((42, 7)),
+            "the matching interface must capture both its name and its version"
+        );
     }
 }
