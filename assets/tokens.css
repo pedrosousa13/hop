@@ -261,8 +261,8 @@
      slight upward drift, and keeps reduced motion opacity-only. Composite
      transition tokens let the reduced overlay remove transform transitions
      without introducing a second motion preference path in Rust. */
-  --hop-toast-transform: translateY(8px);
-  --hop-toast-exit-transform: translateY(-4px);
+  --hop-toast-transform: translateY(8px) scale(0.96);
+  --hop-toast-exit-transform: translateY(-4px) scale(0.98);
   --hop-toast-transition-in: opacity var(--hop-duration-open) var(--hop-ease-out), transform var(--hop-duration-open) var(--hop-ease-out);
   --hop-toast-transition-out: opacity var(--hop-duration-close) var(--hop-ease-in), transform var(--hop-duration-close) var(--hop-ease-in);
 

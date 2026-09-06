@@ -748,13 +748,15 @@ mod tests {
         let reduced_exiting = extract_rule(&reduced, ".hop-toast.hop-toast-exiting");
 
         assert!(
-            full_base.contains("transform: translateY(8px);"),
-            "full motion must start the toast translated upward, got: {full_base}"
+            full_base.contains("transform: translateY(8px) scale(0.96);"),
+            "full motion must start the toast translated upward with the mock's entry scale \
+             pulse, got: {full_base}"
         );
         assert!(
-            full_exiting.contains("transform: translateY(-4px);")
+            full_exiting.contains("transform: translateY(-4px) scale(0.98);")
                 && full_exiting.contains("transform 110ms cubic-bezier(0.4, 0, 1, 1)"),
-            "full motion must include the token-resolved exit slide and fade, got: {full_exiting}"
+            "full motion must include the token-resolved exit slide, scale pulse, and fade, \
+             got: {full_exiting}"
         );
         assert!(
             full_shown.contains("transform 140ms cubic-bezier(0.16, 1, 0.3, 1)"),
