@@ -3303,7 +3303,7 @@ mod tests {
     fn copy_toast_shows_holds_fades_and_retrigger_cancels_stale_lifecycle() {
         run_under_broadway(
             "ui::window::tests::copy_toast_shows_holds_fades_and_retrigger_cancels_stale_lifecycle",
-            1000,
+            1950,
         );
         if std::env::var_os(CHILD_MARKER).is_none() {
             return;
@@ -3315,8 +3315,8 @@ mod tests {
         window.present_with_token(None);
         window.apply_event(IpcEvent::Error("unrelated failure".to_string()));
         assert!(!window.toast.widget.is_visible());
-        assert!(window.status.is_visible());
-        assert_eq!(window.status.text(), "unrelated failure");
+        assert!(window.error_pin.get_visible());
+        assert_eq!(window.error_title.text(), "unrelated failure");
 
         let mut item = test_item(1, "copy result");
         item.actions[0].id = ActionId::new("copy").unwrap();
@@ -3324,7 +3324,7 @@ mod tests {
         item.default_action = ActionId::new("copy").unwrap();
         model::replace(&window.store, vec![item]);
         window.selection.set_selected(0);
-        window.status.set_visible(false);
+        window.error_pin.set_visible(false);
 
         // The production copy path records this pending action before the
         // daemon outcome arrives, then the successful outcome drives the
