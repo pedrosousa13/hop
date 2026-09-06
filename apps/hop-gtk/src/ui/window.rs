@@ -535,9 +535,23 @@ impl HopWindow {
         // `strategy` as an input: the two decisions are independent (a
         // Wayland session's overlay *strategy* depends on layer-shell
         // support; its material *mode* never does — see `material`'s own
-        // module doc for why Wayland is always opaque here), so nothing is
-        // gained by threading one through the other.
-        crate::material::apply(&window, crate::material::resolve());
+        // module doc), so nothing is gained by threading one through the
+        // other.
+        let mode = crate::material::resolve();
+        crate::material::apply(&window, mode);
+        // Issue #259: on a Wayland session, `resolve` can now honestly
+        // answer `Mode::Blur` only once `kde_blur::probe` has confirmed
+        // `org_kde_kwin_blur_manager` — `apply_blur` is what turns that
+        // answer into a real, surface-bound blur object (its own doc
+        // comment has the mechanics and lifetime handling). It is a
+        // documented no-op everywhere else: on X11 (whose blur was already
+        // fully implemented by #253 through the CSS class alone) and on any
+        // other backend, its first downcast of the mapped surface to
+        // `gdkwayland::WaylandSurface` fails and it returns immediately —
+        // which is why this call site needs no session check of its own.
+        if mode == crate::material::Mode::Blur {
+            crate::kde_blur::apply_blur(&window);
+        }
         // Issue #233: the strategy — not a second probe — decides whether
         // this window becomes a layer surface. `apply_or_fallback` still
         // re-checks the probe internally (a documented no-op unless the
