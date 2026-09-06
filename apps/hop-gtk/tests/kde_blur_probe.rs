@@ -148,8 +148,8 @@ fn run_assertions() {
         result,
         hop_gtk::kde_blur::KdeBlurProbe::ManagerAbsent,
         "GNOME/Mutter never advertises org_kde_kwin_blur_manager — see src/material.rs's \
-         module doc, 'Wayland: KDE's org_kde_kwin_blur_manager, detected but not yet applied' \
-         — but the probe returned {result:?}. If this machine's live session is not actually \
-         GNOME/Mutter, this assertion needs deliberately revisiting, not silencing.",
+         module doc, 'Wayland: KDE's org_kde_kwin_blur_manager' — but the probe returned \
+         {result:?}. If this machine's live session is not actually GNOME/Mutter, this \
+         assertion needs deliberately revisiting, not silencing.",
     );
 }

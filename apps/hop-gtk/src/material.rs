@@ -86,31 +86,29 @@
 //! [`Mode::Blur`] on X11. No manager present, or the probe itself failing
 //! for any reason, both degrade to [`Mode::Opaque`] — see [`decide`].
 //!
-//! # Wayland: KDE's `org_kde_kwin_blur_manager`, detected but not yet applied
+//! # Wayland: KDE's `org_kde_kwin_blur_manager`
 //!
 //! GNOME's Mutter exposes no blur API of any kind to clients — the design
 //! spec's own "Known constraints" section says so, the same fact
 //! `layer_shell`'s module doc already leans on for its own GNOME arm — so
 //! there is nothing to probe there at all, ever: this is a permanent fact
 //! about Mutter, not a gap this module will one day close. KDE's KWin does
-//! have a blur protocol, `org_kde_kwin_blur`, and issue #259 adds the probe
-//! for it: [`crate::kde_blur::probe`] asks, over GDK's own Wayland
-//! connection through a dedicated event queue (see that module's own doc
-//! comment for exactly how and why), whether the compositor advertises
+//! have a blur protocol, `org_kde_kwin_blur`, and issue #259 adds both the
+//! probe for it and the code that acts on a positive answer:
+//! [`crate::kde_blur::probe`] asks, over GDK's own Wayland connection
+//! through a dedicated event queue (see that module's own doc comment for
+//! exactly how and why), whether the compositor advertises
 //! `org_kde_kwin_blur_manager` at all. As with X11's compositor probe,
-//! presence is not proof of anything about *this specific surface* — this
-//! slice binds nothing, creates no blur object, commits nothing — only that
-//! the protocol exists to ask for it with.
-//!
-//! Deliberately incomplete, and said so out loud: issue #259 ships in two
-//! slices. This first one wires detection all the way through
-//! [`decide`] and [`report`], with unit coverage exhaustive over the widened
-//! matrix below — but until the second slice adds the surface-bound
-//! `org_kde_kwin_blur` object, a positive detection is not the same thing as
-//! honest translucency. [`resolve`] accounts for this explicitly (see its
-//! own doc comment): the call site downgrades an honestly-*detected*
-//! `Mode::Blur` on Wayland to `Mode::Opaque` until the surface work lands,
-//! rather than letting `decide` itself lie about what it found.
+//! presence is not proof of anything about *this specific surface* —
+//! [`probe`](crate::kde_blur::probe) itself binds nothing, creates no blur
+//! object, commits nothing, only that the protocol exists to ask for it
+//! with. What actually binds the manager and creates the surface-bound
+//! `org_kde_kwin_blur` object is [`crate::kde_blur::apply_blur`], called
+//! from [`resolve`]'s own call site (`ui::window::HopWindow::build`) once,
+//! and only once, [`decide`] has resolved to [`Mode::Blur`] on this arm's
+//! strength — see that function's own doc comment for the full mechanics
+//! and for the one thing even a successful bind here still cannot
+//! guarantee about the surface `apply_blur` acts on later.
 //!
 //! [`decide`]'s `SessionKind::Wayland` arm stays its own match arm,
 //! independent of X11's, exactly as before — see [`KdeBlurProbe`] for the
@@ -213,12 +211,16 @@ impl Mode {
 /// establish, and for the identical reason, so the whole degrade matrix is
 /// unit-tested below with no display connection at all.
 ///
-/// This function answers "did detection honestly confirm blur would
-/// composite" — not "is it safe to apply that answer right now". On
-/// Wayland specifically, [`resolve`]'s own doc comment records why those
-/// are different questions during issue #259's first slice, and why the
-/// gap between them is closed one call site up from here, not by weakening
-/// this function's honesty.
+/// This function answers only "did detection honestly confirm blur would
+/// composite" — it creates nothing itself, on either session kind. X11's
+/// answer needs nothing further: issue #253 already made a compositor
+/// present sufficient for the CSS class alone to render honestly. Wayland's
+/// answer does need a further step — [`resolve`]'s own call site calls
+/// [`crate::kde_blur::apply_blur`] whenever this function resolves to
+/// [`Mode::Blur`] here, which is what actually binds the manager and
+/// creates the surface-bound blur object this answer asserts exists to ask
+/// for. See [`resolve`]'s own doc comment for why that call belongs one
+/// layer up from here rather than inside this function.
 pub fn decide(kind: SessionKind, x11_compositor: CompositorProbe, kde_blur: KdeBlurProbe) -> Mode {
     match kind {
         // X11: honest translucency needs proof alpha actually composites,
@@ -296,10 +298,14 @@ fn probe_x11_compositor() -> CompositorProbe {
 /// `layer_shell`'s doc comment on its own `probe`/`apply_or_fallback`
 /// split).
 ///
-/// `mode` is [`decide`]'s honest answer, not necessarily what gets applied
-/// to a real window on Wayland this slice — see [`resolve`]'s doc comment.
-/// This report always describes detection honestly; it is not the place a
-/// caller's temporary downgrade gets hidden.
+/// `mode` is [`decide`]'s honest answer, and — on Wayland — also the trigger
+/// [`resolve`]'s own call site uses to decide whether to call
+/// [`crate::kde_blur::apply_blur`] at all. This report describes detection,
+/// never the later bind: a `create` that the wire protocol accepts but the
+/// compositor silently ignores would still log the same "manager
+/// advertised" reason here, because this function has no way to see that
+/// failure (see [`crate::kde_blur::apply_blur`]'s own doc comment, "What
+/// this function cannot guarantee").
 pub fn report(
     kind: SessionKind,
     x11_compositor: CompositorProbe,
@@ -322,8 +328,8 @@ pub fn report(
         },
         SessionKind::Wayland => match kde_blur {
             KdeBlurProbe::ManagerPresent => {
-                "a Wayland global advertises org_kde_kwin_blur_manager (issue #259 slice 1: \
-                 detected only — no surface-bound blur object exists yet, see module doc)"
+                "a Wayland global advertises org_kde_kwin_blur_manager; resolve's call site \
+                 binds it and creates the surface-bound blur object (crate::kde_blur::apply_blur)"
             }
             KdeBlurProbe::ManagerAbsent => {
                 "no Wayland global advertises org_kde_kwin_blur_manager (GNOME/Mutter: never \
@@ -350,28 +356,21 @@ pub fn report(
 /// when, the session is Wayland, decides the mode, and logs the one-line
 /// outcome [`report`] formats.
 ///
-/// # This function stays honest; the two-phase Wayland gap is a call
-/// # site's problem, not this function's
+/// # This function decides; it does not itself apply anything to a surface
 ///
-/// [`decide`] can now honestly answer [`Mode::Blur`] for a Wayland session
-/// whose compositor advertises `org_kde_kwin_blur_manager` — this function
+/// [`decide`] honestly answers [`Mode::Blur`] for a Wayland session whose
+/// compositor advertises `org_kde_kwin_blur_manager` — this function
 /// returns exactly that answer, and [`report`] logs exactly that reasoning.
-/// It does **not** downgrade the answer to account for issue #259 being a
-/// two-slice piece of work: this slice's [`crate::kde_blur::probe`] creates
-/// no surface-bound blur object (see that module's doc comment), so a real
-/// window applying `Mode::Blur` here today would render a translucent
-/// ground the compositor is not actually blurring anything behind —
-/// exactly the failure mode the honesty invariant exists to prevent.
-///
-/// That gap is closed at `ui::window::HopWindow::build`'s call site
-/// instead of here, deliberately: this function's job is "what did
-/// detection honestly find", not "what is currently safe to paint", and
-/// conflating the two would make this function's own answer a function of
-/// which slice of #259 happens to be merged — indistinguishable from
-/// weakening the invariant. See that call site's own comment for the
-/// explicit, temporary downgrade and why it is written to be easy to find
-/// and delete once issue #259's second slice lands the surface-bound
-/// application.
+/// It creates nothing: `ui::window::HopWindow::build`'s call site is what
+/// applies [`apply`] and, on a `Mode::Blur` answer, also calls
+/// [`crate::kde_blur::apply_blur`] to bind the manager and create the
+/// surface-bound blur object — deliberately one layer up from here, so this
+/// function's own job stays "what did detection honestly find" rather than
+/// also becoming "and did applying it succeed", a question this function
+/// has no surface to ask against yet (`resolve` never receives the window
+/// it will eventually be applied to). See that call site's own comment, and
+/// [`crate::kde_blur::apply_blur`]'s doc comment, for the mechanics of the
+/// step this function's answer feeds into.
 ///
 /// The `None`-display panic matches `app::install_stylesheet`'s and
 /// `app::resolve_overlay_strategy`'s identical posture: by the time
@@ -639,9 +638,10 @@ mod tests {
         assert!(text.contains("opaque"), "{text}");
         assert!(text.contains("org_kde_kwin_blur_manager"), "{text}");
 
-        // The KDE-present arm's own reason: says the manager was found,
-        // and that this slice does not yet apply blur from it (issue
-        // #259's own two-slice honesty — see `resolve`'s doc comment).
+        // The KDE-present arm's own reason: says the manager was found, and
+        // names the function (`crate::kde_blur::apply_blur`) that binds it
+        // and creates the surface-bound blur object — see this module's
+        // doc comment, "Wayland: KDE's `org_kde_kwin_blur_manager`".
         let text = report(
             SessionKind::Wayland,
             CompositorProbe::ManagerAbsent,
@@ -651,6 +651,6 @@ mod tests {
         assert!(text.contains("Wayland"), "{text}");
         assert!(text.contains("blur"), "{text}");
         assert!(text.contains("org_kde_kwin_blur_manager"), "{text}");
-        assert!(text.contains("slice 1"), "{text}");
+        assert!(text.contains("apply_blur"), "{text}");
     }
 }
